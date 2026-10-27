@@ -36,6 +36,10 @@ npm run test:e2e
 
 ## 组织方式
 
-`App` 装配页面；`ChatPage` 保存已发送的用户消息；`MessageInput` 内的 Lexical 管理草稿、选区和撤销；`MessageList` 只读展示原文。输入区高度稳定，消息列表单独滚动，发送后不自动跟随底部。
+`App` 装配页面；`ChatPage` 保存已发送的用户消息；`MessageInput` 内的 Lexical 管理草稿、选区和撤销；`MessageList` 只读展示原文。输入框随草稿增高，到上限后在内部滚动；低高度和触摸屏分别调整可用高度和操作目标。消息列表单独滚动，输入框增高、发送清空和恢复焦点时保持阅读位置，发送后不自动跟随底部。
+
+视觉按 [design.md](../design.md) 实现：白底、近黑主操作、浅灰用户消息，760px 居中内容列，正文与输入 14px/24px。发送按钮只显示向上箭头，保留可访问名称“发送”；空白稿为浅灰禁用，有效稿为黑底白图标。
+
+三款字体及许可证随应用提供，来源与覆盖范围见 [字体目录说明](public/fonts/README.md)。当前聊天正文、标题与控件使用 Noto Sans CJK SC；EB Garamond 与 Noto Sans Mono CJK SC 在对应的品牌/代码角色使用时加载。完整正文可变字库约 14.25 MB，换取无需假设用户会输入哪些汉字；没有额外运行时字体服务或 npm 依赖。
 
 Button 源码来自 [shadcn/ui 官方 registry](https://ui.shadcn.com/r/styles/new-york-v4/button.json)，本地仅调整类名工具路径及直接使用的 Slot 导入；主题由 Tailwind CSS 提供。接入依据：[Vite 安装说明](https://ui.shadcn.com/docs/installation/vite)、[Lexical React](https://lexical.dev/docs/getting-started/react)、[Lexical 更新与状态读取](https://lexical.dev/docs/concepts/updates)。

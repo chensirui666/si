@@ -1,0 +1,23 @@
+@font-face {
+  font-family: "Noto Sans CJK SC";
+  src: url("/fonts/noto-sans-cjk-sc-variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Noto Sans Mono CJK SC";
+  src: url("/fonts/noto-sans-mono-cjk-sc-regular.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "EB Garamond";
+  src: url("/fonts/eb-garamond-regular.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
