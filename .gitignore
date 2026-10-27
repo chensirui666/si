@@ -1,0 +1,40 @@
+# 本地参考源码，保留各自的仓库，不随本项目上传
+/pi/
+/opencode/
+/hermes/
+/codex/
+/claude-code/
+/deepseek-harness/
+
+# 学习计划仅保留在本地
+/本地Coding Agent学习计划/
+
+# 本机密钥配置；无真实密钥的示例文件可以提交
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!.env.*.example
+*.pem
+*.key
+
+# 依赖、构建结果和缓存
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+*.tsbuildinfo
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本机杂项和日志
+.DS_Store
+._*
+*.log
