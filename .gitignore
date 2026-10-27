@@ -38,3 +38,8 @@ __pycache__/
 .DS_Store
 ._*
 *.log
+
+# 浏览器测试产物
+web/test-results/
+web/playwright-report/
+web/playwright/.cache/
