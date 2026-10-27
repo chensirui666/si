@@ -23,6 +23,8 @@
 - 原生控制打开实际 Safari 的 `/tests/manual-input.html`，确认独立输入组件、空提交列表和真实 `trusted=true` 键盘事件可观察。
 - 初次检查的输入源为 ABC；Control+Space/Control+Option+Space/Caps Lock 的操作后，系统配置最终显示 `com.apple.inputmethod.SCIM.ITABC`（拼音）。但在实际 Safari 刷新并重新聚焦后，通过原生控制逐键输入 `nihao`，仍只观察到英文和 `keydown trusted=true ... composing=false`，没有候选词或 composition 事件。配置中的输入源名称不能证明目标输入框已发生真实中文选字。
 - 系统输入法菜单代理的原生控制连接超时；已请求使用者仅切换 Safari 输入源，之后仍由 Agent 执行候选词确认和结果核验。当前工具操作未产生可验证的真实组合输入，原因尚不能确定；不把这一环境限制改写成产品通过。
+- 补充复核：通过原生 `Raise` 将 Safari 窗口置前、刷新独立组件、重新聚焦，再逐键输入，仍得到 `nihao` 和非组合键盘事件。只读检查确认当前保存布局为 `com.apple.keylayout.PinyinKeyboard`，选择与历史中为 `SCIM.ITABC`，没有 currentHost/ByHost 输入源覆盖，因而不能归因于未安装或未启用拼音。
+- 现有 CUA 控制的 `pressKey`、`typeText` 均未触发可观察的中文候选过程。已请求使用者明确授权 AppleScript/System Events 作为系统键盘操作的替代方式；CUA 规则禁止在没有该明确授权时改用其他技术进行界面动作，因此未执行替代操作。
 - 此处尚不能记为通过；粘贴“你好”、DOM 合成 composition 或 Playwright WebKit 都不构成真实中文选字证据。
 
 ## 已发现并处理的问题
