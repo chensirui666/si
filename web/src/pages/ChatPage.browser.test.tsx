@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/experimental-ct-react'
 import { ChatPage } from './ChatPage'
+import { Button } from '../components/ui/button'
 
 test('发送及恢复焦点时保持阅读位置', async ({ mount, page }) => {
   await mount(<ChatPage />)
@@ -192,4 +193,109 @@ test('正文使用随应用加载的 Noto Sans CJK SC 字体', async ({ mount, p
   const { fonts } = await session.send('CSS.getPlatformFontsForNode', { nodeId })
   expect(fonts.some(font => font.familyName === 'Noto Sans CJK SC' && font.isCustomFont && font.glyphCount > 0)).toBe(true)
   await session.detach()
+})
+
+test('输入区聚焦、切换和发送后保持弱边界，按钮焦点使用内部标记', async ({ mount, page }) => {
+  await mount(<ChatPage />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const composer = page.locator('.message-input')
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  const before = await composer.boundingBox()
+  const expectQuietBoundary = async () => {
+    await expect(composer).toHaveCSS('border-width', '1px')
+    await expect(composer).toHaveCSS('border-color', 'rgb(222, 222, 219)')
+    await expect(composer).toHaveCSS('outline-style', 'none')
+    await expect(composer).toHaveCSS('box-shadow', 'rgba(0, 0, 0, 0.04) 0px 2px 12px 0px')
+    expect(await composer.boundingBox()).toEqual(before)
+  }
+
+  await expectQuietBoundary()
+  await editor.click()
+  await editor.pressSequentially('focus check')
+  await expectQuietBoundary()
+  await expect(send).toBeEnabled()
+  await expect(editor).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(send).toBeFocused()
+  await expectQuietBoundary()
+  await expect(send).toHaveCSS('border-width', '0px')
+  await expect(send).toHaveCSS('outline-style', 'none')
+  await expect(send).toHaveCSS('box-shadow', 'none')
+  await expect.poll(() => send.evaluate(el => {
+    const marker = getComputedStyle(el, '::after')
+    return { opacity: marker.opacity, width: marker.width, height: marker.height }
+  })).toEqual({ opacity: '1', width: '4px', height: '4px' })
+
+  await send.hover()
+  await expect(send).toHaveCSS('background-color', 'rgb(51, 51, 51)')
+  await page.mouse.down()
+  await expect(send).toHaveCSS('background-color', 'rgb(26, 26, 26)')
+  await page.mouse.up()
+  await expect(editor).toHaveText('')
+  await expect(editor).toBeFocused()
+  await expectQuietBoundary()
+  expect(await send.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
+})
+
+test('消息区键盘焦点使用固定局部标记，滚动和高对比度下仍可辨认', async ({ mount, page }) => {
+  await mount(<ChatPage />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const list = page.getByRole('region', { name: '消息列表' })
+  const frame = page.locator('.message-list-frame')
+  for (let i = 0; i < 12; i++) {
+    await editor.fill(`消息 ${i}：${'用于验证滚动。'.repeat(24)}`)
+    await editor.press('Enter')
+  }
+  await page.getByRole('heading', { name: '聊天' }).click()
+  await expect(frame).toHaveCount(1)
+  expect(await frame.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
+  await page.keyboard.press('Tab')
+  await expect(list).toBeFocused()
+  await expect(list).toHaveCSS('border-width', '0px')
+  await expect(list).toHaveCSS('outline-style', 'none')
+  await expect(list).toHaveCSS('box-shadow', 'none')
+  const markerBefore = await frame.evaluate(el => {
+    const marker = getComputedStyle(el, '::after')
+    return { opacity: marker.opacity, width: marker.width, height: marker.height, top: marker.top, left: marker.left }
+  })
+  expect(markerBefore).toMatchObject({ opacity: '1', width: '6px', height: '6px' })
+  const frameBefore = await frame.boundingBox()
+  const scrollBefore = await list.evaluate(el => el.scrollTop)
+  await page.keyboard.press('PageDown')
+  await expect.poll(() => list.evaluate(el => el.scrollTop)).toBeGreaterThan(scrollBefore)
+  expect(await frame.boundingBox()).toEqual(frameBefore)
+  expect(await frame.evaluate(el => {
+    const marker = getComputedStyle(el, '::after')
+    return { opacity: marker.opacity, width: marker.width, height: marker.height, top: marker.top, left: marker.left }
+  })).toEqual(markerBefore)
+
+  await page.emulateMedia({ forcedColors: 'active' })
+  expect(await frame.evaluate(el => {
+    const marker = getComputedStyle(el, '::after')
+    return { opacity: marker.opacity, background: marker.backgroundColor, color: marker.color }
+  })).toEqual({ opacity: '1', background: 'rgb(0, 0, 0)', color: 'rgb(0, 0, 0)' })
+  await expect(list).toHaveCSS('outline-style', 'none')
+})
+
+test('浅色按钮以背景反馈悬停和按下，键盘焦点不叠加外圈', async ({ mount, page }) => {
+  await mount(<><Button variant="secondary">浅色按钮</Button><Button variant="ghost">次要按钮</Button></>)
+  const first = page.getByRole('button', { name: '浅色按钮', exact: true })
+  await page.keyboard.press('Tab')
+  await expect(first).toBeFocused()
+  await expect(first).toHaveCSS('outline-style', 'none')
+  await expect(first).toHaveCSS('box-shadow', 'none')
+  expect(await first.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('1')
+  await page.keyboard.press('Tab')
+  await expect(page.getByRole('button', { name: '次要按钮', exact: true })).toBeFocused()
+  for (const name of ['浅色按钮', '次要按钮']) {
+    const button = page.getByRole('button', { name, exact: true })
+    await button.hover()
+    await expect(button).toHaveCSS('background-color', 'rgb(240, 240, 238)')
+    await page.mouse.down()
+    await expect(button).toHaveCSS('background-color', 'rgb(222, 222, 219)')
+    await page.mouse.up()
+    await expect(button).toHaveCSS('outline-style', 'none')
+    await expect(button).toHaveCSS('box-shadow', 'none')
+    expect(await button.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
+  }
 })

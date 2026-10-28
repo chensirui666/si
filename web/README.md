@@ -40,6 +40,10 @@ npm run test:e2e
 
 视觉按 [design.md](../design.md) 实现：白底、近黑主操作、浅灰用户消息，760px 居中内容列，正文与输入 14px/24px。发送按钮只显示向上箭头，保留可访问名称“发送”；空白稿为浅灰禁用，有效稿为黑底白图标。
 
+输入框保持弱化边界与固定轻微阴影 `0 2px 12px 0 rgba(0, 0, 0, 0.04)`，常态和聚焦一致，不加粗、不加外圈。消息滚动区无框；消息区与按钮以局部小点提示键盘定位，消息区小点不随内容滚动，输入位置由光标标示。按钮用背景变化反馈悬停和按下。
+
+标题只显示“聊天”，不再显示“本地”；输入区不常驻显示“Enter 发送 · Shift+Enter 换行”提示，快捷键行为保持不变。
+
 三款字体及许可证随应用提供，来源与覆盖范围见 [字体目录说明](public/fonts/README.md)。当前聊天正文、标题与控件使用 Noto Sans CJK SC；EB Garamond 与 Noto Sans Mono CJK SC 在对应的品牌/代码角色使用时加载。完整正文可变字库约 14.25 MB，换取无需假设用户会输入哪些汉字；没有额外运行时字体服务或 npm 依赖。
 
-Button 源码来自 [shadcn/ui 官方 registry](https://ui.shadcn.com/r/styles/new-york-v4/button.json)，本地仅调整类名工具路径及直接使用的 Slot 导入；主题由 Tailwind CSS 提供。接入依据：[Vite 安装说明](https://ui.shadcn.com/docs/installation/vite)、[Lexical React](https://lexical.dev/docs/getting-started/react)、[Lexical 更新与状态读取](https://lexical.dev/docs/concepts/updates)。
+Button 源码来自 [shadcn/ui 官方 registry](https://ui.shadcn.com/r/styles/new-york-v4/button.json)，本地调整类名工具路径、Slot 导入及交互样式；焦点使用项目统一的局部标记，替代默认光圈。主题由 Tailwind CSS 提供。接入依据：[Vite 安装说明](https://ui.shadcn.com/docs/installation/vite)、[Lexical React](https://lexical.dev/docs/getting-started/react)、[Lexical 更新与状态读取](https://lexical.dev/docs/concepts/updates)。

@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./fonts.css";
+@source "./";
 
 @theme inline {
   --font-sans: "Noto Sans CJK SC", sans-serif;
@@ -65,9 +66,9 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
   border-bottom: 1px solid var(--border);
 }
 .chat-header h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 600; }
-.chat-header span { font-size: 12px; line-height: 18px; color: var(--muted-text); }
 .chat-main { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 24px; }
 
+.message-list-frame { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; position: relative; }
 .message-list {
   flex: 1;
   min-height: 0;
@@ -75,8 +76,23 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
   overflow: auto;
   overflow-anchor: none;
   padding: 24px 0;
+  outline: none;
 }
-.message-list:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.message-list-frame::after,
+[data-slot="button"]::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0;
+  pointer-events: none;
+  forced-color-adjust: none;
+}
+.message-list-frame::after { width: 6px; height: 6px; top: 4px; left: 0; }
+.message-list-frame:has(> .message-list:focus-visible)::after { opacity: 1; }
+[data-slot="button"] { position: relative; outline: none; }
+[data-slot="button"]::after { width: 4px; height: 4px; bottom: 3px; left: calc(50% - 2px); }
+[data-slot="button"]:focus-visible::after { opacity: 1; }
 .message-items { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 24px; }
 .message-item { max-width: min(90%, 680px); min-width: 0; border-radius: 16px; background: var(--surface); padding: 16px; }
 .message-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 24px; font-weight: 400; }
@@ -84,14 +100,13 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 .message-input {
   flex: none;
   min-width: 0;
-  border: 1px solid var(--control-border);
+  border: 1px solid var(--border);
   border-radius: 16px;
   padding: 16px;
   background: var(--background);
+  box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.04);
   position: relative;
 }
-.message-input:focus-within { border-color: var(--primary); }
-.message-input:has(.message-editor:focus-visible) { outline: 2px solid var(--primary); outline-offset: 2px; }
 .message-editor {
   min-height: 24px;
   max-height: min(200px, 35dvh);
@@ -105,8 +120,7 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 }
 .message-editor p { margin: 0; }
 .message-placeholder { pointer-events: none; position: absolute; top: 16px; left: 16px; right: 16px; color: var(--secondary-text); font-size: 14px; line-height: 24px; }
-.composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
-.composer-hint { color: var(--muted-text); font-size: 12px; line-height: 18px; }
+.composer-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
 .send-button {
   width: 36px;
   height: 36px;
@@ -120,9 +134,14 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
   transition: none;
 }
 .send-button:not(:disabled):hover { background: #333333; }
+.send-button:not(:disabled):active { background: var(--primary); }
 .send-button:disabled { background: var(--surface); color: var(--muted-text); opacity: 1; }
-.send-button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; box-shadow: none; }
 .send-button svg { width: 16px; height: 16px; }
+
+@media (forced-colors: active) {
+  .message-list-frame::after { color: CanvasText; }
+  [data-slot="button"]::after { color: ButtonText; }
+}
 
 @media (max-width: 600px) {
   .chat-page { padding: 0 16px 16px; }

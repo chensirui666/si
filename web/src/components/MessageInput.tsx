@@ -121,7 +121,6 @@ function Composer({ onSend }: MessageInputProps) {
       />
       <HistoryPlugin />
       <div className="composer-actions">
-        <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
         <Button className="send-button" size="icon" type="button" aria-label="发送" title="发送" disabled={!canSend} onClick={() => submit(editor.read($readDraft))}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
             <path d="M8 13V3M3 8l5-5 5 5" />

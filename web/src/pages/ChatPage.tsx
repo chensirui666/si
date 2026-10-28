@@ -17,7 +17,6 @@ export function ChatPage() {
     <div className="chat-page">
       <header className="chat-header">
         <h1>聊天</h1>
-        <span>本地</span>
       </header>
       <main className="chat-main">
         <MessageList messages={messages} />
