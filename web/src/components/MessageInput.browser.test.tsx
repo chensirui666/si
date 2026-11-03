@@ -53,6 +53,35 @@ test('发送成功后隔离撤销历史', async ({ mount }) => {
   await expect(component.getByLabel('已提交原文')).toHaveText('["待发送内容"]')
 })
 
+test('外部门禁切换保留编辑器、原文、焦点与撤销，恢复后可提交原草稿', async ({ mount }) => {
+  const component = await mount(<MessageInputHarness sendDisabled />)
+  const textbox = component.getByRole('textbox', { name: '消息' })
+  const originalEditor = await textbox.elementHandle()
+  await textbox.pressSequentially('draft')
+  await textbox.press('Shift+Enter')
+  await textbox.pressSequentially('tail')
+  await expect(component.getByRole('button', { name: '发送' })).toBeDisabled()
+  await textbox.press('Enter')
+  await expect(component.getByLabel('已提交原文')).toHaveText('[]')
+  await expect(textbox).toHaveText('drafttail')
+  await expect(textbox).toBeFocused()
+
+  await textbox.press('ControlOrMeta+z')
+  await expect(textbox).toHaveText('draft')
+  await textbox.press('ControlOrMeta+Shift+z')
+  await expect(textbox).toHaveText('drafttail')
+
+  await component.update(<MessageInputHarness sendDisabled={false} />)
+  expect(await textbox.evaluate((element, previous) => element === previous, originalEditor)).toBe(true)
+  await expect(textbox).toBeFocused()
+  await expect(textbox).toHaveText('drafttail')
+  await expect(component.getByRole('button', { name: '发送' })).toBeEnabled()
+  await textbox.press('Enter')
+  await expect(component.getByLabel('已提交原文')).toHaveText('["draft\\ntail"]')
+  await expect(textbox).toHaveText('')
+  await expect(textbox).toBeFocused()
+})
+
 test('Enter 接收报错后仍可撤销和继续逐字编辑', async ({ mount, page }) => {
   const errors: string[] = []
   page.on('pageerror', (error) => { errors.push(error.message) })

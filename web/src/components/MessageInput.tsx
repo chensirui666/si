@@ -17,7 +17,7 @@ import { mergeRegister } from '@lexical/utils'
 
 import { Button } from '@/components/ui/button'
 
-type MessageInputProps = { onSend: (text: string) => boolean }
+type MessageInputProps = { onSend: (text: string) => boolean; sendDisabled: boolean }
 
 const initialConfig = {
   namespace: 'message-input',
@@ -28,21 +28,21 @@ function $readDraft() {
   return $getRoot().getChildren().map((paragraph) => paragraph.getTextContent()).join('\n')
 }
 
-export function MessageInput({ onSend }: MessageInputProps) {
+export function MessageInput({ onSend, sendDisabled }: MessageInputProps) {
   return (
     <LexicalComposer initialConfig={initialConfig}>
-      <Composer onSend={onSend} />
+      <Composer onSend={onSend} sendDisabled={sendDisabled} />
     </LexicalComposer>
   )
 }
 
-function Composer({ onSend }: MessageInputProps) {
+function Composer({ onSend, sendDisabled }: MessageInputProps) {
   const [editor] = useLexicalComposerContext()
   const [canSend, setCanSend] = useState(false)
 
   const submit = useCallback((text: string) => {
     try {
-      if (!text.trim() || onSend(text) !== true) return
+      if (sendDisabled || !text.trim() || onSend(text) !== true) return
     } catch (error) {
       // Report receiver errors after Lexical has finished its active update.
       queueMicrotask(() => { throw error })
@@ -62,7 +62,7 @@ function Composer({ onSend }: MessageInputProps) {
         editor.getRootElement()?.focus({ preventScroll: true })
       },
     })
-  }, [editor, onSend])
+  }, [editor, onSend, sendDisabled])
 
   useEffect(() => editor.registerUpdateListener(({ editorState }) => {
     setCanSend(editorState.read(() => Boolean($readDraft().trim())))
@@ -121,7 +121,7 @@ function Composer({ onSend }: MessageInputProps) {
       />
       <HistoryPlugin />
       <div className="composer-actions">
-        <Button className="send-button" size="icon" type="button" aria-label="发送" title="发送" disabled={!canSend} onClick={() => submit(editor.read($readDraft))}>
+        <Button className="send-button" size="icon" type="button" aria-label="发送" title="发送" disabled={sendDisabled || !canSend} onClick={() => submit(editor.read($readDraft))}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
             <path d="M8 13V3M3 8l5-5 5 5" />
           </svg>

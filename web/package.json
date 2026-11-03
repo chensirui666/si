@@ -13,7 +13,7 @@
     "test": "npm run test:unit && npm run test:browser",
     "test:unit": "vitest run",
     "test:browser": "playwright test -c playwright-ct.config.ts",
-    "test:e2e": "playwright test -c playwright.config.ts"
+    "test:e2e": "npm --prefix .. run build && playwright test -c playwright.config.ts"
   },
   "dependencies": {
     "@lexical/history": "0.52.0",
@@ -34,14 +34,14 @@
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",
-    "@types/node": "26.6.5",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.1.2",
     "jsdom": "30.1.3",
     "tailwindcss": "4.3.3",
-    "typescript": "5.9.3",
     "vite": "8.3.5",
-    "vitest": "5.0.5"
+    "@agent-learning/agent": "0.1.0",
+    "@agent-learning/model": "0.1.0",
+    "@agent-learning/server": "0.1.0"
   }
 }

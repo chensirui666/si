@@ -1,0 +1,29 @@
+{
+  "name": "@agent-learning/server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/webserver/index.d.ts",
+      "default": "./dist/webserver/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/webserver/protocol.d.ts",
+      "default": "./dist/webserver/protocol.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "vitest run --environment node test"
+  },
+  "dependencies": {
+    "@agent-learning/agent": "0.1.0",
+    "@agent-learning/credentials": "0.1.0",
+    "ws": "8.22.1"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1"
+  }
+}

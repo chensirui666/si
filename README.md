@@ -11,4 +11,32 @@ Agent 在本项目中的回复必须遵守以下要求：
 
 ## 运行项目
 
-聊天页面的启动与测试命令见 [web/README.md](web/README.md)。
+阶段一已接入本机授权、WebSocket 和 Agent 空快照；草稿可编辑，发送尚未开放。消息只在后端进程内存中，重启后清空。
+
+```sh
+npm ci
+npm run build
+npm --prefix packages/server start
+```
+
+打开终端打印的完整授权链接，浏览器取得 Cookie 后自动跳转到干净地址。默认监听 `127.0.0.1:3000`；首次启动会安全创建 `~/.agent-learning/browser-auth.json`。不要分享授权链接。签名文件损坏或权限错误时服务拒绝启动，不会自动覆盖它。
+
+开发时分别运行：
+
+```sh
+npm run dev:server
+npm --prefix web run dev
+```
+
+前者首次构建全部后端包，并监听 Credentials、Model、Agent、Server 的源码变化和重启；后者固定使用 `127.0.0.1:5173`。打开后端打印的“开发入口”链接（`/auth?token=…`），由 Vite 同源代理交换授权并连接。`AGENT_LEARNING_SERVER_PORT` 可为后端和 Vite 指定一致的其他端口，Vite 页面端口仍固定 5173。
+
+## 校验
+
+```sh
+npx playwright install chromium
+npm test
+```
+
+根 `npm test` 先构建后端并跑包测试，再运行网页单元测试、真实 Chromium 组件测试、两种实际入口 E2E。E2E 前会执行完整构建；测试只使用临时签名路径，不访问真实用户配置。
+
+独立命令、系统输入法检查和说明见 [web/README.md](web/README.md)。本阶段实际证据见 [Feature2 验收记录](planning/里程碑1/feature2/feature2-验收记录.md)。

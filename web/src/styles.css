@@ -66,6 +66,7 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
   border-bottom: 1px solid var(--border);
 }
 .chat-header h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 600; }
+.connection-status { max-width: 72%; margin: 0; color: var(--secondary-text); text-align: right; font-size: 12px; line-height: 18px; }
 .chat-main { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 24px; }
 
 .message-list-frame { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; position: relative; }

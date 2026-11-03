@@ -4,15 +4,12 @@ export default defineConfig({
   testDir: './tests/e2e',
   outputDir: 'test-results/e2e',
   reporter: [['list'], ['json', { outputFile: 'test-results/e2e.json' }]],
+  workers: 1,
+  timeout: 90_000,
   use: {
     browserName: 'chromium',
-    baseURL: 'http://127.0.0.1:4173',
     viewport: { width: 1280, height: 800 },
-    trace: 'retain-on-failure',
-  },
-  webServer: {
-    command: 'npm run dev -- --port 4173 --strictPort',
-    url: 'http://127.0.0.1:4173',
-    reuseExistingServer: false,
+    // 授权导航包含临时令牌，不把它写进 trace。
+    trace: 'off',
   },
 })

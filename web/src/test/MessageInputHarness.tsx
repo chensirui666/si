@@ -2,12 +2,12 @@ import { useState } from 'react'
 
 import { MessageInput } from '../components/MessageInput'
 
-export function MessageInputHarness({ accept = true, throwOnSend = false }: { accept?: boolean; throwOnSend?: boolean }) {
+export function MessageInputHarness({ accept = true, throwOnSend = false, sendDisabled = false }: { accept?: boolean; throwOnSend?: boolean; sendDisabled?: boolean }) {
   const [submitted, setSubmitted] = useState<string[]>([])
 
   return (
     <div>
-      <MessageInput onSend={(text) => {
+      <MessageInput sendDisabled={sendDisabled} onSend={(text) => {
         setSubmitted((previous) => [...previous, text])
         if (throwOnSend) throw new Error('reject')
         return accept

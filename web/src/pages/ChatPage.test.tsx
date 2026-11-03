@@ -1,79 +1,54 @@
-import { StrictMode } from 'react';
-import { act, render } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { UserMessage } from '../types';
-import { ChatPage } from './ChatPage';
+import { StrictMode } from 'react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
+import type { ChatState, Subscribe } from '../chat/state'
+import { ChatPage } from './ChatPage'
 
-const children = vi.hoisted(() => ({
-  onSend: undefined as ((text: string) => boolean) | undefined,
-  messages: [] as readonly UserMessage[],
-}));
+const empty = { seq: 0, messages: [], running: null, activeContent: [] }
 
-vi.mock('../components/MessageInput', () => ({
-  MessageInput: ({ onSend }: { onSend: (text: string) => boolean }) => {
-    children.onSend = onSend;
-    return null;
-  },
-}));
-
-vi.mock('../components/MessageList', () => ({
-  MessageList: ({ messages }: { messages: readonly UserMessage[] }) => {
-    children.messages = messages;
-    return null;
-  },
-}));
-
-beforeEach(() => {
-  children.onSend = undefined;
-  children.messages = [];
-});
-
-afterEach(() => {
-  vi.restoreAllMocks();
-});
+function controlled() {
+  let listener: (state: ChatState) => void = () => {}
+  const cleanup = vi.fn()
+  const subscribe: Subscribe = next => { listener = next; return cleanup }
+  return { subscribe, cleanup, emit: (state: ChatState) => act(() => { listener(state) }) }
+}
 
 describe('ChatPage', () => {
-  it('接收契约与连续追加', () => {
-    const createId = vi.spyOn(crypto, 'randomUUID')
-      .mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
-      .mockReturnValueOnce('00000000-0000-4000-8000-000000000002')
-      .mockReturnValueOnce('00000000-0000-4000-8000-000000000003');
-    const view = render(<StrictMode><ChatPage /></StrictMode>);
-    expect(children.messages).toEqual([]);
-    const onSend = children.onSend!;
+  it('StrictMode 清理订阅，快照仅展示已有用户文字，所有连接状态均不能提交', () => {
+    const source = controlled()
+    const view = render(<StrictMode><ChatPage subscribe={source.subscribe} /></StrictMode>)
+    expect(source.cleanup).toHaveBeenCalledTimes(1)
+    source.emit({ connection: 'ready', slow: false, error: null, snapshot: {
+      ...empty,
+      messages: [
+        { id: 'one', message: { role: 'user', content: '  你好\n世界  ', timestamp: 1 } },
+        { id: 'system', message: { role: 'system', content: '内部指令', timestamp: 1 } },
+        { id: 'two', message: { role: 'user', content: [{ type: 'text', text: '第二条' }, { type: 'text', text: '原文' }], timestamp: 2 } },
+      ],
+    } })
+    expect(screen.getAllByRole('listitem').map(item => item.textContent)).toEqual(['  你好\n世界  ', '第二条原文'])
+    expect(screen.getByRole('status')).toHaveTextContent('对话已同步')
+    expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
+    view.unmount()
+    expect(source.cleanup).toHaveBeenCalledTimes(2)
+  })
 
-    act(() => {
-      expect(onSend(' \n ')).toBe(false);
-    });
-    expect(children.messages).toEqual([]);
-    expect(createId).not.toHaveBeenCalled();
-
-    act(() => {
-      expect(onSend('  你好\n世界  ')).toBe(true);
-      expect(onSend('重复')).toBe(true);
-      expect(onSend('重复')).toBe(true);
-    });
-
-    expect(children.messages).toEqual([
-      { id: '00000000-0000-4000-8000-000000000001', role: 'user', text: '  你好\n世界  ' },
-      { id: '00000000-0000-4000-8000-000000000002', role: 'user', text: '重复' },
-      { id: '00000000-0000-4000-8000-000000000003', role: 'user', text: '重复' },
-    ]);
-    expect(createId).toHaveBeenCalledTimes(3);
-
-    const accepted = children.messages;
-    view.rerender(<StrictMode><ChatPage /></StrictMode>);
-    expect(children.messages).toEqual(accepted);
-    expect(createId).toHaveBeenCalledTimes(3);
-  });
-
-  it('编号创建失败时不会安排追加消息', () => {
-    const error = new Error('编号不可用');
-    vi.spyOn(crypto, 'randomUUID').mockImplementation(() => { throw error; });
-    const view = render(<ChatPage />);
-
-    expect(() => children.onSend!('保留草稿')).toThrow(error);
-    view.rerender(<ChatPage />);
-    expect(children.messages).toEqual([]);
-  });
-});
+  it('连接切换、慢提示与异常保留草稿和焦点；空快照没有演示消息', async () => {
+    const source = controlled()
+    render(<ChatPage subscribe={source.subscribe} />)
+    const textbox = screen.getByRole('textbox', { name: '消息' })
+    await act(async () => {
+      textbox.focus()
+      fireEvent.paste(textbox, { clipboardData: { getData: () => '  未发送草稿  ', types: ['text/plain'], items: [], files: [] } })
+    })
+    for (const connection of ['connecting', 'awaitingSnapshot', 'disconnected', 'ready'] as const) {
+      source.emit({ connection, snapshot: connection === 'ready' ? empty : null, slow: connection === 'awaitingSnapshot', error: connection === 'disconnected' ? '连接异常，请重新打开启动链接后重试' : null })
+      expect(textbox).toHaveFocus()
+      expect(textbox.textContent).toBe('  未发送草稿  ')
+      expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
+      fireEvent.keyDown(textbox, { key: 'Enter' })
+      expect(textbox.textContent).toBe('  未发送草稿  ')
+    }
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0)
+  })
+})
