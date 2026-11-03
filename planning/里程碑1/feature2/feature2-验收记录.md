@@ -2,13 +2,13 @@
 
 日期：2026-11-03。范围：**阶段一：打开、授权与订阅**。阶段二模型凭据设置、阶段三真实聊天与生成中恢复尚未实现或验收。
 
-阶段一已在独立分支完成实现与本阶段自动验收，尚未提交、推送或合并。当前交付：安全授权打开本地页面，建立 WebSocket，订阅唯一 Agent 的真实初始空快照，刷新、断线、离线和服务重启后恢复连接；草稿仍可编辑，聊天发送始终关闭。
+阶段一已完成实现与本阶段自动验收，提交 `31e5d31` 已合并本地主干 `main`，未推送远端。主目录重新安装依赖后，115 项测试再次全部通过；实施 worktree 和已合并功能分支已删除。当前交付：安全授权打开本地页面，建立 WebSocket，订阅唯一 Agent 的真实初始空快照，刷新、断线、离线和服务重启后恢复连接；草稿仍可编辑，聊天发送始终关闭。
 
 ## 交付位置与环境
 
-- worktree：`/Users/stardust/agent learning/.worktrees/feature2-stage1`。
-- 分支：`codex/feature2-stage1`；起点 `973618e`（main）。worktree 位于项目内部，不在 Codex worktrees 目录。
-- 原 checkout 的源码和 Git 工作区保持干净；仅在原仓库本地 `.git/info/exclude` 加入 `/.worktrees/`，避免递归跟踪。
+- 当前交付目录：`/Users/stardust/agent learning`（`main`）。原实施 worktree 为项目内 `.worktrees/feature2-stage1`，已在合并复验后删除。
+- 实施分支：`codex/feature2-stage1`；起点 `973618e`（main），实现提交 `31e5d31`。分支已安全合入 `main` 后删除。
+- 实施期间主 checkout 保持干净，集成时按用户指令快进合并。仓库本地 `.git/info/exclude` 中保留 `/.worktrees/`，避免递归跟踪。
 - Node.js `v24.16.0`，npm `11.13.0`，TypeScript `5.9.3`，Playwright `1.62.1` / Chromium。
 - 根 npm workspace 管理四个后端包及 web，根 package-lock.json 取代 web 独立锁。逐项比较旧锁已有依赖，版本变化为 0；新增运行依赖 ws 固定为 `8.22.1`。
 
@@ -16,7 +16,7 @@
 
 ## 最终命令与结果
 
-在本 worktree 根执行：
+在实施 worktree 根执行，并在合并后的主目录重新执行：
 
 ```sh
 npm ci
@@ -42,7 +42,7 @@ git diff --check
 
 Model 本阶段只有类型，做构建检查，不添加没有行为的运行测试。新增 `.test.ts` 已纳入 Vitest，不会只运行原 `.test.tsx`。E2E 独立命令先执行完整构建，避免旧 web/dist 造成假通过。
 
-最终完整命令输出位于 `web/test-results/verification.log`。这是本机忽略产物，不提交。Playwright 数量及结果在 `web/test-results/components.json`、`web/test-results/e2e.json`；它们会在下次测试时更新。
+合并后主目录完整命令输出位于 `web/test-results/verification.log`；合并前日志与截图另存 `web/test-results/feature2-stage1-premerge/`。这是本机忽略产物，不提交。Playwright 数量及结果在 `web/test-results/components.json`、`web/test-results/e2e.json`；它们会在下次测试时更新。
 
 ## 对照五组阶段验收
 
