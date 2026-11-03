@@ -108,7 +108,9 @@ Vite 使用 strictPort、127.0.0.1:5173，/auth 重写到后端根，/api 代理
 
 ## 阶段二验收
 
-2026-11-03，在新 worktree `/Users/stardust/.codex/worktrees/feature2-stage2/agent learning`、分支 `codex/feature2-stage2` 完成实现与验收；起点为主目录 HEAD `e14df7a`。改动保留在此 worktree，尚未提交或合并；主目录 `main` 保持干净。
+2026-11-03，在 worktree `/Users/stardust/.codex/worktrees/feature2-stage2/agent learning`、分支 `codex/feature2-stage2` 完成实现；起点为主目录 HEAD `e14df7a`。实现已提交为 `6079546`，并按使用者指令快进合并到 `/Users/stardust/agent learning` 的 `main`。提交前及主目录合并后两次完整校验均为 161 项通过。
+
+worktree 清理待完成：Codex 的归档工具返回 `The task's primary checkout cannot be removed.`，因为此聊天当前仍以该 worktree 为主工作目录。尝试切回主目录时，附加工具确认主目录不是受管理 worktree；自动操作 Codex 自身界面也被工具禁止。因此保留这个干净 worktree 和已合并分支，待使用者将此聊天切回主目录后再清理。没有强行删除目录或修改应用内部状态。
 
 依据：[阶段二设计](./feature2-阶段二-凭据配置与本地模型发现.md)与[实施计划](./feature2-阶段二-实施计划.md)。实施前使用者明确选择“按文档方案继续”。
 
@@ -123,7 +125,7 @@ Vite 使用 strictPort、127.0.0.1:5173，/auth 重写到后端根，/api 代理
 
 使用 Node.js v24.16.0、npm 11.13.0。新依赖仅 chokidar 5.0.0 与 Radix Dialog 1.3.1 及其传递依赖，全部锁在根 package-lock.json。
 
-在最终实现上重新执行 `npm ci` 后，根 `npm test` 全量通过；另执行 `npm audit --json` 与 `git diff --check`。
+合并后在主目录重新执行 `npm ci`、根 `npm test`、`npm audit --json` 与 `git diff --check`，均通过。下表为主目录复验结果。
 
 | 检查 | 实际结果 |
 | --- | --- |
@@ -138,7 +140,7 @@ Vite 使用 strictPort、127.0.0.1:5173，/auth 重写到后端根，/api 代理
 | 合计 | 161 / 161 通过，无跳过用例 |
 | 依赖审计与差异 | npm audit 0 漏洞；git diff --check 通过 |
 
-最终日志：[完整测试](../../../web/test-results/verification-stage2.log)、[干净安装](../../../web/test-results/install-stage2.log)、[依赖审计](../../../web/test-results/audit-stage2.json)。产物均在本机忽略目录；组件和 E2E 详细结果为 `web/test-results/components.json`、`e2e.json`，会被下次执行更新。
+主目录复验日志：[完整测试](../../../web/test-results/verification-stage2.log)、[干净安装](../../../web/test-results/install-stage2.log)、[依赖审计](../../../web/test-results/audit-stage2.json)。产物均在本机忽略目录；组件和 E2E 详细结果为 `web/test-results/components.json`、`e2e.json`，会被下次执行更新。合并前的测试、审计、结果 JSON 与截图已另存主目录 `web/test-results/feature2-stage2-premerge/`，包括[提交前全量测试](../../../web/test-results/feature2-stage2-premerge/precommit-stage2.log)，不依赖待清理 worktree。
 
 实际 E2E 使用真实 WebServer、独立后端进程、临时签名与模型文件、浏览器 Cookie、HTTP、WebSocket 和 Vite 代理；业务接口没有拦截或假返回。两种入口都验证保存、替换、关闭清空、另一页面同步、SIGKILL 后同端口重启读回、删除、外部坏文件仍可打开设置且不能覆盖、修复恢复；对话始终空快照、没有提交聊天。测试不读写真实用户配置。
 
