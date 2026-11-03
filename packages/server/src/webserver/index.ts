@@ -1,11 +1,12 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer, validateHeaderValue, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Agent } from '@agent-learning/agent'
-import { loadOrCreateBrowserSecret } from '@agent-learning/credentials'
+import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
+import { discoverModels } from '@agent-learning/model'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
 import type { ClientFrame, ServerFrame } from './protocol.js'
 
@@ -13,11 +14,34 @@ export type WebServerOptions = {
   port?: number
   webRoot?: string
   browserSecretPath?: string
+  modelAuthPath?: string
   devOrigin?: 'http://127.0.0.1:5173'
   agent?: Pick<Agent, 'subscribe'>
   now?: () => number
 }
 const mime: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.woff2': 'font/woff2', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8' }
+class InputError extends Error {
+  constructor(readonly status: number, message: string) { super(message) }
+}
+async function providerKey(req: IncomingMessage): Promise<string> {
+  if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') {
+    req.resume()
+    throw new InputError(415, '请使用 JSON 提交配置')
+  }
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    size += chunk.length
+    if (size > 64 * 1024) { req.resume(); throw new InputError(413, '配置请求过大') }
+    chunks.push(chunk)
+  }
+  let value: unknown
+  try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')) }
+  catch { throw new InputError(400, '配置必须是有效 JSON') }
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1
+    || !('apiKey' in value) || typeof value.apiKey !== 'string') throw new InputError(400, '请仅提交 apiKey 字符串')
+  return value.apiKey
+}
 function validFrame(value: unknown): value is ClientFrame {
   if (!value || typeof value !== 'object') return false
   const frame = value as Partial<ClientFrame>
@@ -34,9 +58,12 @@ export class WebServer {
   private auth?: BrowserAuth
   private readonly disposers = new Map<WebSocket, () => void>()
   private closing?: Promise<void>
+  private readonly credentials: Credentials
+  private stopWatching?: () => void
 
   constructor(private readonly options: WebServerOptions = {}) {
     this.agent = options.agent ?? new Agent()
+    this.credentials = new Credentials(options.modelAuthPath)
   }
   async start(): Promise<{ url: string; authUrl: string; devAuthUrl?: string }> {
     if (this.server) throw new Error('服务已经启动')
@@ -66,6 +93,9 @@ export class WebServer {
       const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
       this.origins = new Set([url])
       if (this.options.devOrigin) this.origins.add(this.options.devOrigin)
+      this.stopWatching = this.credentials.watch(() => {
+        void discoverModels(this.credentials).then(() => this.notifyModelsChanged()).catch(() => {})
+      })
       this.heartbeat = setInterval(() => {
         for (const client of ws.clients) {
           const state = this.missedPongs.get(client) ?? 0
@@ -101,6 +131,29 @@ export class WebServer {
       if (this.admit(req) === 200) { this.respond(res, 303, '', { location: './' }); return }
     }
     if (this.admit(req) !== 200) { this.respond(res, 401, '需要网页授权，请重新打开终端中的启动链接。'); return }
+    if (url.pathname === '/api/models' && req.method === 'GET') {
+      this.respond(res, 200, JSON.stringify(await discoverModels(this.credentials)), { 'content-type': 'application/json; charset=utf-8' })
+      return
+    }
+    if (url.pathname === '/api/providers/deepseek' && (req.method === 'PUT' || req.method === 'DELETE')) {
+      try {
+        if (req.method === 'PUT') {
+          const key = await providerKey(req)
+          if (!key.trim()) throw new InputError(400, 'API Key 须非空且可用于认证头')
+          try { validateHeaderValue('Authorization', `Bearer ${key}`) }
+          catch { throw new InputError(400, 'API Key 须非空且可用于认证头') }
+          await this.credentials.saveApiKey(key)
+        } else await this.credentials.deleteApiKey()
+        const discovery = await discoverModels(this.credentials)
+        this.respond(res, 200, JSON.stringify(discovery), { 'content-type': 'application/json; charset=utf-8' })
+        this.notifyModelsChanged()
+      } catch (error) {
+        const status = error instanceof InputError ? error.status : 500
+        const message = error instanceof Error ? error.message : '本地凭据更新失败'
+        this.respond(res, status, JSON.stringify({ error: message }), { 'content-type': 'application/json; charset=utf-8' })
+      }
+      return
+    }
     if (!['GET', 'HEAD'].includes(req.method ?? '') || url.pathname.startsWith('/api/')) { this.respond(res, 404, '未找到'); return }
     try {
       const root = await realpath(this.options.webRoot ?? fileURLToPath(new URL('../../../../web/dist/', import.meta.url)))
@@ -113,6 +166,16 @@ export class WebServer {
     } catch { this.respond(res, 404, '未找到页面或资源，请先运行 npm run build。') }
   }
   private readonly missedPongs = new Map<WebSocket, number>()
+  private notifyModelsChanged() {
+    for (const client of this.ws?.clients ?? []) {
+      if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > 1024 * 1024) {
+        this.disposers.get(client)?.(); client.terminate(); continue
+      }
+      client.send(JSON.stringify({ type: 'models_changed' } satisfies ServerFrame), error => {
+        if (error) { this.disposers.get(client)?.(); client.terminate() }
+      })
+    }
+  }
   private connect(client: WebSocket) {
     let current: { id: string; controller: AbortController } | undefined
     const cancel = () => { current?.controller.abort(); current = undefined }
@@ -151,6 +214,8 @@ export class WebServer {
     this.closing = (async () => {
       if (this.heartbeat) clearInterval(this.heartbeat)
       this.heartbeat = undefined
+      this.stopWatching?.()
+      this.stopWatching = undefined
       for (const cleanup of this.disposers.values()) cleanup()
       for (const client of this.ws?.clients ?? []) client.terminate()
       this.missedPongs.clear()

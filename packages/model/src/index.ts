@@ -1,4 +1,6 @@
 export type {
+  ModelInfo,
+  ModelDiscovery,
   ModelMessage,
   SystemMessage,
   UserMessage,
@@ -12,3 +14,4 @@ export type {
   ModelUsage,
   ModelStopReason,
 } from './types.js'
+export { discoverModels } from './deepseek.js'

@@ -1,3 +1,5 @@
+import type { CredentialStatus } from '@agent-learning/credentials'
+
 export type ModelMessage = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage
 
 export type SystemMessage = {
@@ -68,3 +70,16 @@ export type ModelUsage = {
 }
 
 export type ModelStopReason = 'stop' | 'length' | 'toolUse' | 'error' | 'aborted'
+
+
+export type ModelInfo = {
+  id: string
+  name: string
+  provider: string
+  api: string
+}
+
+export type ModelDiscovery = {
+  models: ModelInfo[]
+  deepseek: CredentialStatus
+}

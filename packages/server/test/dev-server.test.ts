@@ -28,7 +28,7 @@ it('实际开发入口监听全部后端依赖并重启，退出释放监听与�
   await once(reservation, 'listening')
   const port = (reservation.address() as import('node:net').AddressInfo).port
   await new Promise<void>(done => reservation.close(() => done()))
-  const child = spawn(process.execPath, ['scripts/dev-server.mjs'], { cwd: directory, env: { ...process.env, AGENT_LEARNING_SERVER_PORT: String(port), AGENT_LEARNING_BROWSER_AUTH_FILE: join(directory, 'private/browser-auth.json') }, stdio: ['ignore', 'pipe', 'pipe'] })
+  const child = spawn(process.execPath, ['scripts/dev-server.mjs'], { cwd: directory, env: { ...process.env, AGENT_LEARNING_SERVER_PORT: String(port), AGENT_LEARNING_BROWSER_AUTH_FILE: join(directory, 'private/browser-auth.json'), AGENT_LEARNING_MODEL_AUTH_FILE: join(directory, 'private/auth.json') }, stdio: ['ignore', 'pipe', 'pipe'] })
   let output = ''
   child.stdout.on('data', chunk => { output += String(chunk) })
   child.stderr.on('data', chunk => { output += String(chunk) })

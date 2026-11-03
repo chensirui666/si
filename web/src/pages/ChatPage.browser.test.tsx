@@ -36,7 +36,9 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
     expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
     expect((await oldItem.boundingBox())!.y).toBeCloseTo(oldTop, 0)
   }
-  await editor.fill('')
+  // fill('') 直接设置 DOM 选区后立刻 Delete，可能早于 Lexical 的选区同步。
+  await editor.press('ControlOrMeta+a')
+  await editor.press('Backspace')
   await expect(editor).toHaveText('')
   await expect.poll(async () => (await editor.boundingBox())!.height).toBeCloseTo(before!.height, 0)
   expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
@@ -101,7 +103,8 @@ test('白色页面与消息输入区同轴，正文和标题遵守已确认尺�
   const listBox = (await list.boundingBox())!
   const composerBox = (await composer.boundingBox())!
   expect(composerBox.width).toBeLessThanOrEqual(760)
-  expect(composerBox.x + composerBox.width / 2).toBeCloseTo(640, 0)
+  const workspaceBox = (await page.locator('.chat-workspace').boundingBox())!
+  expect(composerBox.x + composerBox.width / 2).toBeCloseTo(workspaceBox.x + workspaceBox.width / 2, 0)
   expect(listBox.x).toBeCloseTo(composerBox.x, 0)
   expect(listBox.width).toBeCloseTo(composerBox.width, 0)
   await expect(list.getByRole('listitem')).toHaveCSS('background-color', 'rgb(247, 247, 245)')
@@ -152,7 +155,9 @@ test('低高度视口的长草稿仍保留完整输入区和发送操作', async
   await expect(send).toBeDisabled()
   await editor.press('Enter')
   await expect(editor).not.toHaveText('')
-  await editor.fill('')
+  // fill('') 直接设置 DOM 选区后立刻 Delete，可能早于 Lexical 的选区同步。
+  await editor.press('ControlOrMeta+a')
+  await editor.press('Backspace')
   await expect(editor).toBeInViewport({ ratio: 1 })
   await expect(send).toBeInViewport({ ratio: 1 })
   expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(true)

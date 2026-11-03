@@ -19,19 +19,19 @@ async function setup(options: Partial<ConstructorParameters<typeof WebServer>[0]
   await mkdir(join(webRoot, 'assets'), { recursive: true })
   await writeFile(join(webRoot, 'index.html'), '<!doctype html><h1>聊天</h1>')
   await writeFile(join(webRoot, 'assets/app.js'), 'console.log("app")')
-  const config = { port: 0, webRoot, browserSecretPath: join(dir, 'private/browser-auth.json'), ...options }
+  const config = { port: 0, webRoot, browserSecretPath: join(dir, 'private/browser-auth.json'), modelAuthPath: join(dir, 'private/auth.json'), ...options }
   const server = new WebServer(config)
   const started = await server.start()
   cleanups.push(() => server.close())
   return { server, ...started, config }
 }
-function http(url: string, headers: Record<string, string> = {}) {
+function http(url: string, headers: Record<string, string> = {}, method = 'GET', body?: string) {
   return new Promise<{ status: number; headers: import('node:http').IncomingHttpHeaders; text: string }>((resolve, reject) => {
-    const req = request(url, { headers }, res => {
+    const req = request(url, { headers, method }, res => {
       let text = ''
       res.setEncoding('utf8').on('data', chunk => { text += chunk }).on('end', () => resolve({ status: res.statusCode!, headers: res.headers, text }))
     })
-    req.on('error', reject).end()
+    req.on('error', reject).end(body)
   })
 }
 async function cookie(url: string) {
@@ -44,6 +44,17 @@ async function connect(url: string, credentials: string, extra: Record<string, s
   cleanups.push(async () => { socket.terminate() })
   await once(socket, 'open')
   return socket
+}
+function nextConversationFrame(socket: WebSocket) {
+  return new Promise<any>(resolve => {
+    const receive = (data: WebSocket.RawData) => {
+      const frame = JSON.parse(String(data))
+      if (frame.type === 'models_changed') return
+      socket.off('message', receive)
+      resolve(frame)
+    }
+    socket.on('message', receive)
+  })
 }
 async function rejectedHandshake(url: string, headers: Record<string, string>) {
   return new Promise<number>((resolve, reject) => {
@@ -112,9 +123,9 @@ describe('Cookie 交换与重启', () => {
     now += 30 * 86400000
     expect((await http(app.url, { Cookie: credentials })).status).toBe(401)
     expect(await rejectedHandshake(app.url, { Cookie: credentials })).toBe(401)
-    const next = once(socket, 'message')
+    const next = nextConversationFrame(socket)
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'after-expiry' }))
-    expect(JSON.parse(String((await next)[0])).snapshot).toEqual(empty)
+    expect((await next).snapshot).toEqual(empty)
   })
   it('同密钥同地址重启 Cookie 可用，启动令牌更新，换密钥重启后 Cookie 失效', async () => {
     const app = await setup()
@@ -142,6 +153,93 @@ describe('Cookie 交换与重启', () => {
     expect(a.split('=')[0]).not.toBe(b.split('=')[0])
     expect((await http(second.url, { Cookie: a })).status).toBe(401)
     expect((await http(second.url, { Cookie: b.split('=')[0] + '=' + a.slice(a.indexOf('=') + 1) })).status).toBe(401)
+  })
+})
+
+describe('阶段二模型配置', () => {
+  it('授权查询、保存、替换和删除均返回无 Key 的本地发现', async () => {
+    const app = await setup()
+    const headers = { Cookie: await cookie(app.authUrl), Origin: app.url, 'Content-Type': 'application/json' }
+    const missing = await http(app.url + '/api/models', headers)
+    expect(missing.status).toBe(200)
+    expect(JSON.parse(missing.text)).toEqual({ models: [], deepseek: { state: 'missing' } })
+    for (const apiKey of ['stage2-first-fake-key', 'stage2-replacement-fake-key']) {
+      const response = await http(app.url + '/api/providers/deepseek', headers, 'PUT', JSON.stringify({ apiKey }))
+      expect(response.status).toBe(200)
+      expect(JSON.parse(response.text)).toMatchObject({ models: [{ id: 'deepseek-flash', provider: 'deepseek' }], deepseek: { state: 'configured' } })
+      expect(response.text).not.toContain(apiKey)
+      expect(response.headers['cache-control']).toBe('no-store')
+      expect(JSON.parse(await readFile(app.config.modelAuthPath, 'utf8')).deepseek.key).toBe(apiKey)
+    }
+    const removed = await http(app.url + '/api/providers/deepseek', headers, 'DELETE')
+    expect(removed.status).toBe(200)
+    expect(JSON.parse(removed.text)).toEqual({ models: [], deepseek: { state: 'missing' } })
+    expect(JSON.parse(await readFile(app.config.modelAuthPath, 'utf8'))).toEqual({})
+  })
+  it('未授权、跨站和非法输入均拒绝，不能写文件或泄露正文', async () => {
+    const app = await setup()
+    const url = app.url + '/api/providers/deepseek'
+    const secret = 'stage2-never-expose-this'
+    const body = JSON.stringify({ apiKey: secret })
+    expect((await http(url, { 'Content-Type': 'application/json' }, 'PUT', body)).status).toBe(401)
+    const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+    expect((await http(url, { ...headers, Origin: 'https://untrusted.invalid' }, 'PUT', body)).status).toBe(403)
+    expect((await http(url, { ...headers, Origin: 'null' }, 'DELETE')).status).toBe(403)
+    for (const value of ['{', '{}', '[]', 'null', '{"apiKey":23}', JSON.stringify({ apiKey: secret, path: '/tmp/elsewhere' }), JSON.stringify({ apiKey: 'bad\r\nheader' })]) {
+      const response = await http(url, headers, 'PUT', value)
+      expect(response.status).toBe(400)
+      expect(response.text).not.toContain(secret)
+    }
+    expect((await http(url, { ...headers, 'Content-Type': 'text/plain' }, 'PUT', body)).status).toBe(415)
+    expect((await http(url, headers, 'PUT', JSON.stringify({ apiKey: secret.repeat(4000) }))).status).toBe(413)
+    await expect(readFile(app.config.modelAuthPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await http(app.url + '/api/models')).status).toBe(401)
+  })
+  it('坏模型文件仍能授权和打开设置，更新失败保留原文件并脱敏', async () => {
+    const app = await setup()
+    const original = '{bad-json-stage2-private-value'
+    await writeFile(app.config.modelAuthPath, original, { mode: 0o600 })
+    const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+    expect((await http(app.url, headers)).status).toBe(200)
+    const models = await http(app.url + '/api/models', headers)
+    expect(JSON.parse(models.text)).toMatchObject({ models: [], deepseek: { state: 'error' } })
+    for (const method of ['PUT', 'DELETE']) {
+      const response = await http(app.url + '/api/providers/deepseek', headers, method, method === 'PUT' ? '{"apiKey":"new-fake-key"}' : undefined)
+      expect(response.status).toBeGreaterThanOrEqual(400)
+      expect(response.text).not.toContain(original)
+      expect(response.text).not.toContain('new-fake-key')
+      expect(await readFile(app.config.modelAuthPath, 'utf8')).toBe(original)
+    }
+  })
+  it('成功配置和外部变化通知所有连接，不更改对话序号，关闭后可重启', async () => {
+    const app = await setup()
+    const credentials = await cookie(app.authUrl)
+    const a = await connect(app.url, credentials)
+    const b = await connect(app.url, credentials)
+    const frames: any[][] = [[], []]
+    for (const [index, socket] of [a, b].entries()) {
+      socket.on('message', value => frames[index]!.push(JSON.parse(String(value))))
+      socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: `models-${index}` }))
+    }
+    await vi.waitFor(() => expect(frames.every(list => list.some(frame => frame.type === 'snapshot'))).toBe(true))
+    const counts = frames.map(list => list.filter(frame => frame.type === 'models_changed').length)
+    const headers = { Cookie: credentials, 'Content-Type': 'application/json' }
+    expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"notification-fake-key"}')).status).toBe(200)
+    await vi.waitFor(() => expect(frames.every((list, index) => list.filter(frame => frame.type === 'models_changed').length > counts[index]!)).toBe(true))
+    const before = frames.map(list => list.filter(frame => frame.type === 'models_changed').length)
+    await writeFile(app.config.modelAuthPath, '{invalid external data', { mode: 0o600 })
+    await vi.waitFor(() => expect(frames.every((list, index) => list.filter(frame => frame.type === 'models_changed').length > before[index]!)).toBe(true), { timeout: 5000 })
+    expect(JSON.parse((await http(app.url + '/api/models', headers)).text).deepseek.state).toBe('error')
+    for (const list of frames) {
+      expect(list.filter(frame => frame.type === 'snapshot').map(frame => frame.snapshot.seq)).toEqual([0])
+      expect(list.some(frame => frame.type === 'update')).toBe(false)
+      expect(JSON.stringify(list)).not.toContain('notification-fake-key')
+    }
+    await app.server.close()
+    const restarted = new WebServer({ ...app.config, port: Number(new URL(app.url).port) })
+    cleanups.push(() => restarted.close())
+    await restarted.start()
+    expect(JSON.parse((await http(app.url + '/api/models', headers)).text).deepseek.state).toBe('error')
   })
 })
 
@@ -185,9 +283,9 @@ describe('Agent 订阅转发与清理', () => {
     const credentials = await cookie(app.authUrl)
     for (const subscriptionId of ['one', 'two']) {
       const socket = await connect(app.url, credentials)
-      const next = once(socket, 'message')
+      const next = nextConversationFrame(socket)
       socket.send(JSON.stringify({ type: 'subscribe', subscriptionId }))
-      expect(JSON.parse(String((await next)[0]))).toEqual({ type: 'snapshot', subscriptionId, snapshot: empty })
+      expect(await next).toEqual({ type: 'snapshot', subscriptionId, snapshot: empty })
     }
   })
   it('受控源先快照后更新，替换/取消只释放所属订阅和连接', async () => {
@@ -198,7 +296,7 @@ describe('Agent 订阅转发与清理', () => {
     const other = await connect(app.url, credentials)
     expect(agent.active.size).toBe(0)
     const frames: any[] = []
-    socket.on('message', frame => frames.push(JSON.parse(String(frame))))
+    socket.on('message', data => { const frame = JSON.parse(String(data)); if (frame.type !== 'models_changed') frames.push(frame) })
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'old' }))
     await vi.waitFor(() => expect(frames).toHaveLength(2))
     expect(frames.map(frame => frame.type)).toEqual(['snapshot', 'update'])
@@ -264,9 +362,9 @@ describe('Agent 订阅转发与清理', () => {
     const closed = once(slow, 'close')
     slow.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'slow' }))
     await closed
-    const next = once(good, 'message')
+    const next = nextConversationFrame(good)
     good.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'good' }))
-    expect(JSON.parse(String((await next)[0])).snapshot).toEqual(empty)
+    expect((await next).snapshot).toEqual(empty)
     await vi.waitFor(() => expect(agent.active.size).toBe(1))
     expect(good.readyState).toBe(WebSocket.OPEN)
   })
@@ -286,7 +384,7 @@ describe('Agent 订阅转发与清理', () => {
     const app = await setup({ agent })
     const socket = await connect(app.url, await cookie(app.authUrl))
     const frames: any[] = []
-    socket.on('message', data => frames.push(JSON.parse(String(data))))
+    socket.on('message', data => { const frame = JSON.parse(String(data)); if (frame.type !== 'models_changed') frames.push(frame) })
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'old' }))
     await vi.waitFor(() => expect(frames).toHaveLength(1))
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'new' }))

@@ -1,8 +1,12 @@
+import { watch as watchFile } from 'chokidar';
 import { randomBytes } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { lstat } from 'node:fs/promises';
+import { validateHeaderValue } from 'node:http';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { readCredentialFile, withCredentialFileLock, writeCredentialFile } from './credential-file.js';
-import type { BrowserAuthFile } from './types.js';
+import type { AuthFile, BrowserAuthFile, CredentialStatus } from './types.js';
 
 function parseSecret(contents: string): Buffer {
   let value: unknown;
@@ -35,4 +39,131 @@ export async function loadOrCreateBrowserSecret(
     await writeCredentialFile(filename, `${JSON.stringify(file)}\n`);
     return secret;
   });
+}
+
+
+function validateApiKey(key: unknown): asserts key is string {
+  if (typeof key !== 'string' || !key.trim()) throw new Error('API Key must be a non-empty string.');
+  try {
+    validateHeaderValue('Authorization', `Bearer ${key}`);
+  } catch {
+    throw new Error('API Key contains characters that cannot be used in an authentication header.');
+  }
+}
+
+function parseAuthFile(contents: string | undefined): AuthFile {
+  if (contents === undefined) return {};
+  let value: unknown;
+  try {
+    value = JSON.parse(contents);
+  } catch {
+    throw new Error('Model credential file contains invalid JSON. Repair it before updating credentials.');
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Model credential file must contain an object.');
+  }
+  if (Object.hasOwn(value, 'deepseek')) {
+    const entry = (value as Record<string, unknown>).deepseek;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)
+      || !('type' in entry) || entry.type !== 'api_key' || !('key' in entry)) {
+      throw new Error('DeepSeek credentials must contain an API Key.');
+    }
+    validateApiKey(entry.key);
+  }
+  return value as AuthFile;
+}
+
+export class Credentials {
+  private readonly filename: string;
+
+  constructor(filename = join(homedir(), '.agent-learning', 'auth.json')) {
+    this.filename = filename;
+  }
+
+  private async read(): Promise<AuthFile> {
+    return parseAuthFile(await readCredentialFile(this.filename));
+  }
+
+  async readStatus(): Promise<CredentialStatus> {
+    try {
+      const file = await this.read();
+      return { state: file.deepseek === undefined ? 'missing' : 'configured' };
+    } catch (error) {
+      return { state: 'error', message: (error as Error).message };
+    }
+  }
+
+  async readApiKey(): Promise<string> {
+    const file = await this.read();
+    if (file.deepseek === undefined) throw new Error('DeepSeek API Key is not configured.');
+    return file.deepseek.key;
+  }
+
+  async saveApiKey(key: string): Promise<void> {
+    validateApiKey(key);
+    await withCredentialFileLock(this.filename, async () => {
+      const file = await this.read();
+      file.deepseek = { type: 'api_key', key };
+      await writeCredentialFile(this.filename, `${JSON.stringify(file, null, 2)}\n`);
+    });
+  }
+
+  async deleteApiKey(): Promise<void> {
+    await withCredentialFileLock(this.filename, async () => {
+      const file = await this.read();
+      if (file.deepseek === undefined) return;
+      delete file.deepseek;
+      await writeCredentialFile(this.filename, `${JSON.stringify(file, null, 2)}\n`);
+    });
+  }
+
+  watch(onChange: () => void): () => void {
+    let active = true;
+    const notify = () => { if (active) onChange(); };
+    const filename = resolve(this.filename);
+    let directory = dirname(filename);
+    while (!existsSync(directory)) directory = dirname(directory);
+    const watcher = watchFile(directory, {
+      ignoreInitial: true,
+      followSymlinks: false,
+      // Watch an existing ancestor so initial creation cannot race missing-path setup.
+      ignored: path => {
+        const candidate = resolve(path);
+        return candidate !== filename && !filename.startsWith(`${candidate}${sep}`);
+      },
+      awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 25 },
+    });
+    const parent = dirname(filename);
+    const modes = new Map<string, number>();
+    watcher.on('all', (_event, path, stats) => {
+      const target = resolve(path);
+      if (target !== filename && target !== parent) return;
+      if (stats) modes.set(target, stats.mode);
+      else modes.delete(target);
+      if (target === filename) notify();
+    });
+    // Chokidar can suppress chmod after a read; raw metadata checks preserve permission updates.
+    watcher.on('raw', (_event, _path, details) => {
+      const target = (details as { watchedPath?: string })?.watchedPath;
+      if (target !== filename && target !== parent) return;
+      void lstat(target).then(stats => {
+        const changed = modes.has(target) && modes.get(target) !== stats.mode;
+        modes.set(target, stats.mode);
+        if (changed) notify();
+      }, () => {});
+    });
+    // Recheck after setup to cover edits between the first read and watcher readiness.
+    watcher.on('ready', () => {
+      void Promise.all([filename, parent].map(async path => {
+        try { modes.set(path, (await lstat(path)).mode); } catch {}
+      })).then(notify);
+    });
+    watcher.on('error', notify);
+    return () => {
+      if (!active) return;
+      active = false;
+      void watcher.close().catch(notify);
+      watcher.on('error', notify);
+    };
+  }
 }

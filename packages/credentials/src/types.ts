@@ -2,3 +2,14 @@ export type BrowserAuthFile = {
   version: 1;
   secret: string;
 };
+
+
+export type AuthFile = {
+  deepseek?: { type: 'api_key'; key: string };
+  [provider: string]: unknown;
+};
+
+export type CredentialStatus =
+  | { state: 'missing' }
+  | { state: 'configured' }
+  | { state: 'error'; message: string };

@@ -1,6 +1,6 @@
 import { fork, spawn, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -24,6 +24,120 @@ async function stop(child: ChildProcess | undefined, signal: NodeJS.Signals = 'S
   child.kill(signal)
   const deadline = setTimeout(() => child.kill('SIGKILL'), 3000)
   try { await exited } finally { clearTimeout(deadline) }
+}
+
+for (const mode of ['node', 'vite'] as const) {
+  test(`${mode} 阶段二配置、重启与多页面`, async ({ page, context }, testInfo) => {
+    const temporary = await mkdtemp(join(tmpdir(), 'agent-learning-stage2-e2e-'))
+    const secretPath = join(temporary, 'browser-auth.json')
+    const modelPath = join(temporary, 'auth.json')
+    let backend: Awaited<ReturnType<typeof startBackend>> | undefined
+    let vite: ChildProcess | undefined
+    try {
+      backend = await startBackend(secretPath)
+      const port = Number(new URL(backend.result.url).port)
+      if (mode === 'vite') {
+        vite = spawn(process.execPath, [vitePath], { cwd: webDirectory, env: { ...process.env, AGENT_LEARNING_SERVER_PORT: String(port) }, stdio: 'ignore' })
+        await expect.poll(async () => {
+          if (vite!.exitCode !== null) throw new Error('Vite 未启动；请检查 5173 端口和配置')
+          return httpStatus(devUrl + '/@vite/client').catch(() => 0)
+        }, { timeout: 10_000 }).toBe(200)
+      }
+      const origin = mode === 'node' ? backend.result.url : devUrl
+      const observed = observe(page)
+      try { await page.goto(mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl) }
+      catch { throw new Error('阶段二授权导航失败，临时令牌已省略') }
+      await ready(page, observed)
+      const model = page.getByRole('combobox', { name: '模型', exact: true })
+      await expect(model).toHaveText('无可用模型')
+      const editor = page.getByRole('textbox', { name: '消息', exact: true })
+      await editor.fill('设置变化期间保留的草稿')
+      const second = await context.newPage()
+      const otherObserved = observe(second)
+      await second.goto(origin)
+      await ready(second, otherObserved)
+      const otherModel = second.getByRole('combobox', { name: '模型', exact: true })
+      await expect(otherModel).toHaveText('无可用模型')
+
+      const settings = page.getByRole('button', { name: '设置', exact: true })
+      const dialog = page.getByRole('dialog', { name: '设置', exact: true })
+      await settings.click()
+      await dialog.getByRole('button', { name: '模型', exact: true }).click()
+      await dialog.getByRole('button', { name: '添加提供方', exact: true }).click()
+      await dialog.getByRole('button', { name: 'DeepSeek', exact: true }).click()
+      const keyInput = dialog.getByLabel('API Key', { exact: true })
+      await expect(keyInput).toHaveAttribute('type', 'password')
+      await keyInput.fill('stage2-e2e-first-fake-key')
+      await dialog.getByRole('button', { name: '保存', exact: true }).click()
+      await expect(dialog).toContainText('已保存在本机')
+      await expect(keyInput).toHaveValue('')
+      await expect(otherModel).toHaveText('DeepSeek Flash')
+      expect(JSON.parse(await readFile(modelPath, 'utf8')).deepseek.key).toBe('stage2-e2e-first-fake-key')
+      expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual({ local: {}, session: {} })
+      await keyInput.fill('stage2-e2e-replacement-fake-key')
+      await dialog.getByRole('button', { name: '保存', exact: true }).click()
+      await expect(keyInput).toHaveValue('')
+      expect(JSON.parse(await readFile(modelPath, 'utf8')).deepseek.key).toBe('stage2-e2e-replacement-fake-key')
+      await keyInput.fill('stage2-e2e-unsaved-fake-key')
+      await page.keyboard.press('Escape')
+      await expect(dialog).not.toBeVisible()
+      await expect(settings).toBeFocused()
+      await expect(editor).toHaveText('设置变化期间保留的草稿')
+      await expect(model).toHaveText('DeepSeek Flash')
+      await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled()
+      await settings.click()
+      await dialog.getByRole('button', { name: '编辑', exact: true }).click()
+      await expect(keyInput).toHaveValue('')
+      await page.screenshot({ path: testInfo.outputPath(`${mode}-settings.png`), fullPage: true })
+      await page.keyboard.press('Escape')
+
+      const beforeRestart = observed.snapshots.length
+      await stop(backend.child, 'SIGKILL')
+      await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
+      backend = await startBackend(secretPath, port)
+      await ready(page, observed, beforeRestart)
+      await expect(model).toHaveText('DeepSeek Flash')
+      await expect(otherModel).toHaveText('DeepSeek Flash')
+      await settings.click()
+      await dialog.getByRole('button', { name: '编辑', exact: true }).click()
+      await dialog.getByRole('button', { name: '删除 API Key', exact: true }).click()
+      await expect(dialog).toContainText('已删除本机配置')
+      await expect(otherModel).toHaveText('无可用模型')
+      expect(JSON.parse(await readFile(modelPath, 'utf8'))).toEqual({})
+      await page.keyboard.press('Escape')
+      await expect(model).toHaveText('无可用模型')
+
+      await writeFile(modelPath, '{invalid-stage2-external-file', { mode: 0o600 })
+      await expect(page.getByRole('alert')).toContainText(/配置|JSON|credential/i)
+      await expect(second.getByRole('alert')).toContainText(/配置|JSON|credential/i)
+      await settings.click()
+      await expect(dialog).toBeVisible()
+      await dialog.getByRole('button', { name: '添加提供方', exact: true }).click()
+      await dialog.getByRole('button', { name: 'DeepSeek', exact: true }).click()
+      await keyInput.fill('stage2-e2e-cannot-overwrite-bad-file')
+      await dialog.getByRole('button', { name: '保存', exact: true }).click()
+      await expect(dialog.getByRole('alert').last()).toBeVisible()
+      expect(await readFile(modelPath, 'utf8')).toBe('{invalid-stage2-external-file')
+      await page.keyboard.press('Escape')
+      await writeFile(modelPath, '{}', { mode: 0o600 })
+      await expect(page.getByRole('alert')).toHaveCount(0)
+      await expect(second.getByRole('alert')).toHaveCount(0)
+      await expect(editor).toHaveText('设置变化期间保留的草稿')
+      expect(observed.snapshots.every(frame => JSON.stringify(frame.snapshot) === JSON.stringify(emptySnapshot))).toBe(true)
+      expect(observed.submissions).toEqual([])
+      expect(otherObserved.submissions).toEqual([])
+      await page.screenshot({ path: testInfo.outputPath(`${mode}-stage2-ready.png`), fullPage: true })
+      await page.setViewportSize({ width: 390, height: 700 })
+      await settings.click()
+      await expect(dialog).toBeInViewport({ ratio: 1 })
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+      await page.screenshot({ path: testInfo.outputPath(`${mode}-settings-narrow.png`), fullPage: true })
+      await second.close()
+    } finally {
+      await Promise.allSettled([stop(vite), stop(backend?.child)])
+      await rm(temporary, { recursive: true, force: true })
+    }
+  })
 }
 
 function waitForStart(child: ChildProcess): Promise<Started> {

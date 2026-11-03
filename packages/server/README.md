@@ -2,9 +2,9 @@
 
 阅读顺序：本文件 → `src/main.ts` → 公开入口 `src/webserver/index.ts` → `browser-auth.ts` / `protocol.ts` → `test/`。
 
-`WebServer.start()` 安全加载签名文件，装配唯一 Agent，监听 `127.0.0.1:3000` 并返回 `{url,authUrl}`；开发模式额外返回 Vite `/auth` 授权链接。`close()` 停止接入、心跳和所属订阅，释放连接与监听；不会清空 Agent 状态。消息仍只在本进程内存里，进程重启即清空。
+`WebServer.start()` 安全加载签名文件，装配唯一 Agent，监听 `127.0.0.1:3000` 并返回 `{url,authUrl}`；开发模式额外返回 Vite `/auth` 授权链接。`close()` 停止接入、心跳、凭据文件监听和所属订阅，释放连接；不会清空 Agent 状态。消息仍只在本进程内存里，进程重启即清空。
 
-`@agent-learning/server` 导出 WebServer；`@agent-learning/server/protocol` 是独立的公开网络类型入口。网页只 `import type`，不加载服务端运行时代码。Server 仅通过 Credentials / Agent 的公开入口使用它们。
+`@agent-learning/server` 导出 WebServer；`@agent-learning/server/protocol` 是独立的公开网络类型入口。网页只 `import type`，不加载服务端运行时代码。Server 仅通过 Credentials、Model、Agent 的公开入口使用它们。
 
 ```sh
 # 在仓库根安装并构建后
@@ -20,6 +20,8 @@ npm --prefix packages/server test
 
 连接成功后尚未订阅；收到有效 subscribe 后才读取 Agent。替换订阅先取消旧观察者；非法帧关闭所属连接（1008），源错误关闭所属连接（1011），发送失败或缓冲超过 1MiB 则断开该慢连接以便页面重取快照。每 2 秒检查心跳：前两轮无 Pong 时发送 Ping，第三轮仍未响应则清理；收到 Pong 清零。已有 WS 不会仅因 Cookie 到期被强制关闭。
 
-`AGENT_LEARNING_SERVER_PORT` 可指定监听端口（1–65535）。`AGENT_LEARNING_BROWSER_AUTH_FILE` 仅供自动校验隔离签名文件；不设置时仍固定使用 `~/.agent-learning/browser-auth.json`。进程内 WebServerOptions 可注入临时路径、临时端口、受控时钟和订阅源，以测试真实 HTTP/WS；测试不会访问默认签名文件。
+`AGENT_LEARNING_SERVER_PORT` 可指定监听端口（1–65535）。`AGENT_LEARNING_BROWSER_AUTH_FILE`、`AGENT_LEARNING_MODEL_AUTH_FILE` 仅供自动校验隔离签名与模型文件路径；不设置时仍固定使用 `~/.agent-learning/browser-auth.json`、`~/.agent-learning/auth.json`。环境变量不能提供 Key。进程内 WebServerOptions 的 `browserSecretPath/modelAuthPath` 可注入临时路径，另可注入临时端口、受控时钟和订阅源，以测试真实 HTTP/WS；测试不会访问默认用户文件。
 
-阶段一没有模型接口或消息提交。空快照和受控订阅测试不代表真实模型生成已通过。授权文件的异常和人工恢复步骤见 Credentials README。
+阶段二提供 `GET /api/models`、`PUT /api/providers/deepseek`（JSON `{apiKey:string}`）与 `DELETE /api/providers/deepseek`。成功均返回 ModelDiscovery，无 Key；配置通知 `{type:'models_changed'}` 发送给所有连接，不占用 Agent 序号。错误采用 JSON `{error:string}`；输入错误 400、请求过大 413、媒体类型错误 415、文件更新失败 500，授权和来源仍分别是 401/403。保存、替换、删除与外部文件变化均刷新，文件坏掉仍可授权进入设置。
+
+发送仍未开放，不验证远端凭据。空快照和受控订阅测试不代表真实模型生成已通过。授权文件的异常和人工恢复步骤见 Credentials README。

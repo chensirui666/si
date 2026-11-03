@@ -9,7 +9,7 @@ export type ChatState = {
   slow: boolean
   error: string | null
 }
-export type Subscribe = (onState: (state: ChatState) => void) => () => void
+export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void) => () => void
 export const initialState: ChatState = { connection: 'connecting', snapshot: null, slow: false, error: null }
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)

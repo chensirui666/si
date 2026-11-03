@@ -14,20 +14,20 @@ async function inspectDirectory(directory: string, writable = false): Promise<bo
     stats = await lstat(directory);
   } catch (error) {
     if (missing(error)) return false;
-    throw new Error('Unable to read browser signing directory.');
+    throw new Error('Unable to read credential directory.');
   }
-  if (!stats.isDirectory()) throw new Error('Browser signing directory must be a real directory.');
+  if (!stats.isDirectory()) throw new Error('Credential directory must be a real directory.');
   const required = writable ? 0o700 : 0o500;
   if ((stats.mode & 0o077) !== 0 || (stats.mode & required) !== required) {
-    throw new Error('Browser signing directory permissions must allow only its owner to access it.');
+    throw new Error('Credential directory permissions must allow only its owner to access it.');
   }
   return true;
 }
 
 function inspectFile(stats: Stats): void {
-  if (!stats.isFile()) throw new Error('Browser signing path must be a regular file, without symbolic links.');
+  if (!stats.isFile()) throw new Error('Credential path must be a regular file, without symbolic links.');
   if ((stats.mode & 0o077) !== 0 || (stats.mode & 0o400) === 0) {
-    throw new Error('Browser signing file permissions must be owner-only and readable.');
+    throw new Error('Credential file permissions must be owner-only and readable.');
   }
 }
 
@@ -38,7 +38,7 @@ export async function readCredentialFile(filename: string): Promise<string | und
     stats = await lstat(filename);
   } catch (error) {
     if (missing(error)) return undefined;
-    throw new Error('Unable to read browser signing file.');
+    throw new Error('Unable to read credential file.');
   }
   inspectFile(stats);
   let file: FileHandle | undefined;
@@ -48,12 +48,12 @@ export async function readCredentialFile(filename: string): Promise<string | und
     inspectFile(await file.stat());
     return await file.readFile('utf8');
   } catch {
-    throw new Error('Unable to read browser signing file.');
+    throw new Error('Unable to read credential file.');
   } finally {
     try {
       await file?.close();
     } catch {
-      throw new Error('Unable to close browser signing file.');
+      throw new Error('Unable to close credential file.');
     }
   }
 }
@@ -62,7 +62,7 @@ export async function withCredentialFileLock<T>(filename: string, operation: () 
   try {
     await mkdir(dirname(filename), { recursive: true, mode: 0o700 });
   } catch {
-    throw new Error('Unable to create browser signing directory.');
+    throw new Error('Unable to create credential directory.');
   }
   await inspectDirectory(dirname(filename), true);
   const lockPath = `${filename}.lock`;
@@ -74,10 +74,10 @@ export async function withCredentialFileLock<T>(filename: string, operation: () 
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
-        throw new Error('Unable to acquire browser signing file lock.');
+        throw new Error('Unable to acquire credential file lock.');
       }
       // shortcut: crashed-process locks need manual recovery; add proven-owner takeover if this becomes frequent.
-      if (performance.now() >= deadline) throw new Error('Timed out waiting for browser signing file lock.');
+      if (performance.now() >= deadline) throw new Error('Timed out waiting for credential file lock.');
       await wait(25);
     }
   }
@@ -85,7 +85,7 @@ export async function withCredentialFileLock<T>(filename: string, operation: () 
     try {
       await lock.writeFile(`${process.pid}\n`);
     } catch {
-      throw new Error('Unable to write browser signing file lock.');
+      throw new Error('Unable to write credential file lock.');
     }
     return await operation();
   } finally {
@@ -96,7 +96,7 @@ export async function withCredentialFileLock<T>(filename: string, operation: () 
         await rm(lockPath);
       }
     } catch {
-      throw new Error('Unable to release browser signing file lock.');
+      throw new Error('Unable to release credential file lock.');
     }
   }
 }
@@ -115,7 +115,7 @@ export async function writeCredentialFile(filename: string, contents: string): P
     await rename(temporary, filename);
     committed = true;
   } catch {
-    throw new Error('Unable to write browser signing file. The existing file was preserved.');
+    throw new Error('Unable to write credential file. The existing file was preserved.');
   } finally {
     try {
       try {
@@ -124,7 +124,7 @@ export async function writeCredentialFile(filename: string, contents: string): P
         if (created && !committed) await rm(temporary, { force: true });
       }
     } catch {
-      throw new Error('Unable to clean up browser signing temporary file.');
+      throw new Error('Unable to clean up credential temporary file.');
     }
   }
 }

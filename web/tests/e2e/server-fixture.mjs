@@ -1,8 +1,10 @@
 import { WebServer } from '@agent-learning/server'
+import { dirname, join } from 'node:path'
 
 const options = {
   port: Number(process.argv[2]),
   browserSecretPath: process.argv[3],
+  modelAuthPath: join(dirname(process.argv[3]), 'auth.json'),
   devOrigin: 'http://127.0.0.1:5173',
 }
 let server = new WebServer(options)

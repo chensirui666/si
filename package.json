@@ -14,7 +14,7 @@
     "build:packages": "npm run build --workspace @agent-learning/credentials && npm run build --workspace @agent-learning/model && npm run build --workspace @agent-learning/agent && npm run build --workspace @agent-learning/server",
     "build": "npm run build:packages && npm --prefix web run build",
     "dev:server": "npm run build:packages && node scripts/dev-server.mjs",
-    "test:packages": "npm run build:packages && npm run test --workspace @agent-learning/credentials && npm run test --workspace @agent-learning/agent && npm run test --workspace @agent-learning/server",
+    "test:packages": "npm run build:packages && npm run test --workspace @agent-learning/credentials && npm run test --workspace @agent-learning/model && npm run test --workspace @agent-learning/agent && npm run test --workspace @agent-learning/server",
     "test": "npm run test:packages && npm --prefix web test && npm --prefix web run test:e2e"
   },
   "devDependencies": {

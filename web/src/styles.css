@@ -160,3 +160,55 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
   /* 为标题、工具条和消息区最小留白保留空间。 */
   .message-editor { max-height: clamp(24px, calc(100dvh - 184px), 200px); }
 }
+
+.chat-layout { height: 100%; display: flex; }
+.chat-sidebar { width: 168px; flex: none; display: flex; flex-direction: column; gap: 16px; padding: 20px 12px 16px; background: var(--surface); border-right: 1px solid var(--border); }
+.sidebar-title { padding-inline: 12px; font-family: "EB Garamond", serif; font-size: 24px; line-height: 32px; }
+.sidebar-current { border-radius: 8px; padding: 8px 12px; background: var(--interaction); font-weight: 500; }
+.settings-trigger { margin-top: auto; justify-content: flex-start; }
+.chat-workspace { flex: 1; min-width: 0; }
+.chat-page { width: 100%; }
+.composer-stack { flex: none; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.model-toolbar { display: flex; align-items: center; gap: 8px; min-height: 36px; color: var(--secondary-text); font-size: 13px; }
+.model-toolbar select { max-width: 100%; padding: 6px 8px; border: 1px solid var(--control-border); border-radius: 8px; background: var(--background); color: var(--foreground); font: inherit; }
+.model-toolbar select:disabled { color: var(--secondary-text); background: var(--surface); }
+.model-error { margin: 0; }
+.configuration-error { color: #b42318; font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
+.configuration-success { color: #167544; font-size: 13px; line-height: 20px; }
+.dialog-overlay { position: fixed; inset: 0; z-index: 10; background: rgb(0 0 0 / 24%); }
+.dialog-content { position: fixed; top: 50%; left: 50%; z-index: 11; transform: translate(-50%, -50%); width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 24px; border: 1px solid var(--border); border-radius: 16px; background: var(--background); box-shadow: 0 8px 24px 0 rgb(0 0 0 / 8%); }
+.dialog-content:focus { outline: none; }
+.dialog-close { position: absolute; top: 16px; right: 16px; font-size: 24px; font-weight: 400; }
+.settings-title { margin: 0 40px 8px 0; font-size: 20px; line-height: 28px; font-weight: 600; }
+.settings-description, .settings-help { margin: 0; color: var(--secondary-text); font-size: 13px; line-height: 20px; }
+.settings-layout { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 24px; margin-top: 24px; min-height: 260px; }
+.settings-nav { display: flex; flex-direction: column; align-items: stretch; }
+.settings-models { min-width: 0; }
+.settings-models h2 { margin: 0 0 8px; font-size: 16px; line-height: 24px; font-weight: 600; }
+.settings-models > .settings-help { margin-bottom: 24px; }
+.provider-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--border); padding: 12px; border-radius: 12px; }
+.provider-row small { margin-left: 8px; color: #167544; font-size: 12px; }
+.provider-form { display: flex; flex-direction: column; gap: 12px; }
+.provider-form h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.provider-form label { font-weight: 500; }
+.provider-form input { width: 100%; min-width: 0; border: 1px solid var(--control-border); border-radius: 8px; padding: 8px 12px; color: var(--foreground); background: var(--background); font: inherit; }
+.provider-form input:focus, .model-toolbar select:focus { outline: none; }
+.provider-key-field, .model-toolbar { position: relative; }
+.provider-key-field::after, .model-toolbar::after { content: ""; width: 4px; height: 4px; border-radius: 50%; background: var(--foreground); opacity: 0; pointer-events: none; }
+.provider-key-field::after { position: absolute; right: 8px; top: 8px; }
+.provider-key-field:has(input:focus-visible)::after, .model-toolbar:has(select:focus-visible)::after { opacity: 1; }
+.provider-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.delete-provider { color: #b42318; }
+@media (max-width: 600px) {
+  .chat-sidebar { width: 64px; padding: 16px 8px; }
+  .sidebar-title { display: none; }
+  .sidebar-current { padding: 8px 0; text-align: center; }
+  .settings-trigger { min-height: 44px; padding-inline: 4px; justify-content: center; }
+  .dialog-content { padding: 20px 16px; }
+  .settings-layout { grid-template-columns: 1fr; gap: 16px; margin-top: 20px; min-height: 0; }
+  .settings-nav { align-items: flex-start; }
+}
+@media (max-height: 500px) {
+  .chat-page .message-editor { max-height: clamp(24px, calc(100dvh - 228px), 200px); }
+  .chat-main { gap: 8px; }
+}

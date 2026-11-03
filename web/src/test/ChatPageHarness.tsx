@@ -3,6 +3,8 @@ import type { ConversationSnapshot } from '@agent-learning/agent'
 import type { ChatState, Subscribe } from '../chat/state'
 import { ChatPage } from '../pages/ChatPage'
 
+const getModels = async () => ({ models: [], deepseek: { state: 'missing' as const } })
+
 // 只供组件测试：真实服务阶段一始终提供空对话。
 export function ChatPageHarness({ messages = [] }: { messages?: string[] }) {
   const subscribe: Subscribe = useCallback(onState => {
@@ -17,5 +19,5 @@ export function ChatPageHarness({ messages = [] }: { messages?: string[] }) {
     window.addEventListener('chat-test-state', update)
     return () => window.removeEventListener('chat-test-state', update)
   }, [messages])
-  return <ChatPage subscribe={subscribe} />
+  return <ChatPage subscribe={subscribe} getModels={getModels} />
 }

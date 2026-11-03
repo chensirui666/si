@@ -1,7 +1,8 @@
+import type { ModelDiscovery } from '@agent-learning/model'
 import type { ClientFrame } from '@agent-learning/server/protocol'
 import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
 
-export const subscribe: Subscribe = onState => {
+export const subscribe: Subscribe = (onState, onModelsChanged) => {
   let state: ChatState = initialState
   let stopped = false
   let socket: WebSocket | null = null
@@ -62,6 +63,10 @@ export const subscribe: Subscribe = onState => {
       if (stopped || socket !== current) return
       let frame: unknown
       try { frame = JSON.parse(event.data) } catch { return }
+      if (typeof frame === 'object' && frame !== null && 'type' in frame && frame.type === 'models_changed') {
+        onModelsChanged?.()
+        return
+      }
       const result = applyFrame(state, frame, subscriptionId)
       if (result.resubscribe) { prepare(); requestSnapshot(); return }
       if (result.state === state) return
@@ -100,3 +105,35 @@ export const subscribe: Subscribe = onState => {
     releaseSocket()
   }
 }
+
+
+const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+
+function modelDiscovery(value: unknown): value is ModelDiscovery {
+  if (!record(value) || !Array.isArray(value.models) || !record(value.deepseek)) return false
+  return value.models.every(model => record(model) && ['id', 'name', 'provider', 'api'].every(key => typeof model[key] === 'string'))
+    && (value.deepseek.state === 'missing' || value.deepseek.state === 'configured'
+      || (value.deepseek.state === 'error' && typeof value.deepseek.message === 'string'))
+}
+
+async function requestModels(path: string, options: RequestInit = {}, apiKey = ''): Promise<ModelDiscovery> {
+  let response: Response
+  try { response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options }) }
+  catch { throw new Error('网络请求失败，请检查连接后重试') }
+  if (response.status === 401) throw new Error('授权已失效，请重新打开启动链接')
+  if (response.status === 403) throw new Error('访问来源不可信，请从启动链接进入')
+  let value: unknown
+  try { value = await response.json() } catch { throw new Error('模型配置响应无效，请重试') }
+  if (!response.ok) {
+    const message = record(value) && typeof value.error === 'string' ? value.error : '模型配置请求失败，请重试'
+    throw new Error(apiKey ? message.split(apiKey).join('•••') : message)
+  }
+  if (!modelDiscovery(value)) throw new Error('模型配置响应无效，请重试')
+  return value
+}
+
+export const getModels = () => requestModels('/api/models')
+export const saveApiKey = (apiKey: string) => requestModels('/api/providers/deepseek', {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey }),
+}, apiKey)
+export const deleteApiKey = () => requestModels('/api/providers/deepseek', { method: 'DELETE' })

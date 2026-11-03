@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { subscribe } from './client'
+import { deleteApiKey, getModels, saveApiKey, subscribe } from './client'
 import type { ChatState } from './state'
 
 class Socket extends EventTarget {
@@ -159,4 +159,50 @@ describe('browser subscription', () => {
     snapshot()
     expect(current().connection).toBe('ready')
   })
+})
+
+
+describe('model configuration client', () => {
+  const missing = { models: [], deepseek: { state: 'missing' } }
+  it('同源查询、保存和删除，仅保存发送本次输入', async () => {
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => missing })
+    vi.stubGlobal('fetch', fetch)
+    await expect(getModels()).resolves.toEqual(missing)
+    await expect(saveApiKey('new-private-key')).resolves.toEqual(missing)
+    await expect(deleteApiKey()).resolves.toEqual(missing)
+    expect(fetch.mock.calls).toEqual([
+      ['/api/models', { credentials: 'same-origin', cache: 'no-store' }],
+      ['/api/providers/deepseek', { credentials: 'same-origin', cache: 'no-store', method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: 'new-private-key' }) }],
+      ['/api/providers/deepseek', { credentials: 'same-origin', cache: 'no-store', method: 'DELETE' }],
+    ])
+  })
+  it('请求错误不携带 Key，畸形响应不伪装为本地配置', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('new-private-key')))
+    await expect(saveApiKey('new-private-key')).rejects.toThrow('网络请求失败')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ models: [] }) }))
+    await expect(getModels()).rejects.toThrow('模型配置响应无效')
+  })
+  it('配置通知独立于对话编号，旧连接通知不触发刷新', () => {
+    const changed = vi.fn()
+    stop = subscribe(state => states.push(state), changed)
+    socket().open(); snapshot()
+    const ws = socket()
+    const id = ws.id
+    ws.frame({ type: 'models_changed' })
+    expect(changed).toHaveBeenCalledTimes(1)
+    expect(current().snapshot?.seq).toBe(0)
+    expect(ws.id).toBe(id)
+    ws.close()
+    ws.frame({ type: 'models_changed' })
+    expect(changed).toHaveBeenCalledTimes(1)
+  })
+})
+
+
+it.each([
+  [401, '授权已失效，请重新打开启动链接'],
+  [403, '访问来源不可信，请从启动链接进入'],
+])('HTTP %s 即使是纯文本也给出明确错误', async (status, message) => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status, json: async () => { throw new Error('not JSON') } }))
+  await expect(getModels()).rejects.toThrow(message)
 })

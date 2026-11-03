@@ -21,6 +21,7 @@
   "dependencies": {
     "@agent-learning/agent": "0.1.0",
     "@agent-learning/credentials": "0.1.0",
+    "@agent-learning/model": "0.1.0",
     "ws": "8.22.1"
   },
   "devDependencies": {

@@ -11,7 +11,7 @@ Agent 在本项目中的回复必须遵守以下要求：
 
 ## 运行项目
 
-阶段一已接入本机授权、WebSocket 和 Agent 空快照；草稿可编辑，发送尚未开放。消息只在后端进程内存中，重启后清空。
+已接入本机授权、WebSocket、Agent 空快照及阶段二模型设置；草稿可编辑，发送尚未开放。消息只在后端进程内存中，重启后清空。
 
 ```sh
 npm ci
@@ -20,6 +20,8 @@ npm --prefix packages/server start
 ```
 
 打开终端打印的完整授权链接，浏览器取得 Cookie 后自动跳转到干净地址。默认监听 `127.0.0.1:3000`；首次启动会安全创建 `~/.agent-learning/browser-auth.json`。不要分享授权链接。签名文件损坏或权限错误时服务拒绝启动，不会自动覆盖它。
+
+从侧栏底部“设置 → 模型 → 添加提供方 → DeepSeek”保存 API Key，可替换或删除。Key 仅写入本机 `~/.agent-learning/auth.json`，页面只接收配置状态；多个页面会同步模型列表，重启后配置仍在。保存成功只表示本地配置可用，不表示远端认证通过。模型文件损坏仍可进入设置，但需要先人工修复文件，页面不会覆盖坏文件。
 
 开发时分别运行：
 
@@ -37,6 +39,6 @@ npx playwright install chromium
 npm test
 ```
 
-根 `npm test` 先构建后端并跑包测试，再运行网页单元测试、真实 Chromium 组件测试、两种实际入口 E2E。E2E 前会执行完整构建；测试只使用临时签名路径，不访问真实用户配置。
+根 `npm test` 先构建后端并跑 Credentials、Model、Agent、Server 测试，再运行网页单元测试、真实 Chromium 组件测试、两种实际入口 E2E。E2E 前会执行完整构建；测试只使用临时签名与模型文件，不访问真实用户配置。
 
 独立命令、系统输入法检查和说明见 [web/README.md](web/README.md)。本阶段实际证据见 [Feature2 验收记录](planning/里程碑1/feature2/feature2-验收记录.md)。
