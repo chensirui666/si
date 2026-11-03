@@ -1,8 +1,8 @@
 # Feature1：建立基本的聊天页面
 
-状态：第一步基础页面已完成并合并，实现在 `web/`，验收情况见 [Feature1 验收记录](./feature1-验收记录.md)。本文保留第一步设计，后续在其上接入模型；第二步单会话流式聊天仍在技术设计阶段。
+状态：第一步基础页面已完成并合并，实现在 `web/`，验收情况见 [Feature1 验收记录](./feature1-验收记录.md)。本文保留第一步设计，后续单会话流式聊天按三个子阶段推进，完整模型接入尚未实施。
 
-对应里程碑1第一步。后续第二步以[单会话流式聊天范围](./README.md)为准，继续沿用本文的输入、原文展示与阅读位置规则；涉及消息归属、异步提交和整体布局的部分需在第二步设计中重新核对。以下按第一步设计时的状态保留，不代表第二步已开始编码。
+对应里程碑1第一步。第二步以[单会话流式聊天范围](../README.md#single-chat-phases)为准，继续沿用本文的输入、原文展示与阅读位置规则；涉及消息归属、异步提交和整体布局的部分需在第二步设计中重新核对。文档通过不代表开始编码。
 
 ## 1. 总结
 
@@ -108,9 +108,9 @@ main.tsx
 
 **与参考源码的关系：**
 
-Pi 的[事件设计](../../pi/packages/agent/README.md#event-flow)将 Agent 运行与界面展示分开；本步在 `web/` 实现网页职责，不建立或调用 Agent 核心。按用户指定，浏览器交互主要参考 dsh：其[编辑器](../../deepseek-harness/packages/client/ui-conversation/src/client/input/editor/runtime.ts)在 Lexical 纯文本能力上注册引用节点，[消息创建](../../deepseek-harness/packages/llm/llm/src/message.ts)生成稳定编号，[普通用户文字](../../deepseek-harness/packages/client/ui-primitives/src/user-text.tsx)直接展示文本。
+Pi 的[事件设计](</Users/stardust/agent learning/pi/packages/agent/README.md#event-flow>)将 Agent 运行与界面展示分开；本步在 `web/` 实现网页职责，不建立或调用 Agent 核心。按用户指定，浏览器交互主要参考 dsh：其[编辑器](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-conversation/src/client/input/editor/runtime.ts>)在 Lexical 纯文本能力上注册引用节点，[消息创建](</Users/stardust/agent learning/deepseek-harness/packages/llm/llm/src/message.ts>)生成稳定编号，[普通用户文字](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-primitives/src/user-text.tsx>)直接展示文本。
 
-有四处明确差异：dsh 已有独立会话数据层，我们本步由 `ChatPage` 保存页面消息；dsh 的[网页入口](../../deepseek-harness/apps/web/vite.config.ts)依赖自身服务注入启动信息，我们暂用独立 Vite 页面；dsh 的[滚动处理](../../deepseek-harness/packages/client/ui-chat/src/client/chat/use-chat-scroll.ts)会在用户提交后跟随到底部，我们按已确认的交互要求保持阅读位置；dsh 的[基础控件](../../deepseek-harness/packages/client/ui-primitives/src/Button.tsx)主要自行实现，我们选择 shadcn/ui 作为通用控件来源。这些参考文件只读，不修改或直接引入其完整运行体系。
+有四处明确差异：dsh 已有独立会话数据层，我们本步由 `ChatPage` 保存页面消息；dsh 的[网页入口](</Users/stardust/agent learning/deepseek-harness/apps/web/vite.config.ts>)依赖自身服务注入启动信息，我们暂用独立 Vite 页面；dsh 的[滚动处理](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-chat/src/client/chat/use-chat-scroll.ts>)会在用户提交后跟随到底部，我们按已确认的交互要求保持阅读位置；dsh 的[基础控件](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-primitives/src/Button.tsx>)主要自行实现，我们选择 shadcn/ui 作为通用控件来源。这些参考文件只读，不修改或直接引入其完整运行体系。
 
 ### 3.2 数据交互流程
 
@@ -284,12 +284,12 @@ const messages: readonly UserMessage[] = [
 ### 风险 1：选字时按 Enter，消息却被发出
 
 - **案例：** 用户正在用中文输入法选字，按 Enter 是想确认输入、继续写后面的内容。页面却把这次按键当成发送，导致没写完的消息被发出，输入框也被清空。
-- **解决方案：** 输入组件区分“确认中文输入”和“发送消息”。刚结束选字时，也不能把用于确认的 Enter 当成发送。实现后，用真实中文输入法操作验证。实现可参考 dsh 的[输入保护](../../deepseek-harness/packages/client/ui-conversation/src/client/input/editor/keymap.ts)。
+- **解决方案：** 输入组件区分“确认中文输入”和“发送消息”。刚结束选字时，也不能把用于确认的 Enter 当成发送。实现后，用真实中文输入法操作验证。实现可参考 dsh 的[输入保护](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-conversation/src/client/input/editor/keymap.ts>)。
 
 ### 风险 2：发出的消息缺字，或空行数量变了
 
 - **案例：** 用户粘贴了一段带空行的文字，又在末尾补了几个字，立即发送。消息列表里却少了最后输入的几个字，或者原本空一行的地方变成了空两行。
-- **解决方案：** 发送时，输入组件读取编辑器当前的完整文字，保留原有空格和换行；聊天页接收后也不裁剪原文。实现后，用“输入后立刻发送”和带连续空行的粘贴内容验证。文字提取可参考 dsh 的[对应处理](../../deepseek-harness/packages/client/ui-conversation/src/client/input/editor/projection.ts)。
+- **解决方案：** 发送时，输入组件读取编辑器当前的完整文字，保留原有空格和换行；聊天页接收后也不裁剪原文。实现后，用“输入后立刻发送”和带连续空行的粘贴内容验证。文字提取可参考 dsh 的[对应处理](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-conversation/src/client/input/editor/projection.ts>)。
 
 ### 风险 3：发送新消息后，正在看的内容突然跳走
 
@@ -313,7 +313,7 @@ const messages: readonly UserMessage[] = [
 
 避免在多个层级重复同一断言。测试文件均拟新增，测试框架与依赖版本未在本文中指定，所有案例尚未执行。
 
-参考 dsh 的分层做法：[按键路由测试](../../deepseek-harness/packages/client/ui-conversation/tests/keymap-routing.client.spec.tsx)在 DOM 模拟环境中发送合成按键，检查编辑器的处理；[编辑器核心测试](../../deepseek-harness/packages/client/ui-conversation/tests/lexical-editor-core.client.spec.tsx)直接驱动无界面编辑器，检查节点和文字投影。这些局部行为不依赖完整网页；本步同样按待验证行为选择范围，不直接照搬其整套测试工具。
+参考 dsh 的分层做法：[按键路由测试](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-conversation/tests/keymap-routing.client.spec.tsx>)在 DOM 模拟环境中发送合成按键，检查编辑器的处理；[编辑器核心测试](</Users/stardust/agent learning/deepseek-harness/packages/client/ui-conversation/tests/lexical-editor-core.client.spec.tsx>)直接驱动无界面编辑器，检查节点和文字投影。这些局部行为不依赖完整网页；本步同样按待验证行为选择范围，不直接照搬其整套测试工具。
 
 ### 案例 1：ChatPage 接收原文、拒绝空白并连续追加
 

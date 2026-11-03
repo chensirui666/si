@@ -20,7 +20,7 @@
 
 **技术方案：**
 
-新增工具声明文件，用 TypeBox 各维护一份参数规则，推导本地类型并导出 `defaultTools`。后端调用方通过模块二既定的 `ModelContext.tools` 提供声明，复用其消息、事件流和 `result()`，只补齐参数类型并将公共 Model 的最终参数解析改为严格 JSON。声明用单元测试验证，接入用本地集成测试及单独运行的真实 DeepSeek 案例验证。
+新增工具声明文件，用 TypeBox 各维护一份参数规则，推导本地类型并导出 `defaultTools`。后端调用方通过本工具阶段补齐的可选 `ModelContext.tools` 提供声明，复用其消息、事件流和 `result()`，只补齐参数类型并将公共 Model 的最终参数解析改为严格 JSON。声明用单元测试验证，接入用本地集成测试及单独运行的真实 DeepSeek 案例验证。
 
 **当前事实与前置依赖：** 当前 checkout 只有 `web/` 基础聊天页，本项目 Model、凭据等后端能力仍待第二步实施。本文“复用”指复用已批准设计，不声称代码已经存在。实施需先落地模块二，再整合本步参数类型及严格解析变更。
 
@@ -66,7 +66,7 @@ flowchart TD
 
 **拟新增 `server/tests/tools.test.ts`：** 使用 Node 内置测试验证工具参数声明，具体用例见 §6。真实模型请求在后续 Model 接入验收中检查，不在这组声明单元测试中执行。
 
-`server/` 是本阶段暂定后端目录名，最终与模块二的后端组织对齐；上述文件和测试目前均不存在，尚未实施。
+`server/` 是本稿早期暂定的后端目录名；整合后沿用第二步已确定的 `packages/server`、`packages/agent`、`packages/model`、`packages/credentials` 组织，Model 改动与测试归 `packages/model`。工具声明的具体包落点在本步实施计划中对齐，不据旧路径另建根目录 `server/`；上述文件和测试目前均不存在，尚未实施。
 
 **Model 模块——工具接入与验收已批准。**
 
@@ -171,7 +171,7 @@ export type EditParams = Static<typeof editParameters>;
 export type WriteParams = Static<typeof writeParameters>;
 ```
 
-对应 Pi 源码：[read](../../pi/packages/coding-agent/src/core/tools/read.ts#L14)、[bash](../../pi/packages/coding-agent/src/core/tools/bash.ts#L40)、[edit](../../pi/packages/coding-agent/src/core/tools/edit.ts#L32)、[write](../../pi/packages/coding-agent/src/core/tools/write.ts#L11)。
+对应 Pi 源码：[read](</Users/stardust/agent learning/pi/packages/coding-agent/src/core/tools/read.ts:14>)、[bash](</Users/stardust/agent learning/pi/packages/coding-agent/src/core/tools/bash.ts:40>)、[edit](</Users/stardust/agent learning/pi/packages/coding-agent/src/core/tools/edit.ts:32>)、[write](</Users/stardust/agent learning/pi/packages/coding-agent/src/core/tools/write.ts:11>)。
 
 **工具声明与默认导出：**
 
@@ -226,13 +226,13 @@ interface ModelEventStream extends AsyncIterable<ModelEvent> {
 }
 
 declare function stream(
-  model: Model,
+  model: ModelInfo,
   context: ModelContext,
   options?: { signal?: AbortSignal },
 ): ModelEventStream;
 ```
 
-`Model`、`ModelMessage`、`ModelEvent` 和完整 `AssistantMessage` 沿用模块二；这里只重述本步会用到的契约。本阶段后端调用如下，Model 不自行加载具体工具：
+`ModelInfo`、`ModelMessage`、`ModelEvent` 和完整 `AssistantMessage` 沿用模块二；这里只重述本步会用到的契约。本阶段后端调用如下，Model 不自行加载具体工具：
 
 ```ts
 const response = stream(model, {
@@ -252,7 +252,7 @@ type ToolCall = {
   type: 'toolCall';
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: JsonObject;
   argumentsError?: string;
 };
 ```
@@ -261,7 +261,7 @@ type ToolCall = {
 
 最终非空参数文字按严格 JSON 规则解析，无法解析成对象时，保留调用，将 `arguments` 设为 `{}`，并在 `argumentsError` 中保存原因和原始参数文字；后续据此区分真正的空参数与解析失败。空参数文字按 `{}` 接收，具体规则见 §4.6。
 
-对应 Pi 源码：[ToolCall](../../pi/packages/ai/src/types.ts#L436)、[工具结果关联](../../pi/packages/agent/src/agent-loop.ts#L930)。
+对应 Pi 源码：[ToolCall](</Users/stardust/agent learning/pi/packages/ai/src/types.ts:436>)、[工具结果关联](</Users/stardust/agent learning/pi/packages/agent/src/agent-loop.ts:930>)。
 
 **沿用模块二的模型回复内容：**
 
@@ -298,7 +298,7 @@ type AssistantContent = TextContent | ThinkingContent | ToolCall;
 
 调用内容有问题不直接等同于模型请求本身发生网络错误；调用接收与执行前校验分别表达结果。解析错误使用 §3.3 的工具调用数据结构表达，具体参数解析规则见 §4.6；模型流结束后遵守 §4.5 的交付规则。
 
-对应 Pi 源码：[参数解析](../../pi/packages/ai/src/utils/json-parse.ts#L106)、[执行前工具查找与参数校验](../../pi/packages/agent/src/agent-loop.ts#L708)。
+对应 Pi 源码：[参数解析](</Users/stardust/agent learning/pi/packages/ai/src/utils/json-parse.ts:106>)、[执行前工具查找与参数校验](</Users/stardust/agent learning/pi/packages/agent/src/agent-loop.ts:708>)。
 
 ### 4.4 【工程决策｜Model 模块】工具调用保留 Pi 的核心字段
 
@@ -310,7 +310,7 @@ type AssistantContent = TextContent | ThinkingContent | ToolCall;
 
 这一等待规则以最终结束状态为依据，单条工具调用收齐不代表整轮响应已成功结束。本步不执行工具、不生成工具结果，也不因截断或调用内容有问题而再次请求模型。
 
-对应 Pi 源码：[等待最终消息与判断结束原因](../../pi/packages/agent/src/agent-loop.ts#L242)、[截断调用不执行](../../pi/packages/agent/src/agent-loop.ts#L478)。Pi 后续执行层还会将截断调用生成工具错误并回传模型；本步仅实现接收及状态保留。
+对应 Pi 源码：[等待最终消息与判断结束原因](</Users/stardust/agent learning/pi/packages/agent/src/agent-loop.ts:242>)、[截断调用不执行](</Users/stardust/agent learning/pi/packages/agent/src/agent-loop.ts:478>)。Pi 后续执行层还会将截断调用生成工具错误并回传模型；本步仅实现接收及状态保留。
 
 <a id="strict-tool-arguments"></a>
 
@@ -320,9 +320,9 @@ type AssistantContent = TextContent | ThinkingContent | ToolCall;
 
 不修复无效转义或原始控制字符，不自动补齐截断的 JSON，不保留不完整 JSON 中仅能解析成功的前半段。参数解析失败不丢弃调用，也不直接变成模型请求的网络错误。
 
-对应 Pi 源码：[最终参数解析](../../pi/packages/ai/src/utils/json-parse.ts#L106)、[有限 JSON 修复](../../pi/packages/ai/src/utils/json-parse.ts#L86)。本项目沿用空参数和对象类型要求，但不采用 Pi 的有限修复；部分 Pi 能修复的参数会在本项目中记录为解析失败。
+对应 Pi 源码：[最终参数解析](</Users/stardust/agent learning/pi/packages/ai/src/utils/json-parse.ts:106>)、[有限 JSON 修复](</Users/stardust/agent learning/pi/packages/ai/src/utils/json-parse.ts:86>)。本项目沿用空参数和对象类型要求，但不采用 Pi 的有限修复；部分 Pi 能修复的参数会在本项目中记录为解析失败。
 
-**与模块二的衔接：** 模块二的旧记录允许有限修复；本会话随后明确确认严格解析，本条是对该解析行为的局部替代。整合两阶段设计时须将公共 Model 的最终工具参数解析统一为本条规则，不另外建立一套工具专用解析器；其他消息、事件与结束契约保持不变。
+**与模块二的衔接：** 模块二的早期记录允许有限修复；本工具设计随后明确确认严格解析，本条是对该解析行为的局部替代。合并时已将 Feature2 总体、阶段三和里程碑规划中的公共 Model 参数解析统一到本条规则；不另外建立工具专用解析器，其他消息、事件与结束契约保持不变，尚未实施。
 
 ### 4.7 【功能决策｜Model 模块】沿用 Pi 的调用归集与编号处理，不增加额外检查
 
@@ -332,23 +332,23 @@ type AssistantContent = TextContent | ThinkingContent | ToolCall;
 
 后续工具查找与参数校验、执行以及结果回填仍属于后续步骤；结果回填时沿用收到的调用编号，不在本步提前实现。此前已确认的严格 JSON 参数解析保持不变。
 
-对应 Pi 源码：[按位置及编号归集](../../pi/packages/ai/src/api/openai-completions.ts#L499)、[后续补入编号](../../pi/packages/ai/src/api/openai-completions.ts#L655)、[执行前检查](../../pi/packages/agent/src/agent-loop.ts#L708)、[结果关联](../../pi/packages/agent/src/agent-loop.ts#L930)。
+对应 Pi 源码：[按位置及编号归集](</Users/stardust/agent learning/pi/packages/ai/src/api/openai-completions.ts:499>)、[后续补入编号](</Users/stardust/agent learning/pi/packages/ai/src/api/openai-completions.ts:655>)、[执行前检查](</Users/stardust/agent learning/pi/packages/agent/src/agent-loop.ts:708>)、[结果关联](</Users/stardust/agent learning/pi/packages/agent/src/agent-loop.ts:930>)。
 
 ### 4.8 【工程决策｜工具定义模块、Model 模块】使用 TypeBox 统一维护工具参数规则
 
 **做法：** 新增 TypeBox 后端依赖，按 §3.3 为四种工具分别声明一份参数规则，供模型请求读取；本地参数类型由这些规则推导，后续执行前校验可以复用同一份规则。本步仅引入参数声明与类型推导，工具执行前校验仍留给后续模块，不一并引入 Pi 的参数自动转换行为。当前只记录设计，尚未安装依赖。
 
-对应 Pi 源码：[参数声明与类型推导](../../pi/packages/coding-agent/src/core/tools/read.ts#L14)、[通用工具的参数字段](../../pi/packages/ai/src/types.ts#L754)、[转换为模型请求](../../pi/packages/ai/src/api/openai-completions.ts#L1507)。
+对应 Pi 源码：[参数声明与类型推导](</Users/stardust/agent learning/pi/packages/coding-agent/src/core/tools/read.ts:14>)、[通用工具的参数字段](</Users/stardust/agent learning/pi/packages/ai/src/types.ts:754>)、[转换为模型请求](</Users/stardust/agent learning/pi/packages/ai/src/api/openai-completions.ts:1507>)。
 
 ### 4.9 【工程决策｜Model 模块】沿用模块二已经确认的模型输入、消息与事件契约
 
-**做法：** `ModelContext` 的 `systemPrompt`、完整 `messages` 和可选 `tools` 继续由调用方提供；工具声明只有名称、用途和参数规则，不携带执行函数。Model 负责转换为 SDK 请求，不自行管理会话历史。本阶段补齐四种具体工具及 TypeBox 参数规则，不重新建立工具调用消息与流式接收体系。
+**做法：** 沿用 `ModelContext` 的 `systemPrompt` 与完整 `messages`，在本工具阶段补齐此前预留方向的可选 `tools` 字段及通用工具声明类型，均由调用方提供；工具声明只有名称、用途和参数规则，不携带执行函数。Model 负责转换为 SDK 请求，不自行管理会话历史。本阶段补齐四种具体工具及 TypeBox 参数规则，不重新建立工具调用消息与流式接收体系。
 
 模型回复仍采用 `text`、`thinking`、`toolCall` 有序内容块；来源、结束状态、用量和时间沿用既有 `AssistantMessage`。三类块的开始、增量和结束事件继续使用 `contentIndex`，内部事件保留共享 `partial`；`done`、`error` 携带最终完整消息。`toolcall_end` 表示请求内容收齐，不表示参数有效或工具已经执行。
 
 `stream(model, context, { signal? })` 立即返回可异步迭代的 `ModelEventStream`；`result()` 等待同一次调用的最终消息，不另发请求。`done` 的原因仍为 `stop`、`length`、`toolUse`，`error` 的原因仍为 `error`、`aborted`；本步根据 §4.5 决定后续工具调用交付。
 
-**既有批准依据：** 用户明确指出上述内容在模块二已决定；核对[第二步独立 worktree 中的输入与流接口记录](</Users/stardust/.codex/worktrees/a8c7/agent learning/planning/里程碑1/README.md:55>)及[消息与事件记录](</Users/stardust/.codex/worktrees/a8c7/agent learning/planning/里程碑1/README.md:58>)后直接沿用。该处仍是设计记录，不代表当前 checkout 已有实现；除 §4.6 的最新严格解析选择外，不借第三步改动其余既定契约。本轮未修改第二步所属的 worktree。
+**既有批准依据：** 输入由调用方准备、内容块、消息及事件流沿用已合入主干的 [Feature2 总体设计](./feature2/feature2-单会话流式聊天技术设计.md)，不再依赖另一个 worktree 的行号。Feature2 可执行基线只定义 systemPrompt 与 messages，本步补齐 tools 与通用声明类型；除 §4.6 已确认的严格解析替代外，不改动其他既定消息和事件契约。两份设计均尚未实施。
 
 ### 4.10 【功能决策｜工具定义模块、Model 模块】本阶段从后端 Model 函数接口接入与验收
 
@@ -356,7 +356,7 @@ type AssistantContent = TextContent | ThinkingContent | ToolCall;
 
 普通网页聊天暂不接入工具流程，网页串联留到后续工具执行阶段。本阶段的验收入口是后端函数接口，不要求网页参与，也不把普通聊天历史变成带有尚未执行工具调用的可继续对话。可重复测试文件与运行方式见 §6；真实模型文件显式单独运行，不随普通单测自动发请求。
 
-该做法复用模块二已确认的 `ModelContext.tools` 与 `ModelEventStream.result()`，不重新设计 Model 的输入、消息或事件体系。
+该做法沿用模块二的上下文、消息和 `ModelEventStream.result()` 契约，只在本工具阶段补齐 tools 与通用声明类型，不重新设计消息或事件体系。
 
 ## 5. 风险与边界
 
