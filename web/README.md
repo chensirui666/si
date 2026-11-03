@@ -32,7 +32,7 @@ npm run test:e2e
 
 真实中文输入法和实际 Safari 需单独操作。启动开发服务后打开 `http://127.0.0.1:5173/tests/manual-input.html`：该页面只挂载输入组件，显示实际接收到的提交和原生输入事件。用系统中文拼音输入 `nihao`，按空格选出“你好”，确认草稿保留、提交记录仍为 `[]`；另行用 Return 结束组合输入，确认该次 Enter 不发送。选字结束后再主动按 Enter，应正常发送。实际结果由 Agent 记录在验收文档，不以模拟事件或 WebKit 替代。
 
-逐项结果见 [Feature1 验收记录](../planning/里程碑1/feature1-验收记录.md)。
+逐项结果见 [Feature1 验收记录](../planning/里程碑1/feature1/feature1-验收记录.md)。
 
 ## 组织方式
 
