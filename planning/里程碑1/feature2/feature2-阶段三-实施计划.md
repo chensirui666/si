@@ -78,3 +78,5 @@
 - 独立审查 4 项 P2 均已补失败回归后修复：SDK 吞尾部 AbortError、交错内容区间顺序、上一轮延迟清理影响下一轮、本地失败气泡排序。HTTP 明确 4xx 与未知结果也已补齐测试。
 
 - 最终根验收：显式提供授权 dotenv 文件运行 `npm test`，262/262 通过、0 跳过；另 `npm run build`、`npm audit --json`（0 漏洞）和 `git diff --check` 均通过。Chromium 焦点回归已修复并无诊断重复 20 次通过。
+
+- 后续用户指令：已快进合并 main（58d2eca）；主目录 npm ci、包含真实 Key 的根 npm test（262/262、0 跳过）、build、audit（0 漏洞）、diff-check 均通过。阶段三分支已删除。应用归档拒绝删除当前聊天主 checkout，且 attach_worktree 不接受普通 main checkout，因此保留该干净 detached worktree，待聊天切回主目录后再归档；没有绕过应用保护强删。

@@ -1,6 +1,6 @@
 # Feature2 验收记录
 
-日期：2026-11-03（阶段一、二），2026-11-04（阶段三）。范围：**Feature2 三个阶段**。前半保留已合并的阶段一、二历史验收；最新交付见文末“阶段三验收”，其代码位于独立 worktree，尚未合并主干。历史部分的“本阶段”与“未实现”描述仅指当时阶段。
+日期：2026-11-03（阶段一、二），2026-11-04（阶段三）。范围：**Feature2 三个阶段**。前半保留已合并的阶段一、二历史验收；最新交付见文末“阶段三验收”及“阶段三合并后复验与清理”；代码已合入 main，阶段三分支已删除，worktree 的归档受当前聊天占用保护阻止。历史部分的“本阶段”与“未实现”描述仅指当时阶段。
 
 阶段一已完成实现与本阶段自动验收，提交 `31e5d31` 已合并本地主干 `main`，未推送远端。主目录重新安装依赖后，115 项测试再次全部通过；实施 worktree 和已合并功能分支已删除。当前交付：安全授权打开本地页面，建立 WebSocket，订阅唯一 Agent 的真实初始空快照，刷新、断线、离线和服务重启后恢复连接；草稿仍可编辑，聊天发送始终关闭。
 
@@ -227,3 +227,38 @@ Pi 的职责划分、事件队列与同次 result 作为主要参考；本项目
 系统中文输入法与实际 Safari 未实测；合成组合输入、Chromium 原生编辑、剪贴板、撤销和焦点测试不能替代人工检查。未验证 Windows 权限、突然断电或长对话无限增长。生产包超过 Vite 默认 500kB 提示阈值，构建成功，本轮不额外拆包。
 
 聊天仍只在后端内存中，重启清空。失败 assistant 后续被排除；未确认不自动重发；工具只展示、不执行。跨冻结块引用在最终整篇重解析后校准。异常退出遗留文件锁需人工恢复的既有边界不变。
+
+
+## 阶段三合并后复验与清理
+
+2026-11-04，按使用者明确指令将阶段三从 02830b1 快进合并到 `/Users/stardust/agent learning` 的 `main`，实现提交为 58d2eca。合并前两处 checkout 均干净；没有修改或清理其他阶段的 worktree/分支，也没有推送远端。
+
+### 主目录重新校验
+
+在主目录重新执行 `npm ci`，随后显式提供使用者前轮授权的 dotenv 文件位置运行根 `npm test`，再执行 `npm run build`、`npm audit --json`、`git diff --check`，全部退出码 0。不是复用 worktree 的测试结果。
+
+| 检查 | 合并后实际结果 |
+| --- | --- |
+| Credentials | 53 / 53 |
+| Model | 46 / 46 |
+| Agent | 19 / 19 |
+| Server | 28 / 28 |
+| 网页单元 | 81 / 81 |
+| 真实 Chromium 组件 | 27 / 27，0 失败、0 跳过、0 flaky |
+| Node / Vite / 真实 DeepSeek E2E | 8 / 8，0 失败、0 跳过、0 flaky |
+| 总计 | **262 / 262，0 失败、0 跳过** |
+| 构建 | 四后端包、网页 TypeScript 与生产构建全部通过 |
+| 依赖审计 | 0 漏洞 |
+| diff-check | 通过 |
+
+真实 DeepSeek 用例在实际页面完成两轮随机口令记忆、终止前正文增量、替换无效 Key 后明确失败及恢复有效 Key 后成功。只读原 dotenv，模型与签名文件仍使用测试临时目录并已清理。系统输入法和实际 Safari 的未实测边界不变。
+
+主目录复验日志：[完整测试](../../../web/test-results/verification-stage3-postmerge/full-test.log)、[构建](../../../web/test-results/verification-stage3-postmerge/build.log)、[安装](../../../web/test-results/verification-stage3-postmerge/install.log)、[依赖审计](../../../web/test-results/verification-stage3-postmerge/audit.json)。合并前整个 `web/test-results/` 已复制到主目录 `web/test-results/feature2-stage3-premerge-58d2eca/`，保留原审查、日志、结果 JSON 和 10 张截图；`verification-stage3/` 也保留于主目录以维持原日志链接。产物均被 Git 忽略，不会随代码提交。
+
+### 清理结果与应用限制
+
+- 已验证 58d2eca 包含于 main，清理前 stage3 worktree 干净。
+- Codex 原生 `archive_worktree` 返回 `The task's primary checkout cannot be removed.`，因为当前聊天仍使用该目录。
+- 尝试把聊天切回主目录时，`attach_worktree` 返回 `The checkout exists but is not a managed worktree.`；该工具不能把普通 main checkout 设为当前聊天目录。
+- 已将阶段三 checkout 安全切为 detached HEAD，并删除已合并的 `codex/feature2-stage3` 分支；实现完整保留于 main。
+- **worktree 尚未删除**：`/Users/stardust/.codex/worktrees/feature2-stage3/agent learning`。没有绕过应用保护手动强删当前聊天目录。需要先在应用界面把此聊天切回主目录，之后才能继续原生归档。
