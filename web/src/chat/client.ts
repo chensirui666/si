@@ -1,5 +1,5 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { ClientFrame } from '@agent-learning/server/protocol'
+import type { ClientFrame, SubmitMessageAccepted, SubmitMessageRequest } from '@agent-learning/server/protocol'
 import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
 
 export const subscribe: Subscribe = (onState, onModelsChanged) => {
@@ -96,7 +96,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged) => {
   window.addEventListener('online', online)
   if (navigator.onLine) connect()
   else offline()
-  return () => {
+  const stop = () => {
     if (stopped) return
     stopped = true
     clearTimeout(retryTimer)
@@ -104,6 +104,11 @@ export const subscribe: Subscribe = (onState, onModelsChanged) => {
     window.removeEventListener('online', online)
     releaseSocket()
   }
+  return Object.assign(stop, { requestSnapshot: () => {
+    if (stopped || socket?.readyState !== 1) return
+    prepare()
+    requestSnapshot()
+  } })
 }
 
 
@@ -137,3 +142,20 @@ export const saveApiKey = (apiKey: string) => requestModels('/api/providers/deep
   method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey }),
 }, apiKey)
 export const deleteApiKey = () => requestModels('/api/providers/deepseek', { method: 'DELETE' })
+
+export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
+  let response: Response
+  try { response = await fetch('/api/messages', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) }
+  catch { throw new Error('网络请求失败，未确认接收') }
+  const rejected = response.status >= 400 && response.status < 500
+  let value: unknown
+  try { value = await response.json() } catch { value = null }
+  if (rejected) {
+    const message = response.status === 401 ? '授权已失效，请重新打开启动链接' : response.status === 403 ? '访问来源不可信，请从启动链接进入'
+      : record(value) && typeof value.error === 'string' ? value.error : response.status === 409 ? '正在生成，请等待回答结束' : `消息提交被拒绝（HTTP ${response.status}）`
+    throw Object.assign(new Error(message), { status: response.status })
+  }
+  if (response.status !== 202 || !record(value) || value.clientMessageId !== input.clientMessageId || typeof value.userMessageId !== 'string'
+    || !Number.isSafeInteger(value.acceptedSeq) || (value.acceptedSeq as number) < 0) throw new Error('提交回执无效，未确认接收')
+  return value as SubmitMessageAccepted
+}

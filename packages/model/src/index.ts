@@ -13,5 +13,8 @@ export type {
   JsonObject,
   ModelUsage,
   ModelStopReason,
+  ModelContext,
+  ModelEvent,
+  ModelEventStream,
 } from './types.js'
-export { discoverModels } from './deepseek.js'
+export { discoverModels, findModel, stream, createModelStream } from './deepseek.js'

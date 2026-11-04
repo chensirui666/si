@@ -6,11 +6,14 @@ import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary'
 import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin'
 import { PlainTextPlugin } from '@lexical/react/LexicalPlainTextPlugin'
 import {
+  $addUpdateTag,
   $createParagraphNode,
   $getRoot,
   CLEAR_HISTORY_COMMAND,
   COMMAND_PRIORITY_CRITICAL,
   KEY_ENTER_COMMAND,
+  KEY_TAB_COMMAND,
+  SKIP_DOM_SELECTION_TAG,
   SKIP_SCROLL_INTO_VIEW_TAG,
 } from 'lexical'
 import { mergeRegister } from '@lexical/utils'
@@ -87,6 +90,11 @@ function Composer({ onSend, sendDisabled }: MessageInputProps) {
         root?.addEventListener('compositionstart', startComposition)
         root?.addEventListener('compositionend', endComposition)
       }),
+      editor.registerCommand(KEY_TAB_COMMAND, () => {
+        // 原生 Tab 移焦后，避免本次内部选区提交重新抢回输入焦点。
+        $addUpdateTag(SKIP_DOM_SELECTION_TAG)
+        return false
+      }, COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ENTER_COMMAND, (event) => {
         if (event === null) return true
         if (event.ctrlKey || event.metaKey || event.altKey || event.getModifierState('AltGraph')) return true

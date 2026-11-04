@@ -1,6 +1,6 @@
 # 阶段三：提交生成与实时展示
 
-状态：阶段草案，整理已确认方案，后续逐模块核对，尚未实施。依赖[阶段一](./feature2-阶段一-打开授权与订阅.md)的接入与订阅、[阶段二](./feature2-阶段二-凭据配置与本地模型发现.md)的 Key 管理与模型发现；共享契约以[总体设计](./feature2-单会话流式聊天技术设计.md)为准。
+状态：2026-11-04 按用户本轮指令实施，受控完整链路与真实 DeepSeek 验收通过；实现位于 `codex/feature2-stage3` worktree，尚未合并主干。实际结果见[验收记录的阶段三部分](./feature2-验收记录.md#阶段三验收)与[实施计划](./feature2-阶段三-实施计划.md)。依赖[阶段一](./feature2-阶段一-打开授权与订阅.md)的接入与订阅、[阶段二](./feature2-阶段二-凭据配置与本地模型发现.md)的 Key 管理与模型发现；共享契约以[总体设计](./feature2-单会话流式聊天技术设计.md)为准。
 
 ## 1. 总结
 
@@ -20,7 +20,7 @@
 
 ### 3.1 模块变化
 
-本节新增或修改相对前两阶段已完成后的预计基线，当前完整链路仍未实现；保持总体设计的模块与类型归属。
+本节记录相对前两阶段已完成基线的新增与修改；现已按这些边界实施，保持总体设计的模块与类型归属。
 
 #### ① 提交与推送：WebServer（修改）
 
@@ -248,6 +248,7 @@ type LocalSubmission = {
   clientMessageId: string; // ChatPage 为本次人工发送生成的临时编号
   modelId: string; // 本次发送选中的模型，来自页面模型选择
   text: string; // MessageInput 提交的完整原文，仅留当前页面
+  afterMessageId?: string; // 本地气泡创建时上一条正式消息的编号，仅用于保持显示顺序，不参与接收或去重
   state: 'pending' | 'failed' | 'unconfirmed'; // 网页按接收证据或错误更新的临时展示状态
   errorMessage?: string; // 网页从明确拒绝或网络失败得到的展示说明
   accepted?: SubmitMessageAccepted; // 已到达的 HTTP 回执；订阅追上前保留，防止迟到错误降级
@@ -608,7 +609,7 @@ interface Agent {
 
 ## 6. 验收标准
 
-以下均待实施，低层测试使用受控响应，真实模型 E2E 使用实际配置的 Key；根 `npm run test:packages` 准备依赖后执行后端包测试，也可单独运行 `npm --prefix packages/<模块> test`，网页沿用原测试命令；证据不得含密钥或启动令牌。
+以下为实施验收标准，实际执行证据见验收记录。低层测试使用受控响应，真实模型 E2E 使用明确授权的 Key；根 `npm run test:packages` 准备依赖后执行后端包测试，也可单独运行 `npm --prefix packages/<模块> test`，网页沿用原测试命令；证据不得含密钥或启动令牌。
 
 ### 1. 模型适配与终止
 

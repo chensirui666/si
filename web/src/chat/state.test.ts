@@ -37,3 +37,48 @@ describe('conversation state', () => {
     expect(applyFrame(state, { ...accepted, update: { seq: 1, change: { type: 'model', messageId: 'two', event: { type: 'text_delta', contentIndex: 0, delta: 'hello' } } } }, 'current').resubscribe).toBe(true)
   })
 })
+
+it('完整应用三类块、块终值和最终回复，不提前读取或重复累积内容', () => {
+  let state = ready()
+  let seq = 0
+  const push = (event: unknown) => {
+    const result = applyFrame(state, { type: 'update', subscriptionId: 'current', update: { seq: ++seq, change: { type: 'model', messageId: 'answer', event } } }, 'current')
+    expect(result.resubscribe).toBe(false)
+    state = result.state
+  }
+  const initial = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1 }
+  push({ type: 'start', initial })
+  push({ type: 'thinking_start', contentIndex: 0 })
+  push({ type: 'thinking_delta', contentIndex: 0, delta: '想一想' })
+  push({ type: 'thinking_end', contentIndex: 0, content: '完整思考' })
+  push({ type: 'text_start', contentIndex: 1 })
+  const before = state
+  push({ type: 'text_delta', contentIndex: 1, delta: '**答' })
+  expect(before.snapshot?.messages[0].message.content).toEqual([{ type: 'thinking', thinking: '完整思考' }, { type: 'text', text: '' }])
+  push({ type: 'text_end', contentIndex: 1, content: '**答案**' })
+  push({ type: 'toolcall_start', contentIndex: 2 })
+  push({ type: 'toolcall_delta', contentIndex: 2, delta: '{"city":' })
+  expect(state.snapshot?.activeContent).toEqual([{ messageId: 'answer', contentIndex: 2, type: 'toolCall', argumentsText: '{"city":' }])
+  const toolCall = { type: 'toolCall', id: 'call', name: 'weather', arguments: {}, argumentsError: '无效 JSON: {"city":' }
+  push({ type: 'toolcall_end', contentIndex: 2, toolCall })
+  const message = { ...initial, content: [{ type: 'text', text: '最终校准' }, toolCall], stopReason: 'toolUse' }
+  push({ type: 'done', reason: 'toolUse', message })
+  expect(state.snapshot?.messages).toEqual([{ id: 'answer', message }])
+  expect(state.snapshot?.activeContent).toEqual([])
+  expect(state.snapshot?.running).toBeNull()
+})
+
+it('start 前的失败仍形成正式回复并结束运行', () => {
+  const error = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, content: [], stopReason: 'error', errorMessage: '调用失败' }
+  const result = applyFrame(ready(), { type: 'update', subscriptionId: 'current', update: { seq: 1, change: { type: 'model', messageId: 'failed', event: { type: 'error', reason: 'error', error } } } }, 'current')
+  expect(result.resubscribe).toBe(false)
+  expect(result.state.snapshot?.messages).toEqual([{ id: 'failed', message: error }])
+})
+
+it.each([
+  { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, content: [], stopReason: 'error', errorMessage: { unsafe: true } },
+  { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, content: [{ type: 'toolCall', id: 'call', name: 'search', arguments: {}, argumentsError: { unsafe: true } }], stopReason: 'toolUse' },
+])('不接受无法安全展示的错误字段 %j', message => {
+  const state = initialState
+  expect(applyFrame(state, { type: 'snapshot', subscriptionId: 'current', snapshot: { ...empty, messages: [{ id: 'answer', message }] } }, 'current').state).toBe(state)
+})

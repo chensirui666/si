@@ -1,29 +1,129 @@
-import { fork, spawn, type ChildProcess } from 'node:child_process'
-import { once } from 'node:events'
+import type { ChildProcess } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { request } from 'node:http'
-import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { test, expect, type Page } from '@playwright/test'
-import { WebSocket } from 'ws'
+import { join } from 'node:path'
+import { test, expect } from '@playwright/test'
+import { authorize, devUrl, emptySnapshot, httpStatus, observe, ready, saveKey, startBackend, startVite, stop, waitForStart, wsStatus } from './test-utils'
+import { startModelServer } from './model-server'
 
-const webDirectory = fileURLToPath(new URL('../..', import.meta.url))
-const fixturePath = fileURLToPath(new URL('./server-fixture.mjs', import.meta.url))
-const vitePath = join(dirname(createRequire(import.meta.url).resolve('vite/package.json')), 'bin/vite.js')
-const devUrl = 'http://127.0.0.1:5173'
-const emptySnapshot = { seq: 0, messages: [], running: null, activeContent: [] }
+for (const mode of ['node', 'vite'] as const) {
+  test(`${mode} 阶段三 SDK 流式对话、历史与生成恢复`, async ({ page, context }, testInfo) => {
+    const temporary = await mkdtemp(join(tmpdir(), 'agent-learning-stage3-e2e-'))
+    const secretPath = join(temporary, 'browser-auth.json')
+    const modelPath = join(temporary, 'auth.json')
+    const provider = await startModelServer()
+    let backend: Awaited<ReturnType<typeof startBackend>> | undefined
+    let vite: ChildProcess | undefined
+    try {
+      backend = await startBackend(secretPath, 0, provider.baseURL)
+      const port = Number(new URL(backend.result.url).port)
+      if (mode === 'vite') vite = await startVite(port)
+      const origin = mode === 'node' ? backend.result.url : devUrl
+      const observed = observe(page)
+      await authorize(page, mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl)
+      await ready(page, observed)
+      await saveKey(page, 'controlled-stage3-key')
 
-type Started = { url: string; authUrl: string; devAuthUrl: string }
-type FixtureMessage = { type: 'started'; result: Started } | { type: 'error' }
+      const editor = page.getByRole('textbox', { name: '消息', exact: true })
+      const send = page.getByRole('button', { name: '发送', exact: true })
+      const messages = page.getByRole('region', { name: '消息列表' })
+      const original = '  第一轮原文\n保留空格与换行  '
+      await editor.fill(original)
+      await expect(send).toBeEnabled()
+      const accepted = page.waitForResponse(response => new URL(response.url()).pathname === '/api/messages')
+      await send.click()
+      expect((await accepted).status()).toBe(202)
+      await expect(editor).toHaveText('')
+      await expect(editor).toBeFocused()
+      await expect.poll(() => provider.exchanges.length).toBe(1)
+      const first = provider.exchanges[0]!
+      expect(first.path).toBe('/v1/chat/completions')
+      expect(first.authorized).toBe(true)
+      expect(first.body).toMatchObject({ model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'high' })
+      expect(first.body.tools).toBeUndefined()
+      expect(first.body.messages).toEqual([{ role: 'user', content: original }])
+      first.delta({ role: 'assistant', reasoning_content: '先分析原文。' })
+      first.delta({ content: '**第一段**已经到达。' })
+      await expect(messages).toContainText('第一段已经到达。')
+      await expect(messages.getByRole('listitem')).toHaveCount(2)
+      await expect.poll(() => observed.updates.some(({ update }) => update.change.type === 'model' && update.change.event.type === 'text_delta')).toBe(true)
+      expect(observed.updates.some(({ update }) => update.change.type === 'model' && update.change.event.type === 'done')).toBe(false)
+      await editor.fill('生成期间编辑的草稿')
+      await editor.press('Enter')
+      await expect(editor).toHaveText('生成期间编辑的草稿')
+      await expect(send).toBeDisabled()
 
-async function stop(child: ChildProcess | undefined, signal: NodeJS.Signals = 'SIGTERM') {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return
-  const exited = once(child, 'exit')
-  child.kill(signal)
-  const deadline = setTimeout(() => child.kill('SIGKILL'), 3000)
-  try { await exited } finally { clearTimeout(deadline) }
+      const second = await context.newPage()
+      const otherObserved = observe(second)
+      await second.goto(origin)
+      await ready(second, otherObserved, 0, false)
+      await expect(second.getByRole('region', { name: '消息列表' })).toContainText('第一段已经到达。')
+      await second.getByRole('textbox', { name: '消息', exact: true }).fill('另一个页面的草稿')
+      await expect(second.getByRole('button', { name: '发送', exact: true })).toBeDisabled()
+      const running = otherObserved.snapshots.at(-1)!.snapshot.running
+      expect(running).not.toBeNull()
+      expect(otherObserved.snapshots.at(-1)!.snapshot.activeContent).toContainEqual({ messageId: running!.assistantMessageId, contentIndex: 1, type: 'text' })
+
+      const beforeReload = observed.snapshots.length
+      await page.reload()
+      await ready(page, observed, beforeReload, false)
+      await expect(editor).toHaveText('')
+      await expect(messages).toContainText('第一段已经到达。')
+      expect(observed.snapshots.at(-1)!.snapshot.running).toEqual(running)
+      await editor.fill('断线期间保留的新草稿')
+      await expect(send).toBeDisabled()
+      await context.setOffline(true)
+      await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
+      first.delta({ content: '离线时继续生成的第二段。' })
+      const beforeOnline = observed.snapshots.length
+      await context.setOffline(false)
+      await ready(page, observed, beforeOnline, false)
+      await expect(messages).toContainText('第一段已经到达。离线时继续生成的第二段。')
+      await expect(second.getByRole('region', { name: '消息列表' })).toContainText('离线时继续生成的第二段。')
+      expect(observed.snapshots.at(-1)!.snapshot.running).toEqual(running)
+      await expect(editor).toHaveText('断线期间保留的新草稿')
+      await expect(send).toBeDisabled()
+      expect(provider.exchanges).toHaveLength(1)
+      expect(observed.submissions).toEqual(['POST'])
+      expect(otherObserved.submissions).toEqual([])
+
+      first.finish()
+      await expect(send).toBeEnabled()
+      await expect.poll(() => otherObserved.updates.some(({ update }) => update.change.type === 'model' && update.change.event.type === 'done')).toBe(true)
+      await expect(messages.getByRole('listitem')).toHaveCount(2)
+      await editor.fill('第二轮请沿用前面的内容')
+      await send.click()
+      await expect.poll(() => provider.exchanges.length).toBe(2)
+      const next = provider.exchanges[1]!
+      expect(next.body.messages.map(message => message.role)).toEqual(['user', 'assistant', 'user'])
+      expect(next.body.messages.map(message => message.content)).toEqual([original, '**第一段**已经到达。离线时继续生成的第二段。', '第二轮请沿用前面的内容'])
+      next.delta({ role: 'assistant', content: '第二轮已收到历史。' })
+      next.finish()
+      await expect(messages).toContainText('第二轮已收到历史。')
+      await expect(messages.getByRole('listitem')).toHaveCount(4)
+      await editor.fill('后端重启期间仍保留的草稿')
+      await expect(send).toBeEnabled()
+      await page.screenshot({ path: testInfo.outputPath(`${mode}-stage3-chat.png`), fullPage: true })
+
+      const beforeRestart = observed.snapshots.length
+      await stop(backend.child, 'SIGKILL')
+      await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
+      backend = await startBackend(secretPath, port, provider.baseURL)
+      await ready(page, observed, beforeRestart)
+      await expect(messages.getByRole('listitem')).toHaveCount(0)
+      await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('DeepSeek Flash')
+      await expect(editor).toHaveText('后端重启期间仍保留的草稿')
+      await expect(send).toBeEnabled()
+      expect(JSON.parse(await readFile(modelPath, 'utf8')).deepseek.key).toBe('controlled-stage3-key')
+      expect(provider.exchanges).toHaveLength(2)
+      expect(observed.submissions).toEqual(['POST', 'POST'])
+      expect(otherObserved.submissions).toEqual([])
+      await second.close()
+    } finally {
+      await Promise.allSettled([context.setOffline(false), stop(vite), stop(backend?.child), provider.close()])
+      await rm(temporary, { recursive: true, force: true })
+    }
+  })
 }
 
 for (const mode of ['node', 'vite'] as const) {
@@ -37,11 +137,7 @@ for (const mode of ['node', 'vite'] as const) {
       backend = await startBackend(secretPath)
       const port = Number(new URL(backend.result.url).port)
       if (mode === 'vite') {
-        vite = spawn(process.execPath, [vitePath], { cwd: webDirectory, env: { ...process.env, AGENT_LEARNING_SERVER_PORT: String(port) }, stdio: 'ignore' })
-        await expect.poll(async () => {
-          if (vite!.exitCode !== null) throw new Error('Vite 未启动；请检查 5173 端口和配置')
-          return httpStatus(devUrl + '/@vite/client').catch(() => 0)
-        }, { timeout: 10_000 }).toBe(200)
+        vite = await startVite(port)
       }
       const origin = mode === 'node' ? backend.result.url : devUrl
       const observed = observe(page)
@@ -84,7 +180,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(settings).toBeFocused()
       await expect(editor).toHaveText('设置变化期间保留的草稿')
       await expect(model).toHaveText('DeepSeek Flash')
-      await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled()
+      await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
       await settings.click()
       await dialog.getByRole('button', { name: '编辑', exact: true }).click()
       await expect(keyInput).toHaveValue('')
@@ -140,85 +236,6 @@ for (const mode of ['node', 'vite'] as const) {
   })
 }
 
-function waitForStart(child: ChildProcess): Promise<Started> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => fail(), 10_000)
-    const cleanup = () => {
-      clearTimeout(timer)
-      child.off('message', message)
-      child.off('error', fail)
-      child.off('exit', fail)
-    }
-    const fail = () => { cleanup(); reject(new Error('测试后端未能启动；请先运行根 npm run build')) }
-    const message = (data: unknown) => {
-      const value = data as FixtureMessage
-      if (value.type === 'started') { cleanup(); resolve(value.result) }
-      else if (value.type === 'error') fail()
-    }
-    child.on('message', message)
-    child.once('error', fail)
-    child.once('exit', fail)
-  })
-}
-
-async function startBackend(secretPath: string, port = 0) {
-  const child = fork(fixturePath, [String(port), secretPath], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
-  try { return { child, result: await waitForStart(child) } }
-  catch (error) { await stop(child); throw error }
-}
-
-function httpStatus(url: string, headers: Record<string, string> = {}): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const req = request(url, { headers, timeout: 3000 }, res => {
-      res.resume()
-      resolve(res.statusCode ?? 0)
-    })
-    req.once('error', () => reject(new Error('本地 HTTP 请求失败')))
-    req.once('timeout', () => req.destroy())
-    req.end()
-  })
-}
-
-function wsStatus(url: string, headers: Record<string, string> = {}): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url.replace(/^http/, 'ws') + '/api/events', { headers, handshakeTimeout: 3000 })
-    let responded = false
-    socket.once('unexpected-response', (_req, res) => {
-      responded = true
-      res.resume()
-      socket.terminate()
-      resolve(res.statusCode ?? 0)
-    })
-    socket.once('open', () => { responded = true; socket.close(); resolve(101) })
-    socket.on('error', () => { if (!responded) reject(new Error('本地 WebSocket 握手失败')) })
-  })
-}
-
-function observe(page: Page) {
-  const snapshots: { subscriptionId: string; snapshot: unknown }[] = []
-  let closed = 0
-  const submissions: string[] = []
-  page.on('request', req => { if (new URL(req.url()).pathname === '/api/messages') submissions.push(req.method()) })
-  page.on('websocket', socket => {
-    if (new URL(socket.url()).pathname !== '/api/events') return
-    socket.on('close', () => { closed++ })
-    socket.on('framereceived', ({ payload }) => {
-      try {
-        const frame = JSON.parse(String(payload))
-        if (frame.type === 'snapshot') snapshots.push({ subscriptionId: frame.subscriptionId, snapshot: frame.snapshot })
-      } catch { /* 非 JSON 帧由真实网页处理。 */ }
-    })
-  })
-  return { snapshots, submissions, get closed() { return closed } }
-}
-
-async function ready(page: Page, observed: ReturnType<typeof observe>, after = 0) {
-  await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'ready')
-  await expect(page.getByRole('status')).toHaveText('对话已同步，发送暂未开放')
-  await expect.poll(() => observed.snapshots.length).toBeGreaterThan(after)
-  expect(observed.snapshots.at(-1)?.snapshot).toEqual(emptySnapshot)
-}
-
 for (const mode of ['node', 'vite'] as const) {
   test(`${mode} 实际授权、空快照与恢复`, async ({ page, context }, testInfo) => {
     const temporary = await mkdtemp(join(tmpdir(), 'agent-learning-stage1-e2e-'))
@@ -229,15 +246,7 @@ for (const mode of ['node', 'vite'] as const) {
       backend = await startBackend(secretPath)
       const port = Number(new URL(backend.result.url).port)
       if (mode === 'vite') {
-        vite = spawn(process.execPath, [vitePath], {
-          cwd: webDirectory,
-          env: { ...process.env, AGENT_LEARNING_SERVER_PORT: String(port) },
-          stdio: 'ignore',
-        })
-        await expect.poll(async () => {
-          if (vite!.exitCode !== null) throw new Error('Vite 未启动；请检查 5173 端口和配置')
-          return httpStatus(devUrl + '/@vite/client').catch(() => 0)
-        }, { timeout: 10_000 }).toBe(200)
+        vite = await startVite(port)
       }
       const origin = mode === 'node' ? backend.result.url : devUrl
       const authUrl = mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl

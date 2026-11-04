@@ -1,4 +1,4 @@
-export { Agent } from './agent.js'
+export { Agent, AgentSubmitError } from './agent.js'
 export type {
   ConversationMessage,
   RunningState,

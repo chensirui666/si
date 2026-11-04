@@ -212,3 +212,33 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
   .chat-page .message-editor { max-height: clamp(24px, calc(100dvh - 228px), 200px); }
   .chat-main { gap: 8px; }
 }
+
+.message-item-assistant { align-self: flex-start; width: 100%; max-width: 100%; padding: 0; border-radius: 0; background: transparent; }
+.assistant-message { overflow-wrap: anywhere; font-size: 14px; line-height: 24px; }
+.markdown-text > :first-child { margin-top: 0; }
+.markdown-text > :last-child { margin-bottom: 0; }
+.markdown-text p, .markdown-text ul, .markdown-text ol, .markdown-text blockquote, .markdown-text pre, .markdown-table { margin-block: 12px; }
+.markdown-text h1, .markdown-text h2, .markdown-text h3, .markdown-text h4, .markdown-text h5, .markdown-text h6 { margin: 20px 0 8px; font-size: 16px; line-height: 24px; font-weight: 600; }
+.markdown-text ul, .markdown-text ol { padding-left: 24px; }
+.markdown-text ul { list-style: disc; }
+.markdown-text ol { list-style: decimal; }
+.markdown-text li > p { display: inline; }
+.markdown-text li > input { margin-right: 6px; }
+.markdown-text blockquote { padding-left: 12px; border-left: 2px solid var(--border); color: var(--secondary-text); }
+.markdown-text pre, .tool-block pre { max-width: 100%; overflow: auto; padding: 12px; border-radius: 8px; background: var(--surface); white-space: pre; font-size: 13px; line-height: 22px; }
+.markdown-text :not(pre) > code { padding: 1px 4px; border-radius: 4px; background: var(--surface); font-size: 13px; }
+.markdown-text img { max-width: 100%; height: auto; }
+.markdown-table { max-width: 100%; overflow: auto; }
+.markdown-table table { border-collapse: collapse; min-width: 100%; }
+.markdown-table th, .markdown-table td { padding: 6px 10px; border: 1px solid var(--border); text-align: left; white-space: normal; }
+.markdown-table th { background: var(--surface); font-weight: 600; }
+.markdown-footnotes { margin-top: 16px; border-top: 1px solid var(--border); font-size: 12px; }
+.thinking-block { margin: 0 0 16px; color: var(--secondary-text); }
+.thinking-block summary { width: fit-content; cursor: pointer; font-size: 13px; line-height: 22px; }
+.thinking-block[open] summary { margin-bottom: 8px; }
+.thinking-block .markdown-text { padding-left: 12px; border-left: 2px solid var(--border); }
+.tool-block { margin-block: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.tool-block pre { margin: 8px 0 0; }
+.message-error, .message-ending, .submission-status { margin: 8px 0 0; color: var(--secondary-text); font-size: 12px; line-height: 20px; }
+.message-error, .message-ending[role="alert"], .submission-status[data-state="failed"] { color: #b42318; }
+.submission-status p { margin: 4px 0 0; }

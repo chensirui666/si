@@ -206,3 +206,44 @@ it.each([
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status, json: async () => { throw new Error('not JSON') } }))
   await expect(getModels()).rejects.toThrow(message)
 })
+
+it('提交保留完整原文，只发送一次请求并校验 202 回执', async () => {
+  const accepted = { clientMessageId: 'local', userMessageId: 'user', acceptedSeq: 1 }
+  const fetch = vi.fn().mockResolvedValue({ status: 202, ok: true, json: async () => accepted })
+  vi.stubGlobal('fetch', fetch)
+  const { submitMessage } = await import('./client')
+  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', text: '  原文\n\n' }
+  await expect(submitMessage(input)).resolves.toEqual(accepted)
+  expect(fetch.mock.calls).toEqual([['/api/messages', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }]])
+  fetch.mockResolvedValue({ status: 202, ok: true, json: async () => ({ ...accepted, clientMessageId: 'wrong' }) })
+  await expect(submitMessage(input)).rejects.toThrow('提交回执无效')
+})
+
+it('明确拒绝带状态码，网络失败保持接收状态未知且没有自动重发', async () => {
+  const fetch = vi.fn().mockResolvedValue({ status: 409, ok: false, json: async () => ({ error: '正在生成' }) })
+  vi.stubGlobal('fetch', fetch)
+  const { submitMessage } = await import('./client')
+  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', text: 'hello' }
+  await expect(submitMessage(input)).rejects.toMatchObject({ status: 409, message: '正在生成' })
+  fetch.mockRejectedValue(new Error('network'))
+  await expect(submitMessage(input)).rejects.toMatchObject({ message: '网络请求失败，未确认接收' })
+  expect(fetch).toHaveBeenCalledTimes(2)
+})
+
+it('主动重取快照保留清理函数接口，换编号并设置准备超时', () => {
+  const subscription = subscribe(state => states.push(state))
+  stop = subscription
+  socket().open(); snapshot()
+  const old = socket().id
+  subscription.requestSnapshot?.()
+  expect(socket().id).not.toBe(old)
+  expect(current().connection).toBe('awaitingSnapshot')
+  vi.advanceTimersByTime(15_000)
+  expect(current().connection).toBe('disconnected')
+})
+
+it.each([413, 415])('HTTP %s 是明确拒绝而非接收未知', async status => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status, ok: false, json: async () => ({ error: status === 413 ? '消息过长' : '需要 JSON 请求' }) }))
+  const { submitMessage } = await import('./client')
+  await expect(submitMessage({ clientMessageId: 'local', modelId: 'deepseek-flash', text: 'a'.repeat(70_000) })).rejects.toMatchObject({ status })
+})

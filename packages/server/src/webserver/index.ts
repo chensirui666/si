@@ -4,11 +4,11 @@ import { readFile, realpath, stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
-import { Agent } from '@agent-learning/agent'
+import { Agent, AgentSubmitError } from '@agent-learning/agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
-import { discoverModels } from '@agent-learning/model'
+import { createModelStream, discoverModels } from '@agent-learning/model'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
-import type { ClientFrame, ServerFrame } from './protocol.js'
+import type { ClientFrame, ServerFrame, SubmitMessageRequest } from './protocol.js'
 
 export type WebServerOptions = {
   port?: number
@@ -16,31 +16,45 @@ export type WebServerOptions = {
   browserSecretPath?: string
   modelAuthPath?: string
   devOrigin?: 'http://127.0.0.1:5173'
-  agent?: Pick<Agent, 'subscribe'>
+  agent?: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'close'>>
+  modelOptions?: Parameters<typeof createModelStream>[1]
   now?: () => number
 }
 const mime: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.woff2': 'font/woff2', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8' }
 class InputError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
 }
-async function providerKey(req: IncomingMessage): Promise<string> {
+async function readJson(req: IncomingMessage): Promise<unknown> {
   if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') {
     req.resume()
-    throw new InputError(415, '请使用 JSON 提交配置')
+    throw new InputError(415, '请使用 JSON 提交请求')
   }
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     size += chunk.length
-    if (size > 64 * 1024) { req.resume(); throw new InputError(413, '配置请求过大') }
+    if (size > 64 * 1024) { req.resume(); throw new InputError(413, '请求过大') }
     chunks.push(chunk)
   }
-  let value: unknown
-  try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')) }
-  catch { throw new InputError(400, '配置必须是有效 JSON') }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) }
+  catch { throw new InputError(400, '请求必须是有效 JSON') }
+}
+async function providerKey(req: IncomingMessage): Promise<string> {
+  const value = await readJson(req)
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1
     || !('apiKey' in value) || typeof value.apiKey !== 'string') throw new InputError(400, '请仅提交 apiKey 字符串')
   return value.apiKey
+}
+async function messageInput(req: IncomingMessage): Promise<SubmitMessageRequest> {
+  const value = await readJson(req)
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 3
+    || !('text' in value) || typeof value.text !== 'string' || !value.text.trim()
+    || !('modelId' in value) || typeof value.modelId !== 'string'
+    || !('clientMessageId' in value) || typeof value.clientMessageId !== 'string'
+    || !value.clientMessageId.trim() || value.clientMessageId.length > 128) {
+    throw new InputError(400, '请仅提交原文、模型和有效临时编号')
+  }
+  return value as SubmitMessageRequest
 }
 function validFrame(value: unknown): value is ClientFrame {
   if (!value || typeof value !== 'object') return false
@@ -50,7 +64,7 @@ function validFrame(value: unknown): value is ClientFrame {
 }
 
 export class WebServer {
-  private readonly agent: Pick<Agent, 'subscribe'>
+  private readonly agent: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'close'>>
   private server?: Server
   private ws?: WebSocketServer
   private heartbeat?: ReturnType<typeof setInterval>
@@ -62,8 +76,8 @@ export class WebServer {
   private stopWatching?: () => void
 
   constructor(private readonly options: WebServerOptions = {}) {
-    this.agent = options.agent ?? new Agent()
     this.credentials = new Credentials(options.modelAuthPath)
+    this.agent = options.agent ?? new Agent({ stream: createModelStream(this.credentials, options.modelOptions) })
   }
   async start(): Promise<{ url: string; authUrl: string; devAuthUrl?: string }> {
     if (this.server) throw new Error('服务已经启动')
@@ -133,6 +147,19 @@ export class WebServer {
     if (this.admit(req) !== 200) { this.respond(res, 401, '需要网页授权，请重新打开终端中的启动链接。'); return }
     if (url.pathname === '/api/models' && req.method === 'GET') {
       this.respond(res, 200, JSON.stringify(await discoverModels(this.credentials)), { 'content-type': 'application/json; charset=utf-8' })
+      return
+    }
+    if (url.pathname === '/api/messages' && req.method === 'POST') {
+      try {
+        const input = await messageInput(req)
+        if (!this.agent.submit) throw new InputError(503, '当前生成服务不可用')
+        const accepted = await this.agent.submit(input)
+        this.respond(res, 202, JSON.stringify(accepted), { 'content-type': 'application/json; charset=utf-8' })
+      } catch (error) {
+        const status = error instanceof InputError || error instanceof AgentSubmitError ? error.status : 500
+        const message = error instanceof InputError || error instanceof AgentSubmitError ? error.message : '提交暂时不可用'
+        this.respond(res, status, JSON.stringify({ error: message }), { 'content-type': 'application/json; charset=utf-8' })
+      }
       return
     }
     if (url.pathname === '/api/providers/deepseek' && (req.method === 'PUT' || req.method === 'DELETE')) {
@@ -223,6 +250,7 @@ export class WebServer {
       const ws = this.ws
       this.server = undefined
       this.ws = undefined
+      await this.agent.close?.()
       if (ws) await new Promise<void>(done => ws.close(() => done()))
       if (server?.listening) await new Promise<void>((done, reject) => { server.close(error => error ? reject(error) : done()); server.closeAllConnections() })
     })()

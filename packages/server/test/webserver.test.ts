@@ -462,3 +462,86 @@ describe('Agent 订阅转发与清理', () => {
     expect((await http(app.url, { Cookie: await cookie(app.authUrl) })).status).toBe(200)
   })
 })
+
+describe('消息提交与模型生命周期', () => {
+  const message = { clientMessageId: 'local-http', modelId: 'deepseek-flash', text: '  原文\n保留  ' }
+
+  it('提交沿用授权和来源校验，拒绝无效输入，不写正式消息', async () => {
+    const app = await setup()
+    const auth = await cookie(app.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    expect((await http(app.url + '/api/messages', {}, 'POST', JSON.stringify(message))).status).toBe(401)
+    expect((await http(app.url + '/api/messages', { ...headers, Origin: 'https://evil.invalid' }, 'POST', JSON.stringify(message))).status).toBe(403)
+    expect((await http(app.url + '/api/messages', { Cookie: auth }, 'POST', JSON.stringify(message))).status).toBe(415)
+    for (const body of ['{', 'null', '{}', JSON.stringify({ ...message, extra: true }), JSON.stringify({ ...message, text: ' \n ' }), JSON.stringify({ ...message, modelId: 'unknown' }), JSON.stringify({ ...message, clientMessageId: 'x'.repeat(129) })]) {
+      expect((await http(app.url + '/api/messages', headers, 'POST', body)).status).toBe(400)
+    }
+    expect((await http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ ...message, text: 'x'.repeat(65536) }))).status).toBe(413)
+    const socket = await connect(app.url, auth)
+    const first = nextConversationFrame(socket)
+    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'after-rejects' }))
+    expect((await first).snapshot).toEqual({ seq: 0, messages: [], running: null, activeContent: [] })
+  })
+
+  it('凭据未配置也先回执，随后形成正式失败回复并释放忙碌', async () => {
+    const app = await setup()
+    const auth = await cookie(app.authUrl)
+    const response = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify(message))
+    expect(response.status).toBe(202)
+    expect(JSON.parse(response.text)).toMatchObject({ clientMessageId: 'local-http', userMessageId: expect.any(String), acceptedSeq: 1 })
+    const socket = await connect(app.url, auth)
+    const frames: any[] = []
+    socket.on('message', data => { frames.push(JSON.parse(String(data))) })
+    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'missing-key' }))
+    await vi.waitFor(() => expect(frames.find(frame => frame.type === 'snapshot')?.snapshot.messages).toHaveLength(2))
+    const snapshot = frames.find(frame => frame.type === 'snapshot').snapshot
+    expect(snapshot.running).toBeNull()
+    expect(snapshot.messages[0].message.content).toBe('  原文\n保留  ')
+    expect(snapshot.messages[1].message).toMatchObject({ role: 'assistant', stopReason: 'error' })
+  })
+
+  it('真实 SDK 流跨断线继续，重订阅恢复同一进度；关闭服务取消当前调用', async () => {
+    let upstream: ReadableStreamDefaultController<Uint8Array> | undefined
+    let calls = 0, aborted = false
+    const send = (delta: object, finish_reason: string | null = null) => upstream!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ id: 'response-1', model: 'provider-model', choices: [{ index: 0, delta, finish_reason }] })}\n\n`))
+    const controlledFetch: typeof fetch = async (_url, init) => {
+      calls++
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer controlled-server-key')
+      expect(JSON.parse(String(init?.body))).toMatchObject({ model: 'deepseek-flash', stream: true })
+      return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        upstream = controller
+        init?.signal?.addEventListener('abort', () => { aborted = true; controller.error(new DOMException('cancelled', 'AbortError')) }, { once: true })
+      } }), { headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    const app = await setup({ modelOptions: { fetch: controlledFetch } })
+    const auth = await cookie(app.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', JSON.stringify({ apiKey: 'controlled-server-key' }))).status).toBe(200)
+    const socket = await connect(app.url, auth)
+    const frames: any[] = []
+    socket.on('message', data => frames.push(JSON.parse(String(data))))
+    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'live' }))
+    await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot')).toBe(true))
+    const response = await http(app.url + '/api/messages', headers, 'POST', JSON.stringify(message))
+    expect(response.status).toBe(202)
+    await vi.waitFor(() => expect(calls).toBe(1))
+    expect((await http(app.url + '/api/messages', headers, 'POST', JSON.stringify(message))).status).toBe(409)
+    expect(calls).toBe(1)
+    send({ reasoning_content: '想一想' })
+    send({ content: 'A' })
+    await vi.waitFor(() => expect(frames.some(frame => frame.update?.change.event?.type === 'text_delta')).toBe(true))
+    socket.close()
+    await once(socket, 'close')
+    expect(aborted).toBe(false)
+    send({ content: 'B' })
+    const restored = await connect(app.url, auth)
+    const first = nextConversationFrame(restored)
+    restored.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'restored' }))
+    const snapshot = (await first).snapshot
+    expect(snapshot.running?.userMessageId).toBe(JSON.parse(response.text).userMessageId)
+    expect(snapshot.messages[1].message.content).toEqual([{ type: 'thinking', thinking: '想一想' }, { type: 'text', text: 'AB' }])
+    expect(calls).toBe(1)
+    await app.server.close()
+    expect(aborted).toBe(true)
+  })
+})

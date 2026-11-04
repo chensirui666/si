@@ -6,6 +6,9 @@ const options = {
   browserSecretPath: process.argv[3],
   modelAuthPath: join(dirname(process.argv[3]), 'auth.json'),
   devOrigin: 'http://127.0.0.1:5173',
+  ...(process.env.AGENT_LEARNING_E2E_MODEL_BASE_URL
+    ? { modelOptions: { baseURL: process.env.AGENT_LEARNING_E2E_MODEL_BASE_URL } }
+    : {}),
 }
 let server = new WebServer(options)
 let closing = false

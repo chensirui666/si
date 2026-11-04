@@ -1,5 +1,8 @@
 import type { ConversationSnapshot, ConversationUpdate } from '@agent-learning/agent'
 
+export type SubmitMessageRequest = { clientMessageId: string; modelId: string; text: string }
+export type SubmitMessageAccepted = { clientMessageId: string; userMessageId: string; acceptedSeq: number }
+
 export type ClientFrame =
   | { type: 'subscribe'; subscriptionId: string }
   | { type: 'unsubscribe'; subscriptionId: string }

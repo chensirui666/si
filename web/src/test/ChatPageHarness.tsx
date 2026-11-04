@@ -4,9 +4,10 @@ import type { ChatState, Subscribe } from '../chat/state'
 import { ChatPage } from '../pages/ChatPage'
 
 const getModels = async () => ({ models: [], deepseek: { state: 'missing' as const } })
+const getConfiguredModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions' }], deepseek: { state: 'configured' as const } })
 
-// 只供组件测试：真实服务阶段一始终提供空对话。
-export function ChatPageHarness({ messages = [] }: { messages?: string[] }) {
+// 只供组件测试；实际后端与服务商链路由 E2E 验证。
+export function ChatPageHarness({ messages = [], modelConfigured = false }: { messages?: string[]; modelConfigured?: boolean }) {
   const subscribe: Subscribe = useCallback(onState => {
     const snapshot: ConversationSnapshot = {
       seq: 0,
@@ -19,5 +20,5 @@ export function ChatPageHarness({ messages = [] }: { messages?: string[] }) {
     window.addEventListener('chat-test-state', update)
     return () => window.removeEventListener('chat-test-state', update)
   }, [messages])
-  return <ChatPage subscribe={subscribe} getModels={getModels} />
+  return <ChatPage subscribe={subscribe} getModels={modelConfigured ? getConfiguredModels : getModels} />
 }

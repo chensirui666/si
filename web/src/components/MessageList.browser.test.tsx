@@ -1,15 +1,15 @@
 import { expect, test } from '@playwright/experimental-ct-react';
-import type { UserMessage } from '../types';
+import type { ConversationMessage } from '../types';
 import { MessageList } from './MessageList';
 
 test('原文展示、长内容换行与复制', async ({ mount, page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   const original = '  第一行\n\n    第二行  \n';
-  const messages: readonly UserMessage[] = Object.freeze([
-    Object.freeze({ id: 'plain', role: 'user' as const, text: original }),
-    Object.freeze({ id: 'tag', role: 'user' as const, text: '<b>你好</b>' }),
-    Object.freeze({ id: 'markdown', role: 'user' as const, text: '**你好**' }),
-    Object.freeze({ id: 'long', role: 'user' as const, text: 'a'.repeat(1200) }),
+  const messages: readonly ConversationMessage[] = Object.freeze([
+    Object.freeze({ id: 'plain', message: { role: 'user' as const, content: original, timestamp: 1 } }),
+    Object.freeze({ id: 'tag', message: { role: 'user' as const, content: '<b>你好</b>', timestamp: 1 } }),
+    Object.freeze({ id: 'markdown', message: { role: 'user' as const, content: '**你好**', timestamp: 1 } }),
+    Object.freeze({ id: 'long', message: { role: 'user' as const, content: 'a'.repeat(1200), timestamp: 1 } }),
   ]);
   const component = await mount(
     <div style={{ width: 320, height: 320, display: 'flex' }}>
@@ -59,7 +59,7 @@ test('原文展示、长内容换行与复制', async ({ mount, page, context })
   const oldFirst = await region.getByRole('listitem').first().elementHandle();
   await component.update(
     <div style={{ width: 320, height: 320, display: 'flex' }}>
-      <MessageList messages={[...messages, { id: 'later', role: 'user', text: '后来发送' }]} />
+      <MessageList messages={[...messages, { id: 'later', message: { role: 'user', content: '后来发送', timestamp: 2 } }]} />
     </div>,
   );
   expect(await region.evaluate((element, old) => element === old, oldRegion)).toBe(true);

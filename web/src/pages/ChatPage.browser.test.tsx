@@ -231,6 +231,10 @@ test('输入区聚焦、切换和发送后保持弱边界，按钮焦点使用�
     const marker = getComputedStyle(el, '::after')
     return { opacity: marker.opacity, width: marker.width, height: marker.height }
   })).toEqual({ opacity: '1', width: '4px', height: '4px' })
+  await page.keyboard.press('Shift+Tab')
+  await expect(editor).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(send).toBeFocused()
 
   await send.hover()
   await expect(send).toHaveCSS('background-color', 'rgb(51, 51, 51)')
@@ -300,3 +304,140 @@ test('浅色按钮以背景反馈悬停和按下，键盘焦点不叠加外圈',
     expect(await button.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
   }
 })
+
+test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到与迟到拒绝不覆盖新草稿', async ({ mount, page }) => {
+  let request: { clientMessageId: string; modelId: string; text: string } | undefined
+  let release: () => Promise<void> = async () => {}
+  await page.route('**/api/messages', async route => {
+    request = route.request().postDataJSON()
+    await new Promise<void>(resolve => {
+      release = async () => { await route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: '正在生成' }) }); resolve() }
+    })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  const original = '  第一行\n\n第二行  \n'
+  await editor.fill(original)
+  await expect(send).toBeEnabled()
+  await send.click()
+  await expect(editor).toHaveText('')
+  await expect(editor).toBeFocused()
+  await expect.poll(() => request?.text).toBe(original)
+  await editor.press('ControlOrMeta+z')
+  await expect(editor).toHaveText('')
+  await editor.fill('新的草稿')
+  await expect(send).toBeDisabled()
+  await page.evaluate(input => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null,
+      snapshot: { seq: 1, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer' }, activeContent: [] },
+    } }))
+  }, request)
+  await release()
+  await expect(page.getByRole('region', { name: '消息列表' }).locator('.message-text')).toHaveText(original)
+  await expect(page.getByRole('region', { name: '消息列表' }).getByRole('listitem')).toHaveCount(1)
+  await expect(page.getByText('发送失败', { exact: true })).toHaveCount(0)
+  await expect(editor).toHaveText('新的草稿')
+  await expect(editor).toBeFocused()
+  await expect(send).toBeDisabled()
+  await page.evaluate(input => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null,
+      snapshot: { seq: 2, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }, { id: 'answer', message: { role: 'assistant', content: [{ type: 'text', text: '**完成**' }], api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 2, stopReason: 'stop' } }], running: null, activeContent: [] },
+    } }))
+  }, request)
+  await expect(page.locator('.assistant-message strong')).toHaveText('完成')
+  await expect(editor).toHaveText('新的草稿')
+  await expect(send).toBeEnabled()
+})
+
+test('HTTP 回执先到时旧空闲快照不能开放发送，正式消息与结束状态到达后才开放', async ({ mount, page }) => {
+  let input: { clientMessageId: string; modelId: string; text: string } | undefined
+  await page.route('**/api/messages', async route => {
+    input = route.request().postDataJSON()
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ clientMessageId: input!.clientMessageId, userMessageId: 'user', acceptedSeq: 5 }) })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  await editor.fill('回执先到')
+  await send.click()
+  await expect(page.getByText('已接收，正在同步', { exact: true })).toBeVisible()
+  await editor.fill('下一条')
+  await expect(send).toBeDisabled()
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 4, messages: [], running: null, activeContent: [] } } }))
+  })
+  await expect(send).toBeDisabled()
+  await expect(page.getByRole('region', { name: '消息列表' }).getByRole('listitem')).toHaveCount(1)
+  await page.evaluate(input => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 6, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: null, activeContent: [] } } }))
+  }, input)
+  await expect(send).toBeEnabled()
+  await expect(page.getByRole('region', { name: '消息列表' }).getByRole('listitem')).toHaveCount(1)
+  await expect(page.getByText('已接收，正在同步', { exact: true })).toHaveCount(0)
+  await expect(editor).toHaveText('下一条')
+  await expect(editor).toBeFocused()
+})
+
+test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动或抢输入焦点', async ({ mount, page }) => {
+  const history = Array.from({ length: 26 }, (_, i) => `历史 ${i}：${'独立阅读位置。'.repeat(20)}`)
+  await mount(<ChatPageHarness messages={history} modelConfigured />)
+  const list = page.getByRole('region', { name: '消息列表' })
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await list.evaluate(el => { el.scrollTop = 350 })
+  const oldTop = (await list.getByRole('listitem').nth(5).boundingBox())!.y
+  const scrollTop = await list.evaluate(el => el.scrollTop)
+  await editor.fill('生成时继续编辑')
+  for (const seq of [1, 2, 3]) {
+    await page.evaluate(({ history, seq }) => {
+      window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+        connection: 'ready', slow: false, error: null,
+        snapshot: { seq, messages: [...history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), { id: 'answer', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 30, content: [{ type: 'thinking', thinking: '独立思考' }, { type: 'text', text: `# 标题\n\n${'回答内容\n\n'.repeat(seq * 8)}` }], stopReason: seq === 3 ? 'stop' : 'pending' } }], running: seq === 3 ? null : { userMessageId: 'history-25', assistantMessageId: 'answer' }, activeContent: seq === 3 ? [] : [{ messageId: 'answer', contentIndex: 1, type: 'text' }] },
+      } }))
+    }, { history, seq })
+    await expect(list.getByRole('listitem')).toHaveCount(27)
+    expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(scrollTop, 0)
+    expect((await list.getByRole('listitem').nth(5).boundingBox())!.y).toBeCloseTo(oldTop, 0)
+    await expect(editor).toBeFocused()
+    await expect(editor).toHaveText('生成时继续编辑')
+  }
+})
+
+for (const withHistory of [false, true]) {
+  test(`失败 A 后成功 B 的气泡和回复保持原顺序，已有历史：${withHistory}`, async ({ mount, page }) => {
+    let call = 0
+    let second: { clientMessageId: string; text: string } | undefined
+    await page.route('**/api/messages', async route => {
+      call++
+      if (call === 1) await route.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: '输入无效' }) })
+      else {
+        second = route.request().postDataJSON()
+        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ clientMessageId: second!.clientMessageId, userMessageId: 'user-b', acceptedSeq: 1 }) })
+      }
+    })
+    await mount(<ChatPageHarness messages={withHistory ? ['历史 F'] : []} modelConfigured />)
+    const editor = page.getByRole('textbox', { name: '消息', exact: true })
+    const send = page.getByRole('button', { name: '发送', exact: true })
+    await editor.fill('失败 A')
+    await send.click()
+    await expect(page.getByText('发送失败', { exact: true })).toBeVisible()
+    await editor.fill('成功 B')
+    await send.click()
+    await expect.poll(() => second?.text).toBe('成功 B')
+    await page.evaluate(({ withHistory, second }) => {
+      window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+        connection: 'ready', slow: false, error: null,
+        snapshot: { seq: 3, running: null, activeContent: [], messages: [
+          ...(withHistory ? [{ id: 'history-0', message: { role: 'user', content: '历史 F', timestamp: 1 } }] : []),
+          { id: 'user-b', clientMessageId: second!.clientMessageId, message: { role: 'user', content: second!.text, timestamp: 2 } },
+          { id: 'answer-b', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 3, content: [{ type: 'text', text: '回答 B' }], stopReason: 'stop' } },
+        ] },
+      } }))
+    }, { withHistory, second })
+    await expect(page.getByRole('region', { name: '消息列表' }).locator('.message-text,.markdown-text')).toHaveText([...(withHistory ? ['历史 F'] : []), '失败 A', '成功 B', '回答 B'])
+    await expect(editor).toHaveText('')
+    await expect(editor).toBeFocused()
+  })
+}

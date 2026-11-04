@@ -1,6 +1,6 @@
 # Feature2 验收记录
 
-日期：2026-11-03。范围：**阶段一：打开、授权与订阅；阶段二：凭据配置与本地模型发现**。前半保留阶段一合并验收记录，本轮交付见文末“阶段二验收”。阶段三真实聊天与生成中恢复尚未实现或验收。
+日期：2026-11-03（阶段一、二），2026-11-04（阶段三）。范围：**Feature2 三个阶段**。前半保留已合并的阶段一、二历史验收；最新交付见文末“阶段三验收”，其代码位于独立 worktree，尚未合并主干。历史部分的“本阶段”与“未实现”描述仅指当时阶段。
 
 阶段一已完成实现与本阶段自动验收，提交 `31e5d31` 已合并本地主干 `main`，未推送远端。主目录重新安装依赖后，115 项测试再次全部通过；实施 worktree 和已合并功能分支已删除。当前交付：安全授权打开本地页面，建立 WebSocket，订阅唯一 Agent 的真实初始空快照，刷新、断线、离线和服务重启后恢复连接；草稿仍可编辑，聊天发送始终关闭。
 
@@ -161,3 +161,69 @@ worktree 清理待完成：Codex 的归档工具返回 `The task's primary check
 - [Vite 设置](../../../web/test-results/e2e/chat-vite-阶段二配置、重启与多页面/vite-settings.png)、[窄屏设置](../../../web/test-results/e2e/chat-vite-阶段二配置、重启与多页面/vite-settings-narrow.png)。
 
 本轮未请求真实 DeepSeek，未验证远端 Key 或实际聊天生成；这些属于阶段三。未实测 Safari、系统中文输入法、Windows 权限及突然断电恢复。沿用异常退出后残留锁需人工恢复的限制。生产 JS 包约 522kB，Vite 给出超过 500kB 的体积提示，构建成功；本阶段未额外引入拆包方案。
+
+## 阶段三验收
+
+2026-11-04，从干净 `main`（02830b1）新建 Codex managed worktree `/Users/stardust/.codex/worktrees/feature2-stage3/agent learning`，分支 `codex/feature2-stage3`。用户本轮明确要求按阶段三文档继续实现并完成全部校验。主 checkout 保持不变；本轮保留 worktree 供审阅，不合并或推送。
+
+依据：[阶段三设计](./feature2-阶段三-提交生成与实时展示.md)、[实施计划](./feature2-阶段三-实施计划.md)及总体契约。使用 Node.js v24.16.0、npm 11.13.0、TypeScript 5.9.3、Playwright 1.62.1 / Chromium。依赖增加 OpenAI SDK 7.50.0 和 mdast/micromark GFM 解析所需包，固定在根 lock；没有移入工具执行框架或整套 dsh UI。
+
+### 实际功能
+
+- 页面在授权、订阅和模型就绪后提交完整原文；Agent 原子记录正式 user、生成编号与忙碌状态，HTTP 返回 202，模型在后台独立生成。
+- Model 经真实 OpenAI SDK 请求 DeepSeek，显式 enabled/high、无重试。正文、思考与工具请求分别发布开始、增量及块终值；同次 result、不补零用量、实际响应元数据与五种终止原因均保留。
+- 连续五分钟无 SDK 模型数据才超时，心跳不续期；finish 后继续读尾部，缺失结束原因或尾部异常为失败。严格工具参数保留错误和原文，不修复、不执行。
+- Agent 仅累积已消费事件，不拷贝领先的共享 partial；订阅先登记再复制快照，后续序号连续。网页断开不取消生成；刷新、重连和多页面观察同一进度。服务关闭主动取消并等候收尾。
+- 临时编号对应 HTTP/WS 接收证据，不产生重复气泡；十秒未知重取快照，旧订阅/跳号安全恢复。明确拒绝与未知结果区分；不自动重发、恢复草稿或去重。
+- 正文安全 GFM、稳定前块与尾部更新、结束整篇校准；思考默认折叠且保留本页展开。生成期间仍能编辑，原文、撤销、焦点与阅读位置回归保留。
+
+### 真实 DeepSeek 闭环
+
+用户明确提供既有 dotenv 文件位置，测试只读 `DEEPSEEK`，经过实际设置页面写入临时目录的受保护 auth.json，不改原文件或默认用户配置。未提供 `DEEPSEEK_LIVE_KEY_FILE` 时用例明确跳过；本轮显式提供，因此真实模型没有跳过。
+
+`deepseek-live.spec.ts` 实际完成四次页面提交：第一轮记住随机口令，第二轮只凭对话历史复述口令；两轮都在 done 前观察到非空 text_delta。随后在设置中替换为无效 Key，下一次调用收到正式 error 并释放忙碌；恢复有效 Key 后再次正常回答。临时文件读回、HTTP 202、accepted 更新、SDK/SSE 转换和页面展示共同验证链路，不以单独模型脚本或配置保存替代。
+
+live 禁止 trace、截图和录像；日志不输出 Key、启动令牌或 Cookie，比较真实 Key 时只输出布尔断言。退出后删除临时签名和模型文件，原 dotenv 不变。受控 Node/Vite E2E 另验证两轮真实 SDK/SSE、生成中刷新、离线上游继续、多页面同一运行、重启聊天清空而凭据保留，全程没有重发。
+
+### 审查与修复
+
+所有新逻辑先有失败测试，再实现或修复。独立审查与定向检查发现的下列问题已进入回归：
+
+- 超大消息 413 / 媒体类型 415 等明确拒绝不应永久显示未确认；现在明确 4xx 标发送失败，未知 5xx/网络失败保留未确认。
+- 失败气泡必须留在发送时的位置；LocalSubmission 新增可选 `afterMessageId`，仅用于本页显示锚点，不写后端、不参与去重，后续正式聊天不会把旧失败移到底部。
+- 上一轮迭代器延迟清理不能覆盖下一轮取消信号；已发布终止后清理抛错不能再发旧轮 error 或清空新轮状态。
+- SDK 会把传输 AbortError 变成迭代结束；检查上游 controller，防止 finish 后尾部异常误报成功。
+- 各类内容单例会把 text A → tool → text B 合并为 text AB → tool；按连续输出区间结束和创建正文/思考块，保留工具按 index/id 归集。
+- Chromium 全套回归捕获原焦点用例的偶发失败：原生 Tab 后 Lexical 迟到选区提交重新抢回输入框。先在无诊断重复运行中观察失败，并核对 Lexical 的 Tab 指令与选区回写源码；仅给本次 Tab 更新添加 `SKIP_DOM_SELECTION_TAG`，不阻止默认行为、不直接移动焦点。清除诊断后全组件通过，原用例含 Tab / Shift+Tab 重复 20 次全部通过。
+
+Pi 的职责划分、事件队列与同次 result 作为主要参考；本项目没有照搬其重试、缺失 finish 兼容、usage 补零和参数修复。当前 Pi 的正文/思考单例在交错输出时也可能重分组，本项目按既定“有序内容块”契约收紧，这项差异只改变区间展示顺序，不新增工具执行。
+
+### 最终命令与结果
+
+从根目录重新 `npm ci` 后，显式提供用户授权的 `DEEPSEEK_LIVE_KEY_FILE` 运行根 `npm test`（该次没有跳过 live）；再执行 `npm run build`、`npm audit --json` 和 `git diff --check`。全部退出码 0。
+
+| 检查 | 最终实际结果 |
+| --- | --- |
+| Credentials 文件系统与既有回归 | 53 / 53 |
+| Model 发现与真实 SDK 受控流 | 46 / 46 |
+| Agent 接收、历史、进度与生命周期 | 19 / 19 |
+| Server HTTP / WS / 开发 watcher | 28 / 28 |
+| 网页单元 | 81 / 81，7 个文件 |
+| 真实 Chromium 组件 | 27 / 27，0 flaky、0 skipped |
+| 实际入口与真实模型 E2E | 8 / 8，0 flaky、0 skipped；含 6 条 Node/Vite、1 条凭据解析、1 条真实 DeepSeek |
+| 根测试合计 | **262 / 262，0 失败、0 跳过** |
+| 构建 | 后端四包、网页 TypeScript 与生产构建成功 |
+| 依赖审计 | 0 漏洞 |
+| 差异空白检查 | 通过 |
+
+额外对原焦点用例无诊断重复 20 次全部通过，未计入根套件的 262 项。最终生产 JS 616.59 kB、gzip 192.34 kB；Vite 的 500 kB 提示保留，没有隐藏警告或为消除提示扩大本期范围。
+
+最终日志在本机忽略目录：[根测试](../../../web/test-results/verification-stage3/full-test.log)、[构建](../../../web/test-results/verification-stage3/build.log)、[安装](../../../web/test-results/verification-stage3/install.log)、[依赖审计](../../../web/test-results/verification-stage3/audit.json)。独立审查原始发现与实施处置见同目录 `backend-review.md` / `web-review.md`。结果 JSON 为 `web/test-results/components.json`、`e2e.json`，后续测试会更新它们。源码与文本验证产物中未发现真实 Key。
+
+已查看真实浏览器的受控两轮对话截图，正文、折叠思考、用户原文及输入区布局完整。截图仅含受控文字，不是实际服务商回答的替代证据：[Node 对话](../../../web/test-results/e2e/chat-node-阶段三-SDK-流式对话、历史与生成恢复/node-stage3-chat.png)、[Vite 对话](../../../web/test-results/e2e/chat-vite-阶段三-SDK-流式对话、历史与生成恢复/vite-stage3-chat.png)。实际服务商结果由上面的 live 用例验证。
+
+### 未实测与已知边界
+
+系统中文输入法与实际 Safari 未实测；合成组合输入、Chromium 原生编辑、剪贴板、撤销和焦点测试不能替代人工检查。未验证 Windows 权限、突然断电或长对话无限增长。生产包超过 Vite 默认 500kB 提示阈值，构建成功，本轮不额外拆包。
+
+聊天仍只在后端内存中，重启清空。失败 assistant 后续被排除；未确认不自动重发；工具只展示、不执行。跨冻结块引用在最终整篇重解析后校准。异常退出遗留文件锁需人工恢复的既有边界不变。
