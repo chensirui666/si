@@ -137,6 +137,10 @@ export function createModelStream(
           client.chat.completions.create({
             model: model.id, messages: convertMessages(context), stream: true,
             stream_options: { include_usage: true }, reasoning_effort: 'high',
+            ...(context.tools?.length ? { tools: context.tools.map((tool) => ({
+              type: 'function' as const,
+              function: { name: tool.name, description: tool.description, parameters: { ...tool.parameters } },
+            })) } : {}),
             ...{ thinking: { type: 'enabled' } },
           }, { signal: controller.signal, maxRetries: 0 }),
           interrupted,

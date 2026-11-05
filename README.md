@@ -50,3 +50,14 @@ DEEPSEEK_LIVE_KEY_FILE=/absolute/path/to/test.env npm test
 ```
 
 独立命令、系统输入法检查和说明见 [web/README.md](web/README.md)。本阶段实际证据见 [Feature2 验收记录](planning/里程碑1/feature2/feature2-验收记录.md)。
+
+Feature3 在后端提供 `read`、`bash`、`edit`、`write` 四种工具声明，调用方通过 `ModelContext.tools` 显式传给模型。仅接收待校验的调用，不执行工具；普通网页聊天继续不携带工具声明。截断、失败或取消的调用不会交付给后续处理。
+
+四工具真实模型验收独立运行，使用现有 Credentials 只读本机 `~/.agent-learning/auth.json`，不改凭据文件、不执行工具、不自动重试；无配置时明确跳过，失败时如实报错：
+
+```sh
+npm run build:packages
+npm --prefix packages/server run test:tools:live
+```
+
+实际结果见 [Feature3 验收记录](planning/里程碑1/feature3/feature3-验收记录.md)。

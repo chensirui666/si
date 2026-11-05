@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Type } from 'typebox'
 import * as modelApi from '../src/index.js'
 import type { ModelInfo } from '../src/index.js'
 
@@ -51,6 +52,36 @@ async function consume(stream: ReturnType<typeof modelApi.stream>) {
 afterEach(() => vi.useRealTimers())
 
 describe('Model single SDK stream', () => {
+  it('sends caller-provided generic tool declarations through the SDK', async () => {
+    let payload: Record<string, unknown> | undefined
+    const tools: modelApi.Tool[] = [{
+      name: 'lookup', description: 'Find a record by key',
+      parameters: Type.Object({ key: Type.String(), count: Type.Optional(Type.Number()) }),
+    }]
+    const run = modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+      payload = JSON.parse(String(init!.body))
+      return response([chunk({ content: 'ok' }, 'stop')])
+    } })
+    const { result } = await consume(run(selected, { ...context, tools }))
+    expect(result.stopReason).toBe('stop')
+    expect(payload!.tools).toEqual([{
+      type: 'function', function: {
+        name: 'lookup', description: 'Find a record by key',
+        parameters: { type: 'object', properties: { key: { type: 'string' }, count: { type: 'number' } }, required: ['key'] },
+      },
+    }])
+  })
+
+  it('omits the SDK tools field for an empty declaration list', async () => {
+    let payload: Record<string, unknown> | undefined
+    const run = modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+      payload = JSON.parse(String(init!.body))
+      return response([chunk({ content: 'ok' }, 'stop')])
+    } })
+    await consume(run(selected, { ...context, tools: [] }))
+    expect(payload).not.toHaveProperty('tools')
+  })
+
   it('exports the stream contract and a copied static model lookup', () => {
     expect(modelApi.createModelStream).toBeTypeOf('function')
     expect(modelApi.stream).toBeTypeOf('function')
@@ -158,6 +189,8 @@ describe('Model single SDK stream', () => {
     const tool = result.content[0]
     expect(tool.type).toBe('toolCall')
     if (tool.type !== 'toolCall') throw new Error('missing tool')
+    expect(tool.id).toBe('a')
+    expect(tool.name).toBe('unknown')
     const valid = ['', '  ', '{}', '{"a":true,"b":[null,1]}'].includes(argumentsText)
     expect(tool.arguments).toEqual(argumentsText === '{"a":true,"b":[null,1]}' ? { a: true, b: [null, 1] } : {})
     if (valid) expect(tool).not.toHaveProperty('argumentsError')

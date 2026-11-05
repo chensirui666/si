@@ -9,6 +9,7 @@ export type {
   TextContent,
   ThinkingContent,
   ToolCall,
+  Tool,
   JsonValue,
   JsonObject,
   ModelUsage,

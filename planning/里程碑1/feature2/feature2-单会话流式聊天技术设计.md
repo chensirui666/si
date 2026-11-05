@@ -1053,7 +1053,7 @@ function stream(
 
 Pi 的 [AgentState](</Users/stardust/agent learning/pi/packages/agent/src/types.ts:382>) 持有消息、运行状态与流式回复，[Agent.processEvents](</Users/stardust/agent learning/pi/packages/agent/src/agent.ts:565>) 先更新状态再通知内部订阅者。本项目沿用这种核心归属；当前只做单次模型调用，后续工具循环在 Agent 职责中扩展。网页恢复增加的快照、序号与网络封装仍按已确认方案处理，不将 HTTP / WebSocket 对象交给 Agent。
 
-参数解析按主干 [Feature3 §4.6](../feature3-工具定义与调用接收.md#strict-tool-arguments) 的后续确认统一为严格 JSON，替代本稿早期的有限修复选择；不另建工具专用解析器，其他消息、事件与结束契约保持不变。
+参数解析已统一为[本阶段的严格 JSON 约定](#key-model-stream)，替代本稿早期的有限修复选择；已在本阶段实现，不另建工具专用解析器，其他消息、事件与结束契约保持不变。
 
 ### 【工程决策｜Agent、服务入口与传输】快照与增量共同确定恢复进度
 

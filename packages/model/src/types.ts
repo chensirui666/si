@@ -1,4 +1,5 @@
 import type { CredentialStatus } from '@agent-learning/credentials'
+import type { TSchema } from 'typebox'
 
 export type ModelMessage = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage
 
@@ -87,6 +88,13 @@ export type ModelDiscovery = {
 export type ModelContext = {
   systemPrompt?: string
   messages: ModelMessage[]
+  tools?: Tool[]
+}
+
+export type Tool<TParameters extends TSchema = TSchema> = {
+  name: string
+  description: string
+  parameters: TParameters
 }
 
 export type ModelEvent =

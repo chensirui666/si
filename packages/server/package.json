@@ -16,12 +16,14 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
-    "test": "vitest run --environment node test"
+    "test": "vitest run --environment node test",
+    "test:tools:live": "vitest run --config vitest.tools-live.config.ts"
   },
   "dependencies": {
     "@agent-learning/agent": "0.1.0",
     "@agent-learning/credentials": "0.1.0",
     "@agent-learning/model": "0.1.0",
+    "typebox": "1.3.27",
     "ws": "8.22.1"
   },
   "devDependencies": {
