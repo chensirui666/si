@@ -1,8 +1,36 @@
 # Feature3 验收记录
 
-日期：2026-11-05。状态：**实现与本期验收完成，改动尚未提交或合并主干**。
+日期：2026-11-05。状态：**已提交、合并 `main` 并完成主目录全部复验；本次 worktree 与分支已清理**。
 
-工作目录：`/Users/stardust/agent learning/.worktrees/feature3`，分支 `codex/feature3`，起点 `ea2aa4e`。主目录尚未提交的 Feature3 设计及相关规划修改已复制到该 worktree，主目录文件保留原样。
+开发目录原为 `/Users/stardust/agent learning/.worktrees/feature3`，分支 `codex/feature3`，起点 `ea2aa4e`；实现提交为 `cd2a9d7`。当前工作目录为 `/Users/stardust/agent learning`，分支 `main`。主目录原有未提交规划已完整纳入实现提交，合并前临时备份经核对后清理。
+
+## 合并后主目录复验
+
+用户明确要求合并后重新跑全部校验，通过后清理。先以 `git merge --ff-only codex/feature3` 合并，再在主目录实际执行：
+
+| 命令或范围 | 结果 |
+| --- | --- |
+| `npm ci` | 通过，依赖审计 0 项漏洞 |
+| `DEEPSEEK_LIVE_KEY_FILE=/Users/stardust/Downloads/.env npm test` | 279 项通过，无失败、无跳过，含完整构建 |
+| 其中 Node/Vite 实际入口 E2E | 8/8 通过，包含真实设置、两轮历史、流式进度及无效 Key 恢复 |
+| `npm --prefix packages/server run test:tools:live` | 4/4 通过，约 6.14 秒 |
+| 相关 Model/Server 测试及 live 配置的严格 TypeScript 检查 | 通过，退出码 0；在后端构建完成后执行 |
+| `git diff --check` | 通过 |
+
+合计 **283 项通过，无跳过**。用户提供的 dotenv 实际解析为 `/Users/stardust/Downloads/.env`，只读源文件，Key 经真实设置页保存到测试临时目录；未输出 Key、认证头或保留凭据 trace，测试后临时配置清理。本次不再沿用开发阶段“未提供 dotenv 因而跳过”的状态。
+
+主目录四工具真实请求均以 `toolUse` 结束，参数与下文对应任务完全一致：
+
+| 工具 | 本次主目录原调用编号 | 判定 |
+| --- | --- | --- |
+| `read` | `call_00_F6P4d35C20cBNFtoBubP1685` | 通过 |
+| `bash` | `call_00_tYYvI0eMC1QqyDba1OTq8692` | 通过 |
+| `edit` | `call_00_PTHGydPFiDHh0dCdzuhr2178` | 通过 |
+| `write` | `call_00_JLwAyjpVeGJ6tcq4NnLY0033` | 通过 |
+
+全部验证通过后，已检查实现提交是 `main` 的祖先、开发 worktree 干净且无独有成果，再执行普通 `git worktree remove` 和 `git branch -d codex/feature3`。本次 worktree、分支、空 `.worktrees` 目录、此次新增的本地排除规则及临时合并 stash 均已清理；此前其他 worktree、分支和 stash 保留。未推送远端。
+
+测试临时停止了旧 Feature2 Vite，以释放固定 5173；结束后已按原目录、参数及后端端口配置恢复，`/@vite/client` 返回 200。
 
 ## 交付
 
@@ -12,7 +40,7 @@
 - 本期不执行工具、不回填结果、不进入循环、不写普通聊天历史，网页聊天继续省略工具声明。
 - Model 与 Server 均锁定 TypeBox `1.3.27`，与本地 Pi 一致；现有 TypeScript `5.9.3`、Node `24.16.0`、npm `11.13.0` 未升级。
 
-## 自动校验
+## 开发 worktree 自动校验（历史记录）
 
 根 `npm test` 最终退出码为 0，含完整构建、全部离线测试与实际入口 E2E：**278 项通过，1 项跳过**。
 
@@ -37,7 +65,7 @@ T1 由 `tools.test.ts` 的 5 项测试验证四声明、用途、字段、必填
 - `git diff --check`：通过。
 - 独立只读代码审查：无 Critical、Important 或 Minor 发现；审查者另行复跑 61 项相关测试通过。
 
-## 真实 DeepSeek 四案例
+## 开发 worktree 真实 DeepSeek 四案例（历史记录）
 
 命令：`npm --prefix packages/server run test:tools:live`。最终 **4/4 通过**，运行约 5.55 秒。
 
