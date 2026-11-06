@@ -14,9 +14,9 @@ const publicPage = 'https://1.1.1.1/'
 const cases = [
   { name: 'bash', prompt: '使用 bash，command 为 ls，timeout 为 10。最后列出工具实际看到的两个文件名。', result: /draft\.txt[\s\S]*note\.txt/, answer: /draft\.txt[\s\S]*note\.txt|note\.txt[\s\S]*draft\.txt/ },
   { name: 'edit', prompt: '我已读过 note.txt，确认旧文本“状态：开发中”完整且唯一。本次只允许一次工具调用，请直接调用 edit，参数为 {"path":"note.txt","edits":[{"oldText":"状态：开发中","newText":"状态：测试中"}]}。无须再次读取。收到工具结果后报告实际状态和文件名。', result: /note\.txt/, answer: /测试中/ },
-  { name: 'write', prompt: '用 write 完整写入 notes/note.txt，content 必须为“项目名称：青禾”，没有换行。最后报告写入路径。', result: /notes\/note\.txt/, answer: /notes\/note\.txt/ },
+  { name: 'write', prompt: '参数为 {"path":"notes/note.txt","content":"项目名称：青禾"}。write 会创建父目录。收到工具结果后报告实际写入路径。', result: /notes\/note\.txt/, answer: /notes\/note\.txt/ },
   { name: 'find', prompt: '使用 find 在 samples 子目录按通配符 *.txt 查找，limit 为 10。最后给出实际找到的文件名。', result: /matched\.txt/, answer: /matched\.txt/ },
-  { name: 'grep', prompt: '用 grep 在 note.txt 搜索“开发中”，literal 为 true，context 为 1，limit 为 5。最后报告命中行号和完整命中文本。', result: /note\.txt:2:.*状态：开发中/, answer: /状态：开发中/ },
+  { name: 'grep', prompt: '参数为 {"path":"note.txt","pattern":"开发中","literal":true,"context":1,"limit":5}。收到工具结果后报告命中行号和完整命中文本。', result: /note\.txt:2:.*状态：开发中/, answer: /状态：开发中/ },
   { name: 'web_search', prompt: '用 web_search 搜索 “IANA example domains reserved for documentation”，limit 为 3。最后原样给出第一条结果的 URL。', result: /1\. .+\nhttps?:\/\/[^\n]+\n\S/, answer: /https?:\/\// },
   { name: 'web_fetch', prompt: `用 web_fetch 获取 ${publicPage} 的正文，urls 仅有这个网址。最后报告正文中出现的服务提供方名称和该网页原网址。`, result: /1\.1\.1\.1[\s\S]*Cloudflare/i, answer: /Cloudflare/i },
 ] as const
@@ -87,8 +87,9 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
       }
     })
     await Promise.race([listening, waitForTimeout(10_000)])
+    const text = `本次验收 ${scenario.name} 工具。请直接调用 ${scenario.name} 一次，只调用这个工具，收到结果后直接回答。${scenario.prompt}`
     const accepted = await fetch(url + '/api/messages', {
-      method: 'POST', headers, body: JSON.stringify({ workspaceId, clientMessageId: 'live-tool', modelId: 'deepseek-flash', text: scenario.prompt }),
+      method: 'POST', headers, body: JSON.stringify({ workspaceId, clientMessageId: 'live-tool', modelId: 'deepseek-flash', text }),
     })
     expect(accepted.status).toBe(202)
     await Promise.race([finished, waitForTimeout(180_000)])
