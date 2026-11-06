@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { request } from 'node:http'
@@ -19,11 +19,13 @@ async function setup(options: Partial<ConstructorParameters<typeof WebServer>[0]
   await mkdir(join(webRoot, 'assets'), { recursive: true })
   await writeFile(join(webRoot, 'index.html'), '<!doctype html><h1>聊天</h1>')
   await writeFile(join(webRoot, 'assets/app.js'), 'console.log("app")')
-  const config = { port: 0, webRoot, browserSecretPath: join(dir, 'private/browser-auth.json'), modelAuthPath: join(dir, 'private/auth.json'), ...options }
+  const workspace = await realpath(await mkdir(join(dir, 'workspace')).then(() => join(dir, 'workspace')))
+  const config = { port: 0, webRoot, workspacePath: join(dir, 'private/workspaces.json'),
+    webSettingsPath: join(dir, 'private/settings.json'), directoryPicker: async () => workspace, browserSecretPath: join(dir, 'private/browser-auth.json'), modelAuthPath: join(dir, 'private/auth.json'), ...options }
   const server = new WebServer(config)
   const started = await server.start()
   cleanups.push(() => server.close())
-  return { server, ...started, config }
+  return { server, ...started, config, workspace }
 }
 function http(url: string, headers: Record<string, string> = {}, method = 'GET', body?: string) {
   return new Promise<{ status: number; headers: import('node:http').IncomingHttpHeaders; text: string }>((resolve, reject) => {
@@ -49,7 +51,7 @@ function nextConversationFrame(socket: WebSocket) {
   return new Promise<any>(resolve => {
     const receive = (data: WebSocket.RawData) => {
       const frame = JSON.parse(String(data))
-      if (frame.type === 'models_changed') return
+      if (frame.type.endsWith('_changed')) return
       socket.off('message', receive)
       resolve(frame)
     }
@@ -75,7 +77,7 @@ function controlledAgent() {
       return (async function* () {
         try {
           yield { type: 'snapshot' as const, snapshot: structuredClone(empty) }
-          yield { type: 'update' as const, update: { seq: 1, change: { type: 'accepted' as const, user: { id: 'u1', message: { role: 'user' as const, content: '受控', timestamp: 1 } }, running: { userMessageId: 'u1', assistantMessageId: 'a1' } } } }
+          yield { type: 'update' as const, update: { seq: 1, change: { type: 'accepted' as const, user: { id: 'u1', message: { role: 'user' as const, content: '受控', timestamp: 1 } }, running: { userMessageId: 'u1', assistantMessageId: 'a1', phase: 'model' } } } }
           await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }) })
         } finally { active.delete(signal) }
       })()
@@ -296,7 +298,7 @@ describe('Agent 订阅转发与清理', () => {
     const other = await connect(app.url, credentials)
     expect(agent.active.size).toBe(0)
     const frames: any[] = []
-    socket.on('message', data => { const frame = JSON.parse(String(data)); if (frame.type !== 'models_changed') frames.push(frame) })
+    socket.on('message', data => { const frame = JSON.parse(String(data)); if (!frame.type.endsWith('_changed')) frames.push(frame) })
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'old' }))
     await vi.waitFor(() => expect(frames).toHaveLength(2))
     expect(frames.map(frame => frame.type)).toEqual(['snapshot', 'update'])
@@ -384,7 +386,7 @@ describe('Agent 订阅转发与清理', () => {
     const app = await setup({ agent })
     const socket = await connect(app.url, await cookie(app.authUrl))
     const frames: any[] = []
-    socket.on('message', data => { const frame = JSON.parse(String(data)); if (frame.type !== 'models_changed') frames.push(frame) })
+    socket.on('message', data => { const frame = JSON.parse(String(data)); if (!frame.type.endsWith('_changed')) frames.push(frame) })
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'old' }))
     await vi.waitFor(() => expect(frames).toHaveLength(1))
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'new' }))
@@ -464,12 +466,14 @@ describe('Agent 订阅转发与清理', () => {
 })
 
 describe('消息提交与模型生命周期', () => {
-  const message = { clientMessageId: 'local-http', modelId: 'deepseek-flash', text: '  原文\n保留  ' }
+  const baseMessage = { workspaceId: 'invalid-binding', clientMessageId: 'local-http', modelId: 'deepseek-flash', text: '  原文\n保留  ' }
 
   it('提交沿用授权和来源校验，拒绝无效输入，不写正式消息', async () => {
     const app = await setup()
     const auth = await cookie(app.authUrl)
     const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const workspaceId = await pickWorkspace(app.url, auth)
+    const message = { ...baseMessage, workspaceId }
     expect((await http(app.url + '/api/messages', {}, 'POST', JSON.stringify(message))).status).toBe(401)
     expect((await http(app.url + '/api/messages', { ...headers, Origin: 'https://evil.invalid' }, 'POST', JSON.stringify(message))).status).toBe(403)
     expect((await http(app.url + '/api/messages', { Cookie: auth }, 'POST', JSON.stringify(message))).status).toBe(415)
@@ -486,7 +490,8 @@ describe('消息提交与模型生命周期', () => {
   it('凭据未配置也先回执，随后形成正式失败回复并释放忙碌', async () => {
     const app = await setup()
     const auth = await cookie(app.authUrl)
-    const response = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify(message))
+    const workspaceId = await pickWorkspace(app.url, auth)
+    const response = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({ ...baseMessage, workspaceId }))
     expect(response.status).toBe(202)
     expect(JSON.parse(response.text)).toMatchObject({ clientMessageId: 'local-http', userMessageId: expect.any(String), acceptedSeq: 1 })
     const socket = await connect(app.url, auth)
@@ -522,6 +527,7 @@ describe('消息提交与模型生命周期', () => {
     socket.on('message', data => frames.push(JSON.parse(String(data))))
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'live' }))
     await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot')).toBe(true))
+    const message = { ...baseMessage, workspaceId: await pickWorkspace(app.url, auth) }
     const response = await http(app.url + '/api/messages', headers, 'POST', JSON.stringify(message))
     expect(response.status).toBe(202)
     await vi.waitFor(() => expect(calls).toBe(1))
@@ -544,4 +550,91 @@ describe('消息提交与模型生命周期', () => {
     await app.server.close()
     expect(aborted).toBe(true)
   })
+})
+
+async function pickWorkspace(url: string, auth: string) {
+  const picked = await http(url + '/api/workspaces/pick', { Cookie: auth }, 'POST')
+  expect(picked.status).toBe(200)
+  return JSON.parse(picked.text).view.boundWorkspaceId as string
+}
+
+it('W1/W2: cancel does not write, aliases reuse binding, rejection prevents model and tools, restart restores only binding', async () => {
+  let selected: string | null = null
+  const requests: any[] = []
+  const app = await setup({ directoryPicker: async () => selected, modelOptions: { fetch: async (_url, init) => {
+    const body = JSON.parse(String(init?.body))
+    requests.push(body)
+    const first = requests.length === 1
+    const delta = first ? { tool_calls: [{ index: 0, id: 'write-1', type: 'function', function: { name: 'write', arguments: '{"path":"written.txt","content":"working-directory"}' } }] } : { content: '完成' }
+    return new Response(`data: ${JSON.stringify({ id: 'controlled', choices: [{ index: 0, delta, finish_reason: first ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } })
+  } } })
+  const auth = await cookie(app.authUrl)
+  const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const send = (workspaceId?: string) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ text: '写入', modelId: 'deepseek-flash', clientMessageId: 'workspace-test', workspaceId }))
+  expect((await send()).status).toBe(400)
+  expect((await send('unknown')).status).toBe(409)
+  expect((await http(app.url + '/api/workspaces/pick', {}, 'POST')).status).toBe(401)
+  const cancelled = await http(app.url + '/api/workspaces/pick', headers, 'POST')
+  expect(JSON.parse(cancelled.text)).toEqual({ cancelled: true })
+  await expect(readFile(app.config.workspacePath)).rejects.toMatchObject({ code: 'ENOENT' })
+  selected = app.workspace
+  const bound = await pickWorkspace(app.url, auth)
+  selected = join(app.workspace, '..', 'alias')
+  await symlink(app.workspace, selected)
+  expect(await pickWorkspace(app.url, auth)).toBe(bound)
+  const view = { workspaces: [{ id: bound, path: app.workspace, name: 'workspace', available: true }], boundWorkspaceId: bound }
+  expect(JSON.parse((await http(app.url + '/api/workspaces', headers)).text)).toEqual(view)
+  expect((await send('other')).status).toBe(409)
+  await rm(app.workspace, { recursive: true })
+  expect((await send(bound)).status).toBe(409)
+  expect(requests).toHaveLength(0)
+  await mkdir(app.workspace)
+  await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"test-key"}')
+  expect((await send(bound)).status).toBe(202)
+  await vi.waitFor(() => expect(requests).toHaveLength(2))
+  expect(requests[0].messages[0].content).toContain(app.workspace)
+  expect(requests[0].tools).toHaveLength(8)
+  expect(requests[1].tools).toBeUndefined()
+  expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })
+  expect(await readFile(join(app.workspace, 'written.txt'), 'utf8')).toBe('working-directory')
+
+  await app.server.close()
+  const restarted = new WebServer(app.config)
+  cleanups.push(() => restarted.close())
+  const next = await restarted.start()
+  const newCookie = await cookie(next.authUrl)
+  expect(JSON.parse((await http(next.url + '/api/workspaces', { Cookie: newCookie })).text)).toEqual(view)
+  const socket = await connect(next.url, newCookie)
+  const snapshot = nextConversationFrame(socket)
+  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'restarted' }))
+  expect((await snapshot).snapshot).toEqual(empty)
+})
+
+it('P1: saves capability choices independently of the shared Tavily credential and notifies without secrets', async () => {
+  const app = await setup()
+  const auth = await cookie(app.authUrl)
+  const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const socket = await connect(app.url, auth)
+  const frames: string[] = []
+  socket.on('message', data => { frames.push(String(data)) })
+  const settings = app.url + '/api/web/settings'
+  const provider = app.url + '/api/web/providers/tavily'
+  expect((await http(settings)).status).toBe(401)
+  const defaults = { searchProvider: 'tavily', fetchProvider: 'tavily' }
+  expect(JSON.parse((await http(settings, headers)).text)).toMatchObject({ ...defaults, providers: [{ id: 'tavily', capabilities: ['search', 'fetch'], status: { state: 'missing' } }] })
+  expect((await http(settings, headers, 'PUT', '{"searchProvider":"unknown","fetchProvider":"tavily"}')).status).toBe(400)
+  expect((await http(settings, headers, 'PUT', JSON.stringify(defaults))).status).toBe(200)
+  expect(JSON.parse(await readFile(app.config.webSettingsPath, 'utf8'))).toEqual({ web: defaults })
+  await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"model-test-key"}')
+  for (const key of ['first-web-test-key', 'next-web-test-key']) {
+    const saved = await http(provider, headers, 'PUT', JSON.stringify({ apiKey: key }))
+    expect(saved.status).toBe(200)
+    expect(saved.text).not.toContain(key)
+    expect(JSON.parse(saved.text)).toMatchObject({ ...defaults, providers: [{ id: 'tavily', status: { state: 'configured' } }] })
+  }
+  expect(JSON.parse(await readFile(app.config.modelAuthPath, 'utf8'))).toMatchObject({ deepseek: { key: 'model-test-key' }, tavily: { key: 'next-web-test-key' } })
+  expect(JSON.parse((await http(provider, headers, 'DELETE')).text)).toMatchObject({ ...defaults, providers: [{ id: 'tavily', status: { state: 'missing' } }] })
+  expect(JSON.parse(await readFile(app.config.modelAuthPath, 'utf8'))).toEqual({ deepseek: { key: 'model-test-key', type: 'api_key' } })
+  await vi.waitFor(() => expect(frames.some(frame => JSON.parse(frame).type === 'web_settings_changed')).toBe(true))
+  expect(frames.join('')).not.toContain('test-key')
 })

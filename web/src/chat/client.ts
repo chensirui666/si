@@ -1,8 +1,8 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { ClientFrame, SubmitMessageAccepted, SubmitMessageRequest } from '@agent-learning/server/protocol'
+import type { ClientFrame, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspaceView } from '@agent-learning/server/protocol'
 import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
 
-export const subscribe: Subscribe = (onState, onModelsChanged) => {
+export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged) => {
   let state: ChatState = initialState
   let stopped = false
   let socket: WebSocket | null = null
@@ -63,9 +63,10 @@ export const subscribe: Subscribe = (onState, onModelsChanged) => {
       if (stopped || socket !== current) return
       let frame: unknown
       try { frame = JSON.parse(event.data) } catch { return }
-      if (typeof frame === 'object' && frame !== null && 'type' in frame && frame.type === 'models_changed') {
-        onModelsChanged?.()
-        return
+      if (record(frame)) {
+        if (frame.type === 'models_changed') { onModelsChanged?.(); return }
+        if (frame.type === 'workspaces_changed') { onWorkspacesChanged?.(); return }
+        if (frame.type === 'web_settings_changed') { onWebSettingsChanged?.(); return }
       }
       const result = applyFrame(state, frame, subscriptionId)
       if (result.resubscribe) { prepare(); requestSnapshot(); return }
@@ -114,34 +115,66 @@ export const subscribe: Subscribe = (onState, onModelsChanged) => {
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
+const credentialStatus = (value: unknown) => record(value) && (value.state === 'missing' || value.state === 'configured'
+  || (value.state === 'error' && typeof value.message === 'string'))
+
 function modelDiscovery(value: unknown): value is ModelDiscovery {
   if (!record(value) || !Array.isArray(value.models) || !record(value.deepseek)) return false
   return value.models.every(model => record(model) && ['id', 'name', 'provider', 'api'].every(key => typeof model[key] === 'string'))
-    && (value.deepseek.state === 'missing' || value.deepseek.state === 'configured'
-      || (value.deepseek.state === 'error' && typeof value.deepseek.message === 'string'))
+    && credentialStatus(value.deepseek)
 }
 
-async function requestModels(path: string, options: RequestInit = {}, apiKey = ''): Promise<ModelDiscovery> {
+function workspaceView(value: unknown): value is WorkspaceView {
+  return record(value) && (value.boundWorkspaceId === null || typeof value.boundWorkspaceId === 'string')
+    && Array.isArray(value.workspaces) && value.workspaces.every(workspace => record(workspace) && typeof workspace.id === 'string'
+      && typeof workspace.name === 'string' && typeof workspace.path === 'string' && typeof workspace.available === 'boolean')
+}
+
+type WorkspacePick = { cancelled: true } | { cancelled: false; view: WorkspaceView }
+
+function workspacePick(value: unknown): value is WorkspacePick {
+  return record(value) && (value.cancelled === true || (value.cancelled === false && workspaceView(value.view)))
+}
+
+function webSettings(value: unknown): value is WebSettingsView {
+  return record(value) && typeof value.searchProvider === 'string' && typeof value.fetchProvider === 'string'
+    && Array.isArray(value.providers) && value.providers.every(provider => record(provider) && typeof provider.id === 'string'
+      && typeof provider.name === 'string' && Array.isArray(provider.capabilities) && provider.capabilities.every(item => item === 'search' || item === 'fetch')
+      && credentialStatus(provider.status))
+}
+
+async function requestView<T>(path: string, label: string, validate: (value: unknown) => value is T, options: RequestInit = {}, apiKey = ''): Promise<T> {
   let response: Response
   try { response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options }) }
   catch { throw new Error('网络请求失败，请检查连接后重试') }
   if (response.status === 401) throw new Error('授权已失效，请重新打开启动链接')
   if (response.status === 403) throw new Error('访问来源不可信，请从启动链接进入')
   let value: unknown
-  try { value = await response.json() } catch { throw new Error('模型配置响应无效，请重试') }
+  try { value = await response.json() } catch { throw new Error(`${label}响应无效，请重试`) }
   if (!response.ok) {
-    const message = record(value) && typeof value.error === 'string' ? value.error : '模型配置请求失败，请重试'
+    const message = record(value) && typeof value.error === 'string' ? value.error : `${label}请求失败，请重试`
     throw new Error(apiKey ? message.split(apiKey).join('•••') : message)
   }
-  if (!modelDiscovery(value)) throw new Error('模型配置响应无效，请重试')
+  if (!validate(value)) throw new Error(`${label}响应无效，请重试`)
   return value
 }
 
-export const getModels = () => requestModels('/api/models')
-export const saveApiKey = (apiKey: string) => requestModels('/api/providers/deepseek', {
-  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey }),
-}, apiKey)
-export const deleteApiKey = () => requestModels('/api/providers/deepseek', { method: 'DELETE' })
+const putJson = (value: unknown): RequestInit => ({ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
+
+export const getModels = () => requestView('/api/models', '模型配置', modelDiscovery)
+export const saveApiKey = (apiKey: string) => requestView('/api/providers/deepseek', '模型配置', modelDiscovery, putJson({ apiKey }), apiKey)
+export const deleteApiKey = () => requestView('/api/providers/deepseek', '模型配置', modelDiscovery, { method: 'DELETE' })
+
+export const getWorkspaces = () => requestView('/api/workspaces', '工作区', workspaceView)
+export const pickWorkspace = () => requestView('/api/workspaces/pick', '工作区选择', workspacePick, { method: 'POST' })
+
+export const getWebSettings = () => requestView('/api/web/settings', '网页工具设置', webSettings)
+export const saveWebSettings = (selection: Pick<WebSettingsView, 'searchProvider' | 'fetchProvider'>) =>
+  requestView('/api/web/settings', '网页工具设置', webSettings, putJson(selection))
+export const saveWebApiKey = (providerId: string, apiKey: string) =>
+  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, putJson({ apiKey }), apiKey)
+export const deleteWebApiKey = (providerId: string) =>
+  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, { method: 'DELETE' })
 
 export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
   let response: Response

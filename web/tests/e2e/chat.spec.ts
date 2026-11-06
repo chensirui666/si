@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, expect } from '@playwright/test'
-import { authorize, devUrl, emptySnapshot, httpStatus, observe, ready, saveKey, startBackend, startVite, stop, waitForStart, wsStatus } from './test-utils'
+import { addWorkspace, authorize, freeVitePort, emptySnapshot, httpStatus, observe, ready, saveKey, startBackend, startVite, stop, waitForStart, wsStatus } from './test-utils'
 import { startModelServer } from './model-server'
 
 for (const mode of ['node', 'vite'] as const) {
@@ -14,14 +14,16 @@ for (const mode of ['node', 'vite'] as const) {
     const provider = await startModelServer()
     let backend: Awaited<ReturnType<typeof startBackend>> | undefined
     let vite: ChildProcess | undefined
+    const vitePort = mode === 'vite' ? await freeVitePort() : undefined
     try {
-      backend = await startBackend(secretPath, 0, provider.baseURL)
+      backend = await startBackend(secretPath, 0, provider.baseURL, vitePort)
       const port = Number(new URL(backend.result.url).port)
-      if (mode === 'vite') vite = await startVite(port)
-      const origin = mode === 'node' ? backend.result.url : devUrl
+      if (mode === 'vite') vite = await startVite(port, vitePort!)
+      const origin = mode === 'node' ? backend.result.url : `http://127.0.0.1:${vitePort}`
       const observed = observe(page)
       await authorize(page, mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl)
       await ready(page, observed)
+      await addWorkspace(page)
       await saveKey(page, 'controlled-stage3-key')
 
       const editor = page.getByRole('textbox', { name: '消息', exact: true })
@@ -40,8 +42,8 @@ for (const mode of ['node', 'vite'] as const) {
       expect(first.path).toBe('/v1/chat/completions')
       expect(first.authorized).toBe(true)
       expect(first.body).toMatchObject({ model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'high' })
-      expect(first.body.tools).toBeUndefined()
-      expect(first.body.messages).toEqual([{ role: 'user', content: original }])
+      expect(first.body.tools).toHaveLength(8)
+      expect(first.body.messages).toEqual([expect.objectContaining({ role: 'system', content: expect.stringContaining('工作目录') }), { role: 'user', content: original }])
       first.delta({ role: 'assistant', reasoning_content: '先分析原文。' })
       first.delta({ content: '**第一段**已经到达。' })
       await expect(messages).toContainText('第一段已经到达。')
@@ -95,8 +97,8 @@ for (const mode of ['node', 'vite'] as const) {
       await send.click()
       await expect.poll(() => provider.exchanges.length).toBe(2)
       const next = provider.exchanges[1]!
-      expect(next.body.messages.map(message => message.role)).toEqual(['user', 'assistant', 'user'])
-      expect(next.body.messages.map(message => message.content)).toEqual([original, '**第一段**已经到达。离线时继续生成的第二段。', '第二轮请沿用前面的内容'])
+      expect(next.body.messages.map(message => message.role)).toEqual(['system', 'user', 'assistant', 'user'])
+      expect(next.body.messages.slice(1).map(message => message.content)).toEqual([original, '**第一段**已经到达。离线时继续生成的第二段。', '第二轮请沿用前面的内容'])
       next.delta({ role: 'assistant', content: '第二轮已收到历史。' })
       next.finish()
       await expect(messages).toContainText('第二轮已收到历史。')
@@ -108,7 +110,7 @@ for (const mode of ['node', 'vite'] as const) {
       const beforeRestart = observed.snapshots.length
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
-      backend = await startBackend(secretPath, port, provider.baseURL)
+      backend = await startBackend(secretPath, port, provider.baseURL, vitePort)
       await ready(page, observed, beforeRestart)
       await expect(messages.getByRole('listitem')).toHaveCount(0)
       await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('DeepSeek Flash')
@@ -133,17 +135,19 @@ for (const mode of ['node', 'vite'] as const) {
     const modelPath = join(temporary, 'auth.json')
     let backend: Awaited<ReturnType<typeof startBackend>> | undefined
     let vite: ChildProcess | undefined
+    const vitePort = mode === 'vite' ? await freeVitePort() : undefined
     try {
-      backend = await startBackend(secretPath)
+      backend = await startBackend(secretPath, 0, '', vitePort)
       const port = Number(new URL(backend.result.url).port)
       if (mode === 'vite') {
-        vite = await startVite(port)
+        vite = await startVite(port, vitePort!)
       }
-      const origin = mode === 'node' ? backend.result.url : devUrl
+      const origin = mode === 'node' ? backend.result.url : `http://127.0.0.1:${vitePort}`
       const observed = observe(page)
       try { await page.goto(mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl) }
       catch { throw new Error('阶段二授权导航失败，临时令牌已省略') }
       await ready(page, observed)
+      await addWorkspace(page)
       const model = page.getByRole('combobox', { name: '模型', exact: true })
       await expect(model).toHaveText('无可用模型')
       const editor = page.getByRole('textbox', { name: '消息', exact: true })
@@ -190,7 +194,7 @@ for (const mode of ['node', 'vite'] as const) {
       const beforeRestart = observed.snapshots.length
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
-      backend = await startBackend(secretPath, port)
+      backend = await startBackend(secretPath, port, '', vitePort)
       await ready(page, observed, beforeRestart)
       await expect(model).toHaveText('DeepSeek Flash')
       await expect(otherModel).toHaveText('DeepSeek Flash')
@@ -242,13 +246,14 @@ for (const mode of ['node', 'vite'] as const) {
     const secretPath = join(temporary, 'browser-auth.json')
     let backend: Awaited<ReturnType<typeof startBackend>> | undefined
     let vite: ChildProcess | undefined
+    const vitePort = mode === 'vite' ? await freeVitePort() : undefined
     try {
-      backend = await startBackend(secretPath)
+      backend = await startBackend(secretPath, 0, '', vitePort)
       const port = Number(new URL(backend.result.url).port)
       if (mode === 'vite') {
-        vite = await startVite(port)
+        vite = await startVite(port, vitePort!)
       }
-      const origin = mode === 'node' ? backend.result.url : devUrl
+      const origin = mode === 'node' ? backend.result.url : `http://127.0.0.1:${vitePort}`
       const authUrl = mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl
 
       expect(await httpStatus(origin + (mode === 'node' ? '/' : '/auth'))).toBe(401)
@@ -334,7 +339,7 @@ for (const mode of ['node', 'vite'] as const) {
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
       await editor.fill('后端重启期间的草稿')
-      backend = await startBackend(secretPath, port)
+      backend = await startBackend(secretPath, port, '', vitePort)
       await ready(page, observed, beforeRestart)
       await expect(editor).toHaveText('后端重启期间的草稿')
       await expect(editor).toBeFocused()

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { LexicalComposer } from '@lexical/react/LexicalComposer'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
 import { ContentEditable } from '@lexical/react/LexicalContentEditable'
@@ -8,6 +8,7 @@ import { PlainTextPlugin } from '@lexical/react/LexicalPlainTextPlugin'
 import {
   $addUpdateTag,
   $createParagraphNode,
+  $createTextNode,
   $getRoot,
   CLEAR_HISTORY_COMMAND,
   COMMAND_PRIORITY_CRITICAL,
@@ -20,7 +21,7 @@ import { mergeRegister } from '@lexical/utils'
 
 import { Button } from '@/components/ui/button'
 
-type MessageInputProps = { onSend: (text: string) => boolean; sendDisabled: boolean }
+type MessageInputProps = { onSend: (text: string, restoreDraft: () => void) => boolean; sendDisabled: boolean }
 
 const initialConfig = {
   namespace: 'message-input',
@@ -42,10 +43,25 @@ export function MessageInput({ onSend, sendDisabled }: MessageInputProps) {
 function Composer({ onSend, sendDisabled }: MessageInputProps) {
   const [editor] = useLexicalComposerContext()
   const [canSend, setCanSend] = useState(false)
+  const draftRevision = useRef(0)
 
   const submit = useCallback((text: string) => {
+    let clearedRevision: number | undefined
+    const restoreDraft = () => editor.update(() => {
+      if (clearedRevision !== draftRevision.current || $readDraft() !== '') return
+      const root = $getRoot()
+      root.clear()
+      for (const line of text.split('\n')) {
+        const paragraph = $createParagraphNode()
+        if (line) paragraph.append($createTextNode(line))
+        root.append(paragraph)
+      }
+      if (editor.getRootElement() === document.activeElement) root.selectEnd()
+      else $addUpdateTag(SKIP_DOM_SELECTION_TAG)
+    }, { discrete: true, tag: SKIP_SCROLL_INTO_VIEW_TAG })
+
     try {
-      if (sendDisabled || !text.trim() || onSend(text) !== true) return
+      if (sendDisabled || !text.trim() || onSend(text, restoreDraft) !== true) return
     } catch (error) {
       // Report receiver errors after Lexical has finished its active update.
       queueMicrotask(() => { throw error })
@@ -62,13 +78,16 @@ function Composer({ onSend, sendDisabled }: MessageInputProps) {
       discrete: true,
       tag: SKIP_SCROLL_INTO_VIEW_TAG,
       onUpdate: () => {
+        clearedRevision = draftRevision.current
         editor.getRootElement()?.focus({ preventScroll: true })
       },
     })
   }, [editor, onSend, sendDisabled])
 
-  useEffect(() => editor.registerUpdateListener(({ editorState }) => {
-    setCanSend(editorState.read(() => Boolean($readDraft().trim())))
+  useEffect(() => editor.registerUpdateListener(({ editorState, prevEditorState }) => {
+    const text = editorState.read($readDraft)
+    if (text !== prevEditorState.read($readDraft)) draftRevision.current++
+    setCanSend(Boolean(text.trim()))
   }), [editor])
 
   useEffect(() => {

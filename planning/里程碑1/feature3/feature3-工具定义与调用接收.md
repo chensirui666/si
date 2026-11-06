@@ -258,6 +258,8 @@ Pi 的可执行 [AgentTool](</Users/stardust/agent learning/pi/packages/agent/sr
 
 ## 6. 验收标准
 
+本节记录 Feature3 当时的验收。当前真实工具用例及运行命令见 [Feature4 验收记录](../feature4/feature4-验收记录.md)。
+
 声明规则用单元测试；声明、Model、SDK 请求及返回组装用集成测试，真实 DeepSeek 案例也属于后端集成测试。目标不依赖网页实际入口，不新增 E2E。测试沿用现有 Vitest 与 `createModelStream()` 受控网络边界，不增加测试专用生产接口。
 
 以下验收目标均已实施并执行，结果见[验收记录](./feature3-验收记录.md)。已有 Model 测试保留为回归检查，不重列接收、解析和生命周期案例；相关实现与历史验收见 Feature2。自动化由 Agent 执行，日志与验收记录不代替测试代码。

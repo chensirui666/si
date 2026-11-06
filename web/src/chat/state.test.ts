@@ -28,7 +28,7 @@ describe('conversation state', () => {
   it('连续 accepted 保留原文且不修改已有快照，跳号与模型块请求完整快照', () => {
     const state = ready()
     const user = { id: 'one', message: { role: 'user', content: '  原文\n', timestamp: 1 } }
-    const running = { userMessageId: 'one', assistantMessageId: 'two' }
+    const running = { userMessageId: 'one', assistantMessageId: 'two', phase: 'model' }
     const accepted = { type: 'update', subscriptionId: 'current', update: { seq: 1, change: { type: 'accepted', user, running } } }
     const result = applyFrame(state, accepted, 'current')
     expect(result.state.snapshot).toEqual({ ...empty, seq: 1, messages: [user], running })
@@ -81,4 +81,21 @@ it.each([
 ])('不接受无法安全展示的错误字段 %j', message => {
   const state = initialState
   expect(applyFrame(state, { type: 'snapshot', subscriptionId: 'current', snapshot: { ...empty, messages: [{ id: 'answer', message }] } }, 'current').state).toBe(state)
+})
+
+it('模型回复结束后仍忙碌，任务更新带回结果并独立结束', () => {
+  const assistant = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'call', name: 'read', arguments: { path: 'note.txt' } }] }
+  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' }
+  let state = applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: { ...empty, running } }, 'current').state
+  const update = (seq: number, change: unknown) => { state = applyFrame(state, { type: 'update', subscriptionId: 'current', update: { seq, change } }, 'current').state }
+  update(1, { type: 'model', messageId: 'a', event: { type: 'done', reason: 'toolUse', message: assistant } })
+  expect(state.snapshot?.running).toEqual(running)
+  const toolCall = { assistantMessageId: 'a', contentIndex: 0 }
+  update(2, { type: 'task', running: { ...running, phase: 'tools', activeTool: toolCall } })
+  expect(state.snapshot?.running).toMatchObject({ phase: 'tools', activeTool: toolCall })
+  const message = { id: 'result', toolCall, message: { role: 'toolResult', toolCallId: 'call', toolName: 'read', timestamp: 2, isError: false, content: [{ type: 'text', text: '青禾' }] } }
+  update(3, { type: 'task', running: { ...running, phase: 'answer' }, message })
+  expect(state.snapshot?.messages).toEqual([{ id: 'a', message: assistant }, message])
+  update(4, { type: 'task', running: null })
+  expect(state.snapshot?.running).toBeNull()
 })

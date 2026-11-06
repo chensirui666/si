@@ -38,7 +38,7 @@ async function receive(stream: ModelEventStream) {
   return { message, calls: deliveredCalls(message) }
 }
 
-describe('four tool declarations through the real Model and SDK', () => {
+describe('eight tool declarations through the real Model and SDK', () => {
   it('sends every real declaration with its name, description and complete parameter rules', async () => {
     let requestBody: Record<string, unknown> | undefined
     const run = createModelStream(credentials, { fetch: (async (_url, init) => {
@@ -49,7 +49,7 @@ describe('four tool declarations through the real Model and SDK', () => {
     const { message } = await receive(run(model, input))
 
     expect(message.stopReason).toBe('stop')
-    expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write'])
+    expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write', 'find', 'grep', 'web_search', 'web_fetch'])
     expect(requestBody!.tools).toEqual(defaultTools.map(tool => ({
       type: 'function', function: {
         name: tool.name, description: tool.description, parameters: JSON.parse(JSON.stringify(tool.parameters)),

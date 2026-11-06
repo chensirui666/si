@@ -55,7 +55,7 @@ describe('browser subscription', () => {
     start(); socket().open(); snapshot()
     const ws = socket()
     const old = ws.id
-    const accepted = { type: 'accepted', user: { id: 'user-1', message: { role: 'user', content: 'hello', timestamp: 1 } }, running: { userMessageId: 'user-1', assistantMessageId: 'assistant-1' } }
+    const accepted = { type: 'accepted', user: { id: 'user-1', message: { role: 'user', content: 'hello', timestamp: 1 } }, running: { userMessageId: 'user-1', assistantMessageId: 'assistant-1', phase: 'model' } }
     ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
     ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
     expect(current().snapshot?.messages).toHaveLength(1)
@@ -184,12 +184,18 @@ describe('model configuration client', () => {
   })
   it('配置通知独立于对话编号，旧连接通知不触发刷新', () => {
     const changed = vi.fn()
-    stop = subscribe(state => states.push(state), changed)
+    const workspacesChanged = vi.fn()
+    const webSettingsChanged = vi.fn()
+    stop = subscribe(state => states.push(state), changed, workspacesChanged, webSettingsChanged)
     socket().open(); snapshot()
     const ws = socket()
     const id = ws.id
     ws.frame({ type: 'models_changed' })
+    ws.frame({ type: 'workspaces_changed' })
+    ws.frame({ type: 'web_settings_changed' })
     expect(changed).toHaveBeenCalledTimes(1)
+    expect(workspacesChanged).toHaveBeenCalledTimes(1)
+    expect(webSettingsChanged).toHaveBeenCalledTimes(1)
     expect(current().snapshot?.seq).toBe(0)
     expect(ws.id).toBe(id)
     ws.close()
@@ -212,7 +218,7 @@ it('提交保留完整原文，只发送一次请求并校验 202 回执', async
   const fetch = vi.fn().mockResolvedValue({ status: 202, ok: true, json: async () => accepted })
   vi.stubGlobal('fetch', fetch)
   const { submitMessage } = await import('./client')
-  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', text: '  原文\n\n' }
+  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', workspaceId: 'workspace-1', text: '  原文\n\n' }
   await expect(submitMessage(input)).resolves.toEqual(accepted)
   expect(fetch.mock.calls).toEqual([['/api/messages', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }]])
   fetch.mockResolvedValue({ status: 202, ok: true, json: async () => ({ ...accepted, clientMessageId: 'wrong' }) })
@@ -223,7 +229,7 @@ it('明确拒绝带状态码，网络失败保持接收状态未知且没有自�
   const fetch = vi.fn().mockResolvedValue({ status: 409, ok: false, json: async () => ({ error: '正在生成' }) })
   vi.stubGlobal('fetch', fetch)
   const { submitMessage } = await import('./client')
-  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', text: 'hello' }
+  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', workspaceId: 'workspace-1', text: 'hello' }
   await expect(submitMessage(input)).rejects.toMatchObject({ status: 409, message: '正在生成' })
   fetch.mockRejectedValue(new Error('network'))
   await expect(submitMessage(input)).rejects.toMatchObject({ message: '网络请求失败，未确认接收' })
@@ -245,5 +251,5 @@ it('主动重取快照保留清理函数接口，换编号并设置准备超时'
 it.each([413, 415])('HTTP %s 是明确拒绝而非接收未知', async status => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status, ok: false, json: async () => ({ error: status === 413 ? '消息过长' : '需要 JSON 请求' }) }))
   const { submitMessage } = await import('./client')
-  await expect(submitMessage({ clientMessageId: 'local', modelId: 'deepseek-flash', text: 'a'.repeat(70_000) })).rejects.toMatchObject({ status })
+  await expect(submitMessage({ clientMessageId: 'local', modelId: 'deepseek-flash', workspaceId: 'workspace-1', text: 'a'.repeat(70_000) })).rejects.toMatchObject({ status })
 })

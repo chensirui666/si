@@ -73,3 +73,62 @@ test('原文展示、长内容换行与复制', async ({ mount, page, context })
   await expect(region.getByRole('listitem')).toHaveCount(0);
   await expect(region).toHaveText('');
 });
+
+test('执行过程逐步展示并独立展开，正文分段，结果按来源关联并随任务结束收起', async ({ mount }) => {
+  const base = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'pending', content: [] } as const;
+  const call = { type: 'toolCall', id: 'same', name: 'read', arguments: { path: 'note.txt' } } as const;
+  const user: ConversationMessage = { id: 'u', message: { role: 'user', content: '读取文件', timestamp: 1 } };
+  const first = { id: 'a', message: { ...base, content: [{ type: 'thinking', thinking: '先读' }, { type: 'toolCall', id: '', name: '', arguments: {} }] } } satisfies ConversationMessage;
+  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' } as const;
+  const component = await mount(<MessageList messages={[user, first]} running={running} activeContent={[
+    { type: 'thinking', messageId: 'a', contentIndex: 0 },
+    { type: 'toolCall', messageId: 'a', contentIndex: 1, argumentsText: '{"path":' },
+  ]} />);
+  const process = component.locator('details.process-group').first();
+  const thinking = process.locator('.thinking-block');
+  const tool = process.locator('.tool-block').first();
+  await expect(process).toHaveAttribute('open');
+  await expect(thinking.locator('summary')).toContainText('先读');
+  await expect(thinking).not.toHaveAttribute('open');
+  await expect(tool.locator('summary')).toContainText('接收参数中');
+  await thinking.locator('summary').click();
+  await expect(tool).not.toHaveAttribute('open');
+
+  const assistant: ConversationMessage = { id: 'a', message: { ...base, content: [{ type: 'thinking', thinking: '先读文件，再核对' }, call] } };
+  await component.update(<MessageList messages={[user, assistant]} running={running} />);
+  await expect(thinking.locator('.markdown-text')).toHaveText('先读文件，再核对');
+  await expect(tool.locator('summary')).toContainText('等待执行');
+  const activeTool = { assistantMessageId: 'a', contentIndex: 1 };
+  await component.update(<MessageList messages={[user, assistant]} running={{ ...running, phase: 'tools', activeTool }} />);
+  await expect(tool.locator('summary')).toContainText('执行中');
+
+  const answer: ConversationMessage = { id: 'answer', message: { ...base, stopReason: 'stop', content: [
+    { type: 'thinking', thinking: '根据结果回答' }, call, { type: 'text', text: '**最终正文**' }, { type: 'thinking', thinking: '正文后思考' },
+  ] } };
+  const result = (id: string, assistantMessageId: string, contentIndex: number, text: string, isError: boolean): ConversationMessage => ({
+    id, toolCall: { assistantMessageId, contentIndex }, message: { role: 'toolResult', toolCallId: 'same', toolName: 'read', timestamp: 2, isError, content: [{ type: 'text', text }] },
+  });
+  const messages = [user, assistant, result('r1', 'a', 1, '青禾（输出已截断）', false), answer, result('r2', 'answer', 1, '找不到文件', true)];
+  await component.update(<MessageList messages={messages} running={{ ...running, phase: 'answer', assistantMessageId: 'answer' }} />);
+  const groups = component.locator('details.process-group');
+  await expect(groups).toHaveCount(2);
+  await expect(groups.first().locator('.thinking-block')).toHaveCount(2);
+  await expect(groups.last().locator('.thinking-block summary')).toContainText('正文后思考');
+  await expect(tool.locator('summary')).toContainText('读取 · note.txt');
+  await expect(tool.locator('summary')).toContainText('成功');
+  const failed = groups.first().locator('.tool-block').last();
+  await expect(failed.locator('summary')).toContainText('失败');
+  await tool.locator('summary').click();
+  await expect(tool.getByText('青禾（输出已截断）')).toBeVisible();
+  await expect(thinking.first()).toHaveAttribute('open');
+  await expect(thinking.last()).not.toHaveAttribute('open');
+
+  await component.update(<MessageList messages={messages} running={null} />);
+  await expect(groups.first()).not.toHaveAttribute('open');
+  await expect(groups.last()).not.toHaveAttribute('open');
+  await expect(component.getByText('最终正文')).toBeVisible();
+  await groups.first().locator(':scope > summary').click();
+  await failed.locator('summary').click();
+  await expect(failed.getByText('找不到文件')).toBeVisible();
+  await expect(failed.getByText('青禾（输出已截断）')).toHaveCount(0);
+});

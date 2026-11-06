@@ -3,6 +3,15 @@ import { ChatPageHarness } from '../test/ChatPageHarness'
 import { MessageInputHarness } from '../test/MessageInputHarness'
 import { Button } from '../components/ui/button'
 
+test.beforeEach(async ({ page }) => {
+  await page.route('**/api/web/settings', route => route.fulfill({
+    json: {
+      searchProvider: 'tavily', fetchProvider: 'tavily',
+      providers: [{ id: 'tavily', name: 'Tavily', capabilities: ['search', 'fetch'], status: { state: 'missing' } }],
+    },
+  }))
+})
+
 test('连接切换、快照恢复和输入区增高时保留草稿、焦点与阅读位置', async ({ mount, page }) => {
   const history = Array.from({ length: 26 }, (_, i) => `旧消息 ${i}：${'用于验证独立滚动的内容。'.repeat(12)}`)
   await mount(<ChatPageHarness messages={history} />)
@@ -331,7 +340,7 @@ test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到�
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
-      snapshot: { seq: 1, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer' }, activeContent: [] },
+      snapshot: { seq: 1, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model' }, activeContent: [] },
     } }))
   }, request)
   await release()
@@ -394,7 +403,7 @@ test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动�
     await page.evaluate(({ history, seq }) => {
       window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
         connection: 'ready', slow: false, error: null,
-        snapshot: { seq, messages: [...history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), { id: 'answer', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 30, content: [{ type: 'thinking', thinking: '独立思考' }, { type: 'text', text: `# 标题\n\n${'回答内容\n\n'.repeat(seq * 8)}` }], stopReason: seq === 3 ? 'stop' : 'pending' } }], running: seq === 3 ? null : { userMessageId: 'history-25', assistantMessageId: 'answer' }, activeContent: seq === 3 ? [] : [{ messageId: 'answer', contentIndex: 1, type: 'text' }] },
+        snapshot: { seq, messages: [...history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), { id: 'answer', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 30, content: [{ type: 'thinking', thinking: '独立思考' }, { type: 'text', text: `# 标题\n\n${'回答内容\n\n'.repeat(seq * 8)}` }], stopReason: seq === 3 ? 'stop' : 'pending' } }], running: seq === 3 ? null : { userMessageId: 'history-25', assistantMessageId: 'answer', phase: 'model' }, activeContent: seq === 3 ? [] : [{ messageId: 'answer', contentIndex: 1, type: 'text' }] },
       } }))
     }, { history, seq })
     await expect(list.getByRole('listitem')).toHaveCount(27)
@@ -441,3 +450,42 @@ for (const withHistory of [false, true]) {
     await expect(editor).toBeFocused()
   })
 }
+
+test('选择工作区后进入当前对话才可发送，目录失效保留草稿', async ({ mount, page }) => {
+  let view = { workspaces: [] as { id: string; path: string; name: string; available: boolean }[], boundWorkspaceId: null as string | null }
+  const workspace = { id: 'workspace-1', path: '/tmp/青禾', name: '青禾', available: true }
+  let selection = 0
+  await page.route('**/api/workspaces', route => route.fulfill({ json: view }))
+  await page.route('**/api/workspaces/pick', route => {
+    if (++selection === 1) return route.fulfill({ json: { cancelled: true } })
+    view = { workspaces: [workspace], boundWorkspaceId: workspace.id }
+    return route.fulfill({ json: { cancelled: false, view } })
+  })
+  let submitted: unknown
+  await page.route('**/api/messages', route => {
+    submitted = route.request().postDataJSON()
+    return route.fulfill({ status: 409, json: { error: '工作区目录已失效' } })
+  })
+  await mount(<ChatPageHarness modelConfigured useWorkspaceApi />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  const add = page.getByRole('button', { name: '添加工作区' })
+  const conversation = page.getByRole('button', { name: '当前对话' })
+  await editor.fill('保留原文\n第二行')
+  await expect(send).toBeDisabled()
+  await add.click()
+  await expect(conversation).toHaveCount(0)
+  await expect(add).toBeEnabled()
+  await add.click()
+  await expect(page.getByRole('navigation', { name: '工作区' }).getByText('青禾', { exact: true })).toBeVisible()
+  await expect(add).toBeDisabled()
+  await expect(send).toBeDisabled()
+  await conversation.click()
+  await expect(page.getByText('/tmp/青禾', { exact: true })).toBeVisible()
+  await expect(send).toBeEnabled()
+  view = { ...view, workspaces: [{ ...workspace, available: false }] }
+  await send.click()
+  await expect.poll(() => submitted).toMatchObject({ text: '保留原文\n第二行', workspaceId: 'workspace-1' })
+  await expect(editor).toHaveText(/保留原文.*第二行/s)
+  await expect(send).toBeDisabled()
+})

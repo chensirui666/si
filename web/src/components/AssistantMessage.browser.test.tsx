@@ -5,23 +5,16 @@ import { MarkdownText } from './markdown/MarkdownText'
 
 const base: Message = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, content: [], stopReason: 'pending' }
 
-test('思考默认折叠，主动展开跨片段与结束保持，三类块依次展示并显示工具错误', async ({ mount }) => {
-  const message: Message = { ...base, content: [{ type: 'thinking', thinking: '想一想' }, { type: 'text', text: '**答案**' }, { type: 'toolCall', id: '', name: '', arguments: {} }] }
-  const component = await mount(<AssistantMessage message={message} activeContent={[{ messageId: 'a', contentIndex: 0, type: 'thinking' }, { messageId: 'a', contentIndex: 2, type: 'toolCall', argumentsText: '{"city":' }]} />)
-  const details = component.locator('details')
-  await expect(details).not.toHaveAttribute('open')
-  await expect(component.getByText('想一想')).not.toBeVisible()
-  await component.getByText('思考中').click()
-  await expect(component.getByText('想一想')).toBeVisible()
+test('工具开始即显示，展开后可读流式参数和最终参数错误', async ({ mount }) => {
+  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' } as const
+  const message: Message = { ...base, content: [{ type: 'toolCall', id: '', name: '', arguments: {} }] }
+  const component = await mount(<AssistantMessage messages={[{ id: 'a', message }]} running={running} activeContent={[{ messageId: 'a', contentIndex: 0, type: 'toolCall', argumentsText: '{"city":' }]} />)
+  await component.getByText('工具调用', { exact: true }).click()
+  await expect(component.locator('pre')).toBeVisible()
   await expect(component.locator('pre')).toHaveText('{"city":')
-  await component.update(<AssistantMessage message={{ ...message, content: [{ type: 'thinking', thinking: '完整思考' }, { type: 'text', text: '**完整答案**' }, { type: 'toolCall', id: 'call', name: 'weather', arguments: {}, argumentsError: '参数 JSON 无效，原文：{"city":' }], stopReason: 'toolUse' }} />)
-  await expect(details).toHaveAttribute('open')
-  await expect(component.getByText('思考过程')).toBeVisible()
-  await expect(component.getByText('完整思考')).toBeVisible()
-  await expect(component.locator('strong').first()).toHaveText('完整答案')
+  await component.update(<AssistantMessage messages={[{ id: 'a', message: { ...message, content: [{ type: 'toolCall', id: 'call', name: 'weather', arguments: {}, argumentsError: '参数 JSON 无效，原文：{"city":' }], stopReason: 'toolUse' } }]} running={running} />)
   await expect(component.getByText('weather')).toBeVisible()
   await expect(component.getByText('参数 JSON 无效，原文：{"city":')).toBeVisible()
-  await expect(component.getByText('模型请求了工具调用，本阶段不执行工具')).toBeVisible()
 })
 
 test('Markdown GFM 流式尾部更新、最终引用校准与恶意内容隔离', async ({ mount, page }) => {
@@ -45,11 +38,11 @@ test('Markdown GFM 流式尾部更新、最终引用校准与恶意内容隔离'
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
 })
 
-test('五种终止保持真实原因，失败仍显示已生成正文，空块没有伪造回答', async ({ mount }) => {
-  const component = await mount(<AssistantMessage message={base} />)
+test('终止状态保留正文，正常的工具阶段没有报错提示', async ({ mount }) => {
+  const component = await mount(<AssistantMessage messages={[{ id: 'a', message: base }]} />)
   await expect(component).toHaveText('')
-  for (const [stopReason, status] of [['stop', ''], ['length', '达到长度限制，回答可能不完整'], ['toolUse', '模型请求了工具调用，本阶段不执行工具'], ['error', '实际错误'], ['aborted', '回答已中止']] as const) {
-    await component.update(<AssistantMessage message={{ ...base, content: [{ type: 'text', text: '保留正文' }], stopReason, errorMessage: stopReason === 'error' ? '实际错误' : undefined }} />)
+  for (const [stopReason, status] of [['stop', ''], ['length', '达到长度限制，回答可能不完整'], ['toolUse', ''], ['error', '实际错误'], ['aborted', '回答已中止']] as const) {
+    await component.update(<AssistantMessage messages={[{ id: 'a', message: { ...base, content: [{ type: 'text', text: '保留正文' }], stopReason, errorMessage: stopReason === 'error' ? '实际错误' : undefined } }]} />)
     await expect(component.getByText('保留正文')).toBeVisible()
     if (status) await expect(component.getByText(status)).toBeVisible()
     else await expect(component.locator('.message-ending')).toHaveCount(0)

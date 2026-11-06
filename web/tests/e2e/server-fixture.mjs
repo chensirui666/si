@@ -5,7 +5,10 @@ const options = {
   port: Number(process.argv[2]),
   browserSecretPath: process.argv[3],
   modelAuthPath: join(dirname(process.argv[3]), 'auth.json'),
-  devOrigin: 'http://127.0.0.1:5173',
+  ...(process.argv[4] ? { devOrigin: 'http://127.0.0.1:' + process.argv[4] } : {}),
+  workspacePath: join(dirname(process.argv[3]), 'workspaces.json'),
+  webSettingsPath: join(dirname(process.argv[3]), 'settings.json'),
+  directoryPicker: async () => dirname(process.argv[3]),
   ...(process.env.AGENT_LEARNING_E2E_MODEL_BASE_URL
     ? { modelOptions: { baseURL: process.env.AGENT_LEARNING_E2E_MODEL_BASE_URL } }
     : {}),

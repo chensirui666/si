@@ -11,7 +11,7 @@ Agent 在本项目中的回复必须遵守以下要求：
 
 ## 运行项目
 
-已接入本机授权、模型设置和真实 DeepSeek 流式聊天。配置模型后可发送消息，实时查看正文与折叠的思考过程；生成期间仍可编辑下一条草稿。刷新或重连恢复后端进度。消息只在后端进程内存中，重启后清空。
+已接入本机授权、工作区选择、DeepSeek 流式聊天和八种工具。先配置模型，然后在侧栏点击「添加工作区」，从 macOS 系统面板选一个文件夹，再进入该文件夹下的「当前对话」。输入区显示绑定目录。刷新或重连恢复对话和任务进度。服务重启后保留工作区登记和绑定，当前对话从空历史开始。
 
 ```sh
 npm ci
@@ -23,7 +23,11 @@ npm --prefix packages/server start
 
 从侧栏底部“设置 → 模型 → 添加提供方 → DeepSeek”保存 API Key，可替换或删除。Key 仅写入本机 `~/.agent-learning/auth.json`，页面只接收配置状态；多个页面会同步模型列表，重启后配置仍在。保存成功只表示本地配置可用，不表示远端认证通过。模型文件损坏仍可进入设置，但需要先人工修复文件，页面不会覆盖坏文件。
 
-发送后立即清空本次草稿；后端先回执，再推送生成进度。生成、提交未确认或连接恢复期间暂停发送，不影响编辑。明确拒绝和未确认接收分别标记，不自动重发或恢复已清空草稿。失败回复保留展示，但下一轮模型历史排除这条失败回复。当前仅聊天与工具请求展示，不执行工具。
+发送后立即清空本次草稿。提交被明确拒绝时，如果你还没有开始写下一条，输入区会恢复原稿。提交未确认时会标明状态。生成或连接恢复期间可编辑草稿，等任务结束或连接恢复后再发送。
+
+Agent 等模型给完一批工具调用，再依次执行，随后请模型根据结果回答。运行时「执行过程」显示思考与工具状态，结束后自动收起，仍可展开查看参数和真实结果。一次提交可以带多条工具调用。先读文件、再依据读到的内容做修改，需要分两次提交。
+
+本地工具有 `read`、`bash`、`edit`、`write`、`find` 和 `grep`。工作区是相对路径的起点，工具拥有本机服务进程的文件和命令权限。网页工具 `web_search` 与 `web_fetch` 通过「设置 → 网页工具」配置，默认共用 Tavily Key。使用网页工具前，在该设置页保存 Tavily Key。服务商选择写入 `~/.agent-learning/settings.json`，Key 写入同目录下的 `auth.json`。
 
 开发时分别运行：
 
@@ -49,15 +53,15 @@ npm test
 DEEPSEEK_LIVE_KEY_FILE=/absolute/path/to/test.env npm test
 ```
 
-独立命令、系统输入法检查和说明见 [web/README.md](web/README.md)。本阶段实际证据见 [Feature2 验收记录](planning/里程碑1/feature2/feature2-验收记录.md)。
+独立命令、系统输入法检查和说明见 [web/README.md](web/README.md)。Feature2 的实际证据见 [Feature2 验收记录](planning/里程碑1/feature2/feature2-验收记录.md)。
 
-Feature3 在后端提供 `read`、`bash`、`edit`、`write` 四种工具声明，调用方通过 `ModelContext.tools` 显式传给模型。仅接收待校验的调用，不执行工具；普通网页聊天继续不携带工具声明。截断、失败或取消的调用不会交付给后续处理。
-
-四工具真实模型验收独立运行，使用现有 Credentials 只读本机 `~/.agent-learning/auth.json`，不改凭据文件、不执行工具、不自动重试；无配置时明确跳过，失败时如实报错：
+八种工具都从正式服务入口验收。根测试在 Chromium 中发起真实 `read`，其余七种通过下面的命令调用实际 HTTP 和 WebSocket 接口。每项核对工具执行、结果回填及最终回答。指定包含 `DEEPSEEK` 或 `DEEPSEEK_API_KEY` 的 dotenv 文件，以及包含 `TAVILY_API_KEY`（也接受 `TAVILY` 或 `tavily`）的测试文件，两者可以使用同一个文件。凭据和工作区使用测试临时目录。
 
 ```sh
 npm run build:packages
+DEEPSEEK_LIVE_KEY_FILE=/absolute/path/to/test.env \
+TAVILY_LIVE_KEY_FILE=/absolute/path/to/test.env \
 npm --prefix packages/server run test:tools:live
 ```
 
-实际结果见 [Feature3 验收记录](planning/里程碑1/feature3/feature3-验收记录.md)。
+实际结果见 [Feature4 验收记录](planning/里程碑1/feature4/feature4-验收记录.md)。

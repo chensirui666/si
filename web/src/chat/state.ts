@@ -11,14 +11,17 @@ export type ChatState = {
   error: string | null
 }
 export type Subscription = (() => void) & { requestSnapshot?: () => void }
-export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void) => Subscription
+export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void) => Subscription
 export const initialState: ChatState = { connection: 'connecting', snapshot: null, slow: false, error: null }
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const sequence = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const textContent = (value: unknown) => record(value) && value.type === 'text' && typeof value.text === 'string'
+const toolPosition = (value: unknown) => record(value) && typeof value.assistantMessageId === 'string' && sequence(value.contentIndex)
 const runningState = (value: unknown) => record(value) && typeof value.userMessageId === 'string' && typeof value.assistantMessageId === 'string'
+  && (value.phase === 'model' || value.phase === 'tools' || value.phase === 'answer')
+  && (value.activeTool === undefined || (value.phase === 'tools' && toolPosition(value.activeTool)))
 
 function modelMessage(value: unknown): value is ModelMessage {
   if (!record(value) || !finite(value.timestamp)) return false
@@ -37,8 +40,9 @@ function modelMessage(value: unknown): value is ModelMessage {
     ))
 }
 
-function conversationMessage(value: unknown) {
+function conversationMessage(value: unknown): value is ConversationMessage {
   return record(value) && typeof value.id === 'string' && (value.clientMessageId === undefined || typeof value.clientMessageId === 'string') && modelMessage(value.message)
+    && (value.message.role === 'toolResult' ? toolPosition(value.toolCall) : value.toolCall === undefined)
 }
 
 function validSnapshot(value: unknown): value is ConversationSnapshot {
@@ -66,16 +70,21 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     const snapshot = applyModel(state.snapshot, change.messageId, change.event)
     return snapshot ? { state: { ...state, snapshot: { ...snapshot, seq: frame.update.seq } }, resubscribe: false } : { state, resubscribe: true }
   }
-  if (change.type !== 'accepted' || !conversationMessage(change.user) || !record(change.user)
-    || !record(change.user.message) || change.user.message.role !== 'user' || !runningState(change.running)) return unchanged
   const valid = frame as Extract<ServerFrame, { type: 'update' }>
-  if (valid.update.change.type !== 'accepted') return unchanged
-  return { state: { ...state, snapshot: {
-    ...state.snapshot,
-    seq: valid.update.seq,
-    messages: [...state.snapshot.messages, valid.update.change.user],
-    running: valid.update.change.running,
-  } }, resubscribe: false }
+  const update = valid.update.change
+  if (update.type === 'accepted' && conversationMessage(change.user) && change.user.message.role === 'user' && runningState(change.running)) {
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, seq: valid.update.seq, messages: [...state.snapshot.messages, update.user], running: update.running,
+    } }, resubscribe: false }
+  }
+  if (update.type === 'task' && (change.running === null || runningState(change.running))
+    && (change.message === undefined || (conversationMessage(change.message) && change.message.message.role === 'toolResult'))) {
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, seq: valid.update.seq, running: update.running,
+      messages: update.message ? [...state.snapshot.messages, update.message] : state.snapshot.messages,
+    } }, resubscribe: false }
+  }
+  return unchanged
 }
 
 function applyModel(snapshot: ConversationSnapshot, messageId: unknown, event: unknown): ConversationSnapshot | null {
@@ -117,8 +126,7 @@ function applyModel(snapshot: ConversationSnapshot, messageId: unknown, event: u
     }
   }
   const entry: ConversationMessage = { id: messageId, message }
-  return { ...snapshot, messages: existing ? snapshot.messages.map(item => item.id === messageId ? entry : item) : [...snapshot.messages, entry], activeContent,
-    running: event.type === 'done' || event.type === 'error' ? null : snapshot.running }
+  return { ...snapshot, messages: existing ? snapshot.messages.map(item => item.id === messageId ? entry : item) : [...snapshot.messages, entry], activeContent }
 }
 
 export function mergeSubmissions(messages: readonly ConversationMessage[], submissions: readonly LocalSubmission[]): (ConversationMessage | LocalSubmission)[] {

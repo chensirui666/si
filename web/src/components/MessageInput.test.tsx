@@ -40,7 +40,7 @@ describe('MessageInput', () => {
     expect(textbox).toHaveFocus()
     rerender(<MessageInput onSend={onSend} sendDisabled={false} />)
     fireEvent.keyDown(textbox, { key: 'Enter' })
-    expect(onSend).toHaveBeenCalledExactlyOnceWith('  保留草稿\n下一行')
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('  保留草稿\n下一行', expect.any(Function))
     await undo(textbox)
     expect(textbox.textContent).toBe('  保留草稿')
   })
@@ -67,7 +67,7 @@ describe('MessageInput', () => {
     button.focus()
     fireEvent.click(button)
 
-    expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ')
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ', expect.any(Function))
     expect(textbox.textContent).toBe('')
     expect(button).toBeDisabled()
     expect(textbox).toHaveFocus()
@@ -85,7 +85,7 @@ describe('MessageInput', () => {
     await undo(textbox)
 
     expect(textbox.textContent).toBe('')
-    expect(onSend).toHaveBeenCalledExactlyOnceWith('已发送内容')
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('已发送内容', expect.any(Function))
   })
 
   it('按接收结果保护草稿：拒绝后保留原文和撤销历史', async () => {
@@ -96,7 +96,7 @@ describe('MessageInput', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '发送' }))
 
-    expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ')
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ', expect.any(Function))
     expect(textbox.textContent).toContain('第二行  ')
     await undo(textbox)
     expect(textbox.textContent).toBe('  草稿')
@@ -122,7 +122,7 @@ describe('MessageInput', () => {
       if (gesture === 'Enter') fireEvent.keyDown(textbox, { key: 'Enter' })
       else fireEvent.click(screen.getByRole('button', { name: '发送' }))
 
-      expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ')
+      expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ', expect.any(Function))
       await act(async () => {})
       expect(errors).toEqual([failure])
       expect(textbox.textContent).toContain('第二行  ')
@@ -144,7 +144,7 @@ describe('MessageInput', () => {
     fireEvent.keyDown(textbox, { key: 'Enter', repeat: true })
     fireEvent.keyDown(textbox, { key: 'Enter', repeat: true })
 
-    expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ')
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('  草稿\n第二行  ', expect.any(Function))
   })
 
   it('Shift+Enter 只插入换行', async () => {
@@ -158,7 +158,7 @@ describe('MessageInput', () => {
     await paste('第二行')
     fireEvent.click(screen.getByRole('button', { name: '发送' }))
 
-    expect(onSend).toHaveBeenCalledExactlyOnceWith('第一行\n第二行')
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('第一行\n第二行', expect.any(Function))
   })
 
   it.each([
@@ -177,7 +177,7 @@ describe('MessageInput', () => {
 
     expect(onSend).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '发送' }))
-    expect(onSend).toHaveBeenCalledExactlyOnceWith('草稿')
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('草稿', expect.any(Function))
   })
 
   it.each([
@@ -216,6 +216,6 @@ describe('MessageInput', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送' }))
 
     expect(previous).not.toHaveBeenCalled()
-    expect(current).toHaveBeenCalledExactlyOnceWith('保留草稿')
+    expect(current).toHaveBeenCalledExactlyOnceWith('保留草稿', expect.any(Function))
   })
 })

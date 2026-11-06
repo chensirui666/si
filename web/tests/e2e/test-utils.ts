@@ -1,6 +1,7 @@
 import { fork, spawn, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
 import { request } from 'node:http'
+import { createServer } from 'node:net'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,7 +12,14 @@ import { WebSocket } from 'ws'
 const webDirectory = fileURLToPath(new URL('../..', import.meta.url))
 const fixturePath = fileURLToPath(new URL('./server-fixture.mjs', import.meta.url))
 const vitePath = join(dirname(createRequire(import.meta.url).resolve('vite/package.json')), 'bin/vite.js')
-export const devUrl = 'http://127.0.0.1:5173'
+export async function freeVitePort() {
+  const server = createServer()
+  await new Promise<void>((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('无法分配 Vite 测试端口')
+  await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  return address.port
+}
 export const emptySnapshot = { seq: 0, messages: [], running: null, activeContent: [] }
 
 type Started = { url: string; authUrl: string; devAuthUrl: string }
@@ -45,8 +53,8 @@ export function waitForStart(child: ChildProcess): Promise<Started> {
   })
 }
 
-export async function startBackend(secretPath: string, port = 0, modelBaseURL = '') {
-  const child = fork(fixturePath, [String(port), secretPath], {
+export async function startBackend(secretPath: string, port = 0, modelBaseURL = '', vitePort?: number) {
+  const child = fork(fixturePath, [String(port), secretPath, vitePort ? String(vitePort) : ''], {
     env: { ...process.env, AGENT_LEARNING_E2E_MODEL_BASE_URL: modelBaseURL },
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
@@ -54,16 +62,16 @@ export async function startBackend(secretPath: string, port = 0, modelBaseURL = 
   catch (error) { await stop(child); throw error }
 }
 
-export async function startVite(port: number) {
-  const child = spawn(process.execPath, [vitePath], {
+export async function startVite(port: number, vitePort: number) {
+  const child = spawn(process.execPath, [vitePath, '--port', String(vitePort)], {
     cwd: webDirectory,
     env: { ...process.env, AGENT_LEARNING_SERVER_PORT: String(port) },
     stdio: 'ignore',
   })
   try {
     await expect.poll(async () => {
-      if (child.exitCode !== null) throw new Error('Vite 未启动；请检查 5173 端口和配置')
-      return httpStatus(devUrl + '/@vite/client').catch(() => 0)
+      if (child.exitCode !== null) throw new Error('Vite 未启动；请检查测试端口和配置')
+      return httpStatus(`http://127.0.0.1:${vitePort}/@vite/client`).catch(() => 0)
     }, { timeout: 10_000 }).toBe(200)
     return child
   } catch (error) { await stop(child); throw error }
@@ -144,4 +152,9 @@ export async function saveKey(page: Page, key: string) {
 export async function authorize(page: Page, url: string) {
   try { await page.goto(url) }
   catch { throw new Error('授权导航失败，临时令牌已省略') }
+}
+
+export async function addWorkspace(page: Page) {
+  await page.getByRole('button', { name: '添加工作区', exact: true }).click()
+  await page.getByRole('button', { name: '当前对话', exact: true }).click()
 }

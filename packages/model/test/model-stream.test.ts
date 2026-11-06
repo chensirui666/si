@@ -125,7 +125,7 @@ describe('Model single SDK stream', () => {
     expect(payload.messages).toEqual([
       { role: 'system', content: 'system instruction' },
       { role: 'user', content: '  你好\n第二行  ' },
-      { role: 'assistant', content: 'old reply' },
+      { role: 'assistant', content: 'old reply', reasoning_content: 'old hidden thought' },
       { role: 'user', content: 'next question' },
     ])
     expect(JSON.stringify(payload)).not.toContain('test-private-key')
@@ -219,8 +219,9 @@ describe('Model single SDK stream', () => {
 
   it('reads the current Key for each request and does not change an in-flight authentication header', async () => {
     let key = 'old-key'
+    const providers: string[] = []
     const headers: string[] = []
-    const run = modelApi.createModelStream({ readApiKey: async () => key }, { fetch: (async (_url, init) => {
+    const run = modelApi.createModelStream({ readApiKey: async provider => { providers.push(provider); return key } }, { fetch: (async (_url, init) => {
       headers.push(new Headers(init!.headers).get('authorization')!)
       key = 'new-key'
       return response([chunk({}, 'stop')])
@@ -228,6 +229,7 @@ describe('Model single SDK stream', () => {
     await consume(run(selected, context))
     await consume(run(selected, context))
     expect(headers).toEqual(['Bearer old-key', 'Bearer new-key'])
+    expect(providers).toEqual(['deepseek', 'deepseek'])
   })
 
   it('turns setup failure into a final error before start without exposing credential errors', async () => {
@@ -443,15 +445,67 @@ describe('Model single SDK stream', () => {
     expect(calls).toBe(1)
   })
 
-  it('delivers duplicate IDs using Pi index-first and ID-fallback grouping without extra rejection', async () => {
+  it('keeps duplicate IDs under different indices visible for whole-batch validation', async () => {
     const run = modelApi.createModelStream(credentials, { fetch: async () => response([
-      chunk({ tool_calls: [{ index: 0, id: 'same', function: { name: 'read', arguments: '{' } }] }),
-      chunk({ tool_calls: [{ index: 1, id: 'same', function: { arguments: '}' } }] }),
+      chunk({ tool_calls: [{ index: 0, id: 'same', function: { name: 'read', arguments: '{}' } }] }),
+      chunk({ tool_calls: [{ index: 1, id: 'same', function: { name: 'write', arguments: '{}' } }] }),
       chunk({}, 'tool_calls'),
     ]) })
     const { result } = await consume(run(selected, context))
     expect(result.stopReason).toBe('toolUse')
-    expect(result.content).toEqual([{ type: 'toolCall', id: 'same', name: 'read', arguments: {} }])
+    expect(result.content).toEqual([
+      { type: 'toolCall', id: 'same', name: 'read', arguments: {} },
+      { type: 'toolCall', id: 'same', name: 'write', arguments: {} },
+    ])
+  })
+
+  it('fails the model response when an indexed call changes its ID mid-stream', async () => {
+    const run = modelApi.createModelStream(credentials, { fetch: async () => response([
+      chunk({ tool_calls: [{ index: 0, id: 'first', function: { name: 'read', arguments: '{' } }] }),
+      chunk({ tool_calls: [{ index: 0, id: 'changed', function: { arguments: '}' } }] }, 'tool_calls'),
+    ]) })
+    const { result } = await consume(run(selected, context))
+    expect(result.stopReason).toBe('error')
+    expect(result.errorMessage).toContain('编号')
+  })
+
+  it('preserves tool and final-answer reasoning in the next user turn', async () => {
+    const requests: Record<string, unknown>[] = []
+    const replies = [
+      [chunk({ reasoning_content: 'decide to read' }), chunk({
+        tool_calls: [{ index: 0, id: 'read-1', function: { name: 'read', arguments: '{"path":"notes.txt"}' } }],
+      }, 'tool_calls')],
+      [chunk({ reasoning_content: 'read result understood' }), chunk({ content: 'Read it.' }, 'stop')],
+      [chunk({ content: 'Follow-up answered.' }, 'stop')],
+    ]
+    const run = modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+      requests.push(JSON.parse(String(init!.body)))
+      return response(replies.shift()!)
+    } })
+    const tools = [{ name: 'read', description: 'Read text', parameters: Type.Object({ path: Type.String() }) }]
+    const first = (await consume(run(selected, { ...context, tools }))).result
+    const toolResult: modelApi.ToolResultMessage = {
+      role: 'toolResult', toolCallId: 'read-1', toolName: 'read',
+      content: [{ type: 'text', text: 'file content' }], isError: false, timestamp: 3,
+    }
+    const answered = [...context.messages, first, toolResult]
+    const final = (await consume(run(selected, { messages: answered }))).result
+    await consume(run(selected, { messages: [...answered, final, { role: 'user', content: 'Next question', timestamp: 5 }], tools }))
+
+    expect(requests[1]).not.toHaveProperty('tools')
+    expect(requests[1].messages).toMatchObject([
+      { role: 'user' },
+      { role: 'assistant', reasoning_content: 'decide to read', tool_calls: [{ id: 'read-1' }] },
+      { role: 'tool', tool_call_id: 'read-1', content: 'file content' },
+    ])
+    expect(requests[2]).toHaveProperty('tools')
+    expect(requests[2].messages).toMatchObject([
+      { role: 'user' },
+      { role: 'assistant', reasoning_content: 'decide to read', tool_calls: [{ id: 'read-1' }] },
+      { role: 'tool', tool_call_id: 'read-1', content: 'file content' },
+      { role: 'assistant', content: 'Read it.', reasoning_content: 'read result understood' },
+      { role: 'user', content: 'Next question' },
+    ])
   })
 
   it('times out the first response wait at five minutes and aborts the transport without retry', async () => {

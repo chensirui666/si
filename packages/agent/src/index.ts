@@ -1,5 +1,6 @@
 export { Agent, AgentSubmitError } from './agent.js'
 export type {
+  ExecutableTool,
   ConversationMessage,
   RunningState,
   ConversationSnapshot,

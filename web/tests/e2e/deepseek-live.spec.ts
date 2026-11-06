@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { WebServer } from '@agent-learning/server'
 import { expect, test, type Page } from '@playwright/test'
 import { parseLiveKey, readLiveKey } from './live-key'
-import { authorize, observe, ready, saveKey, startBackend, stop } from './test-utils'
+import { addWorkspace, authorize, observe, ready, saveKey, startBackend, stop } from './test-utils'
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' })
 
@@ -28,6 +29,7 @@ test('真实 DeepSeek 设置、两轮历史、流式进度与无效 Key 恢复',
     const observed = observe(page)
     await authorize(page, backend.result.authUrl)
     await ready(page, observed)
+    await addWorkspace(page)
     await saveKey(page, key)
     expect(JSON.parse(await readFile(join(temporary, 'auth.json'), 'utf8')).deepseek.key === key).toBe(true)
     expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual({ local: {}, session: {} })
@@ -74,9 +76,9 @@ async function complete(page: Page, observed: ReturnType<typeof observe>, prompt
   await send.click()
   expect((await accepted).status()).toBe(202)
   await expect(editor).toHaveText('')
-  await expect.poll(() => observed.updates.slice(before).some(({ update }) => update.change.type === 'model' && ['done', 'error'].includes(update.change.event.type)), { timeout: 150_000 }).toBe(true)
+  await expect.poll(() => observed.updates.slice(before).some(({ update }) => update.change.type === 'task' && !update.change.running), { timeout: 150_000 }).toBe(true)
   const frames = observed.updates.slice(before).flatMap(({ update }) => update.change.type === 'model' ? [update.change.event] : [])
-  const terminal = frames.find(frame => frame.type === 'done' || frame.type === 'error')!
+  const terminal = [...frames].reverse().find(frame => frame.type === 'done' || frame.type === 'error')!
   if (terminal.type !== 'done' && terminal.type !== 'error') throw new Error('没有收到最终模型回复')
   expect(terminal.type).toBe(expectFailure ? 'error' : 'done')
   const message = terminal.type === 'done' ? terminal.message : terminal.error
@@ -94,3 +96,55 @@ async function complete(page: Page, observed: ReturnType<typeof observe>, prompt
 function textOf(message: { content: { type: string; text?: string }[] }) {
   return message.content.flatMap(block => block.type === 'text' ? [block.text ?? ''] : []).join('')
 }
+
+test('T1 live: 网页两次读取真实文件，显示工具结果且回答随文件变化', async ({ page, context }) => {
+  test.setTimeout(450_000)
+  const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
+  test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE')
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-learning-feature4-read-'))
+  const cwd = join(temporary, 'workspace')
+  const modelRequests: { messages: { role: string; tool_calls?: { id: string }[]; tool_call_id?: string; content?: string }[]; tools?: unknown[] }[] = []
+  const server = new WebServer({
+    port: 0, directoryPicker: async () => cwd,
+    browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
+    workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
+    modelOptions: { fetch: async (url, init) => {
+      modelRequests.push(JSON.parse(String(init?.body)))
+      return globalThis.fetch(url, init)
+    } },
+  })
+  try {
+    await mkdir(cwd)
+    const observed = observe(page)
+    await authorize(page, (await server.start()).authUrl)
+    await ready(page, observed)
+    await addWorkspace(page)
+    await saveKey(page, await readLiveKey(keyFile!))
+    const messages = page.getByRole('region', { name: '消息列表' })
+    for (const name of ['青禾', '白榆']) {
+      await writeFile(join(cwd, 'note.txt'), `项目名称：${name}\n`)
+      const before = modelRequests.length
+      const result = await complete(page, observed, '请现在用 read 读取工作区的 note.txt，最后只回答文件里当前写的项目名称。每次重新读文件。')
+      expect(textOf(result.message)).toContain(name)
+      expect(modelRequests).toHaveLength(before + 2)
+      expect(modelRequests[before]?.tools).toHaveLength(8)
+      const followup = modelRequests[before + 1]!
+      expect(followup.tools).toBeUndefined()
+      const call = followup.messages.at(-2)?.tool_calls?.[0]
+      expect(call?.id).toBeTruthy()
+      expect(followup.messages.at(-1)).toMatchObject({
+        role: 'tool', tool_call_id: call?.id, content: expect.stringContaining(`项目名称：${name}`),
+      })
+      const lastProcess = messages.getByText('执行过程', { exact: true }).last()
+      await lastProcess.click()
+      const tool = messages.getByText(/读取.*note\.txt/).last()
+      await expect(tool).toBeVisible()
+      await tool.click()
+      await expect(messages.getByText(`项目名称：${name}`, { exact: true }).last()).toBeVisible()
+      await expect(messages.getByRole('listitem').last()).toContainText(name)
+    }
+  } finally {
+    await Promise.allSettled([context.clearCookies(), server.close()])
+    await rm(temporary, { recursive: true, force: true })
+  }
+})

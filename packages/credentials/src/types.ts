@@ -5,7 +5,6 @@ export type BrowserAuthFile = {
 
 
 export type AuthFile = {
-  deepseek?: { type: 'api_key'; key: string };
   [provider: string]: unknown;
 };
 

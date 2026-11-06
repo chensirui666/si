@@ -24,9 +24,9 @@ npm --prefix packages/credentials test
 
 `new Credentials(filename?: string)` 默认使用 `~/.agent-learning/auth.json`，可选路径仅供可信后端和临时目录测试注入。网页不能提供文件路径。公开实例接口：
 
-- `readStatus()` 返回 `missing`、`configured` 或带脱敏原因的 `error`，不会返回 Key。
-- `readApiKey()` 每次重读并校验文件，只向后端提供当前 Key；缺失、损坏或不安全权限时抛错，不回退旧缓存。
-- `saveApiKey(key)` 保存或替换 DeepSeek Key，`deleteApiKey()` 仅删除 DeepSeek 条目，均在锁内重读并保留其他顶层条目。
+- `readStatus(providerId)` 返回 `missing`、`configured` 或带脱敏原因的 `error`，不会返回 Key。
+- `readApiKey(providerId)` 每次重读并校验文件，只向后端提供当前 Key；缺失、损坏或不安全权限时抛错，不回退旧缓存。
+- `saveApiKey(providerId, key)` 保存或替换指定厂商的 Key，`deleteApiKey(providerId)` 仅删除指定厂商的条目，均在锁内重读并保留其他顶层条目。
 - `watch(onChange)` 使用 chokidar 监听目标文件，返回停止函数。覆盖外部新增、原子替换、删除、损坏、修复及文件/目录权限变化；就绪后补查一次，关闭后不再回调。
 
 文件使用 Pi 的提供方 JSON：`{"deepseek":{"type":"api_key","key":"仅作示例"}}`。Key 仅检查非空且能够用作认证头，不猜测前缀或长度；保存成功只表示本地落盘，不验证服务商账号或 Key 有效性。只有此 JSON 提供模型 Key，不读取环境变量、命令或其他凭据来源。删除后后续读取立即失效。

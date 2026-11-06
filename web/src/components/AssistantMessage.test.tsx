@@ -8,25 +8,25 @@ import { IncrementalMarkdownParser, parseMarkdown } from './markdown/incremental
 const message: Message = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'pending', content: [{ type: 'thinking', thinking: '想一想' }, { type: 'text', text: '**答案**' }, { type: 'toolCall', id: 'tool', name: 'search', arguments: {}, argumentsError: '无效 JSON: {' }] }
 
 describe('回复内容', () => {
-  it('thinking 默认收起，展开在流更新和终值校准后保持，工具错误仅展示', () => {
-    const view = render(<AssistantMessage message={message} activeContent={[{ messageId: 'answer', contentIndex: 0, type: 'thinking' }]} />)
-    const details = screen.getByText('思考中').closest('details')!
+  it('思考展开状态跨流更新保留，参数错误在工具块里显示', () => {
+    const running = { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model' } as const
+    const view = render(<AssistantMessage messages={[{ id: 'answer', message }]} running={running} activeContent={[{ messageId: 'answer', contentIndex: 0, type: 'thinking' }]} />)
+    const details = screen.getByText(/思考中 · 想一想/).closest('details')!
     expect(details).not.toHaveAttribute('open')
-    fireEvent.click(screen.getByText('思考中'))
-    view.rerender(<AssistantMessage message={{ ...message, stopReason: 'toolUse', content: [{ type: 'thinking', thinking: '完整思考' }, ...message.content.slice(1)] }} />)
-    expect(screen.getByText('思考过程').closest('details')).toHaveAttribute('open')
+    fireEvent.click(screen.getByText(/思考中 · 想一想/))
+    view.rerender(<AssistantMessage messages={[{ id: 'answer', message: { ...message, stopReason: 'toolUse', content: [{ type: 'thinking', thinking: '完整思考' }, ...message.content.slice(1)] } }]} running={running} />)
+    expect(screen.getByText(/思考 · 完整思考/).closest('details')).toHaveAttribute('open')
     expect(screen.getByText('答案').tagName).toBe('STRONG')
-    expect(screen.getByText('search')).toBeInTheDocument()
-    expect(screen.getByText('无效 JSON: {')).toBeInTheDocument()
-    expect(screen.getByText('模型请求了工具调用，本阶段不执行工具')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('search'))
+    expect(screen.getByText('无效 JSON: {')).toBeVisible()
   })
   it.each([['length', '达到长度限制，回答可能不完整'], ['aborted', '回答已中止'], ['error', '网络中断']] as const)('明确展示 %s 终止原因并保留部分正文', (stopReason, text) => {
-    render(<AssistantMessage message={{ ...message, stopReason, errorMessage: stopReason === 'error' ? '网络中断' : undefined }} />)
+    render(<AssistantMessage messages={[{ id: 'answer', message: { ...message, stopReason, errorMessage: stopReason === 'error' ? '网络中断' : undefined } }]} />)
     expect(screen.getByText(text)).toBeVisible()
     expect(screen.getByText('答案')).toBeVisible()
   })
   it('空内容块不伪造回答或思考折叠区域', () => {
-    const view = render(<AssistantMessage message={{ ...message, content: [{ type: 'thinking', thinking: '' }, { type: 'text', text: '' }] }} />)
+    const view = render(<AssistantMessage messages={[{ id: 'answer', message: { ...message, content: [{ type: 'thinking', thinking: '' }, { type: 'text', text: '' }] } }]} />)
     expect(view.container.textContent).toBe('')
     expect(view.container.querySelector('details')).toBeNull()
   })

@@ -233,25 +233,25 @@ describe('model credentials', () => {
   });
 
   it('starts missing without creating files, and saves, replaces, rereads and deletes the current Key', async () => {
-    expect(await credentials.readStatus()).toEqual({ state: 'missing' });
-    await expect(credentials.readApiKey()).rejects.toThrow(/not configured/i);
+    expect(await credentials.readStatus('deepseek')).toEqual({ state: 'missing' });
+    await expect(credentials.readApiKey('deepseek')).rejects.toThrow(/not configured/i);
     await expect(fs.stat(filename)).rejects.toMatchObject({ code: 'ENOENT' });
-    await credentials.saveApiKey('first-test-key');
+    await credentials.saveApiKey('deepseek', 'first-test-key');
     expect((await fs.stat(dirname(filename))).mode & 0o777).toBe(0o700);
     expect((await fs.stat(filename)).mode & 0o777).toBe(0o600);
-    expect(await credentials.readStatus()).toEqual({ state: 'configured' });
-    expect(await credentials.readApiKey()).toBe('first-test-key');
-    await credentials.saveApiKey('replacement-test-key');
-    expect(await new Credentials(filename).readApiKey()).toBe('replacement-test-key');
-    await credentials.deleteApiKey();
-    expect(await credentials.readStatus()).toEqual({ state: 'missing' });
-    await expect(credentials.readApiKey()).rejects.toThrow(/not configured/i);
+    expect(await credentials.readStatus('deepseek')).toEqual({ state: 'configured' });
+    expect(await credentials.readApiKey('deepseek')).toBe('first-test-key');
+    await credentials.saveApiKey('deepseek', 'replacement-test-key');
+    expect(await new Credentials(filename).readApiKey('deepseek')).toBe('replacement-test-key');
+    await credentials.deleteApiKey('deepseek');
+    expect(await credentials.readStatus('deepseek')).toEqual({ state: 'missing' });
+    await expect(credentials.readApiKey('deepseek')).rejects.toThrow(/not configured/i);
     expect(await fs.readdir(dirname(filename))).toEqual(['auth.json']);
   });
 
   it.each(['', '   ', 'bad\nkey', 'bad\rkey', 'bad\0key', '模型密钥'])('rejects invalid Key %j without creating a file', async key => {
-    await expect(credentials.saveApiKey(key)).rejects.toThrow(/key/i);
-    expect(await credentials.readStatus()).toEqual({ state: 'missing' });
+    await expect(credentials.saveApiKey('deepseek', key)).rejects.toThrow(/key/i);
+    expect(await credentials.readStatus('deepseek')).toEqual({ state: 'missing' });
     await expect(fs.stat(filename)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -266,12 +266,12 @@ describe('model credentials', () => {
     ['invalid header', '{"deepseek":{"type":"api_key","key":"bad\\nkey"}}'],
   ])('reports %s without exposing or overwriting the file', async (_name, text) => {
     await existing(text);
-    const status = await credentials.readStatus();
+    const status = await credentials.readStatus('deepseek');
     expect(status.state).toBe('error');
     expect(JSON.stringify(status)).not.toContain('secret-do-not-print');
-    await expect(credentials.readApiKey()).rejects.toThrow();
-    await expect(credentials.saveApiKey('new-key')).rejects.toThrow();
-    await expect(credentials.deleteApiKey()).rejects.toThrow();
+    await expect(credentials.readApiKey('deepseek')).rejects.toThrow();
+    await expect(credentials.saveApiKey('deepseek', 'new-key')).rejects.toThrow();
+    await expect(credentials.deleteApiKey('deepseek')).rejects.toThrow();
     expect(await fs.readFile(filename, 'utf8')).toBe(text);
     expect(await fs.readdir(dirname(filename))).toEqual(['auth.json']);
   });
@@ -280,16 +280,16 @@ describe('model credentials', () => {
     await existing('{"other":{"type":"api_key","key":"unrelated-key"}}');
     const lock = `${filename}.lock`;
     await fs.writeFile(lock, 'holder\n', { mode: 0o600 });
-    const saving = credentials.saveApiKey('new-key');
+    const saving = credentials.saveApiKey('deepseek', 'new-key');
     await new Promise(resolve => setTimeout(resolve, 60));
     await fs.writeFile(filename, '{"other":{"type":"api_key","key":"updated-by-lock-holder"}}');
     await fs.rm(lock);
     await saving;
-    await Promise.all(Array.from({ length: 8 }, (_, index) => credentials.saveApiKey(`key-${index}`)));
+    await Promise.all(Array.from({ length: 8 }, (_, index) => credentials.saveApiKey('deepseek', `key-${index}`)));
     const saved = JSON.parse(await fs.readFile(filename, 'utf8'));
     expect(saved.other).toEqual({ type: 'api_key', key: 'updated-by-lock-holder' });
     expect(saved.deepseek.key).toMatch(/^key-[0-7]$/);
-    await credentials.deleteApiKey();
+    await credentials.deleteApiKey('deepseek');
     expect(JSON.parse(await fs.readFile(filename, 'utf8'))).toEqual({ other: { type: 'api_key', key: 'updated-by-lock-holder' } });
     expect(await fs.readdir(dirname(filename))).toEqual(['auth.json']);
   });
@@ -303,7 +303,7 @@ describe('model credentials', () => {
         return next(specifier.startsWith('.') && specifier.endsWith('.js') && !context.parentURL?.includes('/node_modules/') ? specifier.slice(0, -3) + '.ts' : specifier, context);
       }});
       const { Credentials } = await import(${JSON.stringify(source)});
-      await new Credentials(process.argv[1]).saveApiKey(process.argv[2]);
+      await new Credentials(process.argv[1]).saveApiKey('deepseek', process.argv[2]);
     `;
     await Promise.all(Array.from({ length: 4 }, (_, index) => exec(process.execPath, ['--input-type=module', '-e', program, filename, `process-${index}`])));
     const saved = JSON.parse(await fs.readFile(filename, 'utf8'));
@@ -315,51 +315,51 @@ describe('model credentials', () => {
   it.each([0o644, 0o660, 0o200])('rejects unsafe file permissions %i without changing them', async mode => {
     await existing('{"deepseek":{"type":"api_key","key":"private-key"}}');
     await fs.chmod(filename, mode);
-    expect(await credentials.readStatus()).toMatchObject({ state: 'error' });
-    await expect(credentials.saveApiKey('new-key')).rejects.toThrow(/permission/i);
-    await expect(credentials.deleteApiKey()).rejects.toThrow(/permission/i);
+    expect(await credentials.readStatus('deepseek')).toMatchObject({ state: 'error' });
+    await expect(credentials.saveApiKey('deepseek', 'new-key')).rejects.toThrow(/permission/i);
+    await expect(credentials.deleteApiKey('deepseek')).rejects.toThrow(/permission/i);
     expect((await fs.stat(filename)).mode & 0o777).toBe(mode);
   });
 
   it('rejects unsafe directories and symbolic links for both reads and writes', async () => {
     await existing('{}');
     await fs.chmod(dirname(filename), 0o755);
-    expect(await credentials.readStatus()).toMatchObject({ state: 'error' });
-    await expect(credentials.saveApiKey('new-key')).rejects.toThrow(/permission/i);
+    expect(await credentials.readStatus('deepseek')).toMatchObject({ state: 'error' });
+    await expect(credentials.saveApiKey('deepseek', 'new-key')).rejects.toThrow(/permission/i);
     await fs.chmod(dirname(filename), 0o700);
     await fs.rename(filename, join(scratch, 'referent.json'));
     await fs.symlink(join(scratch, 'referent.json'), filename);
-    expect(await credentials.readStatus()).toMatchObject({ state: 'error' });
-    await expect(credentials.saveApiKey('new-key')).rejects.toThrow(/regular file/i);
+    expect(await credentials.readStatus('deepseek')).toMatchObject({ state: 'error' });
+    await expect(credentials.saveApiKey('deepseek', 'new-key')).rejects.toThrow(/regular file/i);
     expect(await fs.readFile(join(scratch, 'referent.json'), 'utf8')).toBe('{}');
   });
 
   it('reports filesystem failures without exposing the cause and preserves existing data', async () => {
-    await credentials.saveApiKey('private-key');
+    await credentials.saveApiKey('deepseek', 'private-key');
     const text = await fs.readFile(filename, 'utf8');
     vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('private-key'));
-    const failure = await credentials.saveApiKey('replacement').then(() => undefined, error => error);
+    const failure = await credentials.saveApiKey('deepseek', 'replacement').then(() => undefined, error => error);
     expect(String(failure)).toMatch(/write/i);
     expect(String(failure)).not.toContain('private-key');
     expect(await fs.readFile(filename, 'utf8')).toBe(text);
     expect(await fs.readdir(dirname(filename))).toEqual(['auth.json']);
     vi.spyOn(fs, 'open').mockRejectedValueOnce(new Error('private-key'));
-    const status = await credentials.readStatus();
+    const status = await credentials.readStatus('deepseek');
     expect(status).toMatchObject({ state: 'error' });
     expect(JSON.stringify(status)).not.toContain('private-key');
   });
 
   it('does not return the previous Key after external corruption, removal or replacement', async () => {
-    await credentials.saveApiKey('old-key');
-    expect(await credentials.readApiKey()).toBe('old-key');
+    await credentials.saveApiKey('deepseek', 'old-key');
+    expect(await credentials.readApiKey('deepseek')).toBe('old-key');
     await fs.writeFile(filename, '{');
-    expect(await credentials.readStatus()).toMatchObject({ state: 'error' });
-    await expect(credentials.readApiKey()).rejects.toThrow();
+    expect(await credentials.readStatus('deepseek')).toMatchObject({ state: 'error' });
+    await expect(credentials.readApiKey('deepseek')).rejects.toThrow();
     await fs.rm(filename);
-    expect(await credentials.readStatus()).toEqual({ state: 'missing' });
-    await expect(credentials.readApiKey()).rejects.toThrow(/not configured/i);
+    expect(await credentials.readStatus('deepseek')).toEqual({ state: 'missing' });
+    await expect(credentials.readApiKey('deepseek')).rejects.toThrow(/not configured/i);
     await fs.writeFile(filename, '{"deepseek":{"type":"api_key","key":"external-key"}}', { mode: 0o600 });
-    expect(await credentials.readApiKey()).toBe('external-key');
+    expect(await credentials.readApiKey('deepseek')).toBe('external-key');
   });
 
   it('watches external creation, atomic replacement, permissions, invalid JSON, repair and deletion, then stops', async () => {
@@ -371,7 +371,7 @@ describe('model credentials', () => {
         const before = changes;
         await operation();
         await vi.waitFor(() => expect(changes).toBeGreaterThan(before), { timeout: 3_000 });
-        expect(await credentials.readStatus()).toMatchObject({ state });
+        expect(await credentials.readStatus('deepseek')).toMatchObject({ state });
       }
       await changed(async () => {
         await fs.mkdir(dirname(filename), { mode: 0o700 });
@@ -382,7 +382,7 @@ describe('model credentials', () => {
         await fs.writeFile(temporary, '{"deepseek":{"type":"api_key","key":"replaced-key"}}', { mode: 0o600 });
         await fs.rename(temporary, filename);
       }, 'configured');
-      expect(await credentials.readApiKey()).toBe('replaced-key');
+      expect(await credentials.readApiKey('deepseek')).toBe('replaced-key');
       await changed(() => fs.chmod(dirname(filename), 0o755), 'error');
       await changed(() => fs.chmod(dirname(filename), 0o700), 'configured');
       await changed(() => fs.chmod(filename, 0o644), 'error');
@@ -399,4 +399,22 @@ describe('model credentials', () => {
       stop();
     }
   });
+});
+
+it('updates providers independently, including concurrent writes and a damaged unrelated entry', async () => {
+  const credentials = new Credentials(filename);
+  await Promise.all([
+    credentials.saveApiKey('deepseek', 'model-test-key'),
+    credentials.saveApiKey('tavily', 'web-test-key'),
+  ]);
+  expect(await credentials.readApiKey('deepseek')).toBe('model-test-key');
+  expect(await credentials.readApiKey('tavily')).toBe('web-test-key');
+  await credentials.deleteApiKey('tavily');
+  expect(await credentials.readStatus('tavily')).toEqual({ state: 'missing' });
+  expect(await credentials.readStatus('deepseek')).toEqual({ state: 'configured' });
+  const invalid = JSON.stringify({ deepseek: { type: 'api_key', key: 'model-test-key' }, tavily: { key: 42 } });
+  await fs.writeFile(filename, invalid);
+  await expect(credentials.saveApiKey('tavily', 'replacement')).rejects.toThrow();
+  expect(await fs.readFile(filename, 'utf8')).toBe(invalid);
+  expect(await credentials.readApiKey('deepseek')).toBe('model-test-key');
 });

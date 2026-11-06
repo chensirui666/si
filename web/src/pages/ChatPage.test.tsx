@@ -5,6 +5,8 @@ import type { ChatState, Subscribe } from '../chat/state'
 import { ChatPage } from './ChatPage'
 import * as client from '../chat/client'
 
+const getEmptyWorkspaces = async () => ({ workspaces: [], boundWorkspaceId: null })
+const getConfiguredWorkspaces = async () => ({ workspaces: [{ id: 'workspace-1', path: '/tmp/workspace', name: 'workspace', available: true }], boundWorkspaceId: 'workspace-1' })
 const empty = { seq: 0, messages: [], running: null, activeContent: [] }
 
 function controlled() {
@@ -17,7 +19,7 @@ function controlled() {
 describe('ChatPage', () => {
   it('StrictMode 清理订阅，快照仅展示已有用户文字，所有连接状态均不能提交', () => {
     const source = controlled()
-    const view = render(<StrictMode><ChatPage subscribe={source.subscribe} /></StrictMode>)
+    const view = render(<StrictMode><ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} /></StrictMode>)
     expect(source.cleanup).toHaveBeenCalledTimes(1)
     source.emit({ connection: 'ready', slow: false, error: null, snapshot: {
       ...empty,
@@ -36,7 +38,7 @@ describe('ChatPage', () => {
 
   it('连接切换、慢提示与异常保留草稿和焦点；空快照没有演示消息', async () => {
     const source = controlled()
-    render(<ChatPage subscribe={source.subscribe} />)
+    render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} />)
     const textbox = screen.getByRole('textbox', { name: '消息' })
     await act(async () => {
       textbox.focus()
@@ -64,7 +66,7 @@ it('查询模型并响应配置通知与重连，旧查询不能覆盖新配置�
   let resolveOld: (value: typeof configured) => void = () => {}
   const getModels = vi.fn().mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
     .mockResolvedValueOnce(missing).mockResolvedValue(configured)
-  render(<ChatPage subscribe={subscribe} getModels={getModels} />)
+  render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={subscribe} getModels={getModels} />)
   await act(async () => { changed() })
   expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('无可用模型')
   await act(async () => { resolveOld(configured) })
@@ -79,7 +81,7 @@ it('区分查询网络失败和本地配置错误，错误时仍可打开设置'
   const getModels = vi.fn().mockRejectedValueOnce(new Error('网络请求失败，请检查连接后重试'))
     .mockResolvedValue({ models: [], deepseek: { state: 'error', message: '模型文件格式错误' } })
   const source = controlled()
-  render(<ChatPage subscribe={source.subscribe} getModels={getModels} />)
+  render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
   expect(await screen.findByText('网络请求失败，请检查连接后重试')).toBeVisible()
   source.emit({ connection: 'disconnected', snapshot: empty, slow: false, error: null })
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
@@ -95,7 +97,7 @@ it('晚到的配置保存结果后重新查询当前文件，避免恢复旧模�
   const getModels = vi.fn().mockResolvedValue(missing)
   const source = controlled()
   try {
-    render(<ChatPage subscribe={source.subscribe} getModels={getModels} />)
+    render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
     await screen.findByRole('option', { name: '无可用模型' })
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
     fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
@@ -115,7 +117,7 @@ it('初始模型查询尚未完成时保存失败，仍接收查询结果且关�
   const save = vi.spyOn(client, 'saveApiKey').mockRejectedValue(new Error('无法写入模型凭据文件'))
   const source = controlled()
   try {
-    render(<ChatPage subscribe={source.subscribe} getModels={getModels} />)
+    render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
     expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('正在查询模型…')
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
     fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
@@ -140,7 +142,7 @@ it('有效发送立即清空，HTTP 回执等待 WS；渲染前双手势只提�
   const source = controlled()
   let resolve: (value: {clientMessageId: string; userMessageId: string; acceptedSeq: number}) => void = () => {}
   const submitMessage = vi.fn().mockImplementation(() => new Promise(next => { resolve = next }))
-  render(<ChatPage subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
   const editor = await pasteDraft('  原文\n')
   act(() => { fireEvent.keyDown(editor, { key: 'Enter' }); fireEvent.click(screen.getByRole('button', { name: '发送' })) })
@@ -152,7 +154,7 @@ it('有效发送立即清空，HTTP 回执等待 WS；渲染前双手势只提�
   await pasteDraft('新草稿')
   await act(async () => { resolve({ clientMessageId: input.clientMessageId, userMessageId: 'user', acceptedSeq: 1 }) })
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
-  source.emit({ connection: 'ready', snapshot: { ...empty, seq: 1, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer' } }, slow: false, error: null })
+  source.emit({ connection: 'ready', snapshot: { ...empty, seq: 1, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model' } }, slow: false, error: null })
   expect(screen.getAllByRole('listitem')).toHaveLength(1)
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
   expect(editor.textContent).toBe('新草稿')
@@ -164,7 +166,7 @@ it('WS 先确认后迟到 HTTP 错误不降级，也不覆盖新草稿', async (
   const source = controlled()
   let reject: (error: Error) => void = () => {}
   const submitMessage = vi.fn().mockImplementation(() => new Promise((_, next) => { reject = next }))
-  render(<ChatPage subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
   const editor = await pasteDraft('已发送')
   fireEvent.keyDown(editor, { key: 'Enter' })
@@ -185,7 +187,7 @@ it('十秒无接收证据显示未确认并重取快照，空快照不会开放�
   Object.assign(source.cleanup, { requestSnapshot })
   const submitMessage = vi.fn(() => new Promise<never>(() => {}))
   try {
-    render(<ChatPage subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+    render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
     await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
     const editor = await pasteDraft('未知接收状态')
     fireEvent.keyDown(editor, { key: 'Enter' })
@@ -203,15 +205,14 @@ it('十秒无接收证据显示未确认并重取快照，空快照不会开放�
 it('明确拒绝可编辑下一条，同步抛错保留当前草稿', async () => {
   const source = controlled()
   const submitMessage = vi.fn().mockRejectedValueOnce(Object.assign(new Error('正在生成'), { status: 409 })).mockImplementationOnce(() => { throw new Error('同步拒绝') })
-  render(<ChatPage subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
   const editor = await pasteDraft('被拒绝')
   await act(async () => { fireEvent.keyDown(editor, { key: 'Enter' }) })
   expect(screen.getByText('发送失败')).toBeVisible()
-  expect(editor.textContent).toBe('')
-  await pasteDraft('保留草稿')
+  expect(editor.textContent).toBe('被拒绝')
   fireEvent.keyDown(editor, { key: 'Enter' })
-  expect(editor.textContent).toBe('保留草稿')
+  expect(editor.textContent).toBe('被拒绝')
 })
 
 it('有模型时仍逐项检查连接、快照、运行与模型门禁，切换后保留原草稿', async () => {
@@ -220,7 +221,7 @@ it('有模型时仍逐项检查连接、快照、运行与模型门禁，切换�
   let changed = () => {}
   const subscribe: Subscribe = (next, onModelsChanged) => { changed = onModelsChanged!; return source.subscribe(next) }
   const getModels = vi.fn().mockResolvedValue(configured)
-  render(<ChatPage subscribe={subscribe} getModels={getModels} submitMessage={submitMessage} />)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={subscribe} getModels={getModels} submitMessage={submitMessage} />)
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
   const editor = await pasteDraft('全部门禁')
   expect(screen.getByRole('button', { name: '发送' })).toBeEnabled()
@@ -234,7 +235,7 @@ it('有模型时仍逐项检查连接、快照、运行与模型门禁，切换�
   source.emit({ connection: 'ready', snapshot: null, slow: false, error: null })
   fireEvent.keyDown(editor, { key: 'Enter' })
   expect(submitMessage).not.toHaveBeenCalled()
-  source.emit({ connection: 'ready', snapshot: { ...empty, running: { userMessageId: 'other-user', assistantMessageId: 'other-answer' } }, slow: false, error: null })
+  source.emit({ connection: 'ready', snapshot: { ...empty, running: { userMessageId: 'other-user', assistantMessageId: 'other-answer', phase: 'model' } }, slow: false, error: null })
   fireEvent.keyDown(editor, { key: 'Enter' })
   expect(submitMessage).not.toHaveBeenCalled()
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
@@ -255,7 +256,7 @@ it('网络失败立即标记未确认并重取快照，后续 WS 正式 user 仍
   const requestSnapshot = vi.fn()
   Object.assign(source.cleanup, { requestSnapshot })
   const submitMessage = vi.fn().mockRejectedValue(new Error('网络请求失败，未确认接收'))
-  render(<ChatPage subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
   const editor = await pasteDraft('未知提交')
   await act(async () => { fireEvent.keyDown(editor, { key: 'Enter' }) })
@@ -268,30 +269,31 @@ it('网络失败立即标记未确认并重取快照，后续 WS 正式 user 仍
   expect(screen.queryByText('未确认接收', { exact: true })).not.toBeInTheDocument()
 })
 
-it.each([413, 415])('HTTP %s 明确拒绝后允许新消息，原文仅留失败气泡不恢复草稿', async status => {
+it.each([413, 415])('HTTP %s 明确拒绝后恢复原稿并允许编辑发送', async status => {
   const source = controlled()
   const submitMessage = vi.fn().mockRejectedValue(Object.assign(new Error('提交被拒绝'), { status }))
-  render(<ChatPage subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
   const editor = await pasteDraft('消息原文')
   await act(async () => { fireEvent.keyDown(editor, { key: 'Enter' }) })
   expect(screen.getByText('发送失败', { exact: true })).toBeVisible()
   expect(screen.queryByText('未确认接收', { exact: true })).not.toBeInTheDocument()
-  expect(editor.textContent).toBe('')
-  await pasteDraft('新的消息')
+  expect(editor.textContent).toBe('消息原文')
   expect(screen.getByRole('button', { name: '发送' })).toBeEnabled()
 })
 
 it.each([false, true])('失败 A 后成功 B 保持创建顺序，已有正式历史：%s', async withHistory => {
   const source = controlled()
-  const submitMessage = vi.fn().mockRejectedValueOnce(Object.assign(new Error('输入无效'), { status: 400 })).mockImplementationOnce(() => new Promise<never>(() => {}))
+  let reject: (error: Error) => void = () => {}
+  const submitMessage = vi.fn().mockImplementationOnce(() => new Promise((_, fail) => { reject = fail })).mockImplementationOnce(() => new Promise<never>(() => {}))
   const history = withHistory ? [{ id: 'history', message: { role: 'user' as const, content: '历史 F', timestamp: 1 } }] : []
-  render(<ChatPage subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
   await act(async () => { source.emit({ connection: 'ready', snapshot: { ...empty, messages: history }, slow: false, error: null }) })
   const editor = await pasteDraft('失败 A')
-  await act(async () => { fireEvent.keyDown(editor, { key: 'Enter' }) })
-  expect(screen.getByText('发送失败', { exact: true })).toBeVisible()
+  fireEvent.keyDown(editor, { key: 'Enter' })
   await pasteDraft('成功 B')
+  await act(async () => { reject(Object.assign(new Error('输入无效'), { status: 400 })) })
+  expect(screen.getByText('发送失败', { exact: true })).toBeVisible()
   fireEvent.keyDown(editor, { key: 'Enter' })
   const second = submitMessage.mock.calls[1][0]
   source.emit({ connection: 'ready', slow: false, error: null, snapshot: { ...empty, seq: 3, messages: [...history,

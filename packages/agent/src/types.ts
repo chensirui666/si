@@ -1,14 +1,26 @@
-import type { AssistantMessage, ModelMessage, ToolCall } from '@agent-learning/model'
+import type { AssistantMessage, JsonObject, ModelMessage, Tool, ToolCall } from '@agent-learning/model'
+
+export type ExecutableTool = Tool & {
+  execute(arguments_: JsonObject, context: { cwd: string; signal: AbortSignal }): Promise<string>
+}
+
+type ToolLocation = {
+  assistantMessageId: string
+  contentIndex: number
+}
 
 export type ConversationMessage = {
   id: string
   clientMessageId?: string
+  toolCall?: ToolLocation
   message: ModelMessage
 }
 
 export type RunningState = null | {
   userMessageId: string
   assistantMessageId: string
+  phase: 'model' | 'tools' | 'answer'
+  activeTool?: ToolLocation
 }
 
 export type ConversationSnapshot = {
@@ -23,6 +35,7 @@ export type ConversationUpdate = {
   change:
     | { type: 'accepted'; user: ConversationMessage; running: Exclude<RunningState, null> }
     | { type: 'model'; messageId: string; event: ModelFrame }
+    | { type: 'task'; running: RunningState; message?: ConversationMessage }
 }
 
 export type ActiveContent = {

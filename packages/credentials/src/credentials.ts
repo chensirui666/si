@@ -62,15 +62,19 @@ function parseAuthFile(contents: string | undefined): AuthFile {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error('Model credential file must contain an object.');
   }
-  if (Object.hasOwn(value, 'deepseek')) {
-    const entry = (value as Record<string, unknown>).deepseek;
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)
-      || !('type' in entry) || entry.type !== 'api_key' || !('key' in entry)) {
-      throw new Error('DeepSeek credentials must contain an API Key.');
-    }
-    validateApiKey(entry.key);
-  }
   return value as AuthFile;
+}
+
+function providerEntry(file: AuthFile, providerId: string): { type: 'api_key'; key: string } | undefined {
+  if (!/^[a-z][a-z0-9-]*$/.test(providerId)) throw new Error('Invalid credential provider.');
+  if (!Object.hasOwn(file, providerId)) return undefined;
+  const entry = file[providerId];
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)
+    || !('type' in entry) || entry.type !== 'api_key' || !('key' in entry)) {
+    throw new Error('Provider credentials must contain an API Key.');
+  }
+  validateApiKey(entry.key);
+  return { type: 'api_key', key: entry.key };
 }
 
 export class Credentials {
@@ -84,35 +88,35 @@ export class Credentials {
     return parseAuthFile(await readCredentialFile(this.filename));
   }
 
-  async readStatus(): Promise<CredentialStatus> {
+  async readStatus(providerId: string): Promise<CredentialStatus> {
     try {
-      const file = await this.read();
-      return { state: file.deepseek === undefined ? 'missing' : 'configured' };
+      return { state: providerEntry(await this.read(), providerId) ? 'configured' : 'missing' };
     } catch (error) {
       return { state: 'error', message: (error as Error).message };
     }
   }
 
-  async readApiKey(): Promise<string> {
-    const file = await this.read();
-    if (file.deepseek === undefined) throw new Error('DeepSeek API Key is not configured.');
-    return file.deepseek.key;
+  async readApiKey(providerId: string): Promise<string> {
+    const entry = providerEntry(await this.read(), providerId);
+    if (!entry) throw new Error(`${providerId} API Key is not configured.`);
+    return entry.key;
   }
 
-  async saveApiKey(key: string): Promise<void> {
+  async saveApiKey(providerId: string, key: string): Promise<void> {
     validateApiKey(key);
     await withCredentialFileLock(this.filename, async () => {
       const file = await this.read();
-      file.deepseek = { type: 'api_key', key };
+      providerEntry(file, providerId);
+      file[providerId] = { type: 'api_key', key };
       await writeCredentialFile(this.filename, `${JSON.stringify(file, null, 2)}\n`);
     });
   }
 
-  async deleteApiKey(): Promise<void> {
+  async deleteApiKey(providerId: string): Promise<void> {
     await withCredentialFileLock(this.filename, async () => {
       const file = await this.read();
-      if (file.deepseek === undefined) return;
-      delete file.deepseek;
+      if (!providerEntry(file, providerId)) return;
+      delete file[providerId];
       await writeCredentialFile(this.filename, `${JSON.stringify(file, null, 2)}\n`);
     });
   }

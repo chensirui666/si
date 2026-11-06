@@ -21,7 +21,7 @@ export function findModel(modelId: string): ModelInfo | undefined {
 export async function discoverModels(
   credentials: Pick<Credentials, 'readStatus'> = new Credentials(),
 ): Promise<ModelDiscovery> {
-  const status = await credentials.readStatus()
+  const status = await credentials.readStatus('deepseek')
   return { models: status.state === 'configured' ? [{ ...deepseek }] : [], deepseek: status }
 }
 
@@ -40,12 +40,12 @@ function convertMessages(context: ModelContext): OpenAI.Chat.Completions.ChatCom
       if (!text && !tools.length) continue
       const assistant: OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam & { reasoning_content?: string } = {
         role: 'assistant', content: text || null,
+        reasoning_content: message.content.filter((block) => block.type === 'thinking').map((block) => block.thinking).join(''),
       }
       if (tools.length) {
         assistant.tool_calls = tools.map((tool) => ({
           id: tool.id, type: 'function', function: { name: tool.name, arguments: JSON.stringify(tool.arguments) },
         }))
-        assistant.reasoning_content = message.content.filter((block) => block.type === 'thinking').map((block) => block.thinking).join('')
       }
       messages.push(assistant)
     }
@@ -65,7 +65,7 @@ function safeError(error: unknown): string {
   return '模型请求或响应读取失败，请检查配置与网络。'
 }
 
-type ToolState = { block: ToolCall; contentIndex: number; argumentsText: string }
+type ToolState = { block: ToolCall; contentIndex: number; argumentsText: string; index?: number }
 
 export function createModelStream(
   credentials: Pick<Credentials, 'readApiKey'>,
@@ -125,7 +125,7 @@ export function createModelStream(
           throw new ModelFailure('不支持所选模型。')
         }
         resetTimeout()
-        const apiKey = await Promise.race([credentials.readApiKey(), interrupted])
+        const apiKey = await Promise.race([credentials.readApiKey('deepseek'), interrupted])
         if (interruption) throw new ModelFailure('本次模型调用已取消。')
         const client = new OpenAI({
           apiKey, baseURL: configuration.baseURL ?? 'https://api.deepseek.com', fetch: configuration.fetch,
@@ -208,15 +208,22 @@ export function createModelStream(
               endCurrentContent()
               const index = typeof call.index === 'number' ? call.index : undefined
               let state = index === undefined ? undefined : toolsByIndex.get(index)
-              if (!state && call.id) state = toolsById.get(call.id)
+              if (!state && call.id) {
+                const byId = toolsById.get(call.id)
+                if (index === undefined || byId?.index === undefined) state = byId
+              }
               if (!state) {
                 const block: ToolCall = { type: 'toolCall', id: call.id ?? '', name: call.function?.name ?? '', arguments: {} }
                 state = { block, contentIndex: output.content.push(block) - 1, argumentsText: '' }
                 toolStates.push(state)
                 events.push({ type: 'toolcall_start', contentIndex: state.contentIndex, partial: output })
               }
-              if (index !== undefined) toolsByIndex.set(index, state)
+              if (index !== undefined) {
+                state.index = index
+                toolsByIndex.set(index, state)
+              }
               if (call.id) {
+                if (state.block.id && state.block.id !== call.id) throw new ModelFailure('模型更改了同一工具调用的编号。')
                 toolsById.set(call.id, state)
                 if (!state.block.id) state.block.id = call.id
               }

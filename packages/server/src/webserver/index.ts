@@ -7,6 +7,13 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { Agent, AgentSubmitError } from '@agent-learning/agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, discoverModels } from '@agent-learning/model'
+import { pickDirectory, type DirectoryPicker } from '../directory-picker.js'
+import { Workspaces, WorkspaceBindingError } from '../workspaces.js'
+import { WebSettings } from '../web-settings.js'
+import { createTavilyProvider, type WebProvider } from '../web-providers.js'
+import { createWebTools } from '../web-tools.js'
+import { createTools } from '../tools.js'
+import { ToolRuntime } from '../tool-runtime.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
 import type { ClientFrame, ServerFrame, SubmitMessageRequest } from './protocol.js'
 
@@ -15,7 +22,11 @@ export type WebServerOptions = {
   webRoot?: string
   browserSecretPath?: string
   modelAuthPath?: string
-  devOrigin?: 'http://127.0.0.1:5173'
+  devOrigin?: `http://127.0.0.1:${number}`
+  workspacePath?: string
+  webSettingsPath?: string
+  directoryPicker?: DirectoryPicker
+  webProviders?: WebProvider[]
   agent?: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'close'>>
   modelOptions?: Parameters<typeof createModelStream>[1]
   now?: () => number
@@ -47,12 +58,13 @@ async function providerKey(req: IncomingMessage): Promise<string> {
 }
 async function messageInput(req: IncomingMessage): Promise<SubmitMessageRequest> {
   const value = await readJson(req)
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 3
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 4
+    || !('workspaceId' in value) || typeof value.workspaceId !== 'string' || !value.workspaceId.trim() || value.workspaceId.length > 128
     || !('text' in value) || typeof value.text !== 'string' || !value.text.trim()
     || !('modelId' in value) || typeof value.modelId !== 'string'
     || !('clientMessageId' in value) || typeof value.clientMessageId !== 'string'
     || !value.clientMessageId.trim() || value.clientMessageId.length > 128) {
-    throw new InputError(400, '请仅提交原文、模型和有效临时编号')
+    throw new InputError(400, '请提交原文、模型、有效临时编号和工作区编号')
   }
   return value as SubmitMessageRequest
 }
@@ -73,11 +85,20 @@ export class WebServer {
   private readonly disposers = new Map<WebSocket, () => void>()
   private closing?: Promise<void>
   private readonly credentials: Credentials
+  private readonly workspaces: Workspaces
+  private readonly webSettings: WebSettings
+  private readonly toolRuntime = new ToolRuntime()
+  private selection?: AbortController
   private stopWatching?: () => void
 
   constructor(private readonly options: WebServerOptions = {}) {
     this.credentials = new Credentials(options.modelAuthPath)
-    this.agent = options.agent ?? new Agent({ stream: createModelStream(this.credentials, options.modelOptions) })
+    this.workspaces = new Workspaces(options.workspacePath)
+    this.webSettings = new WebSettings(options.webProviders ?? [createTavilyProvider(this.credentials)], this.credentials, options.webSettingsPath)
+    this.agent = options.agent ?? new Agent({
+      stream: createModelStream(this.credentials, options.modelOptions),
+      tools: createTools(this.toolRuntime, createWebTools(this.webSettings, this.toolRuntime)),
+    })
   }
   async start(): Promise<{ url: string; authUrl: string; devAuthUrl?: string }> {
     if (this.server) throw new Error('服务已经启动')
@@ -108,7 +129,8 @@ export class WebServer {
       this.origins = new Set([url])
       if (this.options.devOrigin) this.origins.add(this.options.devOrigin)
       this.stopWatching = this.credentials.watch(() => {
-        void discoverModels(this.credentials).then(() => this.notifyModelsChanged()).catch(() => {})
+        this.notify('models_changed')
+        this.notify('web_settings_changed')
       })
       this.heartbeat = setInterval(() => {
         for (const client of ws.clients) {
@@ -149,13 +171,35 @@ export class WebServer {
       this.respond(res, 200, JSON.stringify(await discoverModels(this.credentials)), { 'content-type': 'application/json; charset=utf-8' })
       return
     }
+    if (url.pathname === '/api/workspaces' && req.method === 'GET') {
+      try { this.json(res, 200, await this.workspaces.view()) }
+      catch { this.json(res, 500, { error: '无法读取工作区登记，请检查本机配置文件。' }) }
+      return
+    }
+    if (url.pathname === '/api/workspaces/pick' && req.method === 'POST') {
+      await this.pick(req, res)
+      return
+    }
+    const webProvider = /^\/api\/web\/providers\/([a-z][a-z0-9-]*)$/.exec(url.pathname)?.[1]
+    if ((url.pathname === '/api/web/settings' && (req.method === 'GET' || req.method === 'PUT'))
+      || (webProvider && (req.method === 'PUT' || req.method === 'DELETE'))) {
+      await this.handleWebSettings(req, res, webProvider)
+      return
+    }
     if (url.pathname === '/api/messages' && req.method === 'POST') {
       try {
         const input = await messageInput(req)
         if (!this.agent.submit) throw new InputError(503, '当前生成服务不可用')
-        const accepted = await this.agent.submit(input)
+        const { workspaceId, ...message } = input
+        const cwd = await this.workspaces.resolveBoundDirectory(workspaceId)
+        const accepted = await this.agent.submit({ ...message, cwd })
         this.respond(res, 202, JSON.stringify(accepted), { 'content-type': 'application/json; charset=utf-8' })
       } catch (error) {
+        if (error instanceof WorkspaceBindingError) {
+          this.notify('workspaces_changed')
+          this.json(res, 409, { error: error.message })
+          return
+        }
         const status = error instanceof InputError || error instanceof AgentSubmitError ? error.status : 500
         const message = error instanceof InputError || error instanceof AgentSubmitError ? error.message : '提交暂时不可用'
         this.respond(res, status, JSON.stringify({ error: message }), { 'content-type': 'application/json; charset=utf-8' })
@@ -165,15 +209,11 @@ export class WebServer {
     if (url.pathname === '/api/providers/deepseek' && (req.method === 'PUT' || req.method === 'DELETE')) {
       try {
         if (req.method === 'PUT') {
-          const key = await providerKey(req)
-          if (!key.trim()) throw new InputError(400, 'API Key 须非空且可用于认证头')
-          try { validateHeaderValue('Authorization', `Bearer ${key}`) }
-          catch { throw new InputError(400, 'API Key 须非空且可用于认证头') }
-          await this.credentials.saveApiKey(key)
-        } else await this.credentials.deleteApiKey()
+          await this.credentials.saveApiKey('deepseek', await this.readKey(req))
+        } else await this.credentials.deleteApiKey('deepseek')
         const discovery = await discoverModels(this.credentials)
         this.respond(res, 200, JSON.stringify(discovery), { 'content-type': 'application/json; charset=utf-8' })
-        this.notifyModelsChanged()
+        this.notify('models_changed')
       } catch (error) {
         const status = error instanceof InputError ? error.status : 500
         const message = error instanceof Error ? error.message : '本地凭据更新失败'
@@ -192,13 +232,76 @@ export class WebServer {
       res.end(req.method === 'HEAD' ? undefined : content)
     } catch { this.respond(res, 404, '未找到页面或资源，请先运行 npm run build。') }
   }
+  private json(res: ServerResponse, status: number, payload: unknown) {
+    this.respond(res, status, JSON.stringify(payload), { 'content-type': 'application/json; charset=utf-8' })
+  }
+
+  private async readKey(req: IncomingMessage): Promise<string> {
+    const key = await providerKey(req)
+    if (!key.trim()) throw new InputError(400, 'API Key 须非空且可用于认证头')
+    try { validateHeaderValue('Authorization', `Bearer ${key}`) }
+    catch { throw new InputError(400, 'API Key 须非空且可用于认证头') }
+    return key
+  }
+
+  private async pick(req: IncomingMessage, res: ServerResponse) {
+    if (req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) !== 0) {
+      req.resume()
+      this.json(res, 400, { error: '请选择文件夹，无需提交路径或其他数据。' })
+      return
+    }
+    if (this.selection || this.closing) {
+      this.json(res, 409, { error: '文件夹选择当前不可用，请稍后重试。' })
+      return
+    }
+    const controller = this.selection = new AbortController()
+    const disconnect = () => controller.abort()
+    res.once('close', disconnect)
+    try {
+      const path = await (this.options.directoryPicker ?? pickDirectory)(controller.signal)
+      if (controller.signal.aborted) return
+      if (path === null) this.json(res, 200, { cancelled: true })
+      else {
+        const view = await this.workspaces.register(path)
+        if (!res.destroyed) this.json(res, 200, { cancelled: false, view })
+        this.notify('workspaces_changed')
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) this.json(res, error instanceof WorkspaceBindingError ? 400 : 500,
+        { error: error instanceof WorkspaceBindingError ? error.message : '无法选择或保存工作区，请检查本机选择框及工作区配置。' })
+    } finally {
+      res.off('close', disconnect)
+      this.selection = undefined
+    }
+  }
+
+  private async handleWebSettings(req: IncomingMessage, res: ServerResponse, providerId?: string) {
+    try {
+      if (providerId) {
+        if (!this.webSettings.hasProvider(providerId)) throw new InputError(404, '没有此网页服务商。')
+        if (req.method === 'PUT') await this.credentials.saveApiKey(providerId, await this.readKey(req))
+        else await this.credentials.deleteApiKey(providerId)
+      } else if (req.method === 'PUT') {
+        const selection = await readJson(req)
+        if (!this.webSettings.validSelection(selection)) throw new InputError(400, '请选择支持对应能力的网页服务商。')
+        await this.webSettings.save(selection)
+      }
+      if (req.method !== 'GET') this.notify('web_settings_changed')
+      this.json(res, 200, await this.webSettings.view())
+    } catch (error) {
+      this.json(res, error instanceof InputError ? error.status : 500, {
+        error: error instanceof InputError ? error.message : '无法读取或更新网页工具设置，请检查本机配置文件及权限。',
+      })
+    }
+  }
+
   private readonly missedPongs = new Map<WebSocket, number>()
-  private notifyModelsChanged() {
+  private notify(type: 'models_changed' | 'workspaces_changed' | 'web_settings_changed') {
     for (const client of this.ws?.clients ?? []) {
       if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > 1024 * 1024) {
         this.disposers.get(client)?.(); client.terminate(); continue
       }
-      client.send(JSON.stringify({ type: 'models_changed' } satisfies ServerFrame), error => {
+      client.send(JSON.stringify({ type } satisfies ServerFrame), error => {
         if (error) { this.disposers.get(client)?.(); client.terminate() }
       })
     }
@@ -241,6 +344,7 @@ export class WebServer {
     this.closing = (async () => {
       if (this.heartbeat) clearInterval(this.heartbeat)
       this.heartbeat = undefined
+      this.selection?.abort()
       this.stopWatching?.()
       this.stopWatching = undefined
       for (const cleanup of this.disposers.values()) cleanup()
@@ -251,6 +355,7 @@ export class WebServer {
       this.server = undefined
       this.ws = undefined
       await this.agent.close?.()
+      await this.toolRuntime.close()
       if (ws) await new Promise<void>(done => ws.close(() => done()))
       if (server?.listening) await new Promise<void>((done, reject) => { server.close(error => error ? reject(error) : done()); server.closeAllConnections() })
     })()
