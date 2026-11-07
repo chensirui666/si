@@ -230,8 +230,10 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
       expect(requests).toHaveLength(2)
       expect(actualResults).toHaveLength(1)
       expect(actualResults[0]!.message).toMatchObject({ toolName: 'write', isError: false })
-      expect(await readFile(join(cwd, 'note.txt'), 'utf8')).toBe('项目名称：青禾')
       const call = requests[1]!.messages.at(-2)!.tool_calls![0]!
+      const { content } = JSON.parse(call.function.arguments)
+      expect(content).toMatch(/^项目名称：青禾(?:\r?\n)?$/)
+      expect(await readFile(join(cwd, 'note.txt'), 'utf8')).toBe(content)
       expect(requests[1]!.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: call.id, content: expect.stringContaining('note.txt') })
     }
   } finally {
