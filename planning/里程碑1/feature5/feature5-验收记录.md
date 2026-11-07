@@ -73,4 +73,15 @@ npm --prefix packages/server run test:tools:live
 
 停止不保证瞬间结束，也不撤销文件修改；只读底层 I/O 与远端处理不保证物理上同时消失。提交尚未确认时不能中止；刷新和断线不自动停止。完整多轮循环内的停止仍在 Feature6 验收。
 
-实现保留在 feature5 分支与 worktree，未合并、未推送；原主目录的未提交规划文档保持原样。本 worktree 只纳入 feature5 相关规划增量，其他后续规划仍保留在原目录。
+首次交付时实现保留在 feature5 分支与 worktree；本分支只纳入 feature5 相关规划增量，其他后续规划保留在原目录。之后按用户要求完成下述 main 合并、复验和清理。
+
+## main 合并后复验与清理（2026-11-07）
+
+`main` 从 `f360e2e` 快进到实现提交 `123fefc`，随后在 `/Users/stardust/agent learning` 重新执行完整根测试和七项真实工具验收，沿用用户指定的测试凭据与已校验 fd。
+
+- 最终根 `npm test`：369 项通过，无失败、无跳过，包含完整构建、231 项后端、95 项网页单测、31 项 Chromium 组件与 12 项 E2E。
+- 独立真实工具验收：7 项通过，无失败、无跳过。两者合计 376 项通过。
+- 首轮根测试曾在 `ChatPage.browser.test.tsx:234` 的 Tab 移焦断言失败，后续 E2E 因此未执行。保存失败 trace 后，该案例单独连续运行 8 次通过，再完整重跑根测试通过；未修改实现或测试，失败原因尚未确定。专项重复次数不计入上述 376 项。
+- 最终 Chromium 报告为 31 通过，E2E 为 12 通过，均为 0 skipped、0 unexpected、0 flaky。完整日志在 `/tmp/agent-feature5-main-full.log`、`/tmp/agent-feature5-main-live-tools.log`；首次失败日志和 trace 分别保留在 `/tmp/agent-feature5-main-full-first.log`、`/tmp/agent-feature5-main-focus-failure.zip`，专项日志为 `/tmp/agent-feature5-main-focus-repeat.log`。
+- 核对工作区没有未提交文件，忽略文件仅为依赖、构建和测试产物后，删除 `.worktrees/feature5` 和已合并的 `codex/feature5` 分支，已确认路径与分支均不存在。其他 worktree 与分支保留。
+- 主目录原有六份规划改动继续保留为未提交草稿；其中后续第六至第八步规划和 Feature1/2/4 文件均与备份逐字核对，Feature5 旧待实施状态同步为已完成。未推送远端。
