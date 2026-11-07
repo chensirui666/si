@@ -8,7 +8,7 @@ import { once } from 'node:events'
 import { randomBytes } from 'node:crypto'
 import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
-import type { Agent, AgentSubscriptionEvent } from '@agent-learning/agent'
+import { Agent, type AgentSubscriptionEvent } from '@agent-learning/agent'
 
 const cleanups: (() => Promise<unknown>)[] = []
 afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanups.splice(0).reverse()) await close() })
@@ -67,6 +67,94 @@ async function rejectedHandshake(url: string, headers: Record<string, string>) {
   })
 }
 const empty = { seq: 0, messages: [], running: null, activeContent: [] }
+
+describe('主动中止入口', () => {
+  it('沿用来源、授权和 JSON 校验；无效请求不交付 Agent', async () => {
+    const abort = vi.fn(async () => true)
+    const app = await setup({ agent: { ...controlledAgent(), abort } })
+    const auth = await cookie(app.authUrl)
+    const url = app.url + '/api/abort'
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const body = JSON.stringify({ userMessageId: 'user-1' })
+    expect((await http(url, { 'Content-Type': 'application/json' }, 'POST', body)).status).toBe(401)
+    for (const invalid of [{ Origin: 'https://evil.example' }, { Host: 'evil.example' }]) {
+      expect((await http(url, { ...headers, ...invalid }, 'POST', body)).status).toBe(403)
+    }
+    expect((await http(url, { Cookie: auth }, 'POST', body)).status).toBe(415)
+    expect((await http(url, headers, 'POST', 'x'.repeat(65537))).status).toBe(413)
+    for (const value of ['{', 'null', '[]', '{}', '{"userMessageId":0}', '{"userMessageId":" "}', JSON.stringify({ userMessageId: 'x'.repeat(129) }), '{"userMessageId":"u","extra":true}']) {
+      expect((await http(url, headers, 'POST', value)).status).toBe(400)
+    }
+    expect(abort).not.toHaveBeenCalled()
+  })
+
+  it.each([true, false])('等待指定运行收尾后返回同一目标和 handled=%s，无需模型或目录可用', async handled => {
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const abort = vi.fn(async () => { entered.resolve(); await release.promise; return handled })
+    const app = await setup({ agent: { ...controlledAgent(), abort } })
+    const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+    let returned = false
+    const pending = http(app.url + '/api/abort', headers, 'POST', '{"userMessageId":"old-user"}').then(value => { returned = true; return value })
+    await entered.promise
+    expect(returned).toBe(false)
+    expect(abort).toHaveBeenCalledExactlyOnceWith('old-user')
+    release.resolve()
+    const result = await pending
+    expect(result.status).toBe(200)
+    expect(JSON.parse(result.text)).toEqual({ userMessageId: 'old-user', handled })
+  })
+
+  it('未装配中止返回 503，内部错误脱敏', async () => {
+    const agent = { ...controlledAgent(), abort: undefined as undefined | (() => Promise<boolean>) }
+    const app = await setup({ agent })
+    const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+    const send = () => http(app.url + '/api/abort', headers, 'POST', '{"userMessageId":"user-1"}')
+    expect((await send()).status).toBe(503)
+    agent.abort = async () => { throw new Error('private-api-key') }
+    const result = await send()
+    expect(result.status).toBe(500)
+    expect(result.text).not.toContain('private-api-key')
+  })
+
+  it('HTTP 与订阅断开后已交付的中止仍收尾，重新订阅恢复实际结果', async () => {
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const agent = new Agent({ stream: (model, _context, options) => ({
+      result: () => new Promise(() => {}),
+      async *[Symbol.asyncIterator]() {
+        const partial = { role: 'assistant' as const, api: model.api, provider: model.provider, model: model.id, content: [], stopReason: 'pending' as const, timestamp: 1 }
+        yield { type: 'start' as const, partial }
+        if (!options!.signal!.aborted) await new Promise<void>(resolve => options!.signal!.addEventListener('abort', () => resolve(), { once: true }))
+        entered.resolve()
+        try { yield { type: 'error' as const, reason: 'aborted' as const, error: { ...partial, stopReason: 'aborted' as const } } }
+        finally { await release.promise }
+      },
+    }) })
+    const app = await setup({ agent })
+    const auth = await cookie(app.authUrl)
+    const accepted = await agent.submit({ clientMessageId: 'local', modelId: 'deepseek-flash', text: 'stop me' })
+    const socket = await connect(app.url, auth)
+    const first = nextConversationFrame(socket)
+    socket.send('{"type":"subscribe","subscriptionId":"first"}')
+    expect((await first).snapshot.running).not.toBeNull()
+    const req = request(app.url + '/api/abort', { method: 'POST', headers: { Cookie: auth, 'Content-Type': 'application/json' } })
+    req.on('error', () => {})
+    req.end(JSON.stringify({ userMessageId: accepted.userMessageId }))
+    await entered.promise
+    req.destroy()
+    socket.terminate()
+    release.resolve()
+    await vi.waitFor(async () => {
+      const controller = new AbortController()
+      const state = (await agent.subscribe(controller.signal).next()).value
+      controller.abort()
+      expect(state).toMatchObject({ snapshot: { running: null } })
+    })
+    const restored = await connect(app.url, auth)
+    const next = nextConversationFrame(restored)
+    restored.send('{"type":"subscribe","subscriptionId":"restored"}')
+    expect((await next).snapshot).toMatchObject({ running: null, messages: [{}, { message: { stopReason: 'aborted' } }] })
+  })
+})
 function controlledAgent() {
   const active = new Set<AbortSignal>()
   return {

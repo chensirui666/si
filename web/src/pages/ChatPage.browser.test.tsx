@@ -336,7 +336,7 @@ test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到�
   await editor.press('ControlOrMeta+z')
   await expect(editor).toHaveText('')
   await editor.fill('新的草稿')
-  await expect(send).toBeDisabled()
+  await expect(page.getByRole('button', { name: '中止', exact: true })).toBeDisabled()
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
@@ -349,7 +349,7 @@ test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到�
   await expect(page.getByText('发送失败', { exact: true })).toHaveCount(0)
   await expect(editor).toHaveText('新的草稿')
   await expect(editor).toBeFocused()
-  await expect(send).toBeDisabled()
+  await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
@@ -374,11 +374,11 @@ test('HTTP 回执先到时旧空闲快照不能开放发送，正式消息与结
   await send.click()
   await expect(page.getByText('已接收，正在同步', { exact: true })).toBeVisible()
   await editor.fill('下一条')
-  await expect(send).toBeDisabled()
+  await expect(page.getByRole('button', { name: '中止', exact: true })).toBeDisabled()
   await page.evaluate(() => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 4, messages: [], running: null, activeContent: [] } } }))
   })
-  await expect(send).toBeDisabled()
+  await expect(page.getByRole('button', { name: '中止', exact: true })).toBeDisabled()
   await expect(page.getByRole('region', { name: '消息列表' }).getByRole('listitem')).toHaveCount(1)
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 6, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: null, activeContent: [] } } }))

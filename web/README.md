@@ -10,6 +10,8 @@ HTTP 回执与 WebSocket 正式消息无论先后均合并为一个气泡。回�
 
 ## 启动
 
+运行时主按钮显示「中止」，提交未确认时禁用；点击后显示「正在中止」并等待后台空闲。草稿、输入焦点和撤销记录在动作切换时保留。未确认中止会重取后台快照，仍在运行时允许手工重试，不自动重发。已知运行即使模型配置、目录失效或订阅断线也保留中止入口；发送仍需连接恢复并满足原有门禁。中止不回滚文件修改。
+
 使用 Node.js 24.16.0、npm 11.13.0；兼容范围见 package.json。依赖统一从仓库根安装，只有根 package-lock.json。
 
 ```sh
@@ -49,4 +51,4 @@ App 装配页面；ChatPage 维护对话、模型选择与本地提交接收证�
 
 类型通过各包公开入口以 import type 引用，浏览器不加载后端实现。Model 类型归 Model，快照归 Agent，网络帧归 Server/protocol。视觉继续遵守 design.md 的 760px 居中内容列、白底、14/24px 正文和紧凑输入。
 
-结果见 [Feature2 验收记录](../planning/里程碑1/feature2/feature2-验收记录.md)；历史功能见 [Feature1 验收记录](../planning/里程碑1/feature1/feature1-验收记录.md)。
+最新中止验收见 [Feature5 验收记录](../planning/里程碑1/feature5/feature5-验收记录.md)；历史结果见 [Feature2 验收记录](../planning/里程碑1/feature2/feature2-验收记录.md) 与 [Feature1 验收记录](../planning/里程碑1/feature1/feature1-验收记录.md)。

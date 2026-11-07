@@ -5,6 +5,8 @@ export type { WebSettingsView } from '../web-settings.js'
 
 export type SubmitMessageRequest = { clientMessageId: string; modelId: string; text: string; workspaceId: string }
 export type SubmitMessageAccepted = { clientMessageId: string; userMessageId: string; acceptedSeq: number }
+export type AbortRequest = { userMessageId: string }
+export type AbortResult = { userMessageId: string; handled: boolean }
 
 export type ClientFrame =
   | { type: 'subscribe'; subscriptionId: string }

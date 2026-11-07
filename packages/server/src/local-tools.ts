@@ -1,4 +1,5 @@
 import { access, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { addAbortListener } from 'node:events'
 import { homedir } from 'node:os'
 import { basename, dirname, relative, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -28,7 +29,9 @@ function pathFrom(cwd: string, value: string): string {
 async function readText(path: string, signal: AbortSignal, keepBom = false): Promise<string> {
   signal.throwIfAborted()
   if (!(await stat(path)).isFile()) throw new Error(`不是文件：${path}`)
+  signal.throwIfAborted()
   const bytes = await readFile(path, { signal })
+  signal.throwIfAborted()
   try {
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: keepBom }).decode(bytes)
     if (text.includes('\0')) throw new Error('binary')
@@ -36,6 +39,17 @@ async function readText(path: string, signal: AbortSignal, keepBom = false): Pro
   } catch {
     throw new Error(`文件不是有效的 UTF-8 文本：${path}`)
   }
+}
+
+async function readWithAbort(path: string, signal: AbortSignal) {
+  signal.throwIfAborted()
+  let subscription: ReturnType<typeof addAbortListener> | undefined
+  try {
+    return await Promise.race([
+      readText(path, signal),
+      new Promise<never>((_, reject) => { subscription = addAbortListener(signal, () => reject(signal.reason)) }),
+    ])
+  } finally { subscription?.[Symbol.dispose]() }
 }
 
 function linesOf(text: string): string[] {
@@ -64,7 +78,7 @@ class OutputLines {
 async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal }: Context) {
   const start = integer(offset, 'offset') - 1
   const count = limit === undefined ? Infinity : integer(limit, 'limit')
-  const text = await readText(pathFrom(cwd, path), signal)
+  const text = await readWithAbort(pathFrom(cwd, path), signal)
   const lines = linesOf(text)
   if (start >= lines.length && (lines.length || start > 0)) throw new Error(`offset 超出文件范围（共 ${lines.length} 行）`)
 
@@ -90,6 +104,7 @@ async function write({ path, content }: WriteParams, { cwd, signal }: Context) {
   await mkdir(dirname(target), { recursive: true })
   signal.throwIfAborted()
   await writeFile(target, content, 'utf8')
+  signal.throwIfAborted()
   return `已写入 ${target}`
 }
 
@@ -165,6 +180,7 @@ async function edit({ path, edits }: EditParams, { cwd, signal }: Context) {
   if (updated === text) throw new Error('编辑后文件没有变化')
   signal.throwIfAborted()
   await writeFile(target, bom + updated.replaceAll('\n', newline), 'utf8')
+  signal.throwIfAborted()
   return `已在 ${target} 完成 ${edits.length} 处替换`
 }
 
@@ -305,7 +321,7 @@ async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: C
     const label = stats.isDirectory() ? relative(search, match.path) : basename(match.path)
     if (context > 0 && contextPath !== match.path) {
       try {
-        lines = linesOf(await readText(match.path, signal))
+        lines = linesOf(await readWithAbort(match.path, signal))
       } catch {
         signal.throwIfAborted()
         lines = []

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
 import { MessageList } from '../components/MessageList'
-import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getWebSettings, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
+import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { initialState, mergeSubmissions, settleSubmission, type Subscribe, type Subscription } from '../chat/state'
 import type { LocalSubmission } from '../types'
@@ -14,7 +14,10 @@ type Props = {
   getModels?: () => Promise<ModelDiscovery>
   getWorkspaces?: () => Promise<WorkspaceView>
   submitMessage?: (input: SubmitMessageRequest) => Promise<SubmitMessageAccepted>
+  abortMessage?: (input: AbortRequest) => Promise<AbortResult>
 }
+
+type AbortState = { userMessageId: string; status: 'pending' | 'unconfirmed'; error?: string }
 
 function useServerView<T>(load: () => Promise<T>) {
   const [view, setView] = useState<T | null>(null)
@@ -46,12 +49,15 @@ function FolderIcon({ add = false }: { add?: boolean }) {
   </svg>
 }
 
-export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, submitMessage = postMessage }: Props) {
+export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, submitMessage = postMessage, abortMessage = postAbort }: Props) {
   const [state, setState] = useState(initialState)
   const stateRef = useRef(state)
   const [submissions, setSubmissions] = useState<LocalSubmission[]>([])
   const submissionsRef = useRef(submissions)
   const subscription = useRef<Subscription | null>(null)
+  const [abortState, setAbortState] = useState<AbortState | null>(null)
+  const abortRef = useRef(abortState)
+  const updateAbort = (next: AbortState | null) => { abortRef.current = next; setAbortState(next) }
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>())
   const mounted = useRef(false)
   const [discovery, setDiscovery] = useState<ModelDiscovery | null>(null)
@@ -141,6 +147,8 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       }
       previousConnection = next.connection
       stateRef.current = next
+      if (next.connection === 'ready' && next.snapshot && abortRef.current
+        && next.snapshot.running?.userMessageId !== abortRef.current.userMessageId) updateAbort(null)
       updateSubmissions(submissionsRef.current)
       setState(next)
     }, refreshModels, refreshWorkspaces, refreshWebSettings)
@@ -199,6 +207,24 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
 
   const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions)
   const waiting = submissions.some(local => local.state !== 'failed')
+  const target = state.snapshot?.running?.userMessageId
+  const activeAbort = abortState?.userMessageId === target ? abortState : null
+  const abortDisabled = !target || (activeAbort?.status === 'unconfirmed' && state.connection !== 'ready')
+  const action = target || waiting ? activeAbort?.status === 'pending' ? 'aborting' : 'abort' : 'send'
+  const abort = async (userMessageId: string | undefined) => {
+    if (!userMessageId || stateRef.current.snapshot?.running?.userMessageId !== userMessageId
+      || abortRef.current?.userMessageId === userMessageId && abortRef.current.status === 'pending') return
+    updateAbort({ userMessageId, status: 'pending' })
+    try {
+      await abortMessage({ userMessageId })
+      if (!mounted.current || abortRef.current?.userMessageId !== userMessageId) return
+      subscription.current?.requestSnapshot?.()
+    } catch (error) {
+      if (!mounted.current || abortRef.current?.userMessageId !== userMessageId) return
+      updateAbort({ userMessageId, status: 'unconfirmed', error: error instanceof Error ? error.message : '中止请求失败' })
+      subscription.current?.requestSnapshot?.()
+    }
+  }
   const status = state.error ?? (state.slow ? '连接较慢，正在等待对话恢复…' : {
     connecting: '正在连接…', awaitingSnapshot: '正在恢复对话…',
     ready: state.snapshot?.running?.phase === 'tools' ? '正在执行工具…' : state.snapshot?.running ? '正在生成回答…' : waiting ? '正在确认消息接收…' : '对话已同步',
@@ -253,7 +279,8 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
           </div>
           {boundWorkspace && !boundWorkspace.available && <p className="model-error configuration-error" role="alert">工作区目录不可用</p>}
           {(modelError || discovery?.deepseek.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (discovery?.deepseek.state === 'error' ? discovery.deepseek.message : '')}</p>}
-          <MessageInput onSend={send} sendDisabled={!canSubmit()} />
+          {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
+          <MessageInput onSend={send} sendDisabled={!canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
       </div>

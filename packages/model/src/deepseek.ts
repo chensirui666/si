@@ -28,15 +28,31 @@ export async function discoverModels(
 function convertMessages(context: ModelContext): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = []
   if (context.systemPrompt !== undefined) messages.push({ role: 'system', content: context.systemPrompt })
+  let pending: ToolCall[] = []
+  const received = new Set<string>()
+  const heldSystems: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = []
+  const closeTools = () => {
+    for (const call of pending) {
+      if (!received.has(call.id)) messages.push({ role: 'tool', tool_call_id: call.id, content: 'No result provided' })
+    }
+    pending = []
+    received.clear()
+    messages.push(...heldSystems)
+    heldSystems.length = 0
+  }
   for (const message of context.messages) {
+    if (message.role === 'assistant' || message.role === 'user') closeTools()
     if (message.role === 'system' || message.role === 'user') {
       const content = typeof message.content === 'string' ? message.content : message.content.map((block) => block.text).join('')
-      messages.push({ role: message.role, content })
+      if (message.role === 'system' && pending.length) heldSystems.push({ role: 'system', content })
+      else messages.push({ role: message.role, content })
     } else if (message.role === 'toolResult') {
+      received.add(message.toolCallId)
       messages.push({ role: 'tool', tool_call_id: message.toolCallId, content: message.content.map((block) => block.text).join('') })
     } else {
       const text = message.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
       const tools = message.content.filter((block) => block.type === 'toolCall')
+      pending = tools
       if (!text && !tools.length) continue
       const assistant: OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam & { reasoning_content?: string } = {
         role: 'assistant', content: text || null,
@@ -50,6 +66,7 @@ function convertMessages(context: ModelContext): OpenAI.Chat.Completions.ChatCom
       messages.push(assistant)
     }
   }
+  closeTools()
   return messages
 }
 

@@ -52,6 +52,36 @@ async function consume(stream: ReturnType<typeof modelApi.stream>) {
 afterEach(() => vi.useRealTimers())
 
 describe('Model single SDK stream', () => {
+  it.each([false, true])('fills only missing results per batch without mutating history (next user: %s)', async nextUser => {
+    const call = (id: string): modelApi.ToolCall => ({ type: 'toolCall', id, name: 'read', arguments: { path: id } })
+    const turn: modelApi.AssistantMessage = { role: 'assistant', api: selected.api, provider: selected.provider, model: selected.id, timestamp: 1,
+      stopReason: 'toolUse', content: [{ type: 'thinking', thinking: '保留思考' }, call('read'), call('bash'), call('write')] }
+    const result = (id: string, text: string, isError = false): modelApi.ToolResultMessage => ({ role: 'toolResult', toolCallId: id, toolName: 'read', content: [{ type: 'text', text }], isError, timestamp: 1 })
+    const history: modelApi.ModelContext['messages'] = [turn, { role: 'system', content: '穿插系统消息', timestamp: 1 }, result('read', '真实文件'), result('bash', '真实取消', true),
+      { ...turn, content: [call('read'), call('write')] }, result('read', '新一批真实文件'), ...(nextUser ? context.messages : [])]
+    const original = structuredClone(history)
+    const requests: any[] = []
+    const run = modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+      requests.push(JSON.parse(String(init!.body)).messages)
+      return response([chunk({ content: 'ok' }, 'stop')])
+    } })
+    for (let i = 0; i < 2; i++) await consume(run(selected, { messages: history }))
+    const expected = [
+      { role: 'assistant', reasoning_content: '保留思考' },
+      { role: 'tool', tool_call_id: 'read', content: '真实文件' },
+      { role: 'tool', tool_call_id: 'bash', content: '真实取消' },
+      { role: 'tool', tool_call_id: 'write', content: 'No result provided' },
+      { role: 'system', content: '穿插系统消息' },
+      { role: 'assistant' },
+      { role: 'tool', tool_call_id: 'read', content: '新一批真实文件' },
+      { role: 'tool', tool_call_id: 'write', content: 'No result provided' },
+      ...(nextUser ? [{ role: 'user', content: '  你好\n第二行  ' }] : []),
+    ]
+    expect(requests[0]).toMatchObject(expected)
+    expect(requests[0]).toHaveLength(expected.length)
+    expect(requests[1]).toEqual(requests[0])
+    expect(history).toEqual(original)
+  })
   it('sends caller-provided generic tool declarations through the SDK', async () => {
     let payload: Record<string, unknown> | undefined
     const tools: modelApi.Tool[] = [{

@@ -10,6 +10,8 @@
 
 `stream(model, context, { signal }?)` 立即返回 `ModelEventStream`，后台读取当次 Key 并发送一个请求。`context` 包含可选 `systemPrompt`、调用方准备的 `messages` 和可选 `tools`；本包不保存对话历史。固定开启 `thinking: { type: 'enabled' }`、`reasoning_effort: 'high'` 和流式用量报告，不执行工具。Key 只进入认证头，替换凭据作用于后续请求。纳入历史的助手消息都携带 `reasoning_content`，包括执行前的思考与上次普通回答的思考。工具结果沿用原调用编号。
 
+完整工具调用中缺少结果时，在请求输入中补充 `No result provided`，不修改传入历史或真实执行记录，不重新执行工具。按每批调用独立配对，系统消息暂缓到结果之后，跨批复用编号不会串联；失败或中止的未完成回复仍由 Agent 在准备历史时排除。
+
 ```typescript
 const response = stream(model, { messages })
 for await (const event of response) {

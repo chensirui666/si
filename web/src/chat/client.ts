@@ -1,5 +1,5 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { ClientFrame, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, ClientFrame, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspaceView } from '@agent-learning/server/protocol'
 import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
 
 export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged) => {
@@ -175,6 +175,21 @@ export const saveWebApiKey = (providerId: string, apiKey: string) =>
   requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, putJson({ apiKey }), apiKey)
 export const deleteWebApiKey = (providerId: string) =>
   requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, { method: 'DELETE' })
+
+export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
+  let response: Response
+  try { response = await fetch('/api/abort', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) }
+  catch { throw new Error('网络请求失败，未确认中止') }
+  if (response.status === 401) throw new Error('授权已失效，请重新打开启动链接')
+  if (response.status === 403) throw new Error('访问来源不可信，请从启动链接进入')
+  let value: unknown
+  try { value = await response.json() } catch { value = null }
+  if (!response.ok) throw new Error(record(value) && typeof value.error === 'string' ? value.error : '中止请求失败，请重新同步后重试')
+  if (response.status !== 200 || !record(value) || value.userMessageId !== input.userMessageId || typeof value.handled !== 'boolean') {
+    throw new Error('中止回执无效，未确认中止')
+  }
+  return value as AbortResult
+}
 
 export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
   let response: Response

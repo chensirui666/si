@@ -97,6 +97,43 @@ function textOf(message: { content: { type: string; text?: string }[] }) {
   return message.content.flatMap(block => block.type === 'text' ? [block.text ?? ''] : []).join('')
 }
 
+test('真实 DeepSeek 生成中止保留内容和草稿，同一对话可继续', async ({ page, context }) => {
+  test.setTimeout(450_000)
+  const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
+  test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE')
+  let key = await readLiveKey(keyFile!)
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-feature5-live-'))
+  let backend: Awaited<ReturnType<typeof startBackend>> | undefined
+  try {
+    backend = await startBackend(join(temporary, 'browser-auth.json'))
+    const observed = observe(page)
+    await authorize(page, backend.result.authUrl)
+    await ready(page, observed)
+    await addWorkspace(page)
+    await saveKey(page, key)
+    const editor = page.getByRole('textbox', { name: '消息', exact: true })
+    await editor.fill('不要使用工具。请从1开始依次写到1000，每个数字单独一行并附上中文读法，不要省略或汇总。')
+    await page.getByRole('button', { name: '发送', exact: true }).click()
+    await expect.poll(() => observed.updates.some(({ update }) => update.change.type === 'model' && update.change.event.type === 'text_delta'), { timeout: 150_000 }).toBe(true)
+    await editor.fill('中止后保留的草稿')
+    const receipt = page.waitForResponse(response => new URL(response.url()).pathname === '/api/abort')
+    await page.getByRole('button', { name: '中止', exact: true }).click()
+    expect((await receipt).status()).toBe(200)
+    await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
+    const terminals = observed.updates.flatMap(({ update }) => update.change.type === 'model' && update.change.event.type === 'error' ? [update.change.event] : [])
+    expect(terminals).toHaveLength(1)
+    expect(terminals[0]!.reason).toBe('aborted')
+    expect(textOf(terminals[0]!.error).length).toBeGreaterThan(0)
+    await expect(editor).toHaveText('中止后保留的草稿')
+    const next = await complete(page, observed, '不要使用工具。只回答“中止后继续成功”。')
+    expect(textOf(next.message)).toContain('中止后继续成功')
+  } finally {
+    key = ''
+    await Promise.allSettled([context.clearCookies(), stop(backend?.child)])
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
 test('T1 live: 网页两次读取真实文件，显示工具结果且回答随文件变化', async ({ page, context }) => {
   test.setTimeout(450_000)
   const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE

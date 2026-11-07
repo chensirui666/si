@@ -26,6 +26,8 @@ npm --prefix packages/server test
 
 `POST /api/messages` 接收 JSON `{clientMessageId,modelId,text,workspaceId}`，成功返回 202 和 `{clientMessageId,userMessageId,acceptedSeq}`，不等首片段。无效输入 400，忙碌或工作区不可用 409；请求上限 64KiB、媒体类型与授权规则沿用配置接口。Key 在接收后由 Model 读取，凭据失败成为正式失败回复，不回滚 user。WebServer 与 Model 共用同一个 Credentials；生成更新由 Agent 内部订阅经 WS 转发，不维护第二份内容。
 
+`POST /api/abort` 只接收 JSON `{userMessageId}`（非空且最长 128 字符），沿用来源、Cookie、64KiB 与媒体类型校验。等待 Agent 对应运行收尾后返回 HTTP 200 和 `{userMessageId,handled}`；目标已结束时 handled=false，不取消其他运行。无需重新验证模型凭据或工作区，HTTP 与订阅断开不撤销已交付的中止。只读 Agent 替身可省略 abort，此时返回 503；内部异常返回脱敏的 500。实际结束记录和空闲状态仍由订阅提供。
+
 生产入口固定请求 DeepSeek；进程内 `modelOptions` 可注入 fetch/baseURL 让测试穿过真实 SDK/SSE，main 不提供服务商地址的环境变量覆盖。配置保存只验证本地格式，真实调用才验证远端 Key。授权文件的异常和人工恢复步骤见 Credentials README。
 
 工作区由 `GET /api/workspaces` 查询。网页通过无请求体的 `POST /api/workspaces/pick` 打开 macOS 系统选择框。服务以真实绝对路径去重，首次登记同时绑定当前对话。测试可通过 `workspacePath`、`directoryPicker` 注入隔离的配置和选择器。

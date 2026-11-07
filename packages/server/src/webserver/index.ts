@@ -27,7 +27,7 @@ export type WebServerOptions = {
   webSettingsPath?: string
   directoryPicker?: DirectoryPicker
   webProviders?: WebProvider[]
-  agent?: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'close'>>
+  agent?: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'abort' | 'close'>>
   modelOptions?: Parameters<typeof createModelStream>[1]
   now?: () => number
 }
@@ -76,7 +76,7 @@ function validFrame(value: unknown): value is ClientFrame {
 }
 
 export class WebServer {
-  private readonly agent: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'close'>>
+  private readonly agent: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'abort' | 'close'>>
   private server?: Server
   private ws?: WebSocketServer
   private heartbeat?: ReturnType<typeof setInterval>
@@ -184,6 +184,22 @@ export class WebServer {
     if ((url.pathname === '/api/web/settings' && (req.method === 'GET' || req.method === 'PUT'))
       || (webProvider && (req.method === 'PUT' || req.method === 'DELETE'))) {
       await this.handleWebSettings(req, res, webProvider)
+      return
+    }
+    if (url.pathname === '/api/abort' && req.method === 'POST') {
+      try {
+        const input = await readJson(req)
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 1
+          || !('userMessageId' in input) || typeof input.userMessageId !== 'string' || !input.userMessageId.trim() || input.userMessageId.length > 128) {
+          throw new InputError(400, '请仅提交有效的用户消息编号')
+        }
+        if (!this.agent.abort) throw new InputError(503, '当前中止服务不可用')
+        const handled = await this.agent.abort(input.userMessageId)
+        this.json(res, 200, { userMessageId: input.userMessageId, handled })
+      } catch (error) {
+        this.json(res, error instanceof InputError ? error.status : 500,
+          { error: error instanceof InputError ? error.message : '中止暂时不可用，请重新同步对话后重试' })
+      }
       return
     }
     if (url.pathname === '/api/messages' && req.method === 'POST') {

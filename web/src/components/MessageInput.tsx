@@ -21,7 +21,13 @@ import { mergeRegister } from '@lexical/utils'
 
 import { Button } from '@/components/ui/button'
 
-type MessageInputProps = { onSend: (text: string, restoreDraft: () => void) => boolean; sendDisabled: boolean }
+type MessageInputProps = {
+  onSend: (text: string, restoreDraft: () => void) => boolean
+  sendDisabled: boolean
+  action?: 'send' | 'abort' | 'aborting'
+  abortDisabled?: boolean
+  onAbort?: () => void
+}
 
 const initialConfig = {
   namespace: 'message-input',
@@ -32,18 +38,19 @@ function $readDraft() {
   return $getRoot().getChildren().map((paragraph) => paragraph.getTextContent()).join('\n')
 }
 
-export function MessageInput({ onSend, sendDisabled }: MessageInputProps) {
+export function MessageInput(props: MessageInputProps) {
   return (
     <LexicalComposer initialConfig={initialConfig}>
-      <Composer onSend={onSend} sendDisabled={sendDisabled} />
+      <Composer {...props} />
     </LexicalComposer>
   )
 }
 
-function Composer({ onSend, sendDisabled }: MessageInputProps) {
+function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort }: MessageInputProps) {
   const [editor] = useLexicalComposerContext()
   const [canSend, setCanSend] = useState(false)
   const draftRevision = useRef(0)
+  const label = action === 'send' ? '发送' : action === 'abort' ? '中止' : '正在中止'
 
   const submit = useCallback((text: string) => {
     let clearedRevision: number | undefined
@@ -148,9 +155,11 @@ function Composer({ onSend, sendDisabled }: MessageInputProps) {
       />
       <HistoryPlugin />
       <div className="composer-actions">
-        <Button className="send-button" size="icon" type="button" aria-label="发送" title="发送" disabled={sendDisabled || !canSend} onClick={() => submit(editor.read($readDraft))}>
+        <Button className="send-button" size="icon" type="button" aria-label={label} title={label}
+          disabled={action === 'send' ? sendDisabled || !canSend : action === 'aborting' || abortDisabled || !onAbort}
+          onClick={() => { if (action === 'send') submit(editor.read($readDraft)); else if (action === 'abort') onAbort?.() }}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
-            <path d="M8 13V3M3 8l5-5 5 5" />
+            {action === 'send' ? <path d="M8 13V3M3 8l5-5 5 5" /> : <rect x="4" y="4" width="8" height="8" rx="1" fill="currentColor" stroke="none" />}
           </svg>
         </Button>
       </div>

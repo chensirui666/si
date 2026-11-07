@@ -156,6 +156,25 @@ function installed(binary: string) {
   }
 }
 
+it.each(['bash', 'find', 'grep'])('user cancellation stops the real %s process before its delayed file change', async name => {
+  const bin = join(cwd, 'bin')
+  await mkdir(bin)
+  if (name !== 'bash') {
+    const binary = name === 'find' ? 'fd' : 'rg'
+    await writeFile(join(bin, binary), '#!/bin/bash\n[ "$1" = --version ] && exit 0\ntouch ready\nwhile [[ ! -f go ]]; do :; done\ntouch survived\n', { mode: 0o700 })
+    vi.stubEnv('PATH', bin + ':' + process.env.PATH)
+  }
+  const controller = new AbortController()
+  const args = name === 'bash' ? { command: 'printf partial; touch ready; while [[ ! -f go ]]; do :; done; touch survived' } : { pattern: 'anything' }
+  const output = tool(name)(args, context(controller.signal))
+  const rejected = expect(output).rejects.toThrow(name === 'bash' ? /partial[\s\S]*任务已取消/ : /任务已取消/)
+  await vi.waitFor(async () => { await readFile(join(cwd, 'ready')) })
+  controller.abort()
+  await rejected
+  await writeFile(join(cwd, 'go'), '')
+  await expect(readFile(join(cwd, 'survived'))).rejects.toHaveProperty('code', 'ENOENT')
+})
+
 it.skipIf(!installed('fd') && !installed('fdfind'))('find applies path globs, reports relative hidden paths and honors nested ignore rules', async () => {
   await mkdir(join(cwd, 'src'))
   await writeFile(join(cwd, 'src', '.gitignore'), 'ignored.txt\n')

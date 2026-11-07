@@ -72,12 +72,12 @@ export class Agent {
         messages: this.modelHistory(), systemPrompt, ...(declarations.length ? { tools: declarations } : {}),
       }, signal)
       if (first.stopReason === 'error' || first.stopReason === 'aborted') return
-      signal.throwIfAborted()
       const calls = first.content.flatMap((call, contentIndex) => call.type === 'toolCall' ? [{ call, contentIndex }] : [])
       if (!calls.length) {
         if (first.stopReason === 'toolUse') this.fail(model, messageId, '模型未返回可处理的工具调用。')
         return
       }
+      signal.throwIfAborted()
       if (first.stopReason === 'length') {
         this.fail(model, messageId, '首轮模型回复已截断，本批工具未执行。')
         return
@@ -114,6 +114,7 @@ export class Agent {
         })
       }
 
+      signal.throwIfAborted()
       messageId = randomUUID()
       this.updateTask({ ...running, assistantMessageId: messageId, phase: 'answer' })
       const answer = await this.generate(model, messageId, {
@@ -124,10 +125,15 @@ export class Agent {
         this.fail(model, messageId, '最终回答阶段收到额外工具调用，工具未执行。')
       }
     } catch {
+      const current = this.state.messages.find(entry => entry.id === messageId)?.message
+      if (current?.role === 'assistant' && current.stopReason !== 'pending') messageId = randomUUID()
       this.fail(model, messageId, signal.aborted ? '本次生成已取消' : '模型调用意外中断，请重新发送', signal.aborted)
     } finally {
-      this.controller = undefined
-      this.updateTask(null)
+      if (this.controller?.signal === signal) {
+        this.controller = undefined
+        this.task = undefined
+        this.updateTask(null)
+      }
     }
   }
 
@@ -260,6 +266,15 @@ export class Agent {
       },
       return() { close(); return Promise.resolve(done) },
     }
+  }
+
+  async abort(userMessageId: string): Promise<boolean> {
+    if (this.state.running?.userMessageId !== userMessageId) return false
+    const controller = this.controller
+    const task = this.task
+    controller?.abort()
+    await task
+    return true
   }
 
   async close(): Promise<void> {

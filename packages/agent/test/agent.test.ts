@@ -431,7 +431,8 @@ describe('Agent 一批工具与最终回答', () => {
     expect(contexts).toHaveLength(1)
     const current = await snapshot(agent)
     expect(current.running).toBeNull()
-    expect(current.messages[1].message).toMatchObject({ role: 'assistant', stopReason: 'aborted' })
+    expect(current.messages[1].message).toMatchObject({ role: 'assistant', stopReason: 'toolUse' })
+    expect(current.messages[3].message).toMatchObject({ role: 'assistant', stopReason: 'aborted' })
     expect(current.messages[2].message).toMatchObject({
       role: 'toolResult', toolCallId: 'first', isError: true, content: [{ text: '取消前已有部分结果' }],
     })
@@ -484,5 +485,87 @@ describe('Agent 一批工具与最终回答', () => {
     expect(contexts[1].messages.map(item => item.role)).toEqual(['user', 'user'])
     answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
+  })
+})
+
+describe('Agent 主动中止', () => {
+  it.each(['aborted', 'stop'] as const)('重复中止等待同次模型清理，保留 %s 实际终态并允许继续', async reason => {
+    let release!: () => void
+    const cleanup = new Promise<void>(resolve => { release = resolve })
+    let cleaning = false
+    let signal!: AbortSignal
+    let calls = 0
+    const agent = new Agent({ stream: (_model, _context, options) => {
+      signal = options!.signal!
+      const output = controlled()
+      calls++
+      if (calls > 1) {
+        signal.addEventListener('abort', () => output.push({ type: 'error', reason: 'aborted', error: { ...assistant(), stopReason: 'aborted' } }), { once: true })
+        return output.output
+      }
+      return { result: output.output.result, async *[Symbol.asyncIterator]() {
+        const partial = { ...assistant(), content: [{ type: 'text' as const, text: '保留部分文字' }] }
+        yield { type: 'start' as const, partial }
+        if (reason === 'aborted' && !signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+        try {
+          if (reason === 'stop') yield { type: 'done' as const, reason, message: { ...partial, stopReason: reason } }
+          else yield { type: 'error' as const, reason, error: { ...partial, stopReason: reason } }
+        } finally { cleaning = true; await cleanup }
+      } }
+    } })
+    const accepted = await agent.submit(input)
+    let ended = false
+    const aborting = agent.abort(accepted.userMessageId).then(value => { ended = true; return value })
+    const again = agent.abort(accepted.userMessageId)
+    await until(async () => cleaning)
+    expect(signal.aborted).toBe(true)
+    expect(ended).toBe(false)
+    await expect(agent.submit(input)).rejects.toMatchObject({ status: 409 })
+    release()
+    expect(await aborting).toBe(true)
+    expect(await again).toBe(true)
+    const current = await snapshot(agent)
+    expect(current.running).toBeNull()
+    expect(current.messages.slice(1).map(entry => entry.message)).toMatchObject([
+      { stopReason: reason, content: [{ text: '保留部分文字' }] },
+    ])
+    await agent.submit(input)
+    expect(await agent.abort(accepted.userMessageId)).toBe(false)
+    expect(signal.aborted).toBe(false)
+    await agent.close()
+  })
+
+  it.each([2, 3])('在第 %i 项工具中止，保留完整历史、实际结果且不启动回答', async count => {
+    const executed: string[] = []
+    let release!: () => void
+    const finishing = new Promise<void>(resolve => { release = resolve })
+    let cancelled = false
+    const { agent, first, answer, contexts } = withTools(async (args, { signal }) => {
+      executed.push(String(args.path))
+      if (executed.length < count) return '已完成'
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => { cancelled = true; resolve() }, { once: true }))
+      await finishing
+      throw new Error('取消前已有部分结果')
+    })
+    const accepted = await agent.submit(workspaceInput)
+    const complete = { ...assistant(), stopReason: 'toolUse' as const, content: [toolCall('first'), toolCall('second'), toolCall('third')] }
+    first.push({ type: 'done', reason: 'toolUse', message: complete })
+    await until(async () => executed.length === count)
+    const aborting = agent.abort(accepted.userMessageId)
+    await until(async () => cancelled)
+    expect((await snapshot(agent)).running).not.toBeNull()
+    release()
+    expect(await aborting).toBe(true)
+    const current = await snapshot(agent)
+    expect(current.messages[1].message).toEqual(complete)
+    expect(current.messages.filter(entry => entry.message.role === 'toolResult')).toHaveLength(count)
+    expect(current.messages.at(-1)?.message).toMatchObject({ stopReason: 'aborted' })
+    expect(contexts).toHaveLength(1)
+    expect(executed).toEqual(['first', 'second', 'third'].slice(0, count))
+    await agent.submit(workspaceInput)
+    expect(contexts[1].messages.map(message => message.role)).toEqual(['user', 'assistant', ...Array(count).fill('toolResult'), 'user'])
+    answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    await until(async () => (await snapshot(agent)).running === null)
+    expect(await agent.abort(accepted.userMessageId)).toBe(false)
   })
 })

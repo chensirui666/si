@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteApiKey, getModels, saveApiKey, subscribe } from './client'
+import { abortMessage, deleteApiKey, getModels, saveApiKey, subscribe } from './client'
 import type { ChatState } from './state'
 
 class Socket extends EventTarget {
@@ -16,6 +16,21 @@ class Socket extends EventTarget {
 }
 
 const empty = { seq: 0, messages: [], running: null, activeContent: [] }
+
+it.each([true, false])('abort validates the target and handled=%s with same-origin credentials', async handled => {
+  const fetcher = vi.fn(async () => Response.json({ userMessageId: 'user-1', handled }))
+  vi.stubGlobal('fetch', fetcher)
+  expect(await abortMessage({ userMessageId: 'user-1' })).toEqual({ userMessageId: 'user-1', handled })
+  expect(fetcher).toHaveBeenCalledWith('/api/abort', expect.objectContaining({ method: 'POST', credentials: 'same-origin', body: '{"userMessageId":"user-1"}' }))
+})
+
+it.each([
+  [200, { userMessageId: 'wrong', handled: true }], [200, { userMessageId: 'user-1', handled: 'true' }],
+  [202, { userMessageId: 'user-1', handled: true }], [500, { error: '服务不可用' }], [401, null], [403, null],
+] as const)('abort rejects invalid or unsuccessful receipt %s %j', async (status, body) => {
+  vi.stubGlobal('fetch', async () => Response.json(body, { status }))
+  await expect(abortMessage({ userMessageId: 'user-1' })).rejects.toThrow()
+})
 let online = true
 let states: ChatState[]
 let stop: (() => void) | undefined

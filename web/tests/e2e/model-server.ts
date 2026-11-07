@@ -18,6 +18,7 @@ export async function startModelServer() {
     body: RequestBody
     delta: (delta: Record<string, unknown>) => void
     finish: () => void
+    closed: boolean
   }[] = []
   const responses = new Set<ServerResponse>()
   const server = createServer(async (request, response) => {
@@ -34,11 +35,11 @@ export async function startModelServer() {
         choices: [{ index: 0, delta, finish_reason: finishReason }],
       })}\n\n`)
     }
-    exchanges.push({
+    const exchange = {
       path: request.url,
       authorized: request.headers.authorization === 'Bearer controlled-stage3-key',
       body: JSON.parse(body) as RequestBody,
-      delta: delta => chunk(delta),
+      delta: (delta: Record<string, unknown>) => chunk(delta),
       finish: () => {
         chunk({}, 'stop')
         response.write(`data: ${JSON.stringify({
@@ -47,7 +48,10 @@ export async function startModelServer() {
         })}\n\ndata: [DONE]\n\n`)
         response.end()
       },
-    })
+      closed: false,
+    }
+    response.once('close', () => { exchange.closed = true })
+    exchanges.push(exchange)
   })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')

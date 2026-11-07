@@ -9,6 +9,13 @@ const getEmptyWorkspaces = async () => ({ workspaces: [], boundWorkspaceId: null
 const getConfiguredWorkspaces = async () => ({ workspaces: [{ id: 'workspace-1', path: '/tmp/workspace', name: 'workspace', available: true }], boundWorkspaceId: 'workspace-1' })
 const empty = { seq: 0, messages: [], running: null, activeContent: [] }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: Error) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
 function controlled() {
   let listener: (state: ChatState) => void = () => {}
   const cleanup = vi.fn()
@@ -58,6 +65,77 @@ describe('ChatPage', () => {
 
 const missing = { models: [], deepseek: { state: 'missing' as const } }
 const configured = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions' }], deepseek: { state: 'configured' as const } }
+
+const runningState = (id = 'user-1'): ChatState => ({ connection: 'ready', slow: false, error: null, snapshot: {
+  ...empty, seq: 1, running: { userMessageId: id, assistantMessageId: 'answer', phase: 'model' },
+} })
+
+it('空草稿也能中止，重复点击只交付一次，回执先到仍等待后台空闲', async () => {
+  const source = controlled()
+  const receipt = deferred<{ userMessageId: string; handled: boolean }>()
+  const abortMessage = vi.fn(() => receipt.promise)
+  const submitMessage = vi.fn()
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} abortMessage={abortMessage} />)
+  await act(async () => { source.emit(runningState()) })
+  const editor = screen.getByRole('textbox', { name: '消息' })
+  const stop = screen.getByRole('button', { name: '中止' })
+  expect(stop).toBeEnabled()
+  act(() => { fireEvent.click(stop); fireEvent.click(stop) })
+  expect(abortMessage).toHaveBeenCalledExactlyOnceWith({ userMessageId: 'user-1' })
+  expect(screen.getByRole('button', { name: '正在中止' })).toBeDisabled()
+  await pasteDraft('中止期间的新草稿')
+  fireEvent.keyDown(editor, { key: 'Enter' })
+  expect(submitMessage).not.toHaveBeenCalled()
+  await act(async () => { receipt.resolve({ userMessageId: 'user-1', handled: true }) })
+  expect(screen.getByRole('button', { name: '正在中止' })).toBeDisabled()
+  source.emit({ ...runningState(), snapshot: { ...empty, seq: 3 } })
+  expect(screen.getByRole('button', { name: '发送' })).toBeEnabled()
+  expect(editor.textContent).toBe('中止期间的新草稿')
+})
+
+it.each([true, false])('旧中止%s回执不能改变新运行、按钮与草稿', async success => {
+  const source = controlled()
+  const receipt = deferred<{ userMessageId: string; handled: boolean }>()
+  const abortMessage = vi.fn(() => receipt.promise)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} abortMessage={abortMessage} />)
+  await act(async () => { source.emit(runningState()) })
+  fireEvent.click(screen.getByRole('button', { name: '中止' }))
+  source.emit({ ...runningState(), snapshot: { ...empty, seq: 3 } })
+  source.emit(runningState('new-user'))
+  const editor = await pasteDraft('下一轮草稿')
+  await act(async () => { if (success) receipt.resolve({ userMessageId: 'user-1', handled: false }); else receipt.reject(new Error('旧错误')) })
+  expect(screen.getByRole('button', { name: '中止' })).toBeEnabled()
+  expect(screen.queryByText(/旧错误/)).not.toBeInTheDocument()
+  expect(editor.textContent).toBe('下一轮草稿')
+})
+
+it('中止失败显示未确认并重取快照，仍运行时可手工重试，不自动重发', async () => {
+  const source = controlled()
+  const requestSnapshot = vi.fn(() => source.emit({ ...runningState(), connection: 'awaitingSnapshot' }))
+  Object.assign(source.cleanup, { requestSnapshot })
+  const abortMessage = vi.fn().mockRejectedValueOnce(new Error('网络失败')).mockResolvedValue({ userMessageId: 'user-1', handled: false })
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} abortMessage={abortMessage} />)
+  await act(async () => { source.emit(runningState()) })
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '中止' })) })
+  expect(screen.getByRole('alert')).toHaveTextContent('中止未确认')
+  expect(requestSnapshot).toHaveBeenCalledTimes(1)
+  expect(screen.getByRole('button', { name: '中止' })).toBeDisabled()
+  await act(async () => { source.emit(runningState()) })
+  expect(screen.getByRole('button', { name: '中止' })).toBeEnabled()
+  expect(abortMessage).toHaveBeenCalledTimes(1)
+  fireEvent.click(screen.getByRole('button', { name: '中止' }))
+  expect(abortMessage).toHaveBeenCalledTimes(2)
+})
+
+it('模型、目录失效或订阅断线仍可中止已知运行，刷新按快照恢复入口', async () => {
+  const source = controlled()
+  const abortMessage = vi.fn(() => new Promise<never>(() => {}))
+  render(<ChatPage getWorkspaces={async () => ({ ...await getConfiguredWorkspaces(), workspaces: [] })} subscribe={source.subscribe} getModels={async () => missing} abortMessage={abortMessage} />)
+  await act(async () => { source.emit({ ...runningState(), connection: 'disconnected' }) })
+  expect(screen.getByRole('button', { name: '中止' })).toBeEnabled()
+  fireEvent.click(screen.getByRole('button', { name: '中止' }))
+  expect(abortMessage).toHaveBeenCalledExactlyOnceWith({ userMessageId: 'user-1' })
+})
 
 it('查询模型并响应配置通知与重连，旧查询不能覆盖新配置，发送仍禁用', async () => {
   let listener: (state: ChatState) => void = () => {}
@@ -153,10 +231,10 @@ it('有效发送立即清空，HTTP 回执等待 WS；渲染前双手势只提�
   expect(editor).toHaveFocus()
   await pasteDraft('新草稿')
   await act(async () => { resolve({ clientMessageId: input.clientMessageId, userMessageId: 'user', acceptedSeq: 1 }) })
-  expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '中止' })).toBeDisabled()
   source.emit({ connection: 'ready', snapshot: { ...empty, seq: 1, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model' } }, slow: false, error: null })
   expect(screen.getAllByRole('listitem')).toHaveLength(1)
-  expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '中止' })).toBeEnabled()
   expect(editor.textContent).toBe('新草稿')
   source.emit({ connection: 'ready', snapshot: { ...empty, seq: 2, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }] }, slow: false, error: null })
   expect(screen.getByRole('button', { name: '发送' })).toBeEnabled()
@@ -196,7 +274,7 @@ it('十秒无接收证据显示未确认并重取快照，空快照不会开放�
     expect(requestSnapshot).toHaveBeenCalledTimes(1)
     source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null })
     await pasteDraft('下一条')
-    expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '中止' })).toBeDisabled()
     fireEvent.keyDown(editor, { key: 'Enter' })
     expect(submitMessage).toHaveBeenCalledTimes(1)
   } finally { vi.useRealTimers() }
