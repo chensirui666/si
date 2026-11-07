@@ -1,3 +1,4 @@
+import { $getSelection, $isRangeSelection, getNearestEditorFromDOMNode } from 'lexical'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -218,4 +219,22 @@ describe('MessageInput', () => {
     expect(previous).not.toHaveBeenCalled()
     expect(current).toHaveBeenCalledExactlyOnceWith('保留草稿', expect.any(Function))
   })
+})
+
+
+it('移焦到发送按钮后，迟到的选区格式同步不抢回输入焦点', async () => {
+  render(<MessageInput onSend={() => false} sendDisabled={false} />)
+  const textbox = await paste('保留草稿')
+  const button = screen.getByRole('button', { name: '发送' })
+  const editor = getNearestEditorFromDOMNode(textbox)!
+  button.focus()
+  await act(async () => {
+    editor.update(() => {
+      const selection = $getSelection()
+      if (!$isRangeSelection(selection)) throw new Error('missing range selection')
+      selection.toggleFormat('bold')
+    }, { discrete: true })
+  })
+  expect(button).toHaveFocus()
+  expect(textbox).toHaveTextContent('保留草稿')
 })

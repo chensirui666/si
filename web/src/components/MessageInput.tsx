@@ -14,6 +14,7 @@ import {
   COMMAND_PRIORITY_CRITICAL,
   KEY_ENTER_COMMAND,
   KEY_TAB_COMMAND,
+  SELECTION_CHANGE_COMMAND,
   SKIP_DOM_SELECTION_TAG,
   SKIP_SCROLL_INTO_VIEW_TAG,
 } from 'lexical'
@@ -119,6 +120,11 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       editor.registerCommand(KEY_TAB_COMMAND, () => {
         // 原生 Tab 移焦后，避免本次内部选区提交重新抢回输入焦点。
         $addUpdateTag(SKIP_DOM_SELECTION_TAG)
+        return false
+      }, COMMAND_PRIORITY_CRITICAL),
+      editor.registerCommand(SELECTION_CHANGE_COMMAND, () => {
+        // 失焦后的延迟选区同步不应重新聚焦输入框。
+        if (editor.getRootElement() !== document.activeElement) $addUpdateTag(SKIP_DOM_SELECTION_TAG)
         return false
       }, COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ENTER_COMMAND, (event) => {

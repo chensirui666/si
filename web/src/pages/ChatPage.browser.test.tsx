@@ -232,6 +232,12 @@ test('输入区聚焦、切换和发送后保持弱边界，按钮焦点使用�
   await expect(editor).toBeFocused()
   await page.keyboard.press('Tab')
   await expect(send).toBeFocused()
+  await page.evaluate(async () => {
+    document.dispatchEvent(new Event('selectionchange'))
+    document.dispatchEvent(new Event('selectionchange'))
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+  })
+  await expect(send).toBeFocused()
   await expectQuietBoundary()
   await expect(send).toHaveCSS('border-width', '0px')
   await expect(send).toHaveCSS('outline-style', 'none')

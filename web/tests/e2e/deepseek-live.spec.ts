@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { WebServer } from '@agent-learning/server'
 import { expect, test, type Page } from '@playwright/test'
 import { parseLiveKey, readLiveKey } from './live-key'
@@ -212,7 +212,7 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
     await saveKey(page, await readLiveKey(keyFile!))
     const result = await complete(page, observed, scenario === 'loop'
       ? '请根据 index.txt 的线索找到项目名称。请先用 read 读取 index.txt，再根据真实结果继续使用 read，最后只回答项目名称。'
-      : '请用 write 把“项目名称：青禾”写入 note.txt，只写一次，然后直接回答“已保存”。')
+      : '已确认这是新建的空测试工作区，note.txt 不存在。请直接用 write 把“项目名称：青禾”写入 note.txt。本次只允许一次 write 调用，不使用其他工具，不检查目录或读取验证，收到写入结果后直接回答“已保存”。')
     expect(requests.every(request => request.tools?.length === 8)).toBe(true)
     const actualResults = observed.updates.flatMap(({ update }) => update.change.type === 'task' && update.change.message?.message.role === 'toolResult' ? [update.change.message] : [])
     expect(actualResults.every(entry => entry.message.role === 'toolResult' && !entry.message.isError)).toBe(true)
@@ -220,9 +220,9 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
       expect(textOf(result.message)).toContain('青禾')
       expect(requests).toHaveLength(3)
       expect(actualResults.map(entry => entry.message.role === 'toolResult' ? entry.message.toolName : '')).toEqual(['read', 'read'])
-      expect(JSON.parse(requests[1]!.messages.at(-2)!.tool_calls![0]!.function.arguments).path).toBe('index.txt')
+      expect(await realpath(resolve(cwd, JSON.parse(requests[1]!.messages.at(-2)!.tool_calls![0]!.function.arguments).path))).toBe(await realpath(join(cwd, 'index.txt')))
       expect(requests[1]!.messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringContaining('下一条线索在 note.txt') })
-      expect(JSON.parse(requests[2]!.messages.at(-2)!.tool_calls![0]!.function.arguments).path).toBe('note.txt')
+      expect(await realpath(resolve(cwd, JSON.parse(requests[2]!.messages.at(-2)!.tool_calls![0]!.function.arguments).path))).toBe(await realpath(join(cwd, 'note.txt')))
       expect(requests[2]!.messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringContaining('项目名称：青禾') })
       expect(new Set(actualResults.map(entry => entry.toolCall?.assistantMessageId)).size).toBe(2)
     } else {
