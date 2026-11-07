@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { Credentials } from '@agent-learning/credentials'
 import { createTavilyProvider } from '../src/web-providers.js'
+import { createTools } from '../src/tools.js'
 import { createWebTools } from '../src/web-tools.js'
 import { ToolRuntime } from '../src/tool-runtime.js'
 
@@ -37,8 +38,10 @@ it.each(['search', 'fetch'] as const)('Tavily %s cancellation closes a real loca
     const tools = createWebTools({ provider: async () => provider }, { saveTemporary: async () => { throw new Error('unused') } })
     const controller = new AbortController()
     const context = { cwd, signal: controller.signal }
-    const output = capability === 'search' ? tools.web_search({ query: 'test' }, context) : tools.web_fetch({ urls: ['https://8.8.8.8/'] }, context)
-    const rejected = expect(output).rejects.toThrow()
+    const runtime = new ToolRuntime()
+    const tool = createTools(runtime, tools).find(tool => tool.name === `web_${capability}`)!
+    const output = tool.execute(capability === 'search' ? { query: 'test' } : { urls: ['https://8.8.8.8/'] }, context).finally(() => runtime.close())
+    const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted' })
     await entered.promise
     controller.abort()
     await rejected
@@ -70,13 +73,13 @@ it('web_fetch waits for an already-started real cache write before returning', a
   const runtime = new ToolRuntime()
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   const controller = new AbortController()
-  const content = '缓存内容'.repeat(2000)
+  const content = '项目资料'.repeat(5000) + '青禾正文结束'
   let path = '', settled = false
   const tools = createWebTools({ provider: async () => ({ id: 'test', name: 'Test', fetch: async () => [{ url: 'https://8.8.8.8/', content }] }) }, {
     saveTemporary: async text => { entered.resolve(); await release.promise; path = await runtime.saveTemporary(text); return path },
   })
   try {
-    const output = tools.web_fetch({ urls: ['https://8.8.8.8/'], char_limit: 2000 }, { cwd: tmpdir(), signal: controller.signal })
+    const output = tools.web_fetch({ urls: ['https://8.8.8.8/'] }, { cwd: tmpdir(), signal: controller.signal })
     void output.then(() => { settled = true })
     await entered.promise
     controller.abort()
@@ -87,4 +90,15 @@ it('web_fetch waits for an already-started real cache write before returning', a
     expect(await readFile(path, 'utf8')).toBe(content)
   } finally { release.resolve(); await runtime.close() }
   await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' })
+})
+
+it.each(['search', 'fetch'] as const)('普通 %s 网络失败不被同时到达的中止改写', async capability => {
+  const controller = new AbortController()
+  const failure = async () => { controller.abort(); throw new Error('网络原始失败') }
+  const tools = createWebTools({ provider: async () => ({ id: 'test', name: 'Test', search: failure, fetch: failure }) }, { saveTemporary: vi.fn() })
+  const runtime = new ToolRuntime()
+  try {
+    const tool = createTools(runtime, tools).find(tool => tool.name === `web_${capability}`)!
+    await expect(tool.execute(capability === 'search' ? { query: 'test' } : { urls: ['https://8.8.8.8/'] }, { cwd: tmpdir(), signal: controller.signal })).rejects.toMatchObject({ message: expect.stringContaining('网络原始失败') })
+  } finally { await runtime.close() }
 })

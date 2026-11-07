@@ -166,7 +166,7 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
       expect(modelRequests).toHaveLength(before + 2)
       expect(modelRequests[before]?.tools).toHaveLength(8)
       const followup = modelRequests[before + 1]!
-      expect(followup.tools).toBeUndefined()
+      expect(followup.tools).toHaveLength(8)
       const call = followup.messages.at(-2)?.tool_calls?.[0]
       expect(call?.id).toBeTruthy()
       expect(followup.messages.at(-1)).toMatchObject({
@@ -179,6 +179,60 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
       await tool.click()
       await expect(messages.getByText(`项目名称：${name}`, { exact: true }).last()).toBeVisible()
       await expect(messages.getByRole('listitem').last()).toContainText(name)
+    }
+  } finally {
+    await Promise.allSettled([context.clearCookies(), server.close()])
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${scenario}: 实际工具结果进入后续请求，每轮保留八种工具`, async ({ page, context }) => {
+  test.setTimeout(450_000)
+  const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
+  test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE')
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-feature6-live-'))
+  const cwd = join(temporary, 'workspace')
+  const requests: { messages: { role: string; content?: string; tool_calls?: { id: string; function: { name: string; arguments: string } }[]; tool_call_id?: string }[]; tools?: unknown[] }[] = []
+  const server = new WebServer({
+    port: 0, directoryPicker: async () => cwd,
+    browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
+    workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
+    modelOptions: { fetch: async (url, init) => { requests.push(JSON.parse(String(init?.body))); return globalThis.fetch(url, init) } },
+  })
+  try {
+    await mkdir(cwd)
+    if (scenario === 'loop') await Promise.all([
+      writeFile(join(cwd, 'index.txt'), '下一条线索在 note.txt'),
+      writeFile(join(cwd, 'note.txt'), '项目名称：青禾'),
+    ])
+    const observed = observe(page)
+    await authorize(page, (await server.start()).authUrl)
+    await ready(page, observed)
+    await addWorkspace(page)
+    await saveKey(page, await readLiveKey(keyFile!))
+    const result = await complete(page, observed, scenario === 'loop'
+      ? '请根据 index.txt 的线索找到项目名称。请先用 read 读取 index.txt，再根据真实结果继续使用 read，最后只回答项目名称。'
+      : '请用 write 把“项目名称：青禾”写入 note.txt，只写一次，然后直接回答“已保存”。')
+    expect(requests.every(request => request.tools?.length === 8)).toBe(true)
+    const actualResults = observed.updates.flatMap(({ update }) => update.change.type === 'task' && update.change.message?.message.role === 'toolResult' ? [update.change.message] : [])
+    expect(actualResults.every(entry => entry.message.role === 'toolResult' && !entry.message.isError)).toBe(true)
+    if (scenario === 'loop') {
+      expect(textOf(result.message)).toContain('青禾')
+      expect(requests).toHaveLength(3)
+      expect(actualResults.map(entry => entry.message.role === 'toolResult' ? entry.message.toolName : '')).toEqual(['read', 'read'])
+      expect(JSON.parse(requests[1]!.messages.at(-2)!.tool_calls![0]!.function.arguments).path).toBe('index.txt')
+      expect(requests[1]!.messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringContaining('下一条线索在 note.txt') })
+      expect(JSON.parse(requests[2]!.messages.at(-2)!.tool_calls![0]!.function.arguments).path).toBe('note.txt')
+      expect(requests[2]!.messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringContaining('项目名称：青禾') })
+      expect(new Set(actualResults.map(entry => entry.toolCall?.assistantMessageId)).size).toBe(2)
+    } else {
+      expect(textOf(result.message)).toContain('已保存')
+      expect(requests).toHaveLength(2)
+      expect(actualResults).toHaveLength(1)
+      expect(actualResults[0]!.message).toMatchObject({ toolName: 'write', isError: false })
+      expect(await readFile(join(cwd, 'note.txt'), 'utf8')).toBe('项目名称：青禾')
+      const call = requests[1]!.messages.at(-2)!.tool_calls![0]!
+      expect(requests[1]!.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: call.id, content: expect.stringContaining('note.txt') })
     }
   } finally {
     await Promise.allSettled([context.clearCookies(), server.close()])

@@ -6,7 +6,7 @@ import { MarkdownText } from './markdown/MarkdownText'
 const base: Message = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, content: [], stopReason: 'pending' }
 
 test('工具开始即显示，展开后可读流式参数和最终参数错误', async ({ mount }) => {
-  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' } as const
+  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' as const, activeTools: [] }
   const message: Message = { ...base, content: [{ type: 'toolCall', id: '', name: '', arguments: {} }] }
   const component = await mount(<AssistantMessage messages={[{ id: 'a', message }]} running={running} activeContent={[{ messageId: 'a', contentIndex: 0, type: 'toolCall', argumentsText: '{"city":' }]} />)
   await component.getByText('工具调用', { exact: true }).click()

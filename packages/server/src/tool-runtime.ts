@@ -9,7 +9,7 @@ export const MAX_OUTPUT_BYTES = 50 * 1024
 export const MAX_OUTPUT_LINES = 2000
 
 type SearchBinary = 'fd' | 'rg'
-type ChildResult = { code: number | null; signal: NodeJS.Signals | null; stderr: string; stopped?: string }
+type ChildResult = { code: number | null; signal: NodeJS.Signals | null; stderr: string; stopped?: string; aborted?: boolean }
 type RunOptions = {
   cwd: string
   signal: AbortSignal
@@ -183,16 +183,18 @@ export class ToolRuntime {
       const decoder = new StringDecoder('utf8')
       let stderr = ''
       let stopped: string | undefined
+      let aborted = false
       let timer: ReturnType<typeof setTimeout> | undefined
       let error: Error | undefined
 
-      const stop = (reason: string) => {
-        if (stopped) return
+      const stop = (reason: string, cancelled = false) => {
+        if (stopped || error || child.exitCode !== null || child.signalCode !== null) return
         stopped = reason
+        aborted = cancelled
         if (processGroup) stopGroup(child)
         else child.kill('SIGKILL')
       }
-      const onAbort = () => stop(this.shutdown.signal.aborted ? '服务关闭' : '任务已取消')
+      const onAbort = () => stop(this.shutdown.signal.aborted ? '服务关闭' : '任务已取消', true)
       signal.addEventListener('abort', onAbort, { once: true })
 
       if (timeout !== undefined) {
@@ -210,8 +212,8 @@ export class ToolRuntime {
         try {
           if (stdout?.(chunk) === false) stop('达到结果上限')
         } catch (cause) {
-          error = cause instanceof Error ? cause : new Error(String(cause))
           stop('处理工具输出失败')
+          error = cause instanceof Error ? cause : new Error(String(cause))
         }
       })
       child.stderr?.on('data', (chunk: Buffer) => { stderr = (stderr + decoder.write(chunk)).slice(-4096) })
@@ -222,7 +224,7 @@ export class ToolRuntime {
         signal.removeEventListener('abort', onAbort)
         clearTimeout(timer)
         if (error) reject(error)
-        else resolve({ code, signal: exitSignal, stderr: (stderr + decoder.end()).trim(), stopped })
+        else resolve({ code, signal: exitSignal, stderr: (stderr + decoder.end()).trim(), stopped, aborted })
       })
     }))
   }
@@ -252,7 +254,7 @@ export class ToolRuntime {
         if (result.stderr) output = [output, result.stderr].filter(Boolean).join('\n')
         const status = result.stopped ?? (result.code === null ? `进程因 ${result.signal} 结束` : `退出码 ${result.code}`)
         const text = [output, status].filter(Boolean).join('\n')
-        if (result.code !== 0 || result.stopped) throw new Error(text)
+        if (result.code !== 0 || result.stopped) throw Object.assign(new Error(text), result.aborted ? { code: 'interrupted' } : {})
         return text
       } finally {
         await file.close()

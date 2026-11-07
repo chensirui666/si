@@ -104,7 +104,7 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
     expect(toolText).toMatch(scenario.result)
     expect(requests).toHaveLength(2)
     expect(requests[0]?.tools).toHaveLength(8)
-    expect(requests[1]?.tools).toBeUndefined()
+    expect(requests[1]?.tools).toHaveLength(8)
     expect(requests[1]?.messages.at(-2)?.tool_calls?.[0]?.id).toBe(calls[0]!.id)
     expect(requests[1]?.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: calls[0]!.id, content: toolText })
     const answer = assistants[1]?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('') ?? ''

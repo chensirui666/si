@@ -70,7 +70,7 @@ describe('browser subscription', () => {
     start(); socket().open(); snapshot()
     const ws = socket()
     const old = ws.id
-    const accepted = { type: 'accepted', user: { id: 'user-1', message: { role: 'user', content: 'hello', timestamp: 1 } }, running: { userMessageId: 'user-1', assistantMessageId: 'assistant-1', phase: 'model' } }
+    const accepted = { type: 'accepted', user: { id: 'user-1', message: { role: 'user', content: 'hello', timestamp: 1 } }, running: { userMessageId: 'user-1', assistantMessageId: 'assistant-1', phase: 'model', activeTools: [] } }
     ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
     ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
     expect(current().snapshot?.messages).toHaveLength(1)
@@ -267,4 +267,28 @@ it.each([413, 415])('HTTP %s 是明确拒绝而非接收未知', async status =>
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status, ok: false, json: async () => ({ error: status === 413 ? '消息过长' : '需要 JSON 请求' }) }))
   const { submitMessage } = await import('./client')
   await expect(submitMessage({ clientMessageId: 'local', modelId: 'deepseek-flash', workspaceId: 'workspace-1', text: 'a'.repeat(70_000) })).rejects.toMatchObject({ status })
+})
+
+it('W3/W3.5 漏失结果先重订阅，重连与停止后旧连接不能改写结果', () => {
+  start(); socket().open(); snapshot()
+  const ws = socket(), oldId = ws.id
+  ws.frame({ type: 'update', subscriptionId: oldId, update: { seq: 2, change: { type: 'task', running: null } } })
+  expect(current().connection).toBe('awaitingSnapshot')
+  expect(current().snapshot?.seq).toBe(0)
+  ws.close()
+  vi.advanceTimersByTime(250)
+  const next = socket(); next.open()
+  const assistant = { id: 'a', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'read-1', name: 'read', arguments: { path: 'note.txt' } }] } }
+  const result = { id: 'r', toolCall: { assistantMessageId: 'a', contentIndex: 0 }, message: { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', timestamp: 2, isError: false, content: [{ type: 'text', text: '项目名称：青禾' }] } }
+  next.frame({ type: 'snapshot', subscriptionId: next.id, snapshot: { ...empty, seq: 3, messages: [assistant, result] } })
+  expect(current().connection).toBe('ready')
+  const restored = current()
+  ws.frame({ type: 'update', subscriptionId: oldId, update: { seq: 4, change: { type: 'task', running: { userMessageId: 'u', assistantMessageId: 'a', phase: 'tools', activeTools: [{ assistantMessageId: 'a', contentIndex: 0 }] } } } })
+  expect(current()).toBe(restored)
+  const count = states.length
+  stop?.()
+  next.frame({ type: 'snapshot', subscriptionId: next.id, snapshot: empty })
+  vi.advanceTimersByTime(30_000)
+  expect(states).toHaveLength(count)
+  expect(Socket.instances).toHaveLength(2)
 })

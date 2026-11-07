@@ -682,7 +682,7 @@ it('W1/W2: cancel does not write, aliases reuse binding, rejection prevents mode
   await vi.waitFor(() => expect(requests).toHaveLength(2))
   expect(requests[0].messages[0].content).toContain(app.workspace)
   expect(requests[0].tools).toHaveLength(8)
-  expect(requests[1].tools).toBeUndefined()
+  expect(requests[1].tools).toHaveLength(8)
   expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })
   expect(await readFile(join(app.workspace, 'written.txt'), 'utf8')).toBe('working-directory')
 

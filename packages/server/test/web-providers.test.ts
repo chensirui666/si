@@ -105,3 +105,11 @@ it('returns mixed URL statuses in input order and caches oversize content within
     await expect(readFile(path!, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   } finally { await runtime.close() }
 })
+
+it('传输普通失败与取消同时到达时，Tavily 仍报告网络失败', async () => {
+  const { credentials } = await setup()
+  await credentials.saveApiKey('tavily', 'test-only')
+  const controller = new AbortController()
+  const provider = createTavilyProvider(credentials, async () => { controller.abort(); throw new Error('transport failed') })
+  await expect(provider.search!('test', 1, controller.signal)).rejects.toThrow('Tavily 请求失败，请检查网络')
+})

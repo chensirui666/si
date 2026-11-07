@@ -67,7 +67,7 @@ const missing = { models: [], deepseek: { state: 'missing' as const } }
 const configured = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions' }], deepseek: { state: 'configured' as const } }
 
 const runningState = (id = 'user-1'): ChatState => ({ connection: 'ready', slow: false, error: null, snapshot: {
-  ...empty, seq: 1, running: { userMessageId: id, assistantMessageId: 'answer', phase: 'model' },
+  ...empty, seq: 1, running: { userMessageId: id, assistantMessageId: 'answer', phase: 'model', activeTools: [] },
 } })
 
 it('空草稿也能中止，重复点击只交付一次，回执先到仍等待后台空闲', async () => {
@@ -232,7 +232,7 @@ it('有效发送立即清空，HTTP 回执等待 WS；渲染前双手势只提�
   await pasteDraft('新草稿')
   await act(async () => { resolve({ clientMessageId: input.clientMessageId, userMessageId: 'user', acceptedSeq: 1 }) })
   expect(screen.getByRole('button', { name: '中止' })).toBeDisabled()
-  source.emit({ connection: 'ready', snapshot: { ...empty, seq: 1, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model' } }, slow: false, error: null })
+  source.emit({ connection: 'ready', snapshot: { ...empty, seq: 1, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model', activeTools: [] } }, slow: false, error: null })
   expect(screen.getAllByRole('listitem')).toHaveLength(1)
   expect(screen.getByRole('button', { name: '中止' })).toBeEnabled()
   expect(editor.textContent).toBe('新草稿')
@@ -313,7 +313,7 @@ it('有模型时仍逐项检查连接、快照、运行与模型门禁，切换�
   source.emit({ connection: 'ready', snapshot: null, slow: false, error: null })
   fireEvent.keyDown(editor, { key: 'Enter' })
   expect(submitMessage).not.toHaveBeenCalled()
-  source.emit({ connection: 'ready', snapshot: { ...empty, running: { userMessageId: 'other-user', assistantMessageId: 'other-answer', phase: 'model' } }, slow: false, error: null })
+  source.emit({ connection: 'ready', snapshot: { ...empty, running: { userMessageId: 'other-user', assistantMessageId: 'other-answer', phase: 'model', activeTools: [] } }, slow: false, error: null })
   fireEvent.keyDown(editor, { key: 'Enter' })
   expect(submitMessage).not.toHaveBeenCalled()
   await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })

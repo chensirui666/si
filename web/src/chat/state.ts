@@ -20,8 +20,9 @@ const finite = (value: unknown): value is number => typeof value === 'number' &&
 const textContent = (value: unknown) => record(value) && value.type === 'text' && typeof value.text === 'string'
 const toolPosition = (value: unknown) => record(value) && typeof value.assistantMessageId === 'string' && sequence(value.contentIndex)
 const runningState = (value: unknown) => record(value) && typeof value.userMessageId === 'string' && typeof value.assistantMessageId === 'string'
-  && (value.phase === 'model' || value.phase === 'tools' || value.phase === 'answer')
-  && (value.activeTool === undefined || (value.phase === 'tools' && toolPosition(value.activeTool)))
+  && (value.phase === 'model' || value.phase === 'tools')
+  && Array.isArray(value.activeTools) && value.activeTools.every(toolPosition)
+  && (value.phase === 'tools' || value.activeTools.length === 0)
 
 function modelMessage(value: unknown): value is ModelMessage {
   if (!record(value) || !finite(value.timestamp)) return false
@@ -43,6 +44,40 @@ function modelMessage(value: unknown): value is ModelMessage {
 function conversationMessage(value: unknown): value is ConversationMessage {
   return record(value) && typeof value.id === 'string' && (value.clientMessageId === undefined || typeof value.clientMessageId === 'string') && modelMessage(value.message)
     && (value.message.role === 'toolResult' ? toolPosition(value.toolCall) : value.toolCall === undefined)
+    && (value.toolErrorCode === undefined || (typeof value.toolErrorCode === 'string' && value.message.role === 'toolResult' && value.message.isError))
+}
+
+function validRelations(messages: ConversationMessage[], running: ConversationSnapshot['running']): boolean {
+  if (new Set(messages.map(entry => entry.id)).size !== messages.length) return false
+  const results = new Set<string>()
+  for (const [index, entry] of messages.entries()) {
+    if (entry.message.role !== 'toolResult' || !entry.toolCall) continue
+    const { assistantMessageId, contentIndex } = entry.toolCall
+    const assistantIndex = messages.findIndex(item => item.id === assistantMessageId)
+    const assistant = messages[assistantIndex]?.message
+    const call = assistant?.role === 'assistant' ? assistant.content[contentIndex] : undefined
+    const key = `${assistantMessageId}:${contentIndex}`
+    if (assistantIndex >= index || call?.type !== 'toolCall' || call.id !== entry.message.toolCallId || call.name !== entry.message.toolName || results.has(key)) return false
+    const previous = messages[index - 1]?.toolCall
+    if (index > assistantIndex + 1 && (!previous || previous.assistantMessageId !== assistantMessageId || previous.contentIndex >= contentIndex)) return false
+    results.add(key)
+  }
+  if (running) {
+    const userIndex = messages.findIndex(entry => entry.id === running.userMessageId)
+    const assistantIndex = messages.findIndex(entry => entry.id === running.assistantMessageId)
+    if (userIndex < 0 || messages[userIndex]?.message.role !== 'user' || messages.slice(userIndex + 1).some(entry => entry.message.role === 'user')) return false
+    if (assistantIndex < 0) {
+      if (running.phase !== 'model') return false
+    } else if (assistantIndex <= userIndex || messages[assistantIndex]?.message.role !== 'assistant') return false
+  }
+  const active = new Set<string>()
+  for (const location of running?.activeTools ?? []) {
+    const assistant = messages.find(item => item.id === location.assistantMessageId)?.message
+    const key = `${location.assistantMessageId}:${location.contentIndex}`
+    if (location.assistantMessageId !== running?.assistantMessageId || assistant?.role !== 'assistant' || assistant.content[location.contentIndex]?.type !== 'toolCall' || results.has(key) || active.has(key)) return false
+    active.add(key)
+  }
+  return true
 }
 
 function validSnapshot(value: unknown): value is ConversationSnapshot {
@@ -50,6 +85,7 @@ function validSnapshot(value: unknown): value is ConversationSnapshot {
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
     && value.activeContent.every(block => record(block) && typeof block.messageId === 'string' && sequence(block.contentIndex)
       && (block.type === 'text' || block.type === 'thinking' || (block.type === 'toolCall' && typeof block.argumentsText === 'string')))
+    && validRelations(value.messages as ConversationMessage[], value.running as ConversationSnapshot['running'])
 }
 
 export function applyFrame(state: ChatState, frame: unknown, subscriptionId: string): { state: ChatState; resubscribe: boolean } {
@@ -72,16 +108,25 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   }
   const valid = frame as Extract<ServerFrame, { type: 'update' }>
   const update = valid.update.change
-  if (update.type === 'accepted' && conversationMessage(change.user) && change.user.message.role === 'user' && runningState(change.running)) {
+  if (update.type === 'accepted') {
+    if (!conversationMessage(change.user) || change.user.message.role !== 'user' || !runningState(change.running)) return { state, resubscribe: true }
+    const messages = [...state.snapshot.messages, update.user]
+    if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, seq: valid.update.seq, messages: [...state.snapshot.messages, update.user], running: update.running,
+      ...state.snapshot, seq: valid.update.seq, messages, running: update.running,
     } }, resubscribe: false }
   }
-  if (update.type === 'task' && (change.running === null || runningState(change.running))
-    && (change.message === undefined || (conversationMessage(change.message) && change.message.message.role === 'toolResult'))) {
+  if (update.type === 'task') {
+    if (!(change.running === null || runningState(change.running))) return { state, resubscribe: true }
+    const messages = [...state.snapshot.messages]
+    if (change.message !== undefined || change.messageIndex !== undefined) {
+      if (!conversationMessage(change.message) || change.message.message.role !== 'toolResult'
+        || !sequence(change.messageIndex) || change.messageIndex > messages.length) return { state, resubscribe: true }
+      messages.splice(change.messageIndex, 0, change.message)
+    }
+    if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, seq: valid.update.seq, running: update.running,
-      messages: update.message ? [...state.snapshot.messages, update.message] : state.snapshot.messages,
+      ...state.snapshot, seq: valid.update.seq, running: update.running, messages,
     } }, resubscribe: false }
   }
   return unchanged

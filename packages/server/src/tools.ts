@@ -87,9 +87,17 @@ function executable<Schema extends TSchema>(
   return {
     ...declaration,
     async execute(args, context) {
-      context.signal.throwIfAborted()
-      if (!Check(declaration.parameters, args)) throw new Error(`${declaration.name} 工具参数不符合声明`)
-      return execute(args, context)
+      try {
+        context.signal.throwIfAborted()
+        if (!Check(declaration.parameters, args)) throw new Error(`${declaration.name} 工具参数不符合声明`)
+        return await execute(args, context)
+      } catch (error) {
+        const signal = context.signal
+        if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError' && error.cause === signal.reason))) {
+          throw Object.assign(new Error(error instanceof Error ? error.message : '任务已取消', { cause: error }), { code: 'interrupted' })
+        }
+        throw error
+      }
     },
   }
 }

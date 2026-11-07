@@ -1,10 +1,13 @@
 import { useState, type ReactNode } from 'react'
-import type { ActiveContent, RunningState } from '@agent-learning/agent'
-import type { AssistantMessage as Message, ToolCall, ToolResultMessage } from '@agent-learning/model'
+import type { ActiveContent, ConversationMessage, RunningState } from '@agent-learning/agent'
+import type { AssistantMessage as Message, ToolCall } from '@agent-learning/model'
 import { MarkdownText } from './markdown/MarkdownText'
 
 export type AssistantEntry = { id: string; message: Message }
-export type ToolResults = ReadonlyMap<string, ReadonlyMap<number, ToolResultMessage>>
+export type ToolResults = ReadonlyMap<string, ReadonlyMap<number, ConversationMessage>>
+
+type ToolState = 'preparing' | 'running' | 'ok' | 'error' | 'stopped'
+const toolLabels: Record<ToolState, string> = { preparing: '准备中', running: '运行中', ok: '成功', error: '失败', stopped: '已停止' }
 
 const toolSummaries: Record<string, [action: string, target: string]> = {
   read: ['读取', 'path'],
@@ -26,34 +29,39 @@ function ProcessGroup({ running, children }: { running: boolean; children: React
   </details>
 }
 
-function ToolBlock({ block, streaming, argumentsText, running, executing, result }: {
+function ToolBlock({ block, argumentsText, running, executing, result, stopped, failure }: {
   block: ToolCall
-  streaming: boolean
   argumentsText?: string
   running: boolean
   executing: boolean
-  result?: ToolResultMessage
+  result?: ConversationMessage
+  stopped: boolean
+  failure?: string
 }) {
   const presentation = Object.hasOwn(toolSummaries, block.name) ? toolSummaries[block.name] : undefined
   const action = presentation?.[0] ?? (block.name || '工具调用')
   const target = presentation ? block.arguments[presentation[1]] : undefined
   const firstUrl = Array.isArray(target) ? target.find(value => typeof value === 'string') : undefined
   const label = typeof target === 'string' ? target : firstUrl
-  const status = result ? result.isError ? '失败' : '成功'
-    : executing ? '执行中' : streaming ? '接收参数中'
-    : block.argumentsError ? '参数无效' : running ? '等待执行' : '未执行'
+  const outcome = result?.message.role === 'toolResult' ? result.message : undefined
+  const state: ToolState = outcome ? result?.toolErrorCode === 'interrupted' ? 'stopped' : outcome.isError ? 'error' : 'ok'
+    : executing ? 'running' : stopped ? 'stopped' : failure ? 'error' : running ? 'preparing' : 'error'
+  const reason = outcome || state === 'preparing' || state === 'running' ? undefined
+    : state === 'stopped' ? '启动前已取消，本项未启动，没有执行结果。'
+    : failure ?? block.argumentsError ?? '未取得执行结果，不能确认是否已发生修改。'
   return <details className="tool-block">
     <summary>
       <span className="process-preview">{action}{label && ` · ${label}`}</span>
-      <span className="tool-status" data-result={result ? (result.isError ? 'failure' : 'success') : undefined}>{status}</span>
+      <span className="tool-status" data-state={state} data-result={state === 'ok' ? 'success' : state === 'error' ? 'failure' : undefined}>{toolLabels[state]}</span>
     </summary>
     <div className="tool-details">
       <div className="tool-detail-label">参数</div>
       <pre>{argumentsText ?? JSON.stringify(block.arguments, null, 2)}</pre>
       {block.argumentsError && <p className="message-error">{block.argumentsError}</p>}
-      {result && <>
+      {reason && <p className="message-error">{reason}</p>}
+      {outcome && <>
         <div className="tool-detail-label">结果</div>
-        <pre className="tool-result">{result.content.map(item => item.text).join('\n')}</pre>
+        <pre className="tool-result">{outcome.content.map(item => item.text).join('\n')}</pre>
       </>}
     </div>
   </details>
@@ -65,6 +73,7 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
   running?: RunningState
   toolResults?: ToolResults
 }) {
+  const terminal = [...messages].reverse().find(entry => entry.message.stopReason === 'aborted' || entry.message.stopReason === 'error')?.message
   const rows: ReactNode[] = []
   let process: ReactNode[] = []
   let processKey = ''
@@ -93,9 +102,11 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
           <MarkdownText text={block.thinking} streaming={active?.type === 'thinking'} />
         </details>)
       } else {
-        process.push(<ToolBlock key={key} block={block} streaming={active?.type === 'toolCall'} argumentsText={active?.type === 'toolCall' ? active.argumentsText : undefined}
-          running={running?.phase === 'model' || running?.phase === 'tools'}
-          executing={running?.activeTool?.assistantMessageId === id && running.activeTool.contentIndex === index}
+        process.push(<ToolBlock key={key} block={block} argumentsText={active?.type === 'toolCall' ? active.argumentsText : undefined}
+          running={running !== null}
+          executing={running?.activeTools.some(tool => tool.assistantMessageId === id && tool.contentIndex === index) ?? false}
+          stopped={!running && terminal?.stopReason === 'aborted'}
+          failure={message.stopReason === 'length' ? '本批工具未执行：本轮回复截断。' : !running && terminal?.stopReason === 'error' ? terminal.errorMessage ?? '任务失败，本项没有执行结果。' : undefined}
           result={toolResults?.get(id)?.get(index)} />)
       }
     })

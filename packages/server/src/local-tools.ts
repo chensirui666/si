@@ -242,7 +242,7 @@ async function find(runtime: ToolRuntime, { pattern, path = '.', limit = 1000 }:
   const reachedLimit = result.stopped === '达到结果上限'
   if (result.stderr || (!reachedLimit && result.stopped) || (result.code !== 0 && (!reachedLimit || result.code !== null))) {
     const failure = result.stderr || (!reachedLimit && result.stopped) || `退出码 ${result.code ?? result.signal}`
-    throw new Error([text && `部分结果（不完整）\n${text}`, `fd 执行失败：${failure}`].filter(Boolean).join('\n'))
+    throw Object.assign(new Error([text && `部分结果（不完整）\n${text}`, `fd 执行失败：${failure}`].filter(Boolean).join('\n')), result.aborted ? { code: 'interrupted' } : {})
   }
   return [text || '未找到匹配路径', notice && `[${notice}]`].filter(Boolean).join('\n')
 }
@@ -309,7 +309,8 @@ async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: C
   const reachedLimit = result.stopped === '达到结果上限'
   if ((!reachedLimit && result.stopped) ||
       (result.code !== 0 && result.code !== 1 && (!reachedLimit || result.code !== null))) {
-    throw new Error(`rg 执行失败：${result.stopped ?? (result.stderr || `退出码 ${result.code}`)}`)
+    const partial = matches.map(match => `${stats.isDirectory() ? relative(search, match.path) : basename(match.path)}:${match.line}: ${match.text}`).join('\n')
+    throw Object.assign(new Error([partial && `部分结果（不完整）\n${partial}`, `rg 执行失败：${result.stopped ?? (result.stderr || `退出码 ${result.code}`)}`].filter(Boolean).join('\n')), result.aborted ? { code: 'interrupted' } : {})
   }
   if (!matches.length) return '未找到匹配项'
 

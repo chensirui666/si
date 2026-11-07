@@ -17,7 +17,7 @@ export async function startModelServer() {
     authorized: boolean
     body: RequestBody
     delta: (delta: Record<string, unknown>) => void
-    finish: () => void
+    finish: (reason?: 'stop' | 'tool_calls' | 'length') => void
     closed: boolean
   }[] = []
   const responses = new Set<ServerResponse>()
@@ -40,8 +40,8 @@ export async function startModelServer() {
       authorized: request.headers.authorization === 'Bearer controlled-stage3-key',
       body: JSON.parse(body) as RequestBody,
       delta: (delta: Record<string, unknown>) => chunk(delta),
-      finish: () => {
-        chunk({}, 'stop')
+      finish: (reason: 'stop' | 'tool_calls' | 'length' = 'stop') => {
+        chunk({}, reason)
         response.write(`data: ${JSON.stringify({
           id, object: 'chat.completion.chunk', created: 1, model: 'deepseek-flash', choices: [],
           usage: { prompt_tokens: 17, completion_tokens: 9, total_tokens: 26 },

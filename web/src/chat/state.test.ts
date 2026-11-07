@@ -28,7 +28,7 @@ describe('conversation state', () => {
   it('连续 accepted 保留原文且不修改已有快照，跳号与模型块请求完整快照', () => {
     const state = ready()
     const user = { id: 'one', message: { role: 'user', content: '  原文\n', timestamp: 1 } }
-    const running = { userMessageId: 'one', assistantMessageId: 'two', phase: 'model' }
+    const running = { userMessageId: 'one', assistantMessageId: 'two', phase: 'model', activeTools: [] }
     const accepted = { type: 'update', subscriptionId: 'current', update: { seq: 1, change: { type: 'accepted', user, running } } }
     const result = applyFrame(state, accepted, 'current')
     expect(result.state.snapshot).toEqual({ ...empty, seq: 1, messages: [user], running })
@@ -85,17 +85,102 @@ it.each([
 
 it('模型回复结束后仍忙碌，任务更新带回结果并独立结束', () => {
   const assistant = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'call', name: 'read', arguments: { path: 'note.txt' } }] }
-  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' }
-  let state = applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: { ...empty, running } }, 'current').state
+  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model', activeTools: [] }
+  const user = { id: 'u', message: { role: 'user', content: '读取', timestamp: 0 } }
+  let state = applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: { ...empty, messages: [user], running } }, 'current').state
   const update = (seq: number, change: unknown) => { state = applyFrame(state, { type: 'update', subscriptionId: 'current', update: { seq, change } }, 'current').state }
   update(1, { type: 'model', messageId: 'a', event: { type: 'done', reason: 'toolUse', message: assistant } })
   expect(state.snapshot?.running).toEqual(running)
   const toolCall = { assistantMessageId: 'a', contentIndex: 0 }
-  update(2, { type: 'task', running: { ...running, phase: 'tools', activeTool: toolCall } })
-  expect(state.snapshot?.running).toMatchObject({ phase: 'tools', activeTool: toolCall })
+  update(2, { type: 'task', running: { ...running, phase: 'tools', activeTools: [toolCall] } })
+  expect(state.snapshot?.running).toMatchObject({ phase: 'tools', activeTools: [toolCall] })
   const message = { id: 'result', toolCall, message: { role: 'toolResult', toolCallId: 'call', toolName: 'read', timestamp: 2, isError: false, content: [{ type: 'text', text: '青禾' }] } }
-  update(3, { type: 'task', running: { ...running, phase: 'answer' }, message })
-  expect(state.snapshot?.messages).toEqual([{ id: 'a', message: assistant }, message])
+  update(3, { type: 'task', running: { ...running, phase: 'model', activeTools: [] }, message, messageIndex: 2 })
+  expect(state.snapshot?.messages).toEqual([user, { id: 'a', message: assistant }, message])
   update(4, { type: 'task', running: null })
   expect(state.snapshot?.running).toBeNull()
+})
+
+
+describe('Feature6 乱序结果和进度校验', () => {
+  const base = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'toolUse' }
+  const calls = ['note.txt', 'status.txt'].map((path, i) => ({ type: 'toolCall', id: `call-${i}`, name: 'read', arguments: { path } }))
+  const messages = [{ id: 'u', message: { role: 'user', content: '找项目', timestamp: 0 } }, { id: 'a', message: { ...base, content: calls } }]
+  const locations = [0, 1].map(contentIndex => ({ assistantMessageId: 'a', contentIndex }))
+  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'tools', activeTools: locations }
+  const result = (i: number) => ({ id: `r${i}`, toolCall: locations[i], message: { role: 'toolResult', toolCallId: `call-${i}`, toolName: 'read', timestamp: 2, isError: false, content: [{ type: 'text', text: i ? '状态：测试中' : '项目名称：青禾' }] } })
+  const start = () => applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: { ...empty, messages, running } }, 'current').state
+  const task = (state: ReturnType<typeof start>, change: unknown, seq = 1) => applyFrame(state, { type: 'update', subscriptionId: 'current', update: { seq, change } }, 'current')
+
+  it('W2 B 先到、A 后插入，增量与两次刷新快照相同', () => {
+    const state = start()
+    const first = task(state, { type: 'task', running: { ...running, activeTools: [locations[0]] }, message: result(1), messageIndex: 2 })
+    expect(first.resubscribe).toBe(false)
+    expect(first.state.snapshot?.messages).toEqual([...messages, result(1)])
+    const firstRefresh = applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: first.state.snapshot }, 'current').state
+    expect(firstRefresh.snapshot).toEqual(first.state.snapshot)
+    const second = task(first.state, { type: 'task', running: { ...running, activeTools: [] }, message: result(0), messageIndex: 2 }, 2)
+    expect(second.resubscribe).toBe(false)
+    expect(second.state.snapshot?.messages).toEqual([...messages, result(0), result(1)])
+    expect(applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: second.state.snapshot }, 'current').state.snapshot).toEqual(second.state.snapshot)
+    expect(state.snapshot?.messages).toEqual(messages)
+  })
+
+  it('W2.1 新一轮助手尚未 start 也接受 model 进度', () => {
+    const state = start()
+    const result = task(state, { type: 'task', running: { userMessageId: 'u', assistantMessageId: 'next', phase: 'model', activeTools: [] } })
+    expect(result.resubscribe).toBe(false)
+    expect(result.state.snapshot?.running?.assistantMessageId).toBe('next')
+    expect(applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: result.state.snapshot }, 'current').state.connection).toBe('ready')
+  })
+
+  it.each([
+    { message: result(0) },
+    { messageIndex: 2 },
+    { message: result(0), messageIndex: 100 },
+    { message: result(0), messageIndex: -1 },
+    { message: result(0), messageIndex: 0 },
+    { message: { ...result(0), toolErrorCode: 'interrupted' }, messageIndex: 2 },
+    { message: { ...result(0), toolCall: { assistantMessageId: 'unknown', contentIndex: 0 } }, messageIndex: 2 },
+    { message: { ...result(0), message: { ...result(0).message, toolCallId: 'wrong' } }, messageIndex: 2 },
+  ])('W3.1—3.3 无效结果通知要求重新获取记录 %j', fields => {
+    const state = start()
+    const applied = task(state, { type: 'task', running: { ...running, activeTools: [] }, ...fields })
+    expect(applied.resubscribe).toBe(true)
+    expect(applied.state).toBe(state)
+  })
+
+  it.each([
+    { userMessageId: 'missing', assistantMessageId: 'a', phase: 'model', activeTools: [] },
+    { userMessageId: 'u', assistantMessageId: 'missing', phase: 'tools', activeTools: [] },
+    { userMessageId: 'u', assistantMessageId: 'u', phase: 'model', activeTools: [] },
+  ])('任务进度必须对应实际用户和合法助手位置 %j', invalid => {
+    const state = start()
+    const applied = task(state, { type: 'task', running: invalid })
+    expect(applied.resubscribe).toBe(true)
+    expect(applied.state).toBe(state)
+    const snapshot = applyFrame(initialState, { type: 'snapshot', subscriptionId: 'current', snapshot: { ...empty, messages, running: invalid } }, 'current')
+    expect(snapshot.state).toBe(initialState)
+  })
+
+  it.each([
+    [{ assistantMessageId: 'a', contentIndex: 6 }],
+    [{ assistantMessageId: 'unknown', contentIndex: 0 }],
+    [locations[0], locations[0]],
+  ].map(activeTools => ({ activeTools })))('W3.4 不存在或重复的活动工具不能应用 %j', ({ activeTools }) => {
+    const state = start()
+    const applied = task(state, { type: 'task', running: { ...running, activeTools } })
+    expect(applied.resubscribe).toBe(true)
+    expect(applied.state).toBe(state)
+  })
+})
+
+it('accepted 的任务编号不属于所收用户时重取快照', () => {
+  const state = ready()
+  const result = applyFrame(state, { type: 'update', subscriptionId: 'current', update: { seq: 1, change: {
+    type: 'accepted', user: { id: 'u', message: { role: 'user', content: 'hello', timestamp: 1 } },
+    running: { userMessageId: 'missing', assistantMessageId: 'a', phase: 'model', activeTools: [] },
+  } } }, 'current')
+  expect(result.resubscribe).toBe(true)
+  expect(result.state).toBe(state)
 })

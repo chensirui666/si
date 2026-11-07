@@ -79,7 +79,7 @@ test('执行过程逐步展示并独立展开，正文分段，结果按来源�
   const call = { type: 'toolCall', id: 'same', name: 'read', arguments: { path: 'note.txt' } } as const;
   const user: ConversationMessage = { id: 'u', message: { role: 'user', content: '读取文件', timestamp: 1 } };
   const first = { id: 'a', message: { ...base, content: [{ type: 'thinking', thinking: '先读' }, { type: 'toolCall', id: '', name: '', arguments: {} }] } } satisfies ConversationMessage;
-  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' } as const;
+  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' as const, activeTools: [] };
   const component = await mount(<MessageList messages={[user, first]} running={running} activeContent={[
     { type: 'thinking', messageId: 'a', contentIndex: 0 },
     { type: 'toolCall', messageId: 'a', contentIndex: 1, argumentsText: '{"path":' },
@@ -90,17 +90,17 @@ test('执行过程逐步展示并独立展开，正文分段，结果按来源�
   await expect(process).toHaveAttribute('open');
   await expect(thinking.locator('summary')).toContainText('先读');
   await expect(thinking).not.toHaveAttribute('open');
-  await expect(tool.locator('summary')).toContainText('接收参数中');
+  await expect(tool.locator('summary')).toContainText('准备中');
   await thinking.locator('summary').click();
   await expect(tool).not.toHaveAttribute('open');
 
   const assistant: ConversationMessage = { id: 'a', message: { ...base, content: [{ type: 'thinking', thinking: '先读文件，再核对' }, call] } };
   await component.update(<MessageList messages={[user, assistant]} running={running} />);
   await expect(thinking.locator('.markdown-text')).toHaveText('先读文件，再核对');
-  await expect(tool.locator('summary')).toContainText('等待执行');
+  await expect(tool.locator('summary')).toContainText('准备中');
   const activeTool = { assistantMessageId: 'a', contentIndex: 1 };
-  await component.update(<MessageList messages={[user, assistant]} running={{ ...running, phase: 'tools', activeTool }} />);
-  await expect(tool.locator('summary')).toContainText('执行中');
+  await component.update(<MessageList messages={[user, assistant]} running={{ ...running, phase: 'tools', activeTools: [activeTool] }} />);
+  await expect(tool.locator('summary')).toContainText('运行中');
 
   const answer: ConversationMessage = { id: 'answer', message: { ...base, stopReason: 'stop', content: [
     { type: 'thinking', thinking: '根据结果回答' }, call, { type: 'text', text: '**最终正文**' }, { type: 'thinking', thinking: '正文后思考' },
@@ -109,7 +109,7 @@ test('执行过程逐步展示并独立展开，正文分段，结果按来源�
     id, toolCall: { assistantMessageId, contentIndex }, message: { role: 'toolResult', toolCallId: 'same', toolName: 'read', timestamp: 2, isError, content: [{ type: 'text', text }] },
   });
   const messages = [user, assistant, result('r1', 'a', 1, '青禾（输出已截断）', false), answer, result('r2', 'answer', 1, '找不到文件', true)];
-  await component.update(<MessageList messages={messages} running={{ ...running, phase: 'answer', assistantMessageId: 'answer' }} />);
+  await component.update(<MessageList messages={messages} running={{ ...running, phase: 'model', activeTools: [], assistantMessageId: 'answer' }} />);
   const groups = component.locator('details.process-group');
   await expect(groups).toHaveCount(2);
   await expect(groups.first().locator('.thinking-block')).toHaveCount(2);
@@ -131,4 +131,35 @@ test('执行过程逐步展示并独立展开，正文分段，结果按来源�
   await failed.locator('summary').click();
   await expect(failed.getByText('找不到文件')).toBeVisible();
   await expect(failed.getByText('青禾（输出已截断）')).toHaveCount(0);
+});
+
+test('W4 两轮读取使用相同调用编号，整次结束才收起并保留各自结果', async ({ mount }) => {
+  const base = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'toolUse' } as const;
+  const call = (path: string) => ({ type: 'toolCall' as const, id: 'read-1', name: 'read', arguments: { path } });
+  const user: ConversationMessage = { id: 'u', message: { role: 'user', content: '找出项目名称', timestamp: 0 } };
+  const first: ConversationMessage = { id: 'a1', message: { ...base, content: [call('index.txt')] } };
+  const result = (id: string, assistantMessageId: string, text: string): ConversationMessage => ({ id, toolCall: { assistantMessageId, contentIndex: 0 }, message: { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', timestamp: 2, isError: false, content: [{ type: 'text', text }] } });
+  const history = [user, first, result('r1', 'a1', '下一条线索在 note.txt')];
+  const running = { userMessageId: 'u', assistantMessageId: 'a2', phase: 'model' as const, activeTools: [] };
+  const component = await mount(<MessageList messages={history} running={running} />);
+  const process = component.locator('.process-group');
+  await expect(process).toHaveAttribute('open');
+  const second: ConversationMessage = { id: 'a2', message: { ...base, content: [call('note.txt')] } };
+  await component.update(<MessageList messages={[...history, second]} running={{ ...running, phase: 'tools', activeTools: [{ assistantMessageId: 'a2', contentIndex: 0 }] }} />);
+  await expect(process).toHaveAttribute('open');
+  await expect(process.locator('.tool-status')).toHaveText(['成功', '运行中']);
+  const completed = [...history, second, result('r2', 'a2', '项目名称：青禾'), { id: 'a3', message: { ...base, stopReason: 'stop' as const, content: [{ type: 'text' as const, text: '青禾' }] } }];
+  await component.update(<MessageList messages={completed} />);
+  await expect(process).not.toHaveAttribute('open');
+  await process.locator(':scope > summary').click();
+  const tools = process.locator('.tool-block');
+  await tools.nth(0).locator('summary').click();
+  await tools.nth(1).locator('summary').click();
+  await expect(tools.nth(0)).toContainText('下一条线索在 note.txt');
+  await expect(tools.nth(1)).toContainText('项目名称：青禾');
+  await expect(tools.nth(1)).not.toContainText('下一条线索');
+  await process.locator(':scope > summary').click();
+  await expect(process).not.toHaveAttribute('open');
+  await process.locator(':scope > summary').click();
+  await expect(process).toHaveAttribute('open');
 });

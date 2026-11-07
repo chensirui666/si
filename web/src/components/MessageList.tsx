@@ -1,5 +1,4 @@
 import type { ActiveContent, ConversationMessage, RunningState } from '@agent-learning/agent'
-import type { ToolResultMessage } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
 
@@ -13,7 +12,7 @@ export function MessageList({ messages, activeContent = [], running = null }: {
   running?: RunningState
 }) {
   const rows: MessageRow[] = []
-  const toolResults = new Map<string, Map<number, ToolResultMessage>>()
+  const toolResults = new Map<string, Map<number, ConversationMessage>>()
   let userId = ''
   for (const item of messages) {
     if ('state' in item) {
@@ -30,7 +29,7 @@ export function MessageList({ messages, activeContent = [], running = null }: {
       else rows.push({ type: 'assistant', id, userId, messages: [{ id, message }] })
     } else if (message.role === 'toolResult' && toolCall) {
       const results = toolResults.get(toolCall.assistantMessageId) ?? new Map()
-      results.set(toolCall.contentIndex, message)
+      results.set(toolCall.contentIndex, item)
       toolResults.set(toolCall.assistantMessageId, results)
     }
   }

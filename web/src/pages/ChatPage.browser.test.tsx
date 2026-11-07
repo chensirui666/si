@@ -340,7 +340,7 @@ test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到�
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
-      snapshot: { seq: 1, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model' }, activeContent: [] },
+      snapshot: { seq: 1, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model', activeTools: [] }, activeContent: [] },
     } }))
   }, request)
   await release()
@@ -403,7 +403,7 @@ test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动�
     await page.evaluate(({ history, seq }) => {
       window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
         connection: 'ready', slow: false, error: null,
-        snapshot: { seq, messages: [...history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), { id: 'answer', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 30, content: [{ type: 'thinking', thinking: '独立思考' }, { type: 'text', text: `# 标题\n\n${'回答内容\n\n'.repeat(seq * 8)}` }], stopReason: seq === 3 ? 'stop' : 'pending' } }], running: seq === 3 ? null : { userMessageId: 'history-25', assistantMessageId: 'answer', phase: 'model' }, activeContent: seq === 3 ? [] : [{ messageId: 'answer', contentIndex: 1, type: 'text' }] },
+        snapshot: { seq, messages: [...history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), { id: 'answer', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 30, content: [{ type: 'thinking', thinking: '独立思考' }, { type: 'text', text: `# 标题\n\n${'回答内容\n\n'.repeat(seq * 8)}` }], stopReason: seq === 3 ? 'stop' : 'pending' } }], running: seq === 3 ? null : { userMessageId: 'history-25', assistantMessageId: 'answer', phase: 'model', activeTools: [] }, activeContent: seq === 3 ? [] : [{ messageId: 'answer', contentIndex: 1, type: 'text' }] },
       } }))
     }, { history, seq })
     await expect(list.getByRole('listitem')).toHaveCount(27)

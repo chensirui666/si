@@ -167,7 +167,7 @@ it.each(['bash', 'find', 'grep'])('user cancellation stops the real %s process b
   const controller = new AbortController()
   const args = name === 'bash' ? { command: 'printf partial; touch ready; while [[ ! -f go ]]; do :; done; touch survived' } : { pattern: 'anything' }
   const output = tool(name)(args, context(controller.signal))
-  const rejected = expect(output).rejects.toThrow(name === 'bash' ? /partial[\s\S]*任务已取消/ : /任务已取消/)
+  const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted', message: expect.stringMatching(name === 'bash' ? /partial[\s\S]*任务已取消/ : /任务已取消/) })
   await vi.waitFor(async () => { await readFile(join(cwd, 'ready')) })
   controller.abort()
   await rejected
@@ -216,4 +216,59 @@ it.skipIf(!installed('rg'))('grep distinguishes matched lines from context and s
   expect(result).toContain('1 条')
   await expect(tool('grep')({ pattern: '[', path: 'note.txt' }, context())).rejects.toThrow(/rg/)
   expect(await tool('grep')({ pattern: '不存在', path: 'note.txt' }, context())).toContain('未找到')
+})
+
+
+it.each(['timeout', 'failure', 'success'] as const)('T2 %s 原因已确定后再中止，不覆盖实际结果', async kind => {
+  const returned = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  const run = runtime.run.bind(runtime)
+  const controller = new AbortController()
+  vi.spyOn(runtime, 'run').mockImplementationOnce(async (...args) => {
+    const result = await run(...args)
+    returned.resolve()
+    await release.promise
+    return result
+  })
+  const output = tool('bash')({ command: kind === 'timeout' ? 'printf 开始处理; sleep 30' : kind === 'failure' ? 'echo 配置文件不存在; exit 1' : 'echo 项目名称：青禾', ...(kind === 'timeout' ? { timeout: 0.05 } : {}) }, context(controller.signal))
+  const outcome = output.then(text => ({ text, code: undefined }), error => ({ text: error.message, code: error.code }))
+  await returned.promise
+  controller.abort()
+  release.resolve()
+  const result = await outcome
+  expect(result.code).toBeUndefined()
+  expect(result.text).toMatch(kind === 'timeout' ? /开始处理[\s\S]*超时/ : kind === 'failure' ? /配置文件不存在[\s\S]*退出码 1/ : /项目名称：青禾[\s\S]*退出码 0/)
+})
+
+it.each(['find', 'grep'] as const)('T1.2 %s 中止保留已产生的部分结果', async name => {
+  const bin = join(cwd, 'bin')
+  await mkdir(bin)
+  const row = name === 'find' ? 'src/note.txt\\000' : JSON.stringify({ type: 'match', data: { path: { text: join(cwd, 'note.txt') }, lines: { text: '项目名称：青禾' }, line_number: 1 } }) + '\\n'
+  await writeFile(join(bin, name === 'find' ? 'fd' : 'rg'), '#!/bin/bash\n[ "$1" = --version ] && exit 0\nprintf \'%b\' \'' + row + '\'\ntouch ready\nwhile :; do :; done\n', { mode: 0o700 })
+  vi.stubEnv('PATH', bin + ':' + process.env.PATH)
+  const controller = new AbortController()
+  const output = tool(name)({ pattern: '*.txt' }, context(controller.signal))
+  const outcome = output.catch(error => error)
+  await vi.waitFor(async () => { await readFile(join(cwd, 'ready')) })
+  controller.abort()
+  const error = await outcome
+  expect(error).toMatchObject({ code: 'interrupted', message: expect.stringContaining('note.txt') })
+})
+
+it('处理工具输出抛错时仍杀死进程，不能让后续取消失效', async () => {
+  const entered = Promise.withResolvers<void>()
+  const controller = new AbortController()
+  let pid: number | undefined
+  const output = runtime.run(process.execPath, ['-e', "process.stdout.write(String(process.pid) + '\\n'); setInterval(() => {}, 1000)"], {
+    cwd, signal: controller.signal,
+    stdout(chunk) { pid = Number(String(chunk).trim()); entered.resolve(); throw new Error('工具输出无法解析') },
+  })
+  const outcome = output.then(() => 'unexpected success', error => error.message)
+  try {
+    await entered.promise
+    controller.abort()
+    expect(await Promise.race([outcome, delay(300).then(() => 'process still running')])).toBe('工具输出无法解析')
+  } finally {
+    if (pid) { try { process.kill(pid, 'SIGKILL') } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error } }
+    await outcome
+  }
 })

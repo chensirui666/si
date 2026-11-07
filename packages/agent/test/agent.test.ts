@@ -308,11 +308,11 @@ const toolCall = (id: string, overrides: Partial<ToolCall> = {}): ToolCall => ({
   type: 'toolCall', id, name: 'read', arguments: { path: id }, ...overrides,
 })
 
-function withTools(execute: ExecutableTool['execute']) {
+function withTools(execute: ExecutableTool['execute'], executionMode?: ExecutableTool['executionMode']) {
   const first = controlled(), answer = controlled()
   const queues = [first, answer]
   const contexts: ModelContext[] = []
-  const tool = { name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }), execute }
+  const tool = { executionMode, name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }), execute }
   const agent = new Agent({ tools: [tool], stream: (_model, context) => {
     contexts.push(context)
     return queues.shift()!.output
@@ -352,21 +352,21 @@ describe('Agent 一批工具与最终回答', () => {
     await until(async () => (await snapshot(agent)).running?.phase === 'tools')
     const working = await snapshot(agent)
     const firstId = working.messages[1].id
-    expect(working.running).toMatchObject({ phase: 'tools', activeTool: { assistantMessageId: firstId, contentIndex: 1 } })
+    expect(working.running).toMatchObject({ phase: 'tools', activeTools: [{ assistantMessageId: firstId, contentIndex: 1 }] })
     expect(executions).toEqual(['read-1'])
     expect(contexts).toHaveLength(1)
     release()
 
     await until(async () => contexts.length === 2)
     const answering = await snapshot(agent)
-    expect(answering.running).toMatchObject({ phase: 'answer' })
+    expect(answering.running).toMatchObject({ phase: 'model', activeTools: [] })
     expect(answering.running?.assistantMessageId).not.toBe(firstId)
     expect(answering.messages[2]).toMatchObject({
       toolCall: { assistantMessageId: firstId, contentIndex: 1 },
       message: { role: 'toolResult', toolCallId: 'read-1', content: [{ text: '文件内容' }], isError: false },
     })
     expect((await snapshot(agent)).messages[2]).toEqual(answering.messages[2])
-    expect(contexts[1]).not.toHaveProperty('tools')
+    expect(contexts[1].tools).toEqual(contexts[0].tools)
     expect(contexts[1].messages).toEqual(answering.messages.map(entry => entry.message))
     expect(executions).toEqual(['read-1'])
     await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: 409 })
@@ -420,7 +420,7 @@ describe('Agent 一批工具与最终回答', () => {
       executed.push(String(args.path))
       await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
       throw new Error('取消前已有部分结果')
-    })
+    }, 'sequential')
     await agent.submit(workspaceInput)
     first.push({ type: 'done', reason: 'toolUse', message: {
       ...assistant(), stopReason: 'toolUse', content: [toolCall('first'), toolCall('later')],
@@ -438,30 +438,9 @@ describe('Agent 一批工具与最终回答', () => {
     })
   })
 
-  it('最终回答阶段的额外工具请求只展示失败，且不丢弃此前完整的工具历史', async () => {
-    const executed: string[] = []
-    const { agent, first, answer, contexts } = withTools(async args => {
-      executed.push(String(args.path))
-      return '文件内容'
-    })
-    await agent.submit(workspaceInput)
-    first.push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [toolCall('first')] } })
-    await until(async () => contexts.length === 2)
-    answer.push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [toolCall('extra')] } })
-    await until(async () => (await snapshot(agent)).running === null)
-    expect(executed).toEqual(['first'])
-    expect((await snapshot(agent)).messages[3].message).toMatchObject({
-      role: 'assistant', stopReason: 'error', content: [toolCall('extra')],
-    })
-    await agent.submit(workspaceInput)
-    expect(contexts[2].messages.map(message => message.role)).toEqual(['user', 'assistant', 'toolResult', 'user'])
-    await until(async () => (await snapshot(agent)).running === null)
-  })
-
   it.each([
     { reason: 'toolUse' as const, invalidId: '' },
     { reason: 'toolUse' as const, invalidId: 'first' },
-    { reason: 'length' as const, invalidId: 'second' },
     { reason: 'aborted' as const, invalidId: 'second' },
     { reason: 'error' as const, invalidId: 'second' },
   ])('拒绝 $reason 的异常工具批次，下一轮不回填未执行调用 $invalidId', async ({ reason, invalidId }) => {
@@ -546,7 +525,7 @@ describe('Agent 主动中止', () => {
       await new Promise<void>(resolve => signal.addEventListener('abort', () => { cancelled = true; resolve() }, { once: true }))
       await finishing
       throw new Error('取消前已有部分结果')
-    })
+    }, 'sequential')
     const accepted = await agent.submit(workspaceInput)
     const complete = { ...assistant(), stopReason: 'toolUse' as const, content: [toolCall('first'), toolCall('second'), toolCall('third')] }
     first.push({ type: 'done', reason: 'toolUse', message: complete })
@@ -567,5 +546,171 @@ describe('Agent 主动中止', () => {
     answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
     expect(await agent.abort(accepted.userMessageId)).toBe(false)
+  })
+})
+
+
+describe('Feature6 连续决策与同批调度', () => {
+  function loop(execute: ExecutableTool['execute'], executionMode?: ExecutableTool['executionMode']) {
+    const queues = [controlled(), controlled(), controlled(), controlled()]
+    const contexts: ModelContext[] = []
+    const agent = new Agent({ tools: [{ name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }), executionMode, execute }],
+      stream: (_model, context) => { contexts.push(context); return queues[contexts.length - 1].output } })
+    const done = (index: number, calls: ToolCall[] = [], reason: 'stop' | 'length' | 'toolUse' = calls.length ? 'toolUse' : 'stop') => {
+      queues[index].push({ type: 'done', reason, message: { ...assistant(), stopReason: reason, content: calls.length ? calls : [{ type: 'text', text: '青禾' }] } })
+    }
+    return { agent, queues, contexts, done }
+  }
+
+  it('A1/A5.3 连续两轮读取，跨轮相同编号正确回填，每轮都可调用工具', async () => {
+    const paths: string[] = []
+    const { agent, contexts, done } = loop(async args => { paths.push(String(args.path)); return args.path === 'index.txt' ? '下一条线索在 note.txt' : '项目名称：青禾' })
+    const receipt = await agent.submit(workspaceInput)
+    done(0, [toolCall('read-1', { arguments: { path: 'index.txt' } })])
+    await until(async () => contexts.length === 2)
+    expect(contexts[1].messages.at(-1)).toMatchObject({ role: 'toolResult', content: [{ text: '下一条线索在 note.txt' }] })
+    done(1, [toolCall('read-1', { arguments: { path: 'note.txt' } })])
+    await until(async () => contexts.length === 3)
+    expect(paths).toEqual(['index.txt', 'note.txt'])
+    expect(contexts.every(context => context.tools?.length === 1)).toBe(true)
+    expect(contexts[2].messages.at(-1)).toMatchObject({ content: [{ text: '项目名称：青禾' }] })
+    await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: 409 })
+    expect((await snapshot(agent)).running?.userMessageId).toBe(receipt.userMessageId)
+    done(2)
+    await until(async () => (await snapshot(agent)).running === null)
+    const messages = (await snapshot(agent)).messages
+    expect(messages.filter(entry => entry.message.role === 'user')).toHaveLength(1)
+    expect(new Set(messages.filter(entry => entry.message.role === 'assistant').map(entry => entry.id)).size).toBe(3)
+    expect(messages.filter(entry => entry.toolCall).map(entry => entry.toolCall?.assistantMessageId)).toEqual([messages[1].id, messages[3].id])
+  })
+
+  it('A2 同批并行，B 先完成立即保存，再按 A/B 原序交给模型', async () => {
+    const waits = [Promise.withResolvers<string>(), Promise.withResolvers<string>()]
+    const started: number[] = []
+    const { agent, contexts, done } = loop(async args => { const i = Number(args.path); started.push(i); return waits[i].promise })
+    const controller = new AbortController()
+    const subscription = agent.subscribe(controller.signal)
+    await subscription.next()
+    await agent.submit(workspaceInput)
+    done(0, [toolCall('0'), toolCall('1')])
+    await until(async () => started.length === 2)
+    expect((await snapshot(agent)).running?.activeTools).toHaveLength(2)
+    waits[1].resolve('状态：测试中')
+    await until(async () => (await snapshot(agent)).messages.length === 3)
+    expect(contexts).toHaveLength(1)
+    expect((await snapshot(agent)).messages[2].message).toMatchObject({ content: [{ text: '状态：测试中' }] })
+    expect((await snapshot(agent)).running?.activeTools).toHaveLength(1)
+    waits[0].resolve('项目名称：青禾')
+    await until(async () => contexts.length === 2)
+    expect(contexts[1].messages.slice(2)).toMatchObject([{ toolCallId: '0' }, { toolCallId: '1' }])
+    const positions: number[] = []
+    while (positions.length < 2) {
+      const event = (await subscription.next()).value
+      if (event?.type === 'update' && event.update.change.type === 'task' && event.update.change.message) positions.push(event.update.change.messageIndex!)
+    }
+    expect(positions).toEqual([2, 2])
+    controller.abort()
+    done(1)
+    await until(async () => (await snapshot(agent)).running === null)
+  })
+
+  it('A3 sequential 声明使同批其余调用等待', async () => {
+    const wait = Promise.withResolvers<string>()
+    const paths: string[] = []
+    const { agent, contexts, done } = loop(async args => { paths.push(String(args.path)); return args.path === '0' ? wait.promise : '后读' }, 'sequential')
+    await agent.submit(workspaceInput)
+    done(0, [toolCall('0'), toolCall('1')])
+    await until(async () => paths.length === 1)
+    expect(paths).toEqual(['0'])
+    wait.resolve('先写')
+    await until(async () => contexts.length === 2)
+    expect(paths).toEqual(['0', '1'])
+    done(1)
+    await until(async () => (await snapshot(agent)).running === null)
+  })
+
+  it('A3 仅 write 声明 sequential，整批 read 仍须等待 write', async () => {
+    const wait = Promise.withResolvers<string>()
+    const started: string[] = []
+    const queues = [controlled(), controlled()]
+    let requests = 0
+    const agent = new Agent({ tools: [
+      { name: 'write', description: '写', parameters: Type.Object({}), executionMode: 'sequential', execute: async () => { started.push('write'); return wait.promise } },
+      { name: 'read', description: '读', parameters: Type.Object({}), execute: async () => { started.push('read'); return '项目名称：青禾' } },
+    ], stream: () => queues[requests++].output })
+    await agent.submit(workspaceInput)
+    queues[0].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [toolCall('write', { name: 'write', arguments: {} }), toolCall('read', { arguments: {} })] } })
+    await until(async () => started.length === 1)
+    expect(started).toEqual(['write'])
+    wait.resolve('写入成功')
+    await until(async () => requests === 2)
+    expect(started).toEqual(['write', 'read'])
+    queues[1].push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    await until(async () => (await snapshot(agent)).running === null)
+  })
+
+  it('A4 截断整批零执行，回填失败后允许完整新调用', async () => {
+    const paths: string[] = []
+    const { agent, contexts, done } = loop(async args => { paths.push(String(args.path)); return '项目名称：青禾' })
+    await agent.submit(workspaceInput)
+    done(0, [toolCall('0'), toolCall('1')], 'length')
+    await until(async () => contexts.length === 2)
+    expect(paths).toEqual([])
+    expect(contexts[1].messages.slice(2)).toMatchObject([
+      { toolCallId: '0', isError: true, content: [{ text: expect.stringContaining('截断') }] },
+      { toolCallId: '1', isError: true, content: [{ text: expect.stringContaining('截断') }] },
+    ])
+    done(1, [toolCall('retry')])
+    await until(async () => contexts.length === 3)
+    expect(paths).toEqual(['retry'])
+    done(2)
+    await until(async () => (await snapshot(agent)).running === null)
+  })
+
+  it('A4.1 纯文字截断保留内容并结束，不自动重试', async () => {
+    const { agent, contexts, done } = loop(async () => { throw new Error('不应执行') })
+    await agent.submit(workspaceInput)
+    done(0, [], 'length')
+    await until(async () => (await snapshot(agent)).running === null)
+    expect(contexts).toHaveLength(1)
+    expect((await snapshot(agent)).messages[1].message).toMatchObject({ stopReason: 'length', content: [{ text: '青禾' }] })
+  })
+
+  it('A5.2 toolUse 没有调用明确结束', async () => {
+    const { agent, contexts, done } = loop(async () => { throw new Error('不应执行') })
+    await agent.submit(workspaceInput)
+    done(0, [], 'toolUse')
+    await until(async () => (await snapshot(agent)).running === null)
+    expect(contexts).toHaveLength(1)
+    expect((await snapshot(agent)).messages[1].message).toMatchObject({ stopReason: 'error', errorMessage: expect.stringContaining('可处理') })
+  })
+
+  it.each(['abort', 'close'] as const)('A6/A6.1 %s 等所有并行操作收尾，保留先前成功与普通错误', async mode => {
+    const waits = [Promise.withResolvers<string>(), Promise.withResolvers<string>()]
+    const started: string[] = []
+    const { agent, contexts, done } = loop(async args => {
+      const path = String(args.path); started.push(path)
+      if (path === 'ok') return '已有成功'
+      if (path === 'error') throw new Error('普通失败')
+      return waits[Number(path)].promise
+    })
+    const receipt = await agent.submit(workspaceInput)
+    done(0, [toolCall('ok'), toolCall('error'), toolCall('0'), toolCall('1')])
+    await until(async () => started.length === 4 && (await snapshot(agent)).messages.length === 4)
+    let ended = false
+    const ending = (mode === 'abort' ? agent.abort(receipt.userMessageId) : agent.close()).then(() => { ended = true })
+    waits[0].reject(Object.assign(new Error('甲已有输出'), { code: 'interrupted' }))
+    await until(async () => (await snapshot(agent)).messages.length === 5)
+    expect(ended).toBe(false)
+    await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: mode === 'abort' ? 409 : 503 })
+    expect(contexts).toHaveLength(1)
+    waits[1].reject(Object.assign(new Error('乙已有输出'), { code: 'interrupted' }))
+    await ending
+    const results = (await snapshot(agent)).messages.filter(entry => entry.toolCall)
+    expect(results.map(entry => entry.toolErrorCode)).toEqual([undefined, undefined, 'interrupted', 'interrupted'])
+    expect(results.map(entry => entry.message)).toMatchObject([{ isError: false }, { isError: true, content: [{ text: '普通失败' }] }, { content: [{ text: '甲已有输出' }] }, { content: [{ text: '乙已有输出' }] }])
+    expect((await snapshot(agent)).running).toBeNull()
+    if (mode === 'abort') { await agent.submit(workspaceInput); done(1); await until(async () => (await snapshot(agent)).running === null) }
+    else await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: 503 })
   })
 })

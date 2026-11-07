@@ -34,15 +34,18 @@ export function createTavilyProvider(credentials: Credentials, fetchRequest = gl
         headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
         body: JSON.stringify(body), signal,
       })
-    } catch {
-      signal.throwIfAborted()
+    } catch (error) {
+      if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw signal.reason
       throw new Error('Tavily 请求失败，请检查网络。')
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => {})
       throw new Error(`Tavily 请求失败（HTTP ${response.status}）。`)
     }
-    const data = object(await response.json().catch(() => { signal.throwIfAborted(); return undefined }))
+    const data = object(await response.json().catch(error => {
+      if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw signal.reason
+      return undefined
+    }))
     if (!Array.isArray(data.results)) throw new Error('Tavily 返回了无效响应。')
     return {
       results: data.results.map(object),

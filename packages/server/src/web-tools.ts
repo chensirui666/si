@@ -89,7 +89,7 @@ export function createWebTools(settings: Pick<WebSettings, 'provider'>, runtime:
         if (typeof value !== 'string') return { url: '无效网址', error: '网址须为字符串。' }
         try { await publicUrl(value, requestSignal); return { url: value, error: '' } }
         catch (error) {
-          signal.throwIfAborted()
+          if (requestSignal.aborted && error === requestSignal.reason) throw error
           return { url: safeHead(value, 240), error: error instanceof Error ? error.message : '网址无法验证。' }
         }
       }))
@@ -101,7 +101,7 @@ export function createWebTools(settings: Pick<WebSettings, 'provider'>, runtime:
           const provider = await settings.provider('fetch')
           for (const page of await provider.fetch!(eligible, requestSignal)) pages.set(page.url, page)
         } catch (error) {
-          signal.throwIfAborted()
+          if (requestSignal.aborted && error === requestSignal.reason) throw error
           requestError = error instanceof Error ? error.message : '正文请求失败。'
         }
       }
@@ -109,7 +109,7 @@ export function createWebTools(settings: Pick<WebSettings, 'provider'>, runtime:
       let successes = 0
       const pageBudget = Math.min(limit, Math.floor(85_000 / entries.length))
       for (const entry of entries) {
-        signal.throwIfAborted()
+        if (!requestError) signal.throwIfAborted()
         const page = entry.error ? undefined : pages.get(entry.url)
         const url = safeHead(entry.url, 2048)
         if (!page?.content) {

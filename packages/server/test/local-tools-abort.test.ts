@@ -3,6 +3,7 @@ import { getEventListeners } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { createTools } from '../src/tools.js'
 import { createLocalTools } from '../src/local-tools.js'
 import { ToolRuntime } from '../src/tool-runtime.js'
 
@@ -74,4 +75,17 @@ it.each(['readFile', 'writeFile'] as const)('edit waits for %s and never reports
   release.resolve()
   await rejected
   expect(await real.readFile(join(cwd, 'note.txt'), 'utf8')).toBe(stage === 'readFile' ? 'before' : 'after')
+})
+
+
+it('T1.1 正式 read 工具返回明确的中止码，晚到文件结果不会变成成功', async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  vi.mocked(fs.readFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return Buffer.from('项目名称：青禾') })
+  const controller = new AbortController()
+  const read = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }).find(tool => tool.name === 'read')!
+  const output = read.execute({ path: 'note.txt' }, { cwd, signal: controller.signal })
+  const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted' })
+  await entered.promise
+  controller.abort()
+  try { await rejected } finally { release.resolve() }
 })

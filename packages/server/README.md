@@ -33,3 +33,5 @@ npm --prefix packages/server test
 工作区由 `GET /api/workspaces` 查询。网页通过无请求体的 `POST /api/workspaces/pick` 打开 macOS 系统选择框。服务以真实绝对路径去重，首次登记同时绑定当前对话。测试可通过 `workspacePath`、`directoryPicker` 注入隔离的配置和选择器。
 
 `GET/PUT /api/web/settings` 查看或保存两个网页能力的服务商选择。`PUT/DELETE /api/web/providers/:providerId` 管理该厂商的本机 Key。响应只含状态。网页工具用 `web_settings_changed` 通知页面刷新，工作区用 `workspaces_changed`。测试可注入 `webSettingsPath` 和 `webProviders`。
+
+Feature6 的任务更新中，工具结果 `message` 与 `messageIndex` 成对提供，网页按位置插入；`running.activeTools` 可以包含多个同时执行的工具，阶段仅为 model 或 tools。网页与后台需一起更新，旧页面需刷新。工具的明确取消错误使用 `code: interrupted`；命令超时、失败和成功已确定后，不被后来的取消覆盖，部分输出继续保留。

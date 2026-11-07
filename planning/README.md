@@ -26,4 +26,5 @@
 - [原 Feature1：建立基本的聊天页面](./里程碑1/feature1/feature1-基本聊天页面.md)：保留输入与展示行为参考；基础页面实现位于 `web/`，后续在其上接入完整聊天链路，原验收见 [Feature1 验收记录](./里程碑1/feature1/feature1-验收记录.md)。
 - 第三步：[Feature3：工具定义与调用接收](./里程碑1/feature3/feature3-工具定义与调用接收.md)，四工具声明、`ModelContext.tools`、SDK 声明转换和独立验收已实现并合并 `main`，主目录复验 283 项全部通过；见[验收记录](./里程碑1/feature3/feature3-验收记录.md)。本次 worktree 与分支已清理。本步不执行工具、不开启普通聊天工具。
 - 第五步：[Feature5：支持用户停止当前调用](./里程碑1/feature5/feature5-用户停止当前调用技术设计.md)，已实现；停止、收尾、继续对话与真实调用结果见 [验收记录](./里程碑1/feature5/feature5-验收记录.md)。
+- 第六步：[Feature6：ReAct 循环技术设计](./里程碑1/feature6/feature6-ReAct循环技术设计.md)，已按用户于 2026-11-08 的实施指令实现，独立 worktree 全部校验通过，尚未合并 main；见[验收记录](./里程碑1/feature6/feature6-验收记录.md)。
 - [设计妥协记录](./设计妥协记录.md)：记录当前简化、后续改进方向、触发时机与来源文档。
