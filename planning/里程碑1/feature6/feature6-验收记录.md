@@ -1,5 +1,7 @@
 # Feature6 验收记录
 
+当前状态：已合并 main，主目录 **422 项校验通过，无失败或跳过**；本次 worktree 与分支已清理。前半部分保留首次 worktree 验收，main 复验见末节。
+
 2026-11-08，基于 `main 2859034`，在 `.worktrees/feature6`、`codex/feature6` 实现。Node.js `v24.16.0`、npm `11.13.0`，macOS，Chromium。依据为[ReAct循环技术设计](./feature6-ReAct循环技术设计.md)，实施计划见[实施计划](./feature6-实施计划.md)。原目录已有的未提交规划保持原样，新实现只在独立 worktree。
 
 ## 交付结果
@@ -13,7 +15,7 @@
 - 网页同步 `activeTools`、结果位置 `messageIndex` 和明确中止原因 `toolErrorCode`，按五种状态展示。更新不合法或漏号时保留内容并重取快照。
 - 整任务运行期间保留执行过程，结束后收起，用户仍可展开；刷新不重复提交或执行。
 
-## 最终校验
+## worktree 阶段校验
 
 独立审查发现的问题修复后，完整重跑根 `npm test` 及真实工具验收：
 
@@ -85,3 +87,41 @@ npm --prefix packages/server run test:tools:live
 未单独实测 Safari 或系统中文输入法，也未启动参考产品 Pi 的界面。保留已有约 630kB 构建体积及 FORCE_COLOR/NO_COLOR 提示。
 
 按已确认范围不做上下文压缩、排队、重启聊天恢复、自动重试、固定轮数/整任务时限、文件冲突分析和修改回滚。并行修改同文件可能相互覆盖；重复模型决策可能增加费用；中止不撤销文件修改。旧网页需刷新以使用本次协议。worktree 和分支保留，尚未合并主干或推送。
+
+
+## main 合并后复验与清理（2026-11-08）
+
+`main` 从 `2859034` 快进到实现提交 `815df0e`，随后在 `/Users/stardust/agent learning` 重新运行完整根测试及七项真实工具验收。复验补充修复为 `dac35ec`，最后的实际写入效果断言修正为 `500f52a`。最终产品与测试内容均已提交。
+
+| 范围 | main 最终结果 |
+| --- | --- |
+| Credentials | 54 通过 |
+| Model | 52 通过 |
+| Agent | 39 通过 |
+| Server / Tools | 103 通过 |
+| 网页单元 | 119 通过 |
+| Chromium 组件 | 32 通过 |
+| Node / Vite E2E、真实 DeepSeek | 16 通过 |
+| 根 npm test | **415 通过，0 失败，0 跳过** |
+| 独立真实工具验收 | **7 通过，0 失败，0 跳过** |
+| 合计 | **422 通过** |
+
+组件和 E2E 的最终 JSON 报告均为 0 unexpected、0 skipped、0 flaky。包括完整 TypeScript / Vite 构建；`git diff --check` 通过。测试仍使用本次已明确授权的下载目录 dotenv 及工具运行环境校验过的 fd，未修改用户原凭据。
+
+### 复验发现并处理的问题
+
+- 前两次完整运行在原有 Tab 移焦断言失败。单独 8 次通过后，进一步按完整文件运行并记录真实焦点事件，确认 Tab 已移到按钮，迟到的 selectionchange 又把焦点抢回输入框。新增使用实际 Lexical 实例的选区格式同步回归，先观察到焦点错误返回输入框（RED），再以失焦时跳过 DOM 选区同步修复（GREEN）；保留原有 Tab、焦点标记、发送及撤销断言，并增加迟到事件后的焦点检查。
+- 真实模型可以合法使用绝对路径，原 E2 只接受相对字符串。现在按 realpath 核对实际读取的是同一文件，仍检查两轮读取及其结果分别进入下一轮。
+- 原 E3 的“只写一次”允许模型先检查空目录，且模型可能添加文本行尾换行。测试现在明确提供真实的空目录前提、要求只调用一次 write；依然严格核对两次模型请求、一项 write、每轮八工具、最终回答与真实结果回填。文件逐字等于本次 write 的 content 参数，并只允许目标项目名称及正常的可选行尾换行。
+
+上述中间失败均未计为通过。修复与用例修正后重新完整运行得到表中最终结果；没有用重试、跳过或放宽工具次数断言代替检查。早先单独 8 次焦点运行不计入 422 项。
+
+最终日志位于 `/tmp/agent-feature6-main-full.log`、`/tmp/agent-feature6-main-live-tools.log`。首轮失败日志与 trace 保留为 `/tmp/agent-feature6-main-full-first.log`、`/tmp/agent-feature6-main-focus-failure.zip`；选区回归 RED 证据为 `/tmp/agent-feature6-main-selection-red.log`。报告与最新受控截图在主目录的 `web/test-results/`。
+
+### 清理与草稿保留
+
+全部校验通过后，确认 worktree 无未提交或未跟踪文件，忽略内容仅为依赖、构建、缓存与测试产物，使用普通 git worktree remove 删除 `.worktrees/feature6`，再以 git branch -d 删除已合并的 `codex/feature6`。路径和分支均已确认不存在，其他 worktree 与分支保留。
+
+主目录原有六份规划草稿继续保留为未提交改动：Feature1/2/4 三份逐字等于备份，其余三份仅同步 Feature6 的合并与复验状态，未来步骤的规划仍保留。提交只纳入 Feature6 的实现、验收与必要索引更新。原稿备份位于 `/tmp/agent-feature6-merge-backup-hfpsjl2c`。未推送远端。
+
+Safari 与系统输入法仍未单独实测；原有约 630kB 构建提示保留。并行同文件修改、无固定轮数、无压缩与重启聊天恢复等已确认边界不变。
