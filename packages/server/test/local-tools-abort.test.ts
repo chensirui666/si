@@ -25,9 +25,10 @@ afterEach(async () => { await runtime.close(); await real.rm(cwd, { recursive: t
 it.each(['stat', 'readFile'] as const)('read stops waiting during %s and discards late results', async stage => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   const controller = new AbortController()
+  const paths: string[] = []
   if (stage === 'stat') vi.mocked(fs.stat).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return real.stat(join(cwd, 'note.txt')) })
   else vi.mocked(fs.readFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return Buffer.from('late text') })
-  const output = createLocalTools(runtime).read({ path: 'note.txt' }, { cwd, signal: controller.signal })
+  const output = createLocalTools(runtime).read({ path: 'note.txt' }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
   let settled = false
   void output.then(() => { settled = true }, () => { settled = true })
   const rejected = expect(output).rejects.toThrow()
@@ -36,6 +37,7 @@ it.each(['stat', 'readFile'] as const)('read stops waiting during %s and discard
   try {
     await vi.waitFor(() => expect(settled).toBe(true))
     await rejected
+    expect(paths).toEqual([])
     expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
     if (stage === 'stat') expect(fs.readFile).not.toHaveBeenCalled()
   } finally { release.resolve() }
@@ -44,10 +46,11 @@ it.each(['stat', 'readFile'] as const)('read stops waiting during %s and discard
 it.each(['mkdir', 'writeFile'] as const)('write waits for %s to settle and then reports cancellation', async stage => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   const controller = new AbortController()
+  const paths: string[] = []
   if (stage === 'mkdir') vi.mocked(fs.mkdir).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return undefined })
   else vi.mocked(fs.writeFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; await real.writeFile(join(cwd, 'note.txt'), 'after') })
   let settled = false
-  const output = createLocalTools(runtime).write({ path: 'note.txt', content: 'after' }, { cwd, signal: controller.signal })
+  const output = createLocalTools(runtime).write({ path: 'note.txt', content: 'after' }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
   void output.then(() => { settled = true }, () => { settled = true })
   const rejected = expect(output).rejects.toThrow()
   await entered.promise
@@ -57,15 +60,17 @@ it.each(['mkdir', 'writeFile'] as const)('write waits for %s to settle and then 
   release.resolve()
   await rejected
   expect(await real.readFile(join(cwd, 'note.txt'), 'utf8')).toBe(stage === 'mkdir' ? 'before' : 'after')
+  expect(paths).toEqual(stage === 'writeFile' ? [join(cwd, 'note.txt')] : [])
 })
 
 it.each(['readFile', 'writeFile'] as const)('edit waits for %s and never reports a cancelled operation as success', async stage => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   const controller = new AbortController()
+  const paths: string[] = []
   if (stage === 'readFile') vi.mocked(fs.readFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return Buffer.from('before') })
   else vi.mocked(fs.writeFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; await real.writeFile(join(cwd, 'note.txt'), 'after') })
   let settled = false
-  const output = createLocalTools(runtime).edit({ path: 'note.txt', edits: [{ oldText: 'before', newText: 'after' }] }, { cwd, signal: controller.signal })
+  const output = createLocalTools(runtime).edit({ path: 'note.txt', edits: [{ oldText: 'before', newText: 'after' }] }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
   void output.then(() => { settled = true }, () => { settled = true })
   const rejected = expect(output).rejects.toThrow()
   await entered.promise
@@ -75,6 +80,7 @@ it.each(['readFile', 'writeFile'] as const)('edit waits for %s and never reports
   release.resolve()
   await rejected
   expect(await real.readFile(join(cwd, 'note.txt'), 'utf8')).toBe(stage === 'readFile' ? 'before' : 'after')
+  expect(paths).toEqual(stage === 'writeFile' ? [join(cwd, 'note.txt')] : [])
 })
 
 

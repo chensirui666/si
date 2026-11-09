@@ -120,7 +120,8 @@ const credentialStatus = (value: unknown) => record(value) && (value.state === '
 
 function modelDiscovery(value: unknown): value is ModelDiscovery {
   if (!record(value) || !Array.isArray(value.models) || !record(value.deepseek)) return false
-  return value.models.every(model => record(model) && ['id', 'name', 'provider', 'api'].every(key => typeof model[key] === 'string'))
+  return value.models.every(model => record(model) && ['id', 'name', 'provider', 'api'].every(key => typeof model[key] === 'string')
+    && ['contextWindow', 'maxTokens'].every(key => typeof model[key] === 'number' && Number.isSafeInteger(model[key]) && (model[key] as number) > 0))
     && credentialStatus(value.deepseek)
 }
 
@@ -185,7 +186,7 @@ export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
   let value: unknown
   try { value = await response.json() } catch { value = null }
   if (!response.ok) throw new Error(record(value) && typeof value.error === 'string' ? value.error : '中止请求失败，请重新同步后重试')
-  if (response.status !== 200 || !record(value) || value.userMessageId !== input.userMessageId || typeof value.handled !== 'boolean') {
+  if (response.status !== 200 || !record(value) || value.runId !== input.runId || typeof value.handled !== 'boolean') {
     throw new Error('中止回执无效，未确认中止')
   }
   return value as AbortResult
@@ -203,7 +204,7 @@ export async function submitMessage(input: SubmitMessageRequest): Promise<Submit
       : record(value) && typeof value.error === 'string' ? value.error : response.status === 409 ? '正在生成，请等待回答结束' : `消息提交被拒绝（HTTP ${response.status}）`
     throw Object.assign(new Error(message), { status: response.status })
   }
-  if (response.status !== 202 || !record(value) || value.clientMessageId !== input.clientMessageId || typeof value.userMessageId !== 'string'
+  if (response.status !== 202 || !record(value) || value.clientMessageId !== input.clientMessageId || (input.text.trim() === '/compact' ? value.kind !== 'compaction' || typeof value.compactionId !== 'string' || !value.compactionId : value.kind !== 'message' || typeof value.userMessageId !== 'string' || !value.userMessageId)
     || !Number.isSafeInteger(value.acceptedSeq) || (value.acceptedSeq as number) < 0) throw new Error('提交回执无效，未确认接收')
   return value as SubmitMessageAccepted
 }

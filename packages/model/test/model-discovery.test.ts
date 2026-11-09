@@ -24,7 +24,7 @@ describe('discoverModels', () => {
     expect((await discoverModels(credentials)).models).toEqual([]);
     await credentials.saveApiKey('deepseek', 'local-key');
     expect(await discoverModels(credentials)).toEqual({
-      models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions' }],
+      models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }],
       deepseek: { state: 'configured' },
     });
     await credentials.saveApiKey('deepseek', 'replacement-key');

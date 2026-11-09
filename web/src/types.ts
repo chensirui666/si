@@ -2,6 +2,7 @@ import type { SubmitMessageAccepted } from '@agent-learning/server/protocol'
 export type { ConversationMessage } from '@agent-learning/agent'
 
 export type LocalSubmission = {
+  kind: 'message' | 'compaction'
   clientMessageId: string
   modelId: string
   text: string

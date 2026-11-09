@@ -70,7 +70,7 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
 export function AssistantMessage({ messages, activeContent = [], running = null, toolResults }: {
   messages: readonly AssistantEntry[]
   activeContent?: readonly ActiveContent[]
-  running?: RunningState
+  running?: Extract<RunningState, { kind: 'task' }> | null
   toolResults?: ToolResults
 }) {
   const terminal = [...messages].reverse().find(entry => entry.message.stopReason === 'aborted' || entry.message.stopReason === 'error')?.message

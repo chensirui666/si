@@ -3,10 +3,11 @@ import { addAbortListener } from 'node:events'
 import { homedir } from 'node:os'
 import { basename, dirname, relative, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import type { ExecutableTool } from '@agent-learning/agent'
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type ToolRuntime } from './tool-runtime.js'
 import type { BashParams, EditParams, FindParams, GrepParams, ReadParams, WriteParams } from './tools.js'
 
-type Context = { cwd: string; signal: AbortSignal }
+type Context = Parameters<ExecutableTool['execute']>[1]
 
 function nonEmpty(value: string, name: string): string {
   if (!value.trim()) throw new Error(`${name} 不能为空`)
@@ -75,12 +76,14 @@ class OutputLines {
   }
 }
 
-async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal }: Context) {
+async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: Context) {
   const start = integer(offset, 'offset') - 1
   const count = limit === undefined ? Infinity : integer(limit, 'limit')
-  const text = await readWithAbort(pathFrom(cwd, path), signal)
+  const target = pathFrom(cwd, path)
+  const text = await readWithAbort(target, signal)
   const lines = linesOf(text)
   if (start >= lines.length && (lines.length || start > 0)) throw new Error(`offset 超出文件范围（共 ${lines.length} 行）`)
+  recordFileOperation?.(target)
 
   const output = new OutputLines()
   const requested = Math.min(lines.length - start, count)
@@ -98,12 +101,14 @@ async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal }: Co
   return content
 }
 
-async function write({ path, content }: WriteParams, { cwd, signal }: Context) {
+async function write({ path, content }: WriteParams, { cwd, signal, recordFileOperation }: Context) {
   const target = pathFrom(cwd, path)
   signal.throwIfAborted()
   await mkdir(dirname(target), { recursive: true })
   signal.throwIfAborted()
   await writeFile(target, content, 'utf8')
+  // Cancellation cannot undo a completed write.
+  recordFileOperation?.(target)
   signal.throwIfAborted()
   return `已写入 ${target}`
 }
@@ -138,7 +143,7 @@ function withoutTrailingSpaces(text: string) {
   return { text: pieces.join('\n'), positions }
 }
 
-async function edit({ path, edits }: EditParams, { cwd, signal }: Context) {
+async function edit({ path, edits }: EditParams, { cwd, signal, recordFileOperation }: Context) {
   const target = pathFrom(cwd, path)
   if (!edits.length || edits.some(({ oldText }) => !oldText.length)) throw new Error('edits 至少需要一项，且 oldText 不能为空')
   const original = await readText(target, signal, true)
@@ -180,6 +185,7 @@ async function edit({ path, edits }: EditParams, { cwd, signal }: Context) {
   if (updated === text) throw new Error('编辑后文件没有变化')
   signal.throwIfAborted()
   await writeFile(target, bom + updated.replaceAll('\n', newline), 'utf8')
+  recordFileOperation?.(target)
   signal.throwIfAborted()
   return `已在 ${target} 完成 ${edits.length} 处替换`
 }

@@ -79,7 +79,7 @@ test('执行过程逐步展示并独立展开，正文分段，结果按来源�
   const call = { type: 'toolCall', id: 'same', name: 'read', arguments: { path: 'note.txt' } } as const;
   const user: ConversationMessage = { id: 'u', message: { role: 'user', content: '读取文件', timestamp: 1 } };
   const first = { id: 'a', message: { ...base, content: [{ type: 'thinking', thinking: '先读' }, { type: 'toolCall', id: '', name: '', arguments: {} }] } } satisfies ConversationMessage;
-  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' as const, activeTools: [] };
+  const running = { kind: 'task' as const, runId: 'u', assistantMessageId: 'a', phase: 'model' as const, activeTools: [] };
   const component = await mount(<MessageList messages={[user, first]} running={running} activeContent={[
     { type: 'thinking', messageId: 'a', contentIndex: 0 },
     { type: 'toolCall', messageId: 'a', contentIndex: 1, argumentsText: '{"path":' },
@@ -140,7 +140,7 @@ test('W4 两轮读取使用相同调用编号，整次结束才收起并保留�
   const first: ConversationMessage = { id: 'a1', message: { ...base, content: [call('index.txt')] } };
   const result = (id: string, assistantMessageId: string, text: string): ConversationMessage => ({ id, toolCall: { assistantMessageId, contentIndex: 0 }, message: { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', timestamp: 2, isError: false, content: [{ type: 'text', text }] } });
   const history = [user, first, result('r1', 'a1', '下一条线索在 note.txt')];
-  const running = { userMessageId: 'u', assistantMessageId: 'a2', phase: 'model' as const, activeTools: [] };
+  const running = { kind: 'task' as const, runId: 'u', assistantMessageId: 'a2', phase: 'model' as const, activeTools: [] };
   const component = await mount(<MessageList messages={history} running={running} />);
   const process = component.locator('.process-group');
   await expect(process).toHaveAttribute('open');

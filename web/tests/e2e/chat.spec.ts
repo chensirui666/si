@@ -63,7 +63,8 @@ for (const mode of ['node', 'vite'] as const) {
       await second.getByRole('textbox', { name: '消息', exact: true }).fill('另一个页面的草稿')
       await expect(second.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
       const running = otherObserved.snapshots.at(-1)!.snapshot.running
-      expect(running).not.toBeNull()
+      expect(running?.kind).toBe('task')
+      if (running?.kind !== 'task') throw new Error('当前运行应为普通任务')
       expect(otherObserved.snapshots.at(-1)!.snapshot.activeContent).toContainEqual({ messageId: running!.assistantMessageId, contentIndex: 1, type: 'text' })
 
       const beforeReload = observed.snapshots.length

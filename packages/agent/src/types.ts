@@ -1,8 +1,8 @@
-import type { AssistantMessage, JsonObject, ModelMessage, Tool, ToolCall } from '@agent-learning/model'
+import type { AssistantMessage, JsonObject, ModelMessage, ModelUsage, ContextEstimate, Tool, ToolCall } from '@agent-learning/model'
 
 export type ExecutableTool = Tool & {
   executionMode?: 'parallel' | 'sequential'
-  execute(arguments_: JsonObject, context: { cwd: string; signal: AbortSignal }): Promise<string>
+  execute(arguments_: JsonObject, context: { cwd: string; signal: AbortSignal; recordFileOperation?: (path: string) => void }): Promise<string>
 }
 
 type ToolLocation = {
@@ -15,14 +15,45 @@ export type ConversationMessage = {
   clientMessageId?: string
   toolCall?: ToolLocation
   toolErrorCode?: string
+  fileOperation?: { kind: 'read' | 'modified'; path: string }
   message: ModelMessage
 }
 
+export type SubmissionAccepted = { clientMessageId: string; acceptedSeq: number } & (
+  | { kind: 'message'; userMessageId: string }
+  | { kind: 'compaction'; compactionId: string }
+)
+
 export type RunningState = null | {
-  userMessageId: string
+  kind: 'task'
+  runId: string
   assistantMessageId: string
-  phase: 'model' | 'tools'
+  phase: 'model' | 'tools' | 'compaction'
   activeTools: ToolLocation[]
+} | { kind: 'compaction'; runId: string; phase: 'compaction' }
+
+export type CompactionRecord = {
+  id: string
+  trigger: 'manual' | 'auto' | 'overflow'
+  clientMessageId?: string
+  startedAt: number
+  summaryUsage?: ModelUsage
+} & (
+  | { status: 'running' }
+  | { status: 'failed' | 'aborted' | 'skipped'; finishedAt: number; reason: string }
+  | {
+    status: 'success'; finishedAt: number; summary: string
+    firstKeptMessageId: string; contextLastMessageId: string
+    estimatedBefore: number; estimatedAfter: number
+    fileOperations?: { readFiles: string[]; modifiedFiles: string[] }
+    followupMessageId?: string
+  }
+)
+
+export type ContextUsage = {
+  tokens?: number
+  contextWindow?: number
+  breakdown: ContextEstimate
 }
 
 export type ConversationSnapshot = {
@@ -30,13 +61,17 @@ export type ConversationSnapshot = {
   messages: ConversationMessage[]
   running: RunningState
   activeContent: ActiveContent[]
+  compactions: CompactionRecord[]
+  contextUsage: ContextUsage | null
 }
 
 export type ConversationUpdate = {
   seq: number
+  contextUsage?: ContextUsage | null
   change:
-    | { type: 'accepted'; user: ConversationMessage; running: Exclude<RunningState, null> }
+    | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }
+    | { type: 'compaction'; record: CompactionRecord; running: RunningState }
     | ({ type: 'task'; running: RunningState } & ({ message: ConversationMessage; messageIndex: number } | { message?: never; messageIndex?: never }))
 }
 

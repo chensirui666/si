@@ -3,6 +3,8 @@ import type { ModelDiscovery } from '@agent-learning/model'
 import type { AbortRequest, AbortResult, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
+import { ContextMeter } from '../components/ContextMeter'
+import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
 import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
 import { Button } from '../components/ui/button'
@@ -17,7 +19,7 @@ type Props = {
   abortMessage?: (input: AbortRequest) => Promise<AbortResult>
 }
 
-type AbortState = { userMessageId: string; status: 'pending' | 'unconfirmed'; error?: string }
+type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: string }
 
 function useServerView<T>(load: () => Promise<T>) {
   const [view, setView] = useState<T | null>(null)
@@ -101,7 +103,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   }
 
   const updateSubmissions = useCallback((next: LocalSubmission[]) => {
-    const merged = mergeSubmissions(stateRef.current.snapshot?.messages ?? [], next)
+    const merged = mergeSubmissions(stateRef.current.snapshot?.messages ?? [], next, stateRef.current.snapshot?.compactions)
     const unresolved = merged.filter((item): item is LocalSubmission => 'state' in item)
     submissionsRef.current = unresolved
     setSubmissions(unresolved)
@@ -148,7 +150,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       previousConnection = next.connection
       stateRef.current = next
       if (next.connection === 'ready' && next.snapshot && abortRef.current
-        && next.snapshot.running?.userMessageId !== abortRef.current.userMessageId) updateAbort(null)
+        && next.snapshot.running?.runId !== abortRef.current.runId) updateAbort(null)
       updateSubmissions(submissionsRef.current)
       setState(next)
     }, refreshModels, refreshWorkspaces, refreshWebSettings)
@@ -172,7 +174,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const send = (text: string, restoreDraft: () => void) => {
     if (!text.trim() || !boundWorkspace || !canSubmit()) return false
     const input: SubmitMessageRequest = { clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, workspaceId: boundWorkspace.id, text }
-    const local: LocalSubmission = { ...input, state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
+    const local: LocalSubmission = { ...input, kind: text.trim() === '/compact' ? 'compaction' : 'message', state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
     // 同步写门禁，React 渲染前的第二次发送手势也会被拦住。
     const previous = submissionsRef.current
     submissionsRef.current = [...previous, local]
@@ -205,29 +207,29 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     return true
   }
 
-  const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions)
+  const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions.filter(local => local.kind === 'message'))
   const waiting = submissions.some(local => local.state !== 'failed')
-  const target = state.snapshot?.running?.userMessageId
-  const activeAbort = abortState?.userMessageId === target ? abortState : null
+  const target = state.snapshot?.running?.runId
+  const activeAbort = abortState?.runId === target ? abortState : null
   const abortDisabled = !target || (activeAbort?.status === 'unconfirmed' && state.connection !== 'ready')
   const action = target || waiting ? activeAbort?.status === 'pending' ? 'aborting' : 'abort' : 'send'
-  const abort = async (userMessageId: string | undefined) => {
-    if (!userMessageId || stateRef.current.snapshot?.running?.userMessageId !== userMessageId
-      || abortRef.current?.userMessageId === userMessageId && abortRef.current.status === 'pending') return
-    updateAbort({ userMessageId, status: 'pending' })
+  const abort = async (runId: string | undefined) => {
+    if (!runId || stateRef.current.snapshot?.running?.runId !== runId
+      || abortRef.current?.runId === runId && abortRef.current.status === 'pending') return
+    updateAbort({ runId, status: 'pending' })
     try {
-      await abortMessage({ userMessageId })
-      if (!mounted.current || abortRef.current?.userMessageId !== userMessageId) return
+      await abortMessage({ runId })
+      if (!mounted.current || abortRef.current?.runId !== runId) return
       subscription.current?.requestSnapshot?.()
     } catch (error) {
-      if (!mounted.current || abortRef.current?.userMessageId !== userMessageId) return
-      updateAbort({ userMessageId, status: 'unconfirmed', error: error instanceof Error ? error.message : '中止请求失败' })
+      if (!mounted.current || abortRef.current?.runId !== runId) return
+      updateAbort({ runId, status: 'unconfirmed', error: error instanceof Error ? error.message : '中止请求失败' })
       subscription.current?.requestSnapshot?.()
     }
   }
   const status = state.error ?? (state.slow ? '连接较慢，正在等待对话恢复…' : {
     connecting: '正在连接…', awaitingSnapshot: '正在恢复对话…',
-    ready: state.snapshot?.running?.phase === 'tools' ? '正在执行工具…' : state.snapshot?.running ? '正在生成回答…' : waiting ? '正在确认消息接收…' : '对话已同步',
+    ready: state.snapshot?.running?.phase === 'compaction' ? '正在压缩对话…' : state.snapshot?.running?.phase === 'tools' ? '正在执行工具…' : state.snapshot?.running ? '正在生成回答…' : waiting ? '正在确认消息接收…' : '对话已同步',
     disconnected: '连接已断开，正在重试…',
   }[state.connection])
 
@@ -280,7 +282,8 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
           {boundWorkspace && !boundWorkspace.available && <p className="model-error configuration-error" role="alert">工作区目录不可用</p>}
           {(modelError || discovery?.deepseek.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (discovery?.deepseek.state === 'error' ? discovery.deepseek.message : '')}</p>}
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
-          <MessageInput onSend={send} sendDisabled={!canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
+          <CompactionRecords records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
+          <MessageInput contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} onSend={send} sendDisabled={!canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
       </div>

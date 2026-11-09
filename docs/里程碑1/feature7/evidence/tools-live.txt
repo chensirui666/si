@@ -1,0 +1,12 @@
+
+> @agent-learning/server@0.1.0 test:tools:live
+> vitest run --config vitest.tools-live.config.ts
+
+
+ RUN  v5.0.5 /Users/stardust/agent learning/.worktrees/feature7/packages/server
+
+
+ Test Files  1 passed (1)
+      Tests  7 passed (7)
+   Start at  00:58:38
+   Duration  58.08s (tests 100%)

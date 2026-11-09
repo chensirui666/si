@@ -20,7 +20,7 @@ export async function freeVitePort() {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   return address.port
 }
-export const emptySnapshot = { seq: 0, messages: [], running: null, activeContent: [] }
+export const emptySnapshot = { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null } satisfies ConversationSnapshot
 
 type Started = { url: string; authUrl: string; devAuthUrl: string }
 

@@ -15,21 +15,21 @@ class Socket extends EventTarget {
   get id() { return this.sent.at(-1)!.subscriptionId }
 }
 
-const empty = { seq: 0, messages: [], running: null, activeContent: [] }
+const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 
 it.each([true, false])('abort validates the target and handled=%s with same-origin credentials', async handled => {
-  const fetcher = vi.fn(async () => Response.json({ userMessageId: 'user-1', handled }))
+  const fetcher = vi.fn(async () => Response.json({ runId: 'user-1', handled }))
   vi.stubGlobal('fetch', fetcher)
-  expect(await abortMessage({ userMessageId: 'user-1' })).toEqual({ userMessageId: 'user-1', handled })
-  expect(fetcher).toHaveBeenCalledWith('/api/abort', expect.objectContaining({ method: 'POST', credentials: 'same-origin', body: '{"userMessageId":"user-1"}' }))
+  expect(await abortMessage({ runId: 'user-1' })).toEqual({ runId: 'user-1', handled })
+  expect(fetcher).toHaveBeenCalledWith('/api/abort', expect.objectContaining({ method: 'POST', credentials: 'same-origin', body: '{"runId":"user-1"}' }))
 })
 
 it.each([
-  [200, { userMessageId: 'wrong', handled: true }], [200, { userMessageId: 'user-1', handled: 'true' }],
-  [202, { userMessageId: 'user-1', handled: true }], [500, { error: '服务不可用' }], [401, null], [403, null],
+  [200, { runId: 'wrong', handled: true }], [200, { runId: 'user-1', handled: 'true' }],
+  [202, { runId: 'user-1', handled: true }], [500, { error: '服务不可用' }], [401, null], [403, null],
 ] as const)('abort rejects invalid or unsuccessful receipt %s %j', async (status, body) => {
   vi.stubGlobal('fetch', async () => Response.json(body, { status }))
-  await expect(abortMessage({ userMessageId: 'user-1' })).rejects.toThrow()
+  await expect(abortMessage({ runId: 'user-1' })).rejects.toThrow()
 })
 let online = true
 let states: ChatState[]
@@ -70,7 +70,7 @@ describe('browser subscription', () => {
     start(); socket().open(); snapshot()
     const ws = socket()
     const old = ws.id
-    const accepted = { type: 'accepted', user: { id: 'user-1', message: { role: 'user', content: 'hello', timestamp: 1 } }, running: { userMessageId: 'user-1', assistantMessageId: 'assistant-1', phase: 'model', activeTools: [] } }
+    const accepted = { type: 'accepted', user: { id: 'user-1', message: { role: 'user', content: 'hello', timestamp: 1 } }, running: { kind: 'task' as const, runId: 'user-1', assistantMessageId: 'assistant-1', phase: 'model', activeTools: [] } }
     ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
     ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
     expect(current().snapshot?.messages).toHaveLength(1)
@@ -229,7 +229,7 @@ it.each([
 })
 
 it('提交保留完整原文，只发送一次请求并校验 202 回执', async () => {
-  const accepted = { clientMessageId: 'local', userMessageId: 'user', acceptedSeq: 1 }
+  const accepted = { kind: 'message' as const, clientMessageId: 'local', userMessageId: 'user', acceptedSeq: 1 }
   const fetch = vi.fn().mockResolvedValue({ status: 202, ok: true, json: async () => accepted })
   vi.stubGlobal('fetch', fetch)
   const { submitMessage } = await import('./client')
@@ -283,7 +283,7 @@ it('W3/W3.5 漏失结果先重订阅，重连与停止后旧连接不能改写�
   next.frame({ type: 'snapshot', subscriptionId: next.id, snapshot: { ...empty, seq: 3, messages: [assistant, result] } })
   expect(current().connection).toBe('ready')
   const restored = current()
-  ws.frame({ type: 'update', subscriptionId: oldId, update: { seq: 4, change: { type: 'task', running: { userMessageId: 'u', assistantMessageId: 'a', phase: 'tools', activeTools: [{ assistantMessageId: 'a', contentIndex: 0 }] } } } })
+  ws.frame({ type: 'update', subscriptionId: oldId, update: { seq: 4, change: { type: 'task', running: { kind: 'task' as const, runId: 'u', assistantMessageId: 'a', phase: 'tools', activeTools: [{ assistantMessageId: 'a', contentIndex: 0 }] } } } })
   expect(current()).toBe(restored)
   const count = states.length
   stop?.()
@@ -291,4 +291,16 @@ it('W3/W3.5 漏失结果先重订阅，重连与停止后旧连接不能改写�
   vi.advanceTimersByTime(30_000)
   expect(states).toHaveLength(count)
   expect(Socket.instances).toHaveLength(2)
+})
+
+it('压缩与普通消息按各自类型校验接收回执', async () => {
+  const receipt = { kind: 'compaction', clientMessageId: 'draft', compactionId: 'c1', acceptedSeq: 2 }
+  const fetch = vi.fn().mockResolvedValue({ status: 202, ok: true, json: async () => receipt })
+  vi.stubGlobal('fetch', fetch)
+  const { submitMessage } = await import('./client')
+  const input = { clientMessageId: 'draft', modelId: 'deepseek-flash', workspaceId: 'w', text: ' /compact ' }
+  await expect(submitMessage(input)).resolves.toEqual(receipt)
+  await expect(submitMessage({ ...input, text: '普通问题' })).rejects.toThrow('提交回执无效')
+  fetch.mockResolvedValue({ status: 202, ok: true, json: async () => ({ kind: 'message', clientMessageId: 'draft', userMessageId: 'u', acceptedSeq: 2 }) })
+  await expect(submitMessage(input)).rejects.toThrow('提交回执无效')
 })

@@ -14,7 +14,7 @@ describe('Agent 初始订阅', () => {
       done: false,
       value: {
         type: 'snapshot',
-        snapshot: { seq: 0, messages: [], running: null, activeContent: [] },
+        snapshot: { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
       },
     })
 
@@ -42,7 +42,7 @@ describe('Agent 初始订阅', () => {
     const second = agent.subscribe(controller.signal)[Symbol.asyncIterator]()
     expect((await second.next()).value).toEqual({
       type: 'snapshot',
-      snapshot: { seq: 0, messages: [], running: null, activeContent: [] },
+      snapshot: { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
     })
     controller.abort()
   })
@@ -154,9 +154,9 @@ describe('Agent 提交与运行', () => {
     await expect(second).rejects.toMatchObject({ status: 409 })
     const receipt = await first
     const current = await snapshot(agent)
-    expect(receipt).toEqual({ clientMessageId: 'local-1', userMessageId: current.messages[0]?.id, acceptedSeq: 1 })
+    expect(receipt).toEqual({ kind: 'message', clientMessageId: 'local-1', userMessageId: current.messages[0]?.id, acceptedSeq: 1 })
     expect(current.messages[0]?.message).toMatchObject({ role: 'user', content: '  你好\n第二行  ' })
-    expect(current.running?.userMessageId).toBe(receipt.userMessageId)
+    expect(current.running?.runId).toBe(receipt.userMessageId)
     expect(calls).toBe(1)
     queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
@@ -165,7 +165,7 @@ describe('Agent 提交与运行', () => {
   it.each([{ ...input, text: ' \n ' }, { ...input, modelId: 'unknown' }, { ...input, clientMessageId: '' }])('无效提交不改变正式状态', async value => {
     const agent = new Agent({ stream: () => { throw new Error('must not call') } })
     await expect(agent.submit(value)).rejects.toMatchObject({ status: 400 })
-    expect(await snapshot(agent)).toEqual({ seq: 0, messages: [], running: null, activeContent: [] })
+    expect(await snapshot(agent)).toEqual({ seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null })
   })
 
   it('事件独立累积，不读取已领先的 shared partial；切点后更新连续且副本独立', async () => {
@@ -190,7 +190,7 @@ describe('Agent 提交与运行', () => {
     queue.push({ type: 'done', reason: 'stop', message: final })
     const last = (await subscriber.next()).value
     expect(last).toMatchObject({ type: 'update', update: { seq: 6, change: { event: { type: 'done' } } } })
-    expect((await subscriber.next()).value).toEqual({ type: 'update', update: { seq: 7, change: { type: 'task', running: null } } })
+    expect((await subscriber.next()).value).toMatchObject({ type: 'update', update: { seq: 7, change: { type: 'task', running: null } } })
     const current = await snapshot(agent)
     expect(current.running).toBeNull()
     expect(current.activeContent).toEqual([])
@@ -298,7 +298,7 @@ describe('Agent 提交与运行', () => {
     if (!cancelled) second.push({ type: 'error', reason: 'aborted', error: { ...assistant(), stopReason: 'aborted' } })
     await closing
     expect(cancelled).toBe(true)
-    expect(beforeClose.running?.userMessageId).toBe(next.userMessageId)
+    expect(beforeClose.running?.runId).toBe(next.userMessageId)
     expect(beforeClose.messages[1]?.message).toMatchObject({ stopReason: 'stop' })
     expect(beforeClose.seq).toBe(4)
   })
@@ -575,7 +575,7 @@ describe('Feature6 连续决策与同批调度', () => {
     expect(contexts.every(context => context.tools?.length === 1)).toBe(true)
     expect(contexts[2].messages.at(-1)).toMatchObject({ content: [{ text: '项目名称：青禾' }] })
     await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: 409 })
-    expect((await snapshot(agent)).running?.userMessageId).toBe(receipt.userMessageId)
+    expect((await snapshot(agent)).running?.runId).toBe(receipt.userMessageId)
     done(2)
     await until(async () => (await snapshot(agent)).running === null)
     const messages = (await snapshot(agent)).messages

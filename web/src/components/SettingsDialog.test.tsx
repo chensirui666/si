@@ -7,7 +7,7 @@ import { SettingsDialog } from './SettingsDialog'
 
 vi.mock('../chat/client', () => ({ saveApiKey: vi.fn(), deleteApiKey: vi.fn() }))
 const missing: ModelDiscovery = { models: [], deepseek: { state: 'missing' } }
-const configured: ModelDiscovery = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions' }], deepseek: { state: 'configured' } }
+const configured: ModelDiscovery = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], deepseek: { state: 'configured' } }
 function Harness({ initial = missing }: { initial?: ModelDiscovery }) {
   const [discovery, setDiscovery] = useState(initial)
   return <SettingsDialog discovery={discovery} onChange={setDiscovery} />

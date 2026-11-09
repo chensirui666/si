@@ -34,7 +34,7 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
     await page.evaluate(({ connection, history }) => {
       window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
         connection, slow: connection === 'awaitingSnapshot', error: null,
-        snapshot: { seq: 1, messages: history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), running: null, activeContent: [] },
+        snapshot: { seq: 1, messages: history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), running: null, compactions: [], contextUsage: null, activeContent: [] },
       } }))
     }, { connection, history })
     await expect(page.locator('.chat-page')).toHaveAttribute('data-connection', connection)
@@ -61,7 +61,7 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
   await page.evaluate(history => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
-      snapshot: { seq: 2, messages: [...history, '新同步消息'].map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), running: null, activeContent: [] },
+      snapshot: { seq: 2, messages: [...history, '新同步消息'].map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), running: null, compactions: [], contextUsage: null, activeContent: [] },
     } }))
   }, history)
   await expect(items).toHaveCount(27)
@@ -346,7 +346,7 @@ test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到�
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
-      snapshot: { seq: 1, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model', activeTools: [] }, activeContent: [] },
+      snapshot: { seq: 1, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: { kind: 'task' as const, runId: 'user', assistantMessageId: 'answer', phase: 'model', activeTools: [] }, compactions: [], contextUsage: null, activeContent: [] },
     } }))
   }, request)
   await release()
@@ -359,7 +359,7 @@ test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到�
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
-      snapshot: { seq: 2, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }, { id: 'answer', message: { role: 'assistant', content: [{ type: 'text', text: '**完成**' }], api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 2, stopReason: 'stop' } }], running: null, activeContent: [] },
+      snapshot: { seq: 2, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }, { id: 'answer', message: { role: 'assistant', content: [{ type: 'text', text: '**完成**' }], api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 2, stopReason: 'stop' } }], running: null, compactions: [], contextUsage: null, activeContent: [] },
     } }))
   }, request)
   await expect(page.locator('.assistant-message strong')).toHaveText('完成')
@@ -371,7 +371,7 @@ test('HTTP 回执先到时旧空闲快照不能开放发送，正式消息与结
   let input: { clientMessageId: string; modelId: string; text: string } | undefined
   await page.route('**/api/messages', async route => {
     input = route.request().postDataJSON()
-    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ clientMessageId: input!.clientMessageId, userMessageId: 'user', acceptedSeq: 5 }) })
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ kind: 'message' as const, clientMessageId: input!.clientMessageId, userMessageId: 'user', acceptedSeq: 5 }) })
   })
   await mount(<ChatPageHarness modelConfigured />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
@@ -382,12 +382,12 @@ test('HTTP 回执先到时旧空闲快照不能开放发送，正式消息与结
   await editor.fill('下一条')
   await expect(page.getByRole('button', { name: '中止', exact: true })).toBeDisabled()
   await page.evaluate(() => {
-    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 4, messages: [], running: null, activeContent: [] } } }))
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 4, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] } } }))
   })
   await expect(page.getByRole('button', { name: '中止', exact: true })).toBeDisabled()
   await expect(page.getByRole('region', { name: '消息列表' }).getByRole('listitem')).toHaveCount(1)
   await page.evaluate(input => {
-    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 6, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: null, activeContent: [] } } }))
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null, snapshot: { seq: 6, messages: [{ id: 'user', clientMessageId: input!.clientMessageId, message: { role: 'user', content: input!.text, timestamp: 1 } }], running: null, compactions: [], contextUsage: null, activeContent: [] } } }))
   }, input)
   await expect(send).toBeEnabled()
   await expect(page.getByRole('region', { name: '消息列表' }).getByRole('listitem')).toHaveCount(1)
@@ -409,7 +409,7 @@ test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动�
     await page.evaluate(({ history, seq }) => {
       window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
         connection: 'ready', slow: false, error: null,
-        snapshot: { seq, messages: [...history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), { id: 'answer', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 30, content: [{ type: 'thinking', thinking: '独立思考' }, { type: 'text', text: `# 标题\n\n${'回答内容\n\n'.repeat(seq * 8)}` }], stopReason: seq === 3 ? 'stop' : 'pending' } }], running: seq === 3 ? null : { userMessageId: 'history-25', assistantMessageId: 'answer', phase: 'model', activeTools: [] }, activeContent: seq === 3 ? [] : [{ messageId: 'answer', contentIndex: 1, type: 'text' }] },
+        snapshot: { seq, messages: [...history.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })), { id: 'answer', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 30, content: [{ type: 'thinking', thinking: '独立思考' }, { type: 'text', text: `# 标题\n\n${'回答内容\n\n'.repeat(seq * 8)}` }], stopReason: seq === 3 ? 'stop' : 'pending' } }], running: seq === 3 ? null : { kind: 'task' as const, runId: 'history-25', assistantMessageId: 'answer', phase: 'model', activeTools: [] }, compactions: [], contextUsage: null, activeContent: seq === 3 ? [] : [{ messageId: 'answer', contentIndex: 1, type: 'text' }] },
       } }))
     }, { history, seq })
     await expect(list.getByRole('listitem')).toHaveCount(27)
@@ -429,7 +429,7 @@ for (const withHistory of [false, true]) {
       if (call === 1) await route.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: '输入无效' }) })
       else {
         second = route.request().postDataJSON()
-        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ clientMessageId: second!.clientMessageId, userMessageId: 'user-b', acceptedSeq: 1 }) })
+        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ kind: 'message' as const, clientMessageId: second!.clientMessageId, userMessageId: 'user-b', acceptedSeq: 1 }) })
       }
     })
     await mount(<ChatPageHarness messages={withHistory ? ['历史 F'] : []} modelConfigured />)
@@ -444,7 +444,7 @@ for (const withHistory of [false, true]) {
     await page.evaluate(({ withHistory, second }) => {
       window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
         connection: 'ready', slow: false, error: null,
-        snapshot: { seq: 3, running: null, activeContent: [], messages: [
+        snapshot: { seq: 3, running: null, compactions: [], contextUsage: null, activeContent: [], messages: [
           ...(withHistory ? [{ id: 'history-0', message: { role: 'user', content: '历史 F', timestamp: 1 } }] : []),
           { id: 'user-b', clientMessageId: second!.clientMessageId, message: { role: 'user', content: second!.text, timestamp: 2 } },
           { id: 'answer-b', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 3, content: [{ type: 'text', text: '回答 B' }], stopReason: 'stop' } },

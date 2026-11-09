@@ -29,9 +29,11 @@ export type WebServerOptions = {
   webProviders?: WebProvider[]
   agent?: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'abort' | 'close'>>
   modelOptions?: Parameters<typeof createModelStream>[1]
+  compaction?: { triggerTokens: number; keepRecentTokens: number }
   now?: () => number
 }
 const mime: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.woff2': 'font/woff2', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8' }
+const maxBufferedBytes = 1024 * 1024
 class InputError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
 }
@@ -98,6 +100,7 @@ export class WebServer {
     this.agent = options.agent ?? new Agent({
       stream: createModelStream(this.credentials, options.modelOptions),
       tools: createTools(this.toolRuntime, createWebTools(this.webSettings, this.toolRuntime)),
+      compaction: options.compaction,
     })
   }
   async start(): Promise<{ url: string; authUrl: string; devAuthUrl?: string }> {
@@ -135,7 +138,7 @@ export class WebServer {
       this.heartbeat = setInterval(() => {
         for (const client of ws.clients) {
           const state = this.missedPongs.get(client) ?? 0
-          if (state >= 2) { this.disposers.get(client)?.(); client.terminate(); continue }
+          if (state >= 2 || client.bufferedAmount > maxBufferedBytes) { this.disposers.get(client)?.(); client.terminate(); continue }
           this.missedPongs.set(client, state + 1)
           client.ping(undefined, undefined, error => { if (error) { this.disposers.get(client)?.(); client.terminate() } })
         }
@@ -190,12 +193,12 @@ export class WebServer {
       try {
         const input = await readJson(req)
         if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 1
-          || !('userMessageId' in input) || typeof input.userMessageId !== 'string' || !input.userMessageId.trim() || input.userMessageId.length > 128) {
-          throw new InputError(400, '请仅提交有效的用户消息编号')
+          || !('runId' in input) || typeof input.runId !== 'string' || !input.runId.trim() || input.runId.length > 128) {
+          throw new InputError(400, '请仅提交有效的运行编号')
         }
         if (!this.agent.abort) throw new InputError(503, '当前中止服务不可用')
-        const handled = await this.agent.abort(input.userMessageId)
-        this.json(res, 200, { userMessageId: input.userMessageId, handled })
+        const handled = await this.agent.abort(input.runId)
+        this.json(res, 200, { runId: input.runId, handled })
       } catch (error) {
         this.json(res, error instanceof InputError ? error.status : 500,
           { error: error instanceof InputError ? error.message : '中止暂时不可用，请重新同步对话后重试' })
@@ -312,20 +315,35 @@ export class WebServer {
   }
 
   private readonly missedPongs = new Map<WebSocket, number>()
+  private readonly sends = new Map<WebSocket, Promise<void>>()
+  private readonly notifications = new Map<WebSocket, Set<'models_changed' | 'workspaces_changed' | 'web_settings_changed'>>()
+  private send(client: WebSocket, frame: ServerFrame): Promise<void> {
+    const pending = (this.sends.get(client) ?? Promise.resolve()).then(() => new Promise<void>((done, reject) => {
+      if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > maxBufferedBytes) { reject(new Error('Connection unavailable')); return }
+      if (frame.type === 'models_changed' || frame.type === 'workspaces_changed' || frame.type === 'web_settings_changed') {
+        const notifications = this.notifications.get(client)
+        notifications?.delete(frame.type)
+        if (!notifications?.size) this.notifications.delete(client)
+      }
+      client.send(JSON.stringify(frame), error => error ? reject(error) : done())
+    }))
+    this.sends.set(client, pending)
+    return pending
+  }
   private notify(type: 'models_changed' | 'workspaces_changed' | 'web_settings_changed') {
     for (const client of this.ws?.clients ?? []) {
-      if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > 1024 * 1024) {
-        this.disposers.get(client)?.(); client.terminate(); continue
-      }
-      client.send(JSON.stringify({ type } satisfies ServerFrame), error => {
-        if (error) { this.disposers.get(client)?.(); client.terminate() }
-      })
+      const pending = this.notifications.get(client) ?? new Set()
+      if (pending.has(type)) continue
+      pending.add(type)
+      this.notifications.set(client, pending)
+      // Notifications only request a refresh; coalesce each kind while a frame is pending.
+      void this.send(client, { type }).catch(() => { this.disposers.get(client)?.(); client.terminate() })
     }
   }
   private connect(client: WebSocket) {
     let current: { id: string; controller: AbortController } | undefined
     const cancel = () => { current?.controller.abort(); current = undefined }
-    const cleanup = () => { cancel(); this.disposers.delete(client); this.missedPongs.delete(client) }
+    const cleanup = () => { cancel(); this.disposers.delete(client); this.missedPongs.delete(client); this.sends.delete(client); this.notifications.delete(client) }
     this.disposers.set(client, cleanup)
     this.missedPongs.set(client, 0)
     client.on('pong', () => this.missedPongs.set(client, 0))
@@ -343,11 +361,13 @@ export class WebServer {
       const subscription = current = { id: frame.subscriptionId, controller: new AbortController() }
       void (async () => {
         try {
+          await this.sends.get(client)
+          if (current !== subscription || subscription.controller.signal.aborted) return
           for await (const event of this.agent.subscribe(subscription.controller.signal)) {
             if (current !== subscription || subscription.controller.signal.aborted) break
             const outgoing: ServerFrame = { ...event, subscriptionId: subscription.id }
-            if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > 1024 * 1024) { cleanup(); client.terminate(); break }
-            client.send(JSON.stringify(outgoing), error => { if (error) { cleanup(); client.terminate() } })
+            try { await this.send(client, outgoing) }
+            catch { cleanup(); client.terminate(); break }
           }
         } catch {
           if (current === subscription && !subscription.controller.signal.aborted) { cleanup(); client.close(1011, 'Subscription unavailable') }

@@ -10,7 +10,7 @@ const message: Message = { role: 'assistant', api: 'openai-completions', provide
 
 describe('回复内容', () => {
   it('思考展开状态跨流更新保留，参数错误在工具块里显示', () => {
-    const running = { userMessageId: 'user', assistantMessageId: 'answer', phase: 'model' as const, activeTools: [] }
+    const running = { kind: 'task' as const, runId: 'user', assistantMessageId: 'answer', phase: 'model' as const, activeTools: [] }
     const view = render(<AssistantMessage messages={[{ id: 'answer', message }]} running={running} activeContent={[{ messageId: 'answer', contentIndex: 0, type: 'thinking' }]} />)
     const details = screen.getByText(/思考中 · 想一想/).closest('details')!
     expect(details).not.toHaveAttribute('open')
@@ -66,7 +66,7 @@ it('稳定前块冻结，只重解析尾部，最终完整解析校准跨块引�
 it('W1 同任务中成功、失败、中止各自显示，结果优先于任务中止', () => {
   const calls = ['note.txt', 'missing.txt', 'wait'].map((path, i) => ({ type: 'toolCall' as const, id: `call-${i}`, name: 'read', arguments: { path } }))
   const messages = [{ id: 'a', message: { ...message, stopReason: 'toolUse' as const, content: calls } }]
-  const running = { userMessageId: 'u', assistantMessageId: 'a', phase: 'model' as const, activeTools: [] }
+  const running = { kind: 'task' as const, runId: 'u', assistantMessageId: 'a', phase: 'model' as const, activeTools: [] }
   const view = render(<AssistantMessage messages={messages} running={running} />)
   expect(screen.getAllByText('准备中')).toHaveLength(3)
   view.rerender(<AssistantMessage messages={messages} running={{ ...running, phase: 'tools', activeTools: [0, 1, 2].map(contentIndex => ({ assistantMessageId: 'a', contentIndex })) }} />)

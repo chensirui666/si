@@ -8,7 +8,11 @@
 
 `findModel(modelId)` 只查内置支持目录，返回独立的模型信息或 `undefined`；不读凭据、不访问网络。Agent 可以同步校验所选模型，再原子接收消息。
 
-`stream(model, context, { signal }?)` 立即返回 `ModelEventStream`，后台读取当次 Key 并发送一个请求。`context` 包含可选 `systemPrompt`、调用方准备的 `messages` 和可选 `tools`；本包不保存对话历史。固定开启 `thinking: { type: 'enabled' }`、`reasoning_effort: 'high'` 和流式用量报告，不执行工具。Key 只进入认证头，替换凭据作用于后续请求。纳入历史的助手消息都携带 `reasoning_content`，包括执行前的思考与上次普通回答的思考。工具结果沿用原调用编号。
+目录返回 `contextWindow: 1_048_576` 与 `maxTokens: 65_536`；后者是本项目一次请求的输出预算。容量包含输入与输出，因此调用方必须为本次回复预留输出空间。2026-11-09 核对了 [DeepSeek 模型目录](https://api-docs.deepseek.com/api/list-models/)与 [Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)：当前服务商最大输出为 393,216，本项目没有把该最大值作为请求额度。
+
+`estimateMessageTokens(message, includeThinking)` 为近期消息切分估算完整消息；`estimateContextTokens(context)` 返回 `ContextEstimate {systemTokens, toolsTokens, messageTokens}`。估算复用实际请求的消息与工具转换，计序列化内容与结构开销，包含缺失工具结果的协议补位，不计时间、来源、用量或页面编号。最后一个非空系统提示归系统；旧系统消息、正文、适用思考、工具调用与结果归对话；工具一项只含声明。每四字符约一个 token 是参考 Pi/dsh 的近似值，中文与 JSON 可能低估，服务商真实用量才是实测值。估算不发网络请求、不修改原文，也不表示三类是服务商报告的拆分。
+
+`stream(model, context, { signal }?)` 立即返回 `ModelEventStream`，后台读取当次 Key 并发送一个请求。`context` 包含可选 `systemPrompt`、调用方准备的 `messages` 和可选 `tools`；本包不保存对话历史。固定开启 `thinking: { type: 'enabled' }`、`reasoning_effort: 'high'`、`max_tokens: 65_536` 和流式用量报告，不执行工具。Key 只进入认证头，替换凭据作用于后续请求。带工具声明时，纳入历史的助手消息携带 `reasoning_content`，包括执行前的思考与上次普通回答的思考；不带工具声明时省略服务商不计入上下文的历史思考。工具结果沿用原调用编号。
 
 完整工具调用中缺少结果时，在请求输入中补充 `No result provided`，不修改传入历史或真实执行记录，不重新执行工具。按每批调用独立配对，系统消息暂缓到结果之后，跨批复用编号不会串联；失败或中止的未完成回复仍由 Agent 在准备历史时排除。
 
@@ -20,7 +24,7 @@ for await (const event of response) {
 const finalMessage = await response.result()
 ```
 
-`Tool<TParameters extends TSchema = TSchema>` 是通用声明，包含 `name`、`description`、TypeBox `parameters`。调用方显式传入 `tools` 时，Model 将其转换为 SDK 函数工具声明；省略或传空数组时不发送 `tools` 字段，也不自动选择默认工具。Agent 在首轮传入已注册的工具声明，回填结果请求只提供历史。
+`Tool<TParameters extends TSchema = TSchema>` 是通用声明，包含 `name`、`description`、TypeBox `parameters`。调用方显式传入 `tools` 时，Model 将其转换为 SDK 函数工具声明；省略或传空数组时不发送 `tools` 字段，也不自动选择默认工具。Agent 每轮传入已注册的工具声明与有效历史。
 
 ```typescript
 const response = stream(model, { messages, tools })
@@ -37,7 +41,7 @@ const calls = finalMessage.stopReason === 'stop' || finalMessage.stopReason === 
 
 事件与 `result()` 属于同一次调用；反复等待结果不会再次请求。`partial` 是同一个持续变化的回复对象，不能当作某次事件的历史快照。需要恢复状态的调用方应独立应用 delta，并在块结束和最终回复时校准。正文和思考按连续输出区间建块，切换类型或收到工具数据时先结束当前正文/思考块；再次输出正文或思考会新建块。工具块按响应位置归集，位置缺失时用调用编号回查。不同位置即使用了同一编号也保留独立工具块，供 Agent 拒绝整批调用。编号缺失先留空，后续再补，同一调用的后续参数继续写原工具块，整流收尾时只结束一次。
 
-正常终止为 `stop`、`length` 或 `toolUse`；请求、协议、断流、尾部失败或超时为 `error`，明确取消为 `aborted`。准备失败可以直接产生 error；生成失败保留部分内容。最终结果 Promise 正常返回失败消息，不以拒绝 Promise 替代 error 事件。有效结束原因与正常读完整个 SDK 流必须同时成立，终止后不再发送片段。`usage` 仅保留服务商报告的字段，不补零；错误说明不包含原始异常或服务商错误正文。
+正常终止为 `stop`、`length` 或 `toolUse`；请求、协议、断流、尾部失败或超时为 `error`，明确取消为 `aborted`。准备失败可以直接产生 error；生成失败保留部分内容。最终结果 Promise 正常返回失败消息，不以拒绝 Promise 替代 error 事件。有效结束原因与正常读完整个 SDK 流必须同时成立，终止后不再发送片段。`usage` 仅保留服务商报告的字段，不补零；错误说明不包含原始异常或服务商错误正文。明确的上下文超限在脱敏前归类为 `errorCode: 'context_overflow'`；仅接受 400/413/422 中明确的上下文错误码或超限特征，普通参数、认证、限流和网络失败不归类，不增加 SDK 重试。
 
 SDK 与本包均不重试。连续五分钟没有 SDK 模型数据才中止；原始 SSE 心跳不续期，持续产生数据可以超过五分钟。超时和调用方取消均中止上游，并清理计时器与监听。SDK 的默认等待时间设为 Node 支持的最大计时值，由本包的滚动计时器实际控制无数据等待。
 

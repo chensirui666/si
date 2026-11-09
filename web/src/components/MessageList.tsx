@@ -16,6 +16,7 @@ export function MessageList({ messages, activeContent = [], running = null }: {
   let userId = ''
   for (const item of messages) {
     if ('state' in item) {
+      if (item.kind === 'compaction') continue
       rows.push({ type: 'user', id: item.clientMessageId, text: item.text, local: item })
       continue
     }
@@ -41,7 +42,7 @@ export function MessageList({ messages, activeContent = [], running = null }: {
           {rows.map(row => <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.id} data-message-id={row.id}>
             {row.type === 'assistant'
               ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults}
-                running={running && (row.userId === running.userMessageId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
+                running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
               : <>
                 <div className="message-text">{row.text}<br /></div>
                 {row.local && <div className="submission-status" data-state={row.local.state}>

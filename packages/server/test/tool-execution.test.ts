@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { watch } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -38,6 +39,17 @@ it('reads UTF-8 lines from task cwd and from an absolute path', async () => {
   expect(await read({ path: join(cwd, 'note.txt'), offset: 4 }, context())).toContain('丁')
   await expect(read({ path: 'note.txt', offset: 1.5 }, context())).rejects.toThrow('offset')
   await expect(read({ path: 'note.txt', offset: 5 }, context())).rejects.toThrow('offset')
+})
+
+it('records the resolved path of an empty read and omits a failed read', async () => {
+  const path = join(cwd, 'empty.txt')
+  await writeFile(path, '')
+  const paths: string[] = []
+  const execution = { ...context(), recordFileOperation: (path: string) => paths.push(path) }
+  const read = tool('read')
+  expect(await read({ path: 'nested/../empty.txt' }, execution)).toBe('')
+  await expect(read({ path: 'empty.txt', offset: 2 }, execution)).rejects.toThrow('offset')
+  expect(paths).toEqual([path])
 })
 
 it('shows the next offset for a caller-limited read and preserves a final newline at EOF', async () => {
@@ -166,13 +178,24 @@ it.each(['bash', 'find', 'grep'])('user cancellation stops the real %s process b
   }
   const controller = new AbortController()
   const args = name === 'bash' ? { command: 'printf partial; touch ready; while [[ ! -f go ]]; do :; done; touch survived' } : { pattern: 'anything' }
+  const ready = Promise.withResolvers<void>()
+  const watcher = watch(cwd, (_event, filename) => {
+    if (filename === 'ready') void readFile(join(cwd, 'ready')).then(() => ready.resolve(), ready.reject)
+  })
+  watcher.on('error', ready.reject)
   const output = tool(name)(args, context(controller.signal))
-  const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted', message: expect.stringMatching(name === 'bash' ? /partial[\s\S]*任务已取消/ : /任务已取消/) })
-  await vi.waitFor(async () => { await readFile(join(cwd, 'ready')) })
-  controller.abort()
-  await rejected
-  await writeFile(join(cwd, 'go'), '')
-  await expect(readFile(join(cwd, 'survived'))).rejects.toHaveProperty('code', 'ENOENT')
+  const settled = output.then(() => undefined, error => error)
+  try {
+    await Promise.race([ready.promise, output.then(() => { throw new Error('工具未通知 ready 就已结束') })])
+    controller.abort()
+    expect(await settled).toMatchObject({ code: 'interrupted', message: expect.stringMatching(name === 'bash' ? /partial[\s\S]*任务已取消/ : /任务已取消/) })
+    await writeFile(join(cwd, 'go'), '')
+    await expect(readFile(join(cwd, 'survived'))).rejects.toHaveProperty('code', 'ENOENT')
+  } finally {
+    watcher.close()
+    controller.abort()
+    await settled
+  }
 })
 
 it.skipIf(!installed('fd') && !installed('fdfind'))('find applies path globs, reports relative hidden paths and honors nested ignore rules', async () => {

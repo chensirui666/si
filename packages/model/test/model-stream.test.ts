@@ -4,7 +4,7 @@ import * as modelApi from '../src/index.js'
 import type { ModelInfo } from '../src/index.js'
 
 const selected: ModelInfo = {
-  id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions',
+  id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536,
 }
 const context = { messages: [{ role: 'user' as const, content: '  你好\n第二行  ', timestamp: 1 }] }
 const credentials = { readApiKey: async () => 'test-private-key' }
@@ -65,7 +65,7 @@ describe('Model single SDK stream', () => {
       requests.push(JSON.parse(String(init!.body)).messages)
       return response([chunk({ content: 'ok' }, 'stop')])
     } })
-    for (let i = 0; i < 2; i++) await consume(run(selected, { messages: history }))
+    for (let i = 0; i < 2; i++) await consume(run(selected, { messages: history, tools: [{ name: 'read', description: 'Read text', parameters: Type.Object({}) }] }))
     const expected = [
       { role: 'assistant', reasoning_content: '保留思考' },
       { role: 'tool', tool_call_id: 'read', content: '真实文件' },
@@ -151,11 +151,11 @@ describe('Model single SDK stream', () => {
     expect(requests[0].url).toBe('https://api.deepseek.com/chat/completions')
     expect(new Headers(requests[0].init.headers).get('authorization')).toBe('Bearer test-private-key')
     const payload = JSON.parse(requests[0].init.body as string)
-    expect(payload).toMatchObject({ model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'high', stream_options: { include_usage: true } })
+    expect(payload).toMatchObject({ model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'high', max_tokens: 65_536, stream_options: { include_usage: true } })
     expect(payload.messages).toEqual([
       { role: 'system', content: 'system instruction' },
       { role: 'user', content: '  你好\n第二行  ' },
-      { role: 'assistant', content: 'old reply', reasoning_content: 'old hidden thought' },
+      { role: 'assistant', content: 'old reply' },
       { role: 'user', content: 'next question' },
     ])
     expect(JSON.stringify(payload)).not.toContain('test-private-key')
@@ -274,7 +274,7 @@ describe('Model single SDK stream', () => {
     expect(fetcher).not.toHaveBeenCalled()
   })
 
-  it.each([401, 429, 500])('does not retry HTTP %s and sanitizes provider text', async (status) => {
+  it.each([400, 401, 403, 422, 429, 500])('does not retry HTTP %s and sanitizes provider text', async (status) => {
     let calls = 0
     const run = modelApi.createModelStream(credentials, { fetch: async () => {
       calls++
@@ -284,8 +284,31 @@ describe('Model single SDK stream', () => {
     expect(calls).toBe(1)
     expect(events.map((event) => event.type)).toEqual(['error'])
     expect(result.stopReason).toBe('error')
+    expect(result).not.toHaveProperty('errorCode')
     expect(result.errorMessage).not.toMatch(/test-private-key|raw provider message/)
     expect(result.errorMessage).toContain(String(status))
+  })
+
+  it.each([
+    [400, 'context_length_exceeded', 'private test-private-key', true],
+    [422, undefined, "This model's maximum context length is 1048576 tokens. You requested 1100000 tokens. test-private-key", true],
+    [400, undefined, 'Input length (1100000) exceeds model maximum context length (1048576). test-private-key', true],
+    [400, undefined, 'invalid max_tokens parameter; maximum context length is 1048576', false],
+    [401, 'context_length_exceeded', 'test-private-key', false],
+    [429, 'context_length_exceeded', 'test-private-key', false],
+    [500, 'context_length_exceeded', 'test-private-key', false],
+    [400, undefined, 'rate limit: too many tokens', false],
+  ])('classifies only explicit context overflow (%s, %s, classified %s)', async (status, code, message, overflow) => {
+    let requests = 0
+    const run = modelApi.createModelStream(credentials, { fetch: async () => {
+      requests++
+      return new Response(JSON.stringify({ error: { message, code } }), { status, headers: { 'content-type': 'application/json' } })
+    } })
+    const { result } = await consume(run(selected, context))
+    expect(requests).toBe(1)
+    expect(result.stopReason).toBe('error')
+    expect(result.errorCode).toBe(overflow ? 'context_overflow' : undefined)
+    expect(JSON.stringify(result)).not.toMatch(/test-private-key|1100000|1048576/)
   })
 
   it.each([null, 'content_filter', 'network_error', 'unknown'])('fails missing or unsupported finish reason %s while preserving text', async (finish) => {
@@ -525,9 +548,10 @@ describe('Model single SDK stream', () => {
     expect(requests[1]).not.toHaveProperty('tools')
     expect(requests[1].messages).toMatchObject([
       { role: 'user' },
-      { role: 'assistant', reasoning_content: 'decide to read', tool_calls: [{ id: 'read-1' }] },
+      { role: 'assistant', tool_calls: [{ id: 'read-1' }] },
       { role: 'tool', tool_call_id: 'read-1', content: 'file content' },
     ])
+    expect(requests[1].messages).not.toEqual(expect.arrayContaining([expect.objectContaining({ reasoning_content: expect.anything() })]))
     expect(requests[2]).toHaveProperty('tools')
     expect(requests[2].messages).toMatchObject([
       { role: 'user' },

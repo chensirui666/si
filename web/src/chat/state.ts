@@ -1,4 +1,4 @@
-import type { ConversationMessage, ConversationSnapshot } from '@agent-learning/agent'
+import type { CompactionRecord, ConversationMessage, ConversationSnapshot } from '@agent-learning/agent'
 import type { AssistantMessage, ModelMessage } from '@agent-learning/model'
 import type { ServerFrame } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
@@ -19,10 +19,42 @@ const sequence = (value: unknown): value is number => Number.isSafeInteger(value
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const textContent = (value: unknown) => record(value) && value.type === 'text' && typeof value.text === 'string'
 const toolPosition = (value: unknown) => record(value) && typeof value.assistantMessageId === 'string' && sequence(value.contentIndex)
-const runningState = (value: unknown) => record(value) && typeof value.userMessageId === 'string' && typeof value.assistantMessageId === 'string'
-  && (value.phase === 'model' || value.phase === 'tools')
-  && Array.isArray(value.activeTools) && value.activeTools.every(toolPosition)
-  && (value.phase === 'tools' || value.activeTools.length === 0)
+const runningState = (value: unknown) => record(value) && typeof value.runId === 'string' && value.runId.length > 0 && (
+  value.kind === 'compaction' ? value.phase === 'compaction'
+  : value.kind === 'task' && typeof value.assistantMessageId === 'string'
+    && ['model', 'tools', 'compaction'].includes(value.phase as string)
+    && Array.isArray(value.activeTools) && value.activeTools.every(toolPosition)
+    && (value.phase === 'tools' || value.activeTools.length === 0)
+)
+const nonnegative = (value: unknown): value is number => finite(value) && value >= 0
+const usage = (value: unknown) => record(value) && ['input', 'output', 'total'].every(key => value[key] === undefined || nonnegative(value[key]))
+const contextUsage = (value: unknown) => value === null || record(value)
+  && (value.tokens === undefined || nonnegative(value.tokens))
+  && (value.contextWindow === undefined || nonnegative(value.contextWindow) && value.contextWindow > 0)
+  && record(value.breakdown) && ['systemTokens', 'toolsTokens', 'messageTokens'].every(key => nonnegative((value.breakdown as Record<string, unknown>)[key]))
+const filePath = (value: unknown) => typeof value === 'string' && value.length > 0 && !value.includes('\0')
+const fileOperations = (value: unknown) => record(value)
+  && Array.isArray(value.readFiles) && value.readFiles.every(filePath)
+  && Array.isArray(value.modifiedFiles) && value.modifiedFiles.every(filePath)
+function fileOperation(value: unknown, message: ModelMessage): boolean {
+  if (value === undefined) return true
+  if (message.role !== 'toolResult' || !record(value) || !filePath(value.path)) return false
+  return value.kind === 'read' ? message.toolName === 'read'
+    : value.kind === 'modified' && (message.toolName === 'write' || message.toolName === 'edit')
+}
+function compactionRecord(value: unknown): value is CompactionRecord {
+  if (!record(value) || typeof value.id !== 'string' || !value.id || !['manual', 'auto', 'overflow'].includes(value.trigger as string)
+    || !finite(value.startedAt) || (value.clientMessageId !== undefined && typeof value.clientMessageId !== 'string')
+    || (value.summaryUsage !== undefined && !usage(value.summaryUsage))
+    || (value.fileOperations !== undefined && (value.status !== 'success' || !fileOperations(value.fileOperations)))) return false
+  if (value.status === 'running') return true
+  if (!finite(value.finishedAt)) return false
+  if (['failed', 'aborted', 'skipped'].includes(value.status as string)) return typeof value.reason === 'string'
+  return value.status === 'success' && typeof value.summary === 'string' && !!value.summary.trim()
+    && typeof value.firstKeptMessageId === 'string' && typeof value.contextLastMessageId === 'string'
+    && nonnegative(value.estimatedBefore) && nonnegative(value.estimatedAfter) && value.estimatedAfter < value.estimatedBefore
+    && (value.followupMessageId === undefined || typeof value.followupMessageId === 'string')
+}
 
 function modelMessage(value: unknown): value is ModelMessage {
   if (!record(value) || !finite(value.timestamp)) return false
@@ -35,6 +67,7 @@ function modelMessage(value: unknown): value is ModelMessage {
   }
   return value.role === 'assistant' && typeof value.api === 'string' && typeof value.provider === 'string'
     && typeof value.model === 'string' && (value.errorMessage === undefined || typeof value.errorMessage === 'string') && ['pending', 'stop', 'length', 'toolUse', 'error', 'aborted'].includes(value.stopReason as string)
+    && (value.usage === undefined || usage(value.usage)) && (value.errorCode === undefined || value.errorCode === 'context_overflow')
     && Array.isArray(value.content) && value.content.every(block => record(block) && (
       textContent(block) || (block.type === 'thinking' && typeof block.thinking === 'string')
       || (block.type === 'toolCall' && typeof block.id === 'string' && typeof block.name === 'string' && record(block.arguments) && (block.argumentsError === undefined || typeof block.argumentsError === 'string'))
@@ -45,6 +78,7 @@ function conversationMessage(value: unknown): value is ConversationMessage {
   return record(value) && typeof value.id === 'string' && (value.clientMessageId === undefined || typeof value.clientMessageId === 'string') && modelMessage(value.message)
     && (value.message.role === 'toolResult' ? toolPosition(value.toolCall) : value.toolCall === undefined)
     && (value.toolErrorCode === undefined || (typeof value.toolErrorCode === 'string' && value.message.role === 'toolResult' && value.message.isError))
+    && fileOperation(value.fileOperation, value.message)
 }
 
 function validRelations(messages: ConversationMessage[], running: ConversationSnapshot['running']): boolean {
@@ -62,19 +96,19 @@ function validRelations(messages: ConversationMessage[], running: ConversationSn
     if (index > assistantIndex + 1 && (!previous || previous.assistantMessageId !== assistantMessageId || previous.contentIndex >= contentIndex)) return false
     results.add(key)
   }
-  if (running) {
-    const userIndex = messages.findIndex(entry => entry.id === running.userMessageId)
+  if (running?.kind === 'task') {
+    const userIndex = messages.findIndex(entry => entry.id === running.runId)
     const assistantIndex = messages.findIndex(entry => entry.id === running.assistantMessageId)
     if (userIndex < 0 || messages[userIndex]?.message.role !== 'user' || messages.slice(userIndex + 1).some(entry => entry.message.role === 'user')) return false
     if (assistantIndex < 0) {
-      if (running.phase !== 'model') return false
+      if (running.phase !== 'model' && running.phase !== 'compaction') return false
     } else if (assistantIndex <= userIndex || messages[assistantIndex]?.message.role !== 'assistant') return false
   }
   const active = new Set<string>()
-  for (const location of running?.activeTools ?? []) {
+  for (const location of running?.kind === 'task' ? running.activeTools : []) {
     const assistant = messages.find(item => item.id === location.assistantMessageId)?.message
     const key = `${location.assistantMessageId}:${location.contentIndex}`
-    if (location.assistantMessageId !== running?.assistantMessageId || assistant?.role !== 'assistant' || assistant.content[location.contentIndex]?.type !== 'toolCall' || results.has(key) || active.has(key)) return false
+    if ((running?.kind !== 'task' || location.assistantMessageId !== running.assistantMessageId) || assistant?.role !== 'assistant' || assistant.content[location.contentIndex]?.type !== 'toolCall' || results.has(key) || active.has(key)) return false
     active.add(key)
   }
   return true
@@ -85,6 +119,10 @@ function validSnapshot(value: unknown): value is ConversationSnapshot {
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
     && value.activeContent.every(block => record(block) && typeof block.messageId === 'string' && sequence(block.contentIndex)
       && (block.type === 'text' || block.type === 'thinking' || (block.type === 'toolCall' && typeof block.argumentsText === 'string')))
+    && Array.isArray(value.compactions) && value.compactions.every(compactionRecord)
+    && new Set(value.compactions.map(item => item.id)).size === value.compactions.length
+    && contextUsage(value.contextUsage)
+    && (value.running === null || !record(value.running) || value.running.kind !== 'compaction' || value.compactions.some(item => item.id === (value.running as Record<string, unknown>).runId))
     && validRelations(value.messages as ConversationMessage[], value.running as ConversationSnapshot['running'])
 }
 
@@ -100,21 +138,32 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   if (frame.type !== 'update' || state.connection !== 'ready' || !state.snapshot || !record(frame.update) || !sequence(frame.update.seq)) return unchanged
   if (frame.update.seq <= state.snapshot.seq) return unchanged
   if (frame.update.seq !== state.snapshot.seq + 1) return { state, resubscribe: true }
+  if (frame.update.contextUsage !== undefined && !contextUsage(frame.update.contextUsage)) return { state, resubscribe: true }
+  const capacity = frame.update.contextUsage === undefined ? state.snapshot.contextUsage : frame.update.contextUsage as ConversationSnapshot['contextUsage']
   const change = frame.update.change
-  if (!record(change)) return unchanged
+  if (!record(change)) return { state, resubscribe: true }
   if (change.type === 'model') {
     const snapshot = applyModel(state.snapshot, change.messageId, change.event)
-    return snapshot ? { state: { ...state, snapshot: { ...snapshot, seq: frame.update.seq } }, resubscribe: false } : { state, resubscribe: true }
+    return snapshot ? { state: { ...state, snapshot: { ...snapshot, seq: frame.update.seq, contextUsage: capacity } }, resubscribe: false } : { state, resubscribe: true }
   }
   const valid = frame as Extract<ServerFrame, { type: 'update' }>
   const update = valid.update.change
   if (update.type === 'accepted') {
-    if (!conversationMessage(change.user) || change.user.message.role !== 'user' || !runningState(change.running)) return { state, resubscribe: true }
+    if (!conversationMessage(change.user) || change.user.message.role !== 'user' || !runningState(change.running) || !record(change.running) || change.running.kind !== 'task') return { state, resubscribe: true }
     const messages = [...state.snapshot.messages, update.user]
     if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, seq: valid.update.seq, messages, running: update.running,
+      ...state.snapshot, seq: valid.update.seq, messages, running: update.running, contextUsage: capacity,
     } }, resubscribe: false }
+  }
+  if (update.type === 'compaction') {
+    if (!compactionRecord(change.record) || !(change.running === null || runningState(change.running))) return { state, resubscribe: true }
+    const compactions = state.snapshot.compactions.some(item => item.id === update.record.id)
+      ? state.snapshot.compactions.map(item => item.id === update.record.id ? update.record : item)
+      : [...state.snapshot.compactions, update.record]
+    const snapshot = { ...state.snapshot, seq: valid.update.seq, compactions, running: update.running, contextUsage: capacity }
+    if (!validSnapshot(snapshot)) return { state, resubscribe: true }
+    return { state: { ...state, snapshot }, resubscribe: false }
   }
   if (update.type === 'task') {
     if (!(change.running === null || runningState(change.running))) return { state, resubscribe: true }
@@ -126,7 +175,7 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     }
     if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, seq: valid.update.seq, running: update.running, messages,
+      ...state.snapshot, seq: valid.update.seq, running: update.running, messages, contextUsage: capacity,
     } }, resubscribe: false }
   }
   return unchanged
@@ -174,8 +223,10 @@ function applyModel(snapshot: ConversationSnapshot, messageId: unknown, event: u
   return { ...snapshot, messages: existing ? snapshot.messages.map(item => item.id === messageId ? entry : item) : [...snapshot.messages, entry], activeContent }
 }
 
-export function mergeSubmissions(messages: readonly ConversationMessage[], submissions: readonly LocalSubmission[]): (ConversationMessage | LocalSubmission)[] {
-  const unresolved = submissions.filter(local => !messages.some(item => item.message.role === 'user' && (item.clientMessageId === local.clientMessageId || item.id === local.accepted?.userMessageId)))
+export function mergeSubmissions(messages: readonly ConversationMessage[], submissions: readonly LocalSubmission[], compactions: readonly CompactionRecord[] = []): (ConversationMessage | LocalSubmission)[] {
+  const unresolved = submissions.filter(local => local.kind === 'compaction'
+    ? !compactions.some(item => item.clientMessageId === local.clientMessageId || local.accepted?.kind === 'compaction' && item.id === local.accepted.compactionId)
+    : !messages.some(item => item.message.role === 'user' && (item.clientMessageId === local.clientMessageId || local.accepted?.kind === 'message' && item.id === local.accepted.userMessageId)))
   const formalIds = new Set(messages.map(item => item.id))
   const anchored = new Map<string | undefined, LocalSubmission[]>()
   for (const local of unresolved) {

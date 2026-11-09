@@ -7,6 +7,7 @@ type RequestBody = {
   messages: { role: string; content: string; reasoning_content?: string }[]
   thinking: { type: string }
   reasoning_effort: string
+  max_tokens: number
   tools?: unknown
 }
 

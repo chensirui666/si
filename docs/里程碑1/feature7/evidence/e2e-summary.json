@@ -1,0 +1,199 @@
+{
+  "stats": {
+    "startTime": "2026-11-08T16:56:33.558Z",
+    "duration": 85938.062,
+    "expected": 17,
+    "skipped": 0,
+    "unexpected": 0,
+    "flaky": 0
+  },
+  "tests": [
+    {
+      "file": "abort.spec.ts",
+      "title": "node 网页主动中止保留部分回复与草稿，关闭模型连接并继续发送",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 939
+        }
+      ]
+    },
+    {
+      "file": "abort.spec.ts",
+      "title": "vite 网页主动中止保留部分回复与草稿，关闭模型连接并继续发送",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 1451
+        }
+      ]
+    },
+    {
+      "file": "chat.spec.ts",
+      "title": "node 阶段三 SDK 流式对话、历史与生成恢复",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 1282
+        }
+      ]
+    },
+    {
+      "file": "chat.spec.ts",
+      "title": "vite 阶段三 SDK 流式对话、历史与生成恢复",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 2093
+        }
+      ]
+    },
+    {
+      "file": "chat.spec.ts",
+      "title": "node 阶段二配置、重启与多页面",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 1983
+        }
+      ]
+    },
+    {
+      "file": "chat.spec.ts",
+      "title": "vite 阶段二配置、重启与多页面",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 2570
+        }
+      ]
+    },
+    {
+      "file": "chat.spec.ts",
+      "title": "node 实际授权、空快照与恢复",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 1738
+        }
+      ]
+    },
+    {
+      "file": "chat.spec.ts",
+      "title": "vite 实际授权、空快照与恢复",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 1815
+        }
+      ]
+    },
+    {
+      "file": "compaction.live.spec.ts",
+      "title": "Feature7 live case68: 同网页会话手动和自动压缩两次，实测输入下降并继续真实文件任务",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 36974
+        }
+      ]
+    },
+    {
+      "file": "deepseek-live.spec.ts",
+      "title": "真实模型凭据文件解析只接收明确的 DeepSeek 变量",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 1
+        }
+      ]
+    },
+    {
+      "file": "deepseek-live.spec.ts",
+      "title": "真实 DeepSeek 设置、两轮历史、流式进度与无效 Key 恢复",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 8126
+        }
+      ]
+    },
+    {
+      "file": "deepseek-live.spec.ts",
+      "title": "真实 DeepSeek 生成中止保留内容和草稿，同一对话可继续",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 8524
+        }
+      ]
+    },
+    {
+      "file": "deepseek-live.spec.ts",
+      "title": "T1 live: 网页两次读取真实文件，显示工具结果且回答随文件变化",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 6348
+        }
+      ]
+    },
+    {
+      "file": "deepseek-live.spec.ts",
+      "title": "Feature6 live loop: 实际工具结果进入后续请求，每轮保留八种工具",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 4312
+        }
+      ]
+    },
+    {
+      "file": "deepseek-live.spec.ts",
+      "title": "Feature6 live write-once: 实际工具结果进入后续请求，每轮保留八种工具",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 3274
+        }
+      ]
+    },
+    {
+      "file": "react-loop.spec.ts",
+      "title": "E1 node 连续读取、并行回填，刷新后中止等待命令并继续",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 1405
+        }
+      ]
+    },
+    {
+      "file": "react-loop.spec.ts",
+      "title": "E1 vite 连续读取、并行回填，刷新后中止等待命令并继续",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 2010
+        }
+      ]
+    }
+  ]
+}

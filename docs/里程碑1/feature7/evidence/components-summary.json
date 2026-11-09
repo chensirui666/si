@@ -1,0 +1,496 @@
+{
+  "stats": {
+    "startTime": "2026-11-08T16:56:18.652Z",
+    "duration": 10408.456,
+    "expected": 44,
+    "skipped": 0,
+    "unexpected": 0,
+    "flaky": 0
+  },
+  "tests": [
+    {
+      "file": "components/AssistantMessage.browser.test.tsx",
+      "title": "工具开始即显示，展开后可读流式参数和最终参数错误",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 215
+        }
+      ]
+    },
+    {
+      "file": "components/AssistantMessage.browser.test.tsx",
+      "title": "Markdown GFM 流式尾部更新、最终引用校准与恶意内容隔离",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 153
+        }
+      ]
+    },
+    {
+      "file": "components/AssistantMessage.browser.test.tsx",
+      "title": "终止状态保留正文，正常的工具阶段没有报错提示",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 129
+        }
+      ]
+    },
+    {
+      "file": "components/ContextMeter.browser.test.tsx",
+      "title": "悬停查看三类估算，压缩后立即下降，移出后关闭且不抢编辑焦点",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 213
+        }
+      ]
+    },
+    {
+      "file": "components/ContextMeter.browser.test.tsx",
+      "title": "键盘聚焦打开，Esc 关闭且保持焦点；缺少数据会关闭旧浮层",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 84
+        }
+      ]
+    },
+    {
+      "file": "components/ContextMeter.browser.test.tsx",
+      "title": "真实零值显示 0% 且无已用色段，超量仍显示完整 token",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 110
+        }
+      ]
+    },
+    {
+      "file": "components/ContextMeter.browser.test.tsx",
+      "title": "390px 视口内完整显示分布且发送按钮不被遮挡",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 183
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "逐字输入后立即提交原文",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 141
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "逐字输入后立即提交原文，包含最后几个字",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 133
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "粘贴后立即提交原文",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 116
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "粘贴后立即提交原文，包含最后几个字",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 101
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "发送成功后隔离撤销历史",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 128
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "外部门禁切换保留编辑器、原文、焦点与撤销，恢复后可提交原草稿",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 117
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "Enter 接收报错后仍可撤销和继续逐字编辑",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 122
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "发送、中止和正在中止切换保留同一编辑器、草稿、焦点和撤销记录",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 196
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "命令前缀通过 click 仅补全，下一次 Enter 才发送",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 119
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "命令前缀通过 Tab 仅补全，下一次 Enter 才发送",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 91
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "命令前缀通过 Enter 仅补全，下一次 Enter 才发送",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 99
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "补全保留撤销与重做，Esc 关闭保留前缀且普通重渲染不重开",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 139
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "普通内容 请读取 src/index.txt 没有命令候选且 Tab 正常移焦",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 95
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "普通内容 /unknown 没有命令候选且 Tab 正常移焦",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 102
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "任务忙碌时仍能补全，失焦关闭菜单且不发送",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 153
+        }
+      ]
+    },
+    {
+      "file": "components/MessageInput.browser.test.tsx",
+      "title": "Esc 关闭后清空并重新输入相同命令前缀会再次提供候选",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 100
+        }
+      ]
+    },
+    {
+      "file": "components/MessageList.browser.test.tsx",
+      "title": "原文展示、长内容换行与复制",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 121
+        }
+      ]
+    },
+    {
+      "file": "components/MessageList.browser.test.tsx",
+      "title": "执行过程逐步展示并独立展开，正文分段，结果按来源关联并随任务结束收起",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 440
+        }
+      ]
+    },
+    {
+      "file": "components/MessageList.browser.test.tsx",
+      "title": "W4 两轮读取使用相同调用编号，整次结束才收起并保留各自结果",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 449
+        }
+      ]
+    },
+    {
+      "file": "components/SettingsDialog.browser.test.tsx",
+      "title": "设置弹窗约束键盘焦点，Escape 关闭后返回入口并清空 Key",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 485
+        }
+      ]
+    },
+    {
+      "file": "components/SettingsDialog.browser.test.tsx",
+      "title": "网页工具分别选择能力服务商，保存共用 Key 后再编辑没有旧 Key",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 494
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "连接切换、快照恢复和输入区增高时保留草稿、焦点与阅读位置",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 469
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "输入组件发送按钮随空白和有效草稿切换颜色，发送后恢复空白状态",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 202
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "白色页面与消息输入区同轴，正文和标题遵守已确认尺寸",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 203
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "窄屏长草稿到上限后内部滚动，输入和发送操作始终可见",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 177
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "低高度视口的长草稿仍保留完整输入区和发送操作",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 193
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "正文使用随应用加载的 Noto Sans CJK SC 字体",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 419
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "输入区聚焦、切换和发送后保持弱边界，按钮焦点使用内部标记",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 224
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "消息区键盘焦点使用固定局部标记，滚动和高对比度下仍可辨认",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 257
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "浅色按钮以背景反馈悬停和按下，键盘焦点不叠加外圈",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 952
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "真实异步发送保留原文、清空撤销历史和焦点，WS 先到与迟到拒绝不覆盖新草稿",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 169
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "HTTP 回执先到时旧空闲快照不能开放发送，正式消息与结束状态到达后才开放",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 175
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "回复逐块增长和最终校准保留旧消息阅读位置，不滚动或抢输入焦点",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 170
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "失败 A 后成功 B 的气泡和回复保持原顺序，已有历史：false",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 218
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "失败 A 后成功 B 的气泡和回复保持原顺序，已有历史：true",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 229
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "选择工作区后进入当前对话才可发送，目录失效保留草稿",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 389
+        }
+      ]
+    },
+    {
+      "file": "pages/ChatPage.browser.test.tsx",
+      "title": "平板及横屏发送目标至少为44×44",
+      "ok": true,
+      "results": [
+        {
+          "status": "passed",
+          "duration": 173
+        }
+      ]
+    }
+  ]
+}

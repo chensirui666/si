@@ -25,6 +25,7 @@ export type AssistantMessage = {
   responseModel?: string
   stopReason: 'pending' | ModelStopReason
   errorMessage?: string
+  errorCode?: 'context_overflow'
   usage?: ModelUsage
   timestamp: number
   durationMs?: number
@@ -78,11 +79,19 @@ export type ModelInfo = {
   name: string
   provider: string
   api: string
+  contextWindow: number
+  maxTokens: number
 }
 
 export type ModelDiscovery = {
   models: ModelInfo[]
   deepseek: CredentialStatus
+}
+
+export type ContextEstimate = {
+  systemTokens: number
+  toolsTokens: number
+  messageTokens: number
 }
 
 export type ModelContext = {

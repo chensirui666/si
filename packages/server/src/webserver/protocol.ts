@@ -1,12 +1,12 @@
-import type { ConversationSnapshot, ConversationUpdate } from '@agent-learning/agent'
+import type { ConversationSnapshot, ConversationUpdate, SubmissionAccepted } from '@agent-learning/agent'
 
 export type { WorkspaceView } from '../workspaces.js'
 export type { WebSettingsView } from '../web-settings.js'
 
 export type SubmitMessageRequest = { clientMessageId: string; modelId: string; text: string; workspaceId: string }
-export type SubmitMessageAccepted = { clientMessageId: string; userMessageId: string; acceptedSeq: number }
-export type AbortRequest = { userMessageId: string }
-export type AbortResult = { userMessageId: string; handled: boolean }
+export type SubmitMessageAccepted = SubmissionAccepted
+export type AbortRequest = { runId: string }
+export type AbortResult = { runId: string; handled: boolean }
 
 export type ClientFrame =
   | { type: 'subscribe'; subscriptionId: string }

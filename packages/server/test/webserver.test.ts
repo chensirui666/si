@@ -8,7 +8,8 @@ import { once } from 'node:events'
 import { randomBytes } from 'node:crypto'
 import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
-import { Agent, type AgentSubscriptionEvent } from '@agent-learning/agent'
+import { Agent, type AgentSubscriptionEvent, type ConversationSnapshot } from '@agent-learning/agent'
+import { createModelStream } from '@agent-learning/model'
 
 const cleanups: (() => Promise<unknown>)[] = []
 afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanups.splice(0).reverse()) await close() })
@@ -66,7 +67,7 @@ async function rejectedHandshake(url: string, headers: Record<string, string>) {
     socket.on('error', () => {})
   })
 }
-const empty = { seq: 0, messages: [], running: null, activeContent: [] }
+const empty = { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
 
 describe('主动中止入口', () => {
   it('沿用来源、授权和 JSON 校验；无效请求不交付 Agent', async () => {
@@ -75,14 +76,14 @@ describe('主动中止入口', () => {
     const auth = await cookie(app.authUrl)
     const url = app.url + '/api/abort'
     const headers = { Cookie: auth, 'Content-Type': 'application/json' }
-    const body = JSON.stringify({ userMessageId: 'user-1' })
+    const body = JSON.stringify({ runId: 'user-1' })
     expect((await http(url, { 'Content-Type': 'application/json' }, 'POST', body)).status).toBe(401)
     for (const invalid of [{ Origin: 'https://evil.example' }, { Host: 'evil.example' }]) {
       expect((await http(url, { ...headers, ...invalid }, 'POST', body)).status).toBe(403)
     }
     expect((await http(url, { Cookie: auth }, 'POST', body)).status).toBe(415)
     expect((await http(url, headers, 'POST', 'x'.repeat(65537))).status).toBe(413)
-    for (const value of ['{', 'null', '[]', '{}', '{"userMessageId":0}', '{"userMessageId":" "}', JSON.stringify({ userMessageId: 'x'.repeat(129) }), '{"userMessageId":"u","extra":true}']) {
+    for (const value of ['{', 'null', '[]', '{}', '{"runId":0}', '{"runId":" "}', JSON.stringify({ runId: 'x'.repeat(129) }), '{"runId":"u","extra":true}']) {
       expect((await http(url, headers, 'POST', value)).status).toBe(400)
     }
     expect(abort).not.toHaveBeenCalled()
@@ -94,21 +95,21 @@ describe('主动中止入口', () => {
     const app = await setup({ agent: { ...controlledAgent(), abort } })
     const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
     let returned = false
-    const pending = http(app.url + '/api/abort', headers, 'POST', '{"userMessageId":"old-user"}').then(value => { returned = true; return value })
+    const pending = http(app.url + '/api/abort', headers, 'POST', '{"runId":"old-user"}').then(value => { returned = true; return value })
     await entered.promise
     expect(returned).toBe(false)
     expect(abort).toHaveBeenCalledExactlyOnceWith('old-user')
     release.resolve()
     const result = await pending
     expect(result.status).toBe(200)
-    expect(JSON.parse(result.text)).toEqual({ userMessageId: 'old-user', handled })
+    expect(JSON.parse(result.text)).toEqual({ runId: 'old-user', handled })
   })
 
   it('未装配中止返回 503，内部错误脱敏', async () => {
     const agent = { ...controlledAgent(), abort: undefined as undefined | (() => Promise<boolean>) }
     const app = await setup({ agent })
     const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
-    const send = () => http(app.url + '/api/abort', headers, 'POST', '{"userMessageId":"user-1"}')
+    const send = () => http(app.url + '/api/abort', headers, 'POST', '{"runId":"user-1"}')
     expect((await send()).status).toBe(503)
     agent.abort = async () => { throw new Error('private-api-key') }
     const result = await send()
@@ -138,7 +139,7 @@ describe('主动中止入口', () => {
     expect((await first).snapshot.running).not.toBeNull()
     const req = request(app.url + '/api/abort', { method: 'POST', headers: { Cookie: auth, 'Content-Type': 'application/json' } })
     req.on('error', () => {})
-    req.end(JSON.stringify({ userMessageId: accepted.userMessageId }))
+    req.end(JSON.stringify({ runId: accepted.kind === 'message' ? accepted.userMessageId : accepted.compactionId }))
     await entered.promise
     req.destroy()
     socket.terminate()
@@ -165,7 +166,7 @@ function controlledAgent() {
       return (async function* () {
         try {
           yield { type: 'snapshot' as const, snapshot: structuredClone(empty) }
-          yield { type: 'update' as const, update: { seq: 1, change: { type: 'accepted' as const, user: { id: 'u1', message: { role: 'user' as const, content: '受控', timestamp: 1 } }, running: { userMessageId: 'u1', assistantMessageId: 'a1', phase: 'model' } } } }
+          yield { type: 'update' as const, update: { seq: 1, change: { type: 'accepted' as const, user: { id: 'u1', message: { role: 'user' as const, content: '受控', timestamp: 1 } }, running: { kind: 'task', runId: 'u1', assistantMessageId: 'a1', phase: 'model', activeTools: [] } } } }
           await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }) })
         } finally { active.delete(signal) }
       })()
@@ -572,7 +573,7 @@ describe('消息提交与模型生命周期', () => {
     const socket = await connect(app.url, auth)
     const first = nextConversationFrame(socket)
     socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'after-rejects' }))
-    expect((await first).snapshot).toEqual({ seq: 0, messages: [], running: null, activeContent: [] })
+    expect((await first).snapshot).toEqual(empty)
   })
 
   it('凭据未配置也先回执，随后形成正式失败回复并释放忙碌', async () => {
@@ -632,11 +633,263 @@ describe('消息提交与模型生命周期', () => {
     const first = nextConversationFrame(restored)
     restored.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'restored' }))
     const snapshot = (await first).snapshot
-    expect(snapshot.running?.userMessageId).toBe(JSON.parse(response.text).userMessageId)
+    expect(snapshot.running?.runId).toBe(JSON.parse(response.text).userMessageId)
     expect(snapshot.messages[1].message.content).toEqual([{ type: 'thinking', thinking: '想一想' }, { type: 'text', text: 'AB' }])
     expect(calls).toBe(1)
     await app.server.close()
     expect(aborted).toBe(true)
+  })
+})
+
+it('3 MiB 原始历史快照写完后继续交付紧随增量和配置通知', async () => {
+  const longText = 'x'.repeat(3 * 1024 * 1024)
+  const snapshot: ConversationSnapshot = {
+    ...empty, seq: 1,
+    messages: [{ id: 'u-large', message: { role: 'user', content: longText, timestamp: 1 } }],
+    compactions: [{ id: 'compact-large', trigger: 'manual', startedAt: 0, status: 'success', finishedAt: 1,
+      summary: 'earlier summary', firstKeptMessageId: 'u-large', contextLastMessageId: 'u-large', estimatedBefore: 1_000_000, estimatedAfter: 800_000 }],
+  }
+  const agent = {
+    async *subscribe(signal: AbortSignal): AsyncIterable<AgentSubscriptionEvent> {
+      yield { type: 'snapshot', snapshot }
+      yield { type: 'update', update: { seq: 2, change: { type: 'task', running: null } } }
+      if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+    },
+  }
+  const app = await setup({ agent })
+  const auth = await cookie(app.authUrl)
+  const socket = await connect(app.url, auth)
+  const frames: any[] = []
+  socket.on('message', data => frames.push(JSON.parse(String(data))))
+  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'large' }))
+  await vi.waitFor(() => expect(frames.filter(frame => frame.type === 'snapshot' || frame.type === 'update')).toHaveLength(2))
+  expect(frames[0].snapshot.messages[0].message.content).toBe(longText)
+  expect(frames[0].snapshot.compactions).toEqual(snapshot.compactions)
+  expect(frames[1]).toMatchObject({ type: 'update', subscriptionId: 'large', update: { seq: 2 } })
+  expect(socket.readyState).toBe(WebSocket.OPEN)
+  const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"large-snapshot-key"}')).status).toBe(200)
+  await vi.waitFor(() => expect(frames.some(frame => frame.type === 'models_changed')).toBe(true))
+})
+
+it('快照发送回调未完成时等待增量并合并重复通知', async () => {
+  const app = await setup({ agent: controlledAgent() })
+  const socket = await connect(app.url, await cookie(app.authUrl))
+  const release = Promise.withResolvers<void>(), releaseNotification = Promise.withResolvers<void>()
+  let firstNotification = false
+  const original = WebSocket.prototype.send
+  vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: any, ...args: any[]) {
+    const frame = JSON.parse(String(data))
+    if (frame.type === 'snapshot' && frame.subscriptionId === 'callback') {
+      const callback = args.at(-1)
+      args[args.length - 1] = (error?: Error) => { if (error) callback(error); else void release.promise.then(() => callback()) }
+    } else if (frame.type === 'models_changed' && firstNotification) {
+      firstNotification = false
+      const callback = args.at(-1)
+      args[args.length - 1] = (error?: Error) => { if (error) callback(error); else void releaseNotification.promise.then(() => callback()) }
+    }
+    return original.call(this, data, ...args as [any])
+  } as any)
+  const frames: any[] = []
+  socket.on('message', data => frames.push(JSON.parse(String(data))))
+  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'callback' }))
+  try {
+    await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot')).toBe(true))
+    firstNotification = true
+    for (let index = 0; index < 100; index++) (app.server as unknown as { notify(type: string): void }).notify('models_changed')
+    expect(frames.filter(frame => frame.type === 'update' || frame.type === 'models_changed')).toHaveLength(0)
+    release.resolve()
+    await vi.waitFor(() => expect(frames.some(frame => frame.type === 'models_changed')).toBe(true))
+    expect(frames.filter(frame => frame.type === 'models_changed')).toHaveLength(1)
+    ;(app.server as unknown as { notify(type: string): void }).notify('models_changed')
+    releaseNotification.resolve()
+    await vi.waitFor(() => expect(frames.filter(frame => frame.type === 'models_changed')).toHaveLength(2))
+    expect(frames.find(frame => frame.type === 'update').update.seq).toBe(1)
+    expect(socket.readyState).toBe(WebSocket.OPEN)
+  } finally { release.resolve(); releaseNotification.resolve() }
+})
+
+it('发送未完成时反复替换订阅只为最后一个订阅读取新快照', async () => {
+  const agent = controlledAgent(), subscribe = vi.spyOn(agent, 'subscribe')
+  const app = await setup({ agent })
+  const socket = await connect(app.url, await cookie(app.authUrl))
+  const release = Promise.withResolvers<void>(), original = WebSocket.prototype.send
+  vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: any, ...args: any[]) {
+    const frame = JSON.parse(String(data))
+    if (frame.type === 'snapshot' && frame.subscriptionId === 'blocked') {
+      const callback = args.at(-1)
+      args[args.length - 1] = (error?: Error) => { if (error) callback(error); else void release.promise.then(() => callback()) }
+    }
+    return original.call(this, data, ...args as [any])
+  } as any)
+  const frames: any[] = []
+  socket.on('message', data => frames.push(JSON.parse(String(data))))
+  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'blocked' }))
+  try {
+    await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot')).toBe(true))
+    for (let index = 0; index < 100; index++) socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: `replacement-${index}` }))
+    const pong = once(socket, 'pong')
+    socket.ping('processed-replacements')
+    await pong
+    expect(subscribe).toHaveBeenCalledTimes(1)
+    release.resolve()
+    await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot' && frame.subscriptionId === 'replacement-99')).toBe(true))
+    expect(subscribe).toHaveBeenCalledTimes(2)
+    expect(socket.readyState).toBe(WebSocket.OPEN)
+  } finally { release.resolve() }
+})
+
+async function serverSnapshot(url: string, auth: string, subscriptionId = 'snapshot') {
+  const socket = await connect(url, auth)
+  const next = nextConversationFrame(socket)
+  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId }))
+  const snapshot = (await next).snapshot as ConversationSnapshot
+  socket.terminate()
+  return snapshot
+}
+
+function summaryProvider() {
+  let calls = 0, summaryCalls = 0, aborted = false
+  let summary: ReadableStreamDefaultController<Uint8Array> | undefined
+  const event = (content: string) => new TextEncoder().encode(`data: ${JSON.stringify({
+    id: 'controlled-compaction', model: 'deepseek-flash', choices: [{ index: 0, delta: { content }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 200, completion_tokens: 20, total_tokens: 220 },
+  })}\n\ndata: [DONE]\n\n`)
+  const controlledFetch: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body))
+    if (String(body.messages[0]?.content).startsWith('你负责整理对话摘要')) {
+      summaryCalls++
+      return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+        summary = controller
+        init?.signal?.addEventListener('abort', () => { aborted = true; controller.error(new DOMException('cancelled', 'AbortError')) }, { once: true })
+      } }), { headers: { 'content-type': 'text/event-stream' } })
+    }
+    calls++
+    return new Response(event('任务进展已记录。'), { headers: { 'content-type': 'text/event-stream' } })
+  }
+  return {
+    fetch: controlledFetch,
+    get calls() { return calls }, get summaryCalls() { return summaryCalls }, get aborted() { return aborted },
+    finish(failed = false) {
+      if (failed) summary!.error(new Error('controlled summary failure'))
+      else { summary!.enqueue(event('项目青禾；仅修改临时工作区。')); summary!.close() }
+    },
+  }
+}
+
+describe('压缩的正式 HTTP/WS 生命周期', () => {
+  it('没有可整理历史时返回独立命令回执和未执行记录，不新增聊天消息', async () => {
+    const app = await setup()
+    const auth = await cookie(app.authUrl), workspaceId = await pickWorkspace(app.url, auth)
+    const response = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({
+      workspaceId, clientMessageId: 'empty-compact', modelId: 'deepseek-flash', text: ' /compact\n',
+    }))
+    expect(response.status).toBe(202)
+    const accepted = JSON.parse(response.text)
+    expect(accepted).toMatchObject({ kind: 'compaction', clientMessageId: 'empty-compact', compactionId: expect.any(String) })
+    expect(accepted.userMessageId).toBeUndefined()
+    await vi.waitFor(async () => {
+      const snapshot = await serverSnapshot(app.url, auth)
+      expect(snapshot.running).toBeNull()
+      expect(snapshot.messages).toEqual([])
+      expect(snapshot.compactions).toMatchObject([{ id: accepted.compactionId, status: 'skipped', clientMessageId: 'empty-compact' }])
+    })
+  })
+
+  it.each(['success', 'failed', 'aborted'] as const)('断线后压缩 %s 的原始历史和结果可恢复，命令只执行一次', async outcome => {
+    const provider = summaryProvider()
+    const app = await setup({ compaction: { triggerTokens: 100_000, keepRecentTokens: 30 }, modelOptions: { fetch: provider.fetch } })
+    const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const workspaceId = await pickWorkspace(app.url, auth)
+    expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"compaction-fixture-key"}')).status).toBe(200)
+    const submit = (clientMessageId: string, text: string) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({
+      workspaceId, clientMessageId, modelId: 'deepseek-flash', text,
+    }))
+    for (let index = 0; index < 2; index++) {
+      expect((await submit(`seed-${index}`, `项目青禾；仅修改临时工作区。${'earlier data '.repeat(300)}`)).status).toBe(202)
+      await vi.waitFor(async () => expect((await serverSnapshot(app.url, auth)).running).toBeNull())
+    }
+    const before = await serverSnapshot(app.url, auth)
+    const response = await submit('manual-compact', '/compact')
+    expect(response.status).toBe(202)
+    const accepted = JSON.parse(response.text)
+    expect(accepted.kind).toBe('compaction')
+    await vi.waitFor(() => expect(provider.summaryCalls).toBe(1))
+    const socket = await connect(app.url, auth), first = nextConversationFrame(socket)
+    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'during' }))
+    expect((await first).snapshot).toMatchObject({ running: { kind: 'compaction', runId: accepted.compactionId }, compactions: [{ status: 'running' }] })
+    expect((await submit('rejected-busy', '/compact')).status).toBe(409)
+    socket.close()
+    await once(socket, 'close')
+    expect(provider.aborted).toBe(false)
+    expect((await http(app.url + '/api/abort', headers, 'POST', '{"runId":"stale-id"}')).text).toContain('"handled":false')
+    if (outcome === 'aborted') {
+      const stopped = await http(app.url + '/api/abort', headers, 'POST', JSON.stringify({ runId: accepted.compactionId }))
+      expect(JSON.parse(stopped.text)).toEqual({ runId: accepted.compactionId, handled: true })
+    } else if (outcome === 'success') {
+      const crossing = await connect(app.url, auth), frames: any[] = []
+      crossing.on('message', data => { const frame = JSON.parse(String(data)); if (frame.type === 'snapshot' || frame.type === 'update') frames.push(frame) })
+      crossing.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'commit-crossing' }))
+      provider.finish()
+      await vi.waitFor(() => expect(frames.some(frame => frame.snapshot?.compactions.some((record: any) => record.status === 'success')
+        || frame.update?.change.type === 'compaction' && frame.update.change.record.status === 'success')).toBe(true))
+      const sequences = frames.map(frame => frame.snapshot?.seq ?? frame.update.seq)
+      for (let index = 1; index < sequences.length; index++) expect(sequences[index]).toBe(sequences[index - 1] + 1)
+      crossing.terminate()
+    } else provider.finish(true)
+    let restored!: ConversationSnapshot
+    await vi.waitFor(async () => {
+      restored = await serverSnapshot(app.url, auth, 'restored')
+      expect(restored.running).toBeNull()
+      expect(restored.compactions).toMatchObject([{ id: accepted.compactionId, status: outcome }])
+    })
+    expect(restored.messages).toEqual(before.messages)
+    expect(restored.compactions).toHaveLength(1)
+    expect(provider.summaryCalls).toBe(1)
+    expect(provider.calls).toBe(2)
+    expect(provider.aborted).toBe(outcome !== 'success')
+    expect(restored.contextUsage?.breakdown).toBeDefined()
+    if (outcome === 'success') {
+      expect(restored.compactions[0]).toMatchObject({ summary: '项目青禾；仅修改临时工作区。', summaryUsage: { input: 200 } })
+    }
+  })
+
+  it('真实暂停读取的连接超过缓冲阈值被清理，后台摘要仍成功且新连接可恢复大快照', async () => {
+    let heartbeat!: () => void
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void) => {
+      heartbeat = callback
+      return { unref() {} } as any
+    }) as any)
+    const provider = summaryProvider()
+    const agent = new Agent({ compaction: { triggerTokens: 100_000, keepRecentTokens: 30 },
+      stream: createModelStream({ readApiKey: async () => 'compaction-fixture-key' }, { fetch: provider.fetch }) })
+    const state = (agent as unknown as { state: ConversationSnapshot }).state
+    state.messages.push(
+      { id: 'old-large', message: { role: 'user', content: 'x'.repeat(3 * 1024 * 1024), timestamp: 1 } },
+      { id: 'recent-user', message: { role: 'user', content: 'recent '.repeat(100), timestamp: 2 } },
+    )
+    const app = await setup({ agent })
+    const auth = await cookie(app.authUrl), workspaceId = await pickWorkspace(app.url, auth)
+    const accepted = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({
+      workspaceId, modelId: 'deepseek-flash', clientMessageId: 'slow-compact', text: '/compact',
+    }))
+    expect(accepted.status).toBe(202)
+    await vi.waitFor(() => expect(provider.summaryCalls).toBe(1))
+    const slow = await connect(app.url, auth)
+    slow.pause()
+    slow.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'slow-large' }))
+    const serverSocket = [...(app.server as unknown as { ws: import('ws').WebSocketServer }).ws.clients][0]
+    await vi.waitFor(() => expect(serverSocket.bufferedAmount).toBeGreaterThan(1024 * 1024))
+    heartbeat()
+    await vi.waitFor(() => expect(serverSocket.readyState).toBe(WebSocket.CLOSED))
+    slow.terminate()
+    expect(provider.aborted).toBe(false)
+    provider.finish()
+    await vi.waitFor(() => expect(state.running).toBeNull())
+    const restored = await serverSnapshot(app.url, auth)
+    expect(restored.messages[0].message.content).toBe('x'.repeat(3 * 1024 * 1024))
+    expect(restored.compactions).toMatchObject([{ status: 'success' }])
+    expect(provider.summaryCalls).toBe(1)
   })
 })
 

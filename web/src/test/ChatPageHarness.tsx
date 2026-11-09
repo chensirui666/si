@@ -4,7 +4,7 @@ import type { ChatState, Subscribe } from '../chat/state'
 import { ChatPage } from '../pages/ChatPage'
 
 const getModels = async () => ({ models: [], deepseek: { state: 'missing' as const } })
-const getConfiguredModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions' }], deepseek: { state: 'configured' as const } })
+const getConfiguredModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], deepseek: { state: 'configured' as const } })
 
 const getEmptyWorkspaces = async () => ({ workspaces: [], boundWorkspaceId: null })
 const getConfiguredWorkspaces = async () => ({ workspaces: [{ id: 'workspace-1', path: '/tmp/workspace', name: 'workspace', available: true }], boundWorkspaceId: 'workspace-1' })
@@ -16,7 +16,7 @@ export function ChatPageHarness({ messages = [], modelConfigured = false, useWor
       seq: 0,
       messages: messages.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })),
       running: null,
-      activeContent: [],
+      compactions: [], contextUsage: null, activeContent: [],
     }
     onState({ connection: 'ready', snapshot, slow: false, error: null })
     const update = (event: Event) => onState((event as CustomEvent<ChatState>).detail)

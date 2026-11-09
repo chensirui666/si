@@ -1,0 +1,226 @@
+Using verified temporary fd for complete validation.
+
+> agent-learning@0.1.0 test
+> npm run test:packages && npm --prefix web test && npm --prefix web run test:e2e
+
+
+> agent-learning@0.1.0 test:packages
+> npm run build:packages && npm run test --workspace @agent-learning/credentials && npm run test --workspace @agent-learning/model && npm run test --workspace @agent-learning/agent && npm run test --workspace @agent-learning/server
+
+
+> agent-learning@0.1.0 build:packages
+> npm run build --workspace @agent-learning/credentials && npm run build --workspace @agent-learning/model && npm run build --workspace @agent-learning/agent && npm run build --workspace @agent-learning/server
+
+
+> @agent-learning/credentials@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> @agent-learning/model@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> @agent-learning/agent@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> @agent-learning/server@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> @agent-learning/credentials@0.1.0 test
+> vitest run --environment node test
+
+
+ RUN  v5.0.5 /Users/stardust/agent learning/.worktrees/feature7/packages/credentials
+
+
+ Test Files  1 passed (1)
+      Tests  54 passed (54)
+   Start at  00:56:03
+   Duration  4.77s (tests 99%, import 1%)
+
+
+> @agent-learning/model@0.1.0 test
+> vitest run --environment node test
+
+
+ RUN  v5.0.5 /Users/stardust/agent learning/.worktrees/feature7/packages/model
+
+
+ Test Files  3 passed (3)
+      Tests  67 passed (67)
+   Start at  00:56:08
+   Duration  263ms (import 85%, tests 9%, transform 5%, worker 1%)
+
+
+> @agent-learning/agent@0.1.0 test
+> vitest run --environment node test
+
+
+ RUN  v5.0.5 /Users/stardust/agent learning/.worktrees/feature7/packages/agent
+
+
+ Test Files  3 passed (3)
+      Tests  76 passed (76)
+   Start at  00:56:09
+   Duration  323ms (import 52%, tests 31%, transform 16%, worker 1%)
+
+
+> @agent-learning/server@0.1.0 test
+> vitest run --environment node test
+
+
+ RUN  v5.0.5 /Users/stardust/agent learning/.worktrees/feature7/packages/server
+
+
+ Test Files  8 passed (8)
+      Tests  111 passed (111)
+   Start at  00:56:09
+   Duration  6.27s (tests 90%, import 9%, transform 1%)
+
+
+> agent-learning-web@0.1.0 test
+> npm run test:unit && npm run test:browser
+
+
+> agent-learning-web@0.1.0 test:unit
+> vitest run
+
+
+ RUN  v5.0.5 /Users/stardust/agent learning/.worktrees/feature7/web
+
+
+ Test Files  8 passed (8)
+      Tests  132 passed (132)
+   Start at  00:56:16
+   Duration  1.55s (environment 55%, tests 17%, setup 13%, transform 9%, import 7%)
+
+
+> agent-learning-web@0.1.0 test:browser
+> playwright test -c playwright-ct.config.ts
+
+
+Running 44 tests using 1 worker
+
+(node:19564) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓   1 src/components/AssistantMessage.browser.test.tsx:8:1 › 工具开始即显示，展开后可读流式参数和最终参数错误 (215ms)
+  ✓   2 src/components/AssistantMessage.browser.test.tsx:20:1 › Markdown GFM 流式尾部更新、最终引用校准与恶意内容隔离 (153ms)
+  ✓   3 src/components/AssistantMessage.browser.test.tsx:41:1 › 终止状态保留正文，正常的工具阶段没有报错提示 (129ms)
+  ✓   4 src/components/ContextMeter.browser.test.tsx:7:1 › 悬停查看三类估算，压缩后立即下降，移出后关闭且不抢编辑焦点 (213ms)
+  ✓   5 src/components/ContextMeter.browser.test.tsx:26:1 › 键盘聚焦打开，Esc 关闭且保持焦点；缺少数据会关闭旧浮层 (84ms)
+  ✓   6 src/components/ContextMeter.browser.test.tsx:41:1 › 真实零值显示 0% 且无已用色段，超量仍显示完整 token (110ms)
+  ✓   7 src/components/ContextMeter.browser.test.tsx:51:1 › 390px 视口内完整显示分布且发送按钮不被遮挡 (183ms)
+  ✓   8 src/components/MessageInput.browser.test.tsx:9:5 › 逐字输入后立即提交原文 (141ms)
+  ✓   9 src/components/MessageInput.browser.test.tsx:9:5 › 逐字输入后立即提交原文，包含最后几个字 (133ms)
+  ✓  10 src/components/MessageInput.browser.test.tsx:9:5 › 粘贴后立即提交原文 (116ms)
+  ✓  11 src/components/MessageInput.browser.test.tsx:9:5 › 粘贴后立即提交原文，包含最后几个字 (101ms)
+  ✓  12 src/components/MessageInput.browser.test.tsx:35:1 › 发送成功后隔离撤销历史 (128ms)
+  ✓  13 src/components/MessageInput.browser.test.tsx:56:1 › 外部门禁切换保留编辑器、原文、焦点与撤销，恢复后可提交原草稿 (117ms)
+  ✓  14 src/components/MessageInput.browser.test.tsx:85:1 › Enter 接收报错后仍可撤销和继续逐字编辑 (122ms)
+  ✓  15 src/components/MessageInput.browser.test.tsx:107:1 › 发送、中止和正在中止切换保留同一编辑器、草稿、焦点和撤销记录 (196ms)
+  ✓  16 src/components/MessageInput.browser.test.tsx:139:3 › 命令前缀通过 click 仅补全，下一次 Enter 才发送 (119ms)
+  ✓  17 src/components/MessageInput.browser.test.tsx:139:3 › 命令前缀通过 Tab 仅补全，下一次 Enter 才发送 (91ms)
+  ✓  18 src/components/MessageInput.browser.test.tsx:139:3 › 命令前缀通过 Enter 仅补全，下一次 Enter 才发送 (99ms)
+  ✓  19 src/components/MessageInput.browser.test.tsx:158:1 › 补全保留撤销与重做，Esc 关闭保留前缀且普通重渲染不重开 (139ms)
+  ✓  20 src/components/MessageInput.browser.test.tsx:178:3 › 普通内容 请读取 src/index.txt 没有命令候选且 Tab 正常移焦 (95ms)
+  ✓  21 src/components/MessageInput.browser.test.tsx:178:3 › 普通内容 /unknown 没有命令候选且 Tab 正常移焦 (102ms)
+  ✓  22 src/components/MessageInput.browser.test.tsx:190:1 › 任务忙碌时仍能补全，失焦关闭菜单且不发送 (153ms)
+  ✓  23 src/components/MessageInput.browser.test.tsx:207:1 › Esc 关闭后清空并重新输入相同命令前缀会再次提供候选 (100ms)
+  ✓  24 src/components/MessageList.browser.test.tsx:5:1 › 原文展示、长内容换行与复制 (121ms)
+  ✓  25 src/components/MessageList.browser.test.tsx:77:1 › 执行过程逐步展示并独立展开，正文分段，结果按来源关联并随任务结束收起 (440ms)
+  ✓  26 src/components/MessageList.browser.test.tsx:136:1 › W4 两轮读取使用相同调用编号，整次结束才收起并保留各自结果 (449ms)
+  ✓  27 src/components/SettingsDialog.browser.test.tsx:13:1 › 设置弹窗约束键盘焦点，Escape 关闭后返回入口并清空 Key (485ms)
+  ✓  28 src/components/SettingsDialog.browser.test.tsx:45:1 › 网页工具分别选择能力服务商，保存共用 Key 后再编辑没有旧 Key (494ms)
+  ✓  29 src/pages/ChatPage.browser.test.tsx:15:1 › 连接切换、快照恢复和输入区增高时保留草稿、焦点与阅读位置 (469ms)
+  ✓  30 src/pages/ChatPage.browser.test.tsx:73:1 › 输入组件发送按钮随空白和有效草稿切换颜色，发送后恢复空白状态 (202ms)
+  ✓  31 src/pages/ChatPage.browser.test.tsx:99:1 › 白色页面与消息输入区同轴，正文和标题遵守已确认尺寸 (203ms)
+  ✓  32 src/pages/ChatPage.browser.test.tsx:126:1 › 窄屏长草稿到上限后内部滚动，输入和发送操作始终可见 (177ms)
+  ✓  33 src/pages/ChatPage.browser.test.tsx:153:1 › 低高度视口的长草稿仍保留完整输入区和发送操作 (193ms)
+  ✓  34 src/pages/ChatPage.browser.test.tsx:178:3 › 触屏操作 › 平板及横屏发送目标至少为44×44 (173ms)
+  ✓  35 src/pages/ChatPage.browser.test.tsx:191:1 › 正文使用随应用加载的 Noto Sans CJK SC 字体 (419ms)
+  ✓  36 src/pages/ChatPage.browser.test.tsx:213:1 › 输入区聚焦、切换和发送后保持弱边界，按钮焦点使用内部标记 (224ms)
+  ✓  37 src/pages/ChatPage.browser.test.tsx:265:1 › 消息区键盘焦点使用固定局部标记，滚动和高对比度下仍可辨认 (257ms)
+  ✓  38 src/pages/ChatPage.browser.test.tsx:300:1 › 浅色按钮以背景反馈悬停和按下，键盘焦点不叠加外圈 (952ms)
+  ✓  39 src/pages/ChatPage.browser.test.tsx:323:1 › 真实异步发送保留原文、清空撤销历史和焦点，WS 先到与迟到拒绝不覆盖新草稿 (169ms)
+  ✓  40 src/pages/ChatPage.browser.test.tsx:370:1 › HTTP 回执先到时旧空闲快照不能开放发送，正式消息与结束状态到达后才开放 (175ms)
+  ✓  41 src/pages/ChatPage.browser.test.tsx:399:1 › 回复逐块增长和最终校准保留旧消息阅读位置，不滚动或抢输入焦点 (170ms)
+  ✓  42 src/pages/ChatPage.browser.test.tsx:424:3 › 失败 A 后成功 B 的气泡和回复保持原顺序，已有历史：false (218ms)
+  ✓  43 src/pages/ChatPage.browser.test.tsx:424:3 › 失败 A 后成功 B 的气泡和回复保持原顺序，已有历史：true (229ms)
+  ✓  44 src/pages/ChatPage.browser.test.tsx:460:1 › 选择工作区后进入当前对话才可发送，目录失效保留草稿 (389ms)
+
+  44 passed (10.4s)
+
+> agent-learning-web@0.1.0 test:e2e
+> npm --prefix .. run build && playwright test -c playwright.config.ts
+
+
+> agent-learning@0.1.0 build
+> npm run build:packages && npm --prefix web run build
+
+
+> agent-learning@0.1.0 build:packages
+> npm run build --workspace @agent-learning/credentials && npm run build --workspace @agent-learning/model && npm run build --workspace @agent-learning/agent && npm run build --workspace @agent-learning/server
+
+
+> @agent-learning/credentials@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> @agent-learning/model@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> @agent-learning/agent@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> @agent-learning/server@0.1.0 build
+> tsc -p tsconfig.json
+
+
+> agent-learning-web@0.1.0 build
+> tsc --noEmit && vite build
+
+vite v8.3.5 building client environment for production...
+transforming...
+✓ 281 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.40 kB │ gzip:   0.29 kB
+dist/assets/index-CZX5iNl4.css   27.63 kB │ gzip:   6.73 kB
+dist/assets/index-BP-3cpmJ.js   639.75 kB │ gzip: 199.83 kB
+
+[plugin builtin:vite-reporter]
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+✓ built in 158ms
+
+Running 17 tests using 1 worker
+
+(node:20001) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓   1 tests/e2e/abort.spec.ts:10:3 › node 网页主动中止保留部分回复与草稿，关闭模型连接并继续发送 (939ms)
+  ✓   2 tests/e2e/abort.spec.ts:10:3 › vite 网页主动中止保留部分回复与草稿，关闭模型连接并继续发送 (1.5s)
+  ✓   3 tests/e2e/chat.spec.ts:10:3 › node 阶段三 SDK 流式对话、历史与生成恢复 (1.3s)
+  ✓   4 tests/e2e/chat.spec.ts:10:3 › vite 阶段三 SDK 流式对话、历史与生成恢复 (2.1s)
+  ✓   5 tests/e2e/chat.spec.ts:133:3 › node 阶段二配置、重启与多页面 (2.0s)
+  ✓   6 tests/e2e/chat.spec.ts:133:3 › vite 阶段二配置、重启与多页面 (2.6s)
+  ✓   7 tests/e2e/chat.spec.ts:245:3 › node 实际授权、空快照与恢复 (1.7s)
+  ✓   8 tests/e2e/chat.spec.ts:245:3 › vite 实际授权、空快照与恢复 (1.8s)
+  ✓   9 tests/e2e/react-loop.spec.ts:10:3 › E1 node 连续读取、并行回填，刷新后中止等待命令并继续 (1.4s)
+  ✓  10 tests/e2e/react-loop.spec.ts:10:3 › E1 vite 连续读取、并行回填，刷新后中止等待命令并继续 (2.0s)
+(node:20117) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓  11 tests/e2e/compaction.live.spec.ts:68:1 › Feature7 live case68: 同网页会话手动和自动压缩两次，实测输入下降并继续真实文件任务 (37.0s)
+  ✓  12 tests/e2e/deepseek-live.spec.ts:12:1 › 真实模型凭据文件解析只接收明确的 DeepSeek 变量 (1ms)
+  ✓  13 tests/e2e/deepseek-live.spec.ts:20:1 › 真实 DeepSeek 设置、两轮历史、流式进度与无效 Key 恢复 (8.1s)
+  ✓  14 tests/e2e/deepseek-live.spec.ts:100:1 › 真实 DeepSeek 生成中止保留内容和草稿，同一对话可继续 (8.5s)
+  ✓  15 tests/e2e/deepseek-live.spec.ts:137:1 › T1 live: 网页两次读取真实文件，显示工具结果且回答随文件变化 (6.3s)
+  ✓  16 tests/e2e/deepseek-live.spec.ts:189:57 › Feature6 live loop: 实际工具结果进入后续请求，每轮保留八种工具 (4.3s)
+  ✓  17 tests/e2e/deepseek-live.spec.ts:189:57 › Feature6 live write-once: 实际工具结果进入后续请求，每轮保留八种工具 (3.3s)
+
+  17 passed (1.4m)

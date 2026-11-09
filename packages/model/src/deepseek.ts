@@ -2,6 +2,7 @@ import { Credentials } from '@agent-learning/credentials'
 import OpenAI from 'openai'
 import { AssistantEventStream } from './event-stream.js'
 import { parseToolArguments } from './tool-arguments.js'
+import { convertMessages, convertTools } from './context.js'
 import type {
   AssistantMessage, ModelContext, ModelDiscovery, ModelEventStream, ModelInfo,
   ModelStopReason, TextContent, ThinkingContent, ToolCall,
@@ -12,6 +13,8 @@ const deepseek: ModelInfo = {
   name: 'DeepSeek Flash',
   provider: 'deepseek',
   api: 'openai-completions',
+  contextWindow: 1_048_576,
+  maxTokens: 65_536,
 }
 
 export function findModel(modelId: string): ModelInfo | undefined {
@@ -25,50 +28,6 @@ export async function discoverModels(
   return { models: status.state === 'configured' ? [{ ...deepseek }] : [], deepseek: status }
 }
 
-function convertMessages(context: ModelContext): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = []
-  if (context.systemPrompt !== undefined) messages.push({ role: 'system', content: context.systemPrompt })
-  let pending: ToolCall[] = []
-  const received = new Set<string>()
-  const heldSystems: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = []
-  const closeTools = () => {
-    for (const call of pending) {
-      if (!received.has(call.id)) messages.push({ role: 'tool', tool_call_id: call.id, content: 'No result provided' })
-    }
-    pending = []
-    received.clear()
-    messages.push(...heldSystems)
-    heldSystems.length = 0
-  }
-  for (const message of context.messages) {
-    if (message.role === 'assistant' || message.role === 'user') closeTools()
-    if (message.role === 'system' || message.role === 'user') {
-      const content = typeof message.content === 'string' ? message.content : message.content.map((block) => block.text).join('')
-      if (message.role === 'system' && pending.length) heldSystems.push({ role: 'system', content })
-      else messages.push({ role: message.role, content })
-    } else if (message.role === 'toolResult') {
-      received.add(message.toolCallId)
-      messages.push({ role: 'tool', tool_call_id: message.toolCallId, content: message.content.map((block) => block.text).join('') })
-    } else {
-      const text = message.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
-      const tools = message.content.filter((block) => block.type === 'toolCall')
-      pending = tools
-      if (!text && !tools.length) continue
-      const assistant: OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam & { reasoning_content?: string } = {
-        role: 'assistant', content: text || null,
-        reasoning_content: message.content.filter((block) => block.type === 'thinking').map((block) => block.thinking).join(''),
-      }
-      if (tools.length) {
-        assistant.tool_calls = tools.map((tool) => ({
-          id: tool.id, type: 'function', function: { name: tool.name, arguments: JSON.stringify(tool.arguments) },
-        }))
-      }
-      messages.push(assistant)
-    }
-  }
-  closeTools()
-  return messages
-}
 
 class ModelFailure extends Error {}
 
@@ -80,6 +39,16 @@ function safeError(error: unknown): string {
     return `模型服务请求失败（HTTP ${error.status}）。`
   }
   return '模型请求或响应读取失败，请检查配置与网络。'
+}
+
+function isContextOverflow(error: unknown): boolean {
+  if (!(error instanceof OpenAI.APIError) || ![400, 413, 422].includes(error.status ?? 0)) return false
+  const body = error.error as { message?: unknown } | undefined
+  const message = typeof body?.message === 'string' ? body.message : ''
+  if (/rate limit|too many requests/i.test(message)) return false
+  if (error.code === 'context_length_exceeded' || error.code === 'model_context_window_exceeded') return true
+  return /\b(?:input|request|prompt)\b.{0,120}\bexceeds\b.{0,60}\bcontext (?:window|length)\b/i.test(message)
+    || /\bmaximum context length is [\d,]+ tokens?\b.{0,160}\brequested(?: about)? [\d,]+ tokens?\b/i.test(message)
 }
 
 type ToolState = { block: ToolCall; contentIndex: number; argumentsText: string; index?: number }
@@ -152,12 +121,9 @@ export function createModelStream(
         })
         const upstream = await Promise.race([
           client.chat.completions.create({
-            model: model.id, messages: convertMessages(context), stream: true,
+            model: model.id, messages: convertMessages(context), max_tokens: model.maxTokens, stream: true,
             stream_options: { include_usage: true }, reasoning_effort: 'high',
-            ...(context.tools?.length ? { tools: context.tools.map((tool) => ({
-              type: 'function' as const,
-              function: { name: tool.name, description: tool.description, parameters: { ...tool.parameters } },
-            })) } : {}),
+            ...(context.tools?.length ? { tools: convertTools(context.tools) } : {}),
             ...{ thinking: { type: 'enabled' } },
           }, { signal: controller.signal, maxRetries: 0 }),
           interrupted,
@@ -265,6 +231,7 @@ export function createModelStream(
         controller.abort()
         output.stopReason = interruption ?? 'error'
         output.errorMessage = interruptionMessage ?? safeError(error)
+        if (!interruption && isContextOverflow(error)) output.errorCode = 'context_overflow'
       } finally {
         clearTimeout(timer)
         options?.signal?.removeEventListener('abort', cancel)
