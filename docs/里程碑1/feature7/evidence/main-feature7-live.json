@@ -1,0 +1,41 @@
+{
+  "model": {
+    "id": "deepseek-flash",
+    "contextWindow": 1048576,
+    "maxTokens": 65536
+  },
+  "testBudget": {
+    "triggerTokens": 20000,
+    "keepRecentTokens": 400
+  },
+  "comparisons": [
+    {
+      "recordId": "f5a733a0-4b6b-46f7-89df-20b754b1df5c",
+      "trigger": "manual",
+      "actualBefore": 13409,
+      "actualAfter": 3254,
+      "summaryInput": 10762,
+      "summaryOutput": 637
+    },
+    {
+      "recordId": "77eb4a18-6540-4853-9267-ccfbf444223e",
+      "trigger": "auto",
+      "actualBefore": 39351,
+      "actualAfter": 29839,
+      "summaryInput": 6668,
+      "summaryOutput": 979
+    }
+  ],
+  "successfulCompactions": 3,
+  "actualReadResults": 3,
+  "actualWriteResults": 1,
+  "actualTools": [
+    "read",
+    "read",
+    "read",
+    "write"
+  ],
+  "finalFileVerified": true,
+  "systemAndToolsUnchanged": true,
+  "comparisonRepliesExcludedFromHistory": true
+}
