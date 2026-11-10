@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/experimental-ct-react'
+import { draftKey, recentSessionKey } from '../chat/drafts'
 import { ChatPageHarness } from '../test/ChatPageHarness'
 
 test.beforeEach(async ({ page }) => {
@@ -39,7 +40,10 @@ test('设置弹窗约束键盘焦点，Escape 关闭后返回入口并清空 Key
   await page.getByRole('button', { name: '添加提供方', exact: true }).click()
   await page.getByRole('button', { name: 'DeepSeek', exact: true }).click()
   await expect(key).toHaveValue('')
-  expect(await page.evaluate(() => localStorage.length)).toBe(0)
+  expect(await page.evaluate(() => Object.fromEntries(Object.entries(localStorage)))).toEqual({
+    [recentSessionKey]: 'session-a', [draftKey('session-a')]: '设置期间保留的草稿',
+  })
+  expect(await page.evaluate(() => sessionStorage.length)).toBe(0)
 })
 
 test('网页工具分别选择能力服务商，保存共用 Key 后再编辑没有旧 Key', async ({ mount, page }) => {
@@ -76,5 +80,6 @@ test('网页工具分别选择能力服务商，保存共用 Key 后再编辑没
   await tools.click()
   await edit.click()
   await expect(key).toHaveValue('')
-  expect(await page.evaluate(() => localStorage.length)).toBe(0)
+  expect(await page.evaluate(() => Object.fromEntries(Object.entries(localStorage)))).toEqual({ [recentSessionKey]: 'session-a' })
+  expect(await page.evaluate(() => sessionStorage.length)).toBe(0)
 })

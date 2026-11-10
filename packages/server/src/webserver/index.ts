@@ -4,18 +4,24 @@ import { readFile, realpath, stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
-import { Agent, AgentSubmitError } from '@agent-learning/agent'
+import {
+  AgentSession, SessionSubmitError, Sessions, ToolRuntime, createTools, createWebTools,
+  type SessionSubscriptionEvent, type WebProvider,
+} from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, discoverModels } from '@agent-learning/model'
 import { pickDirectory, type DirectoryPicker } from '../directory-picker.js'
 import { Workspaces, WorkspaceBindingError } from '../workspaces.js'
 import { WebSettings } from '../web-settings.js'
-import { createTavilyProvider, type WebProvider } from '../web-providers.js'
-import { createWebTools } from '../web-tools.js'
-import { createTools } from '../tools.js'
-import { ToolRuntime } from '../tool-runtime.js'
+import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
-import type { ClientFrame, ServerFrame, SubmitMessageRequest } from './protocol.js'
+import type { ClientFrame, ServerFrame, StartSessionAccepted, StartSessionRequest } from './protocol.js'
+
+type SessionTarget = {
+  subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
+} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close'>>
+
+type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
 
 export type WebServerOptions = {
   port?: number
@@ -27,7 +33,7 @@ export type WebServerOptions = {
   webSettingsPath?: string
   directoryPicker?: DirectoryPicker
   webProviders?: WebProvider[]
-  agent?: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'abort' | 'close'>>
+  createSession?: (resolveDirectory: () => Promise<string>) => SessionTarget
   modelOptions?: Parameters<typeof createModelStream>[1]
   compaction?: { triggerTokens: number; keepRecentTokens: number }
   now?: () => number
@@ -58,27 +64,30 @@ async function providerKey(req: IncomingMessage): Promise<string> {
     || !('apiKey' in value) || typeof value.apiKey !== 'string') throw new InputError(400, '请仅提交 apiKey 字符串')
   return value.apiKey
 }
-async function messageInput(req: IncomingMessage): Promise<SubmitMessageRequest> {
+function validId(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 128 && !!value.trim()
+}
+async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspaceId') {
   const value = await readJson(req)
+  const targetLabel = target === 'sessionId' ? '会话' : '工作区'
+  const targetId = value && typeof value === 'object' ? (value as Record<string, unknown>)[target] : undefined
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 4
-    || !('workspaceId' in value) || typeof value.workspaceId !== 'string' || !value.workspaceId.trim() || value.workspaceId.length > 128
+    || !validId(targetId)
     || !('text' in value) || typeof value.text !== 'string' || !value.text.trim()
     || !('modelId' in value) || typeof value.modelId !== 'string'
-    || !('clientMessageId' in value) || typeof value.clientMessageId !== 'string'
-    || !value.clientMessageId.trim() || value.clientMessageId.length > 128) {
-    throw new InputError(400, '请提交原文、模型、有效临时编号和工作区编号')
+    || !('clientMessageId' in value) || !validId(value.clientMessageId)) {
+    throw new InputError(400, `请提交原文、模型、有效临时编号和${targetLabel}编号`)
   }
-  return value as SubmitMessageRequest
+  return { targetId, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text } }
 }
 function validFrame(value: unknown): value is ClientFrame {
   if (!value || typeof value !== 'object') return false
   const frame = value as Partial<ClientFrame>
-  return (frame.type === 'subscribe' || frame.type === 'unsubscribe')
-    && typeof frame.subscriptionId === 'string' && frame.subscriptionId.trim().length > 0 && frame.subscriptionId.length <= 128
+  return validId(frame.subscriptionId) && (frame.type === 'unsubscribe' || (frame.type === 'subscribe' && validId(frame.sessionId)))
 }
 
 export class WebServer {
-  private readonly agent: Pick<Agent, 'subscribe'> & Partial<Pick<Agent, 'submit' | 'abort' | 'close'>>
+  private sessions: Sessions<SessionTarget>
   private server?: Server
   private ws?: WebSocketServer
   private heartbeat?: ReturnType<typeof setInterval>
@@ -89,7 +98,6 @@ export class WebServer {
   private readonly credentials: Credentials
   private readonly workspaces: Workspaces
   private readonly webSettings: WebSettings
-  private readonly toolRuntime = new ToolRuntime()
   private selection?: AbortController
   private stopWatching?: () => void
 
@@ -97,14 +105,27 @@ export class WebServer {
     this.credentials = new Credentials(options.modelAuthPath)
     this.workspaces = new Workspaces(options.workspacePath)
     this.webSettings = new WebSettings(options.webProviders ?? [createTavilyProvider(this.credentials)], this.credentials, options.webSettingsPath)
-    this.agent = options.agent ?? new Agent({
-      stream: createModelStream(this.credentials, options.modelOptions),
-      tools: createTools(this.toolRuntime, createWebTools(this.webSettings, this.toolRuntime)),
-      compaction: options.compaction,
+    this.sessions = this.createSessions()
+  }
+  private createSessions() {
+    const runtime = new ToolRuntime()
+    const webTools = createWebTools(this.webSettings, runtime)
+    const stream = createModelStream(this.credentials, this.options.modelOptions)
+    return new Sessions<SessionTarget>({
+      resolveDirectory: id => this.workspaces.resolveDirectory(id),
+      createSession: this.options.createSession ?? (resolveDirectory => new AgentSession({
+        resolveDirectory, stream, tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+      })),
+      closeTools: () => runtime.close(),
+      onStarted: () => this.notify('sessions_changed'),
     })
   }
   async start(): Promise<{ url: string; authUrl: string; devAuthUrl?: string }> {
     if (this.server) throw new Error('服务已经启动')
+    if (this.closing) {
+      await this.closing
+      this.sessions = this.createSessions()
+    }
     const secret = await loadOrCreateBrowserSecret(this.options.browserSecretPath)
     this.auth = new BrowserAuth(secret, this.options.now)
     this.closing = undefined
@@ -114,6 +135,7 @@ export class WebServer {
     }) })
     const ws = this.ws = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024, perMessageDeflate: false })
     server.on('upgrade', (req, socket, head) => {
+      if (this.closing) { socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return }
       const status = this.admit(req)
       if (status !== 200 || req.url !== '/api/events') {
         const code = status === 200 ? 404 : status
@@ -170,6 +192,7 @@ export class WebServer {
       if (this.admit(req) === 200) { this.respond(res, 303, '', { location: './' }); return }
     }
     if (this.admit(req) !== 200) { this.respond(res, 401, '需要网页授权，请重新打开终端中的启动链接。'); return }
+    if (this.closing) { this.json(res, 503, { error: '服务正在关闭' }); return }
     if (url.pathname === '/api/models' && req.method === 'GET') {
       this.respond(res, 200, JSON.stringify(await discoverModels(this.credentials)), { 'content-type': 'application/json; charset=utf-8' })
       return
@@ -183,6 +206,38 @@ export class WebServer {
       await this.pick(req, res)
       return
     }
+    if (url.pathname === '/api/sessions' && req.method === 'GET') {
+      this.json(res, 200, { sessions: this.sessions.list() })
+      return
+    }
+    if (url.pathname === '/api/sessions' && req.method === 'POST') {
+      try {
+        const input = await readJson(req)
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 1
+          || !('workspaceId' in input) || !validId(input.workspaceId)) throw new InputError(400, '请仅提交有效的工作区编号')
+        const session = await this.sessions.create(input.workspaceId)
+        this.json(res, 201, session)
+        this.notify('sessions_changed')
+      } catch (error) {
+        this.sessionError(res, error, '暂时无法新建会话')
+      }
+      return
+    }
+    if (url.pathname === '/api/sessions/start' && req.method === 'POST') {
+      try {
+        const { targetId: workspaceId, message } = await messageInput(req, 'workspaceId')
+        const input: StartSessionRequest = { workspaceId, ...message }
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.clientMessageId)) {
+          throw new InputError(400, '首次发送需要有效的 UUID 临时编号')
+        }
+        const { session, accepted } = await this.sessions.start(input, target => this.submit(target, message))
+        const response: StartSessionAccepted = { session, accepted: { ...accepted, sessionId: session.id } }
+        this.json(res, 202, response)
+      } catch (error) {
+        this.sessionError(res, error, '暂时无法发送首条消息')
+      }
+      return
+    }
     const webProvider = /^\/api\/web\/providers\/([a-z][a-z0-9-]*)$/.exec(url.pathname)?.[1]
     if ((url.pathname === '/api/web/settings' && (req.method === 'GET' || req.method === 'PUT'))
       || (webProvider && (req.method === 'PUT' || req.method === 'DELETE'))) {
@@ -192,13 +247,14 @@ export class WebServer {
     if (url.pathname === '/api/abort' && req.method === 'POST') {
       try {
         const input = await readJson(req)
-        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 1
-          || !('runId' in input) || typeof input.runId !== 'string' || !input.runId.trim() || input.runId.length > 128) {
-          throw new InputError(400, '请仅提交有效的运行编号')
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 2
+          || !('sessionId' in input) || !validId(input.sessionId) || !('runId' in input) || !validId(input.runId)) {
+          throw new InputError(400, '请提交有效的会话编号和运行编号')
         }
-        if (!this.agent.abort) throw new InputError(503, '当前中止服务不可用')
-        const handled = await this.agent.abort(input.runId)
-        this.json(res, 200, { runId: input.runId, handled })
+        const session = this.target(input.sessionId)
+        if (!session.abort) throw new InputError(503, '当前中止服务不可用')
+        const handled = await session.abort(input.runId)
+        this.json(res, 200, { sessionId: input.sessionId, runId: input.runId, handled })
       } catch (error) {
         this.json(res, error instanceof InputError ? error.status : 500,
           { error: error instanceof InputError ? error.message : '中止暂时不可用，请重新同步对话后重试' })
@@ -207,21 +263,11 @@ export class WebServer {
     }
     if (url.pathname === '/api/messages' && req.method === 'POST') {
       try {
-        const input = await messageInput(req)
-        if (!this.agent.submit) throw new InputError(503, '当前生成服务不可用')
-        const { workspaceId, ...message } = input
-        const cwd = await this.workspaces.resolveBoundDirectory(workspaceId)
-        const accepted = await this.agent.submit({ ...message, cwd })
-        this.respond(res, 202, JSON.stringify(accepted), { 'content-type': 'application/json; charset=utf-8' })
+        const { targetId: sessionId, message } = await messageInput(req, 'sessionId')
+        const accepted = await this.submit(this.target(sessionId), message)
+        this.json(res, 202, { ...accepted, sessionId })
       } catch (error) {
-        if (error instanceof WorkspaceBindingError) {
-          this.notify('workspaces_changed')
-          this.json(res, 409, { error: error.message })
-          return
-        }
-        const status = error instanceof InputError || error instanceof AgentSubmitError ? error.status : 500
-        const message = error instanceof InputError || error instanceof AgentSubmitError ? error.message : '提交暂时不可用'
-        this.respond(res, status, JSON.stringify({ error: message }), { 'content-type': 'application/json; charset=utf-8' })
+        this.sessionError(res, error, '提交暂时不可用')
       }
       return
     }
@@ -250,6 +296,26 @@ export class WebServer {
       res.writeHead(200, { 'content-type': mime[extname(filename)] ?? 'application/octet-stream', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff' })
       res.end(req.method === 'HEAD' ? undefined : content)
     } catch { this.respond(res, 404, '未找到页面或资源，请先运行 npm run build。') }
+  }
+  private target(id: string): SessionTarget {
+    if (this.closing) throw new InputError(503, '服务正在关闭')
+    const session = this.sessions.get(id)
+    if (!session) throw new InputError(404, '会话已不可用')
+    return session
+  }
+  private submit(session: SessionTarget, message: Parameters<AgentSession['submit']>[0]) {
+    if (!session.submit) throw new InputError(503, '当前生成服务不可用')
+    return session.submit(message)
+  }
+  private sessionError(res: ServerResponse, error: unknown, fallback: string) {
+    if (error instanceof WorkspaceBindingError) {
+      this.notify('workspaces_changed')
+      this.json(res, 409, { error: error.message })
+    } else if (error instanceof SessionSubmitError) {
+      this.json(res, { invalid: 400, busy: 409, closed: 503 }[error.code], { error: error.message })
+    } else if (error instanceof InputError) {
+      this.json(res, error.status, { error: error.message })
+    } else this.json(res, 500, { error: fallback })
   }
   private json(res: ServerResponse, status: number, payload: unknown) {
     this.respond(res, status, JSON.stringify(payload), { 'content-type': 'application/json; charset=utf-8' })
@@ -281,8 +347,8 @@ export class WebServer {
       if (controller.signal.aborted) return
       if (path === null) this.json(res, 200, { cancelled: true })
       else {
-        const view = await this.workspaces.register(path)
-        if (!res.destroyed) this.json(res, 200, { cancelled: false, view })
+        const picked = await this.workspaces.register(path)
+        if (!res.destroyed) this.json(res, 200, { cancelled: false, ...picked })
         this.notify('workspaces_changed')
       }
     } catch (error) {
@@ -316,11 +382,12 @@ export class WebServer {
 
   private readonly missedPongs = new Map<WebSocket, number>()
   private readonly sends = new Map<WebSocket, Promise<void>>()
-  private readonly notifications = new Map<WebSocket, Set<'models_changed' | 'workspaces_changed' | 'web_settings_changed'>>()
-  private send(client: WebSocket, frame: ServerFrame): Promise<void> {
+  private readonly notifications = new Map<WebSocket, Set<Notification>>()
+  private send(client: WebSocket, frame: ServerFrame, signal?: AbortSignal): Promise<void> {
     const pending = (this.sends.get(client) ?? Promise.resolve()).then(() => new Promise<void>((done, reject) => {
+      if (signal?.aborted) { done(); return }
       if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > maxBufferedBytes) { reject(new Error('Connection unavailable')); return }
-      if (frame.type === 'models_changed' || frame.type === 'workspaces_changed' || frame.type === 'web_settings_changed') {
+      if (!('subscriptionId' in frame)) {
         const notifications = this.notifications.get(client)
         notifications?.delete(frame.type)
         if (!notifications?.size) this.notifications.delete(client)
@@ -330,7 +397,7 @@ export class WebServer {
     this.sends.set(client, pending)
     return pending
   }
-  private notify(type: 'models_changed' | 'workspaces_changed' | 'web_settings_changed') {
+  private notify(type: Notification) {
     for (const client of this.ws?.clients ?? []) {
       const pending = this.notifications.get(client) ?? new Set()
       if (pending.has(type)) continue
@@ -350,6 +417,7 @@ export class WebServer {
     client.on('close', cleanup)
     client.on('error', () => { cleanup(); client.terminate() })
     client.on('message', (data, binary) => {
+      if (client.readyState !== WebSocket.OPEN) return
       let frame: unknown
       try { frame = binary ? undefined : JSON.parse(data.toString()) } catch { frame = undefined }
       if (!validFrame(frame)) { cleanup(); client.close(1008, 'Invalid subscription frame'); return }
@@ -359,18 +427,24 @@ export class WebServer {
       }
       cancel()
       const subscription = current = { id: frame.subscriptionId, controller: new AbortController() }
+      const { sessionId } = frame
+      const signal = subscription.controller.signal
+      const send = async (event: SessionSubscriptionEvent | { type: 'subscription_error'; error: string }) => {
+        try { await this.send(client, { ...event, sessionId, subscriptionId: subscription.id }, signal) }
+        catch { cleanup(); client.terminate() }
+      }
       void (async () => {
         try {
           await this.sends.get(client)
-          if (current !== subscription || subscription.controller.signal.aborted) return
-          for await (const event of this.agent.subscribe(subscription.controller.signal)) {
-            if (current !== subscription || subscription.controller.signal.aborted) break
-            const outgoing: ServerFrame = { ...event, subscriptionId: subscription.id }
-            try { await this.send(client, outgoing) }
-            catch { cleanup(); client.terminate(); break }
+          if (signal.aborted) return
+          const session = this.sessions.get(sessionId)
+          if (!session) { await send({ type: 'subscription_error', error: '会话已不可用' }); return }
+          for await (const event of session.subscribe(signal)) {
+            if (signal.aborted) break
+            await send(event)
           }
         } catch {
-          if (current === subscription && !subscription.controller.signal.aborted) { cleanup(); client.close(1011, 'Subscription unavailable') }
+          if (!signal.aborted) { cleanup(); client.close(1011, 'Subscription unavailable') }
         }
       })()
     })
@@ -390,10 +464,11 @@ export class WebServer {
       const ws = this.ws
       this.server = undefined
       this.ws = undefined
-      await this.agent.close?.()
-      await this.toolRuntime.close()
-      if (ws) await new Promise<void>(done => ws.close(() => done()))
-      if (server?.listening) await new Promise<void>((done, reject) => { server.close(error => error ? reject(error) : done()); server.closeAllConnections() })
+      try { await this.sessions.close() }
+      finally {
+        if (ws) await new Promise<void>(done => ws.close(() => done()))
+        if (server?.listening) await new Promise<void>((done, reject) => { server.close(error => error ? reject(error) : done()); server.closeAllConnections() })
+      }
     })()
     return this.closing
   }

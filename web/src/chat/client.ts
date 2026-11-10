@@ -1,8 +1,8 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, ClientFrame, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, ClientFrame, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
 import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
 
-export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged) => {
+export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged) => {
   let state: ChatState = initialState
   let stopped = false
   let socket: WebSocket | null = null
@@ -44,9 +44,11 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     deadline = setTimeout(() => fail('连接超时，正在重试；如持续异常，请重新打开启动链接'), 15_000)
   }
   function requestSnapshot() {
+    const sessionId = state.sessionId
+    if (!sessionId) return
     subscriptionId = crypto.randomUUID()
     publish({ ...state, connection: 'awaitingSnapshot', error: null })
-    try { socket!.send(JSON.stringify({ type: 'subscribe', subscriptionId } satisfies ClientFrame)) } catch { fail() }
+    try { socket!.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId } satisfies ClientFrame)) } catch { fail() }
   }
   function connect() {
     clearTimeout(retryTimer)
@@ -58,7 +60,15 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
       socket = new WebSocket(url.href)
     } catch { fail(); return }
     const current = socket
-    const open = () => { if (!stopped && socket === current) requestSnapshot() }
+    const open = () => {
+      if (stopped || socket !== current) return
+      if (state.sessionId) requestSnapshot()
+      else {
+        clearPreparation()
+        retryCount = 0
+        publish({ ...state, connection: 'ready', slow: false, error: null })
+      }
+    }
     const message = (event: MessageEvent) => {
       if (stopped || socket !== current) return
       let frame: unknown
@@ -66,6 +76,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
       if (record(frame)) {
         if (frame.type === 'models_changed') { onModelsChanged?.(); return }
         if (frame.type === 'workspaces_changed') { onWorkspacesChanged?.(); return }
+        if (frame.type === 'sessions_changed') { onSessionsChanged?.(); return }
         if (frame.type === 'web_settings_changed') { onWebSettingsChanged?.(); return }
       }
       const result = applyFrame(state, frame, subscriptionId)
@@ -105,11 +116,34 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     window.removeEventListener('online', online)
     releaseSocket()
   }
-  return Object.assign(stop, { requestSnapshot: () => {
-    if (stopped || socket?.readyState !== 1) return
-    prepare()
-    requestSnapshot()
-  } })
+  return Object.assign(stop, {
+    requestSnapshot: () => {
+      if (stopped || socket?.readyState !== 1 || !state.sessionId) return
+      prepare()
+      requestSnapshot()
+    },
+    setSession: (sessionId: string | null) => {
+      if (stopped || state.sessionId === sessionId) return
+      state = { ...state, sessionId, snapshot: null, slow: false, error: null }
+      if (socket?.readyState !== 1) {
+        publish(state)
+        return
+      }
+      if (sessionId) {
+        prepare()
+        requestSnapshot()
+      } else {
+        clearPreparation()
+        const previous = subscriptionId
+        subscriptionId = ''
+        if (previous) {
+          try { socket.send(JSON.stringify({ type: 'unsubscribe', subscriptionId: previous } satisfies ClientFrame)) }
+          catch { fail(); return }
+        }
+        publish({ ...state, connection: 'ready' })
+      }
+    },
+  })
 }
 
 
@@ -126,15 +160,25 @@ function modelDiscovery(value: unknown): value is ModelDiscovery {
 }
 
 function workspaceView(value: unknown): value is WorkspaceView {
-  return record(value) && (value.boundWorkspaceId === null || typeof value.boundWorkspaceId === 'string')
-    && Array.isArray(value.workspaces) && value.workspaces.every(workspace => record(workspace) && typeof workspace.id === 'string'
+  return record(value) && Array.isArray(value.workspaces) && value.workspaces.every(workspace => record(workspace) && typeof workspace.id === 'string'
       && typeof workspace.name === 'string' && typeof workspace.path === 'string' && typeof workspace.available === 'boolean')
 }
 
-type WorkspacePick = { cancelled: true } | { cancelled: false; view: WorkspaceView }
-
 function workspacePick(value: unknown): value is WorkspacePick {
-  return record(value) && (value.cancelled === true || (value.cancelled === false && workspaceView(value.view)))
+  return record(value) && (value.cancelled === true || (value.cancelled === false && typeof value.created === 'boolean'
+    && workspaceView(value.view) && value.view.workspaces.some(workspace => workspace.id === value.workspaceId)))
+}
+
+function sessionSummary(value: unknown): value is SessionSummary {
+  return record(value) && typeof value.id === 'string' && !!value.id.trim()
+    && typeof value.workspaceId === 'string' && !!value.workspaceId.trim()
+    && typeof value.name === 'string' && !!value.name.trim()
+    && typeof value.createdAt === 'string' && Number.isFinite(Date.parse(value.createdAt))
+}
+
+function sessionList(value: unknown): value is SessionList {
+  return record(value) && Array.isArray(value.sessions) && value.sessions.every(sessionSummary)
+    && new Set(value.sessions.map(item => item.id)).size === value.sessions.length
 }
 
 function webSettings(value: unknown): value is WebSettingsView {
@@ -169,6 +213,8 @@ export const deleteApiKey = () => requestView('/api/providers/deepseek', '模型
 export const getWorkspaces = () => requestView('/api/workspaces', '工作区', workspaceView)
 export const pickWorkspace = () => requestView('/api/workspaces/pick', '工作区选择', workspacePick, { method: 'POST' })
 
+export const getSessions = async () => (await requestView('/api/sessions', '会话列表', sessionList)).sessions
+
 export const getWebSettings = () => requestView('/api/web/settings', '网页工具设置', webSettings)
 export const saveWebSettings = (selection: Pick<WebSettingsView, 'searchProvider' | 'fetchProvider'>) =>
   requestView('/api/web/settings', '网页工具设置', webSettings, putJson(selection))
@@ -186,25 +232,47 @@ export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
   let value: unknown
   try { value = await response.json() } catch { value = null }
   if (!response.ok) throw new Error(record(value) && typeof value.error === 'string' ? value.error : '中止请求失败，请重新同步后重试')
-  if (response.status !== 200 || !record(value) || value.runId !== input.runId || typeof value.handled !== 'boolean') {
+  if (response.status !== 200 || !record(value) || value.sessionId !== input.sessionId || value.runId !== input.runId || typeof value.handled !== 'boolean') {
     throw new Error('中止回执无效，未确认中止')
   }
   return value as AbortResult
 }
 
-export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
+async function postSubmission(path: string, input: SubmitMessageRequest | StartSessionRequest, signal?: AbortSignal) {
   let response: Response
-  try { response = await fetch('/api/messages', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) }
+  try { response = await fetch(path, { ...putJson(input), method: 'POST', credentials: 'same-origin', cache: 'no-store', ...(signal && { signal }) }) }
   catch { throw new Error('网络请求失败，未确认接收') }
-  const rejected = response.status >= 400 && response.status < 500
   let value: unknown
   try { value = await response.json() } catch { value = null }
-  if (rejected) {
+  if (response.status >= 400 && response.status < 500) {
     const message = response.status === 401 ? '授权已失效，请重新打开启动链接' : response.status === 403 ? '访问来源不可信，请从启动链接进入'
       : record(value) && typeof value.error === 'string' ? value.error : response.status === 409 ? '正在生成，请等待回答结束' : `消息提交被拒绝（HTTP ${response.status}）`
     throw Object.assign(new Error(message), { status: response.status })
   }
-  if (response.status !== 202 || !record(value) || value.clientMessageId !== input.clientMessageId || (input.text.trim() === '/compact' ? value.kind !== 'compaction' || typeof value.compactionId !== 'string' || !value.compactionId : value.kind !== 'message' || typeof value.userMessageId !== 'string' || !value.userMessageId)
-    || !Number.isSafeInteger(value.acceptedSeq) || (value.acceptedSeq as number) < 0) throw new Error('提交回执无效，未确认接收')
-  return value as SubmitMessageAccepted
+  if (response.status !== 202) throw new Error('提交回执无效，未确认接收')
+  return value
+}
+
+function acceptedSubmission(value: unknown, sessionId: string, clientMessageId: string, kind: SubmitMessageAccepted['kind']): value is SubmitMessageAccepted {
+  return record(value) && value.sessionId === sessionId && value.clientMessageId === clientMessageId
+    && value.kind === kind && typeof value[kind === 'compaction' ? 'compactionId' : 'userMessageId'] === 'string'
+    && !!value[kind === 'compaction' ? 'compactionId' : 'userMessageId']
+    && Number.isSafeInteger(value.acceptedSeq) && (value.acceptedSeq as number) >= 0
+}
+
+export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
+  const value = await postSubmission('/api/messages', input)
+  if (!acceptedSubmission(value, input.sessionId, input.clientMessageId, input.text.trim() === '/compact' ? 'compaction' : 'message')) {
+    throw new Error('提交回执无效，未确认接收')
+  }
+  return value
+}
+
+export async function startSession(input: StartSessionRequest): Promise<StartSessionAccepted> {
+  const value = await postSubmission('/api/sessions/start', input, AbortSignal.timeout(10_000))
+  if (!record(value) || !sessionSummary(value.session) || value.session.id !== input.clientMessageId || value.session.workspaceId !== input.workspaceId
+    || !acceptedSubmission(value.accepted, value.session.id, input.clientMessageId, 'message')) {
+    throw new Error('首条消息回执无效，未确认接收')
+  }
+  return { session: value.session, accepted: value.accepted }
 }

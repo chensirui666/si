@@ -5,9 +5,8 @@ import { parseEnv } from 'node:util'
 import { WebSocket } from 'ws'
 import { expect, it } from 'vitest'
 import type { AssistantMessage, ToolResultMessage } from '@agent-learning/model'
-import type { ConversationMessage } from '@agent-learning/agent'
 import { WebServer } from '../src/webserver/index.js'
-import type { ServerFrame } from '../src/webserver/protocol.js'
+import type { ConversationMessage, ServerFrame, SessionSummary } from '../src/webserver/protocol.js'
 
 // Use a public IP so the host's synthetic DNS answers do not prevent this live extraction.
 const publicPage = 'https://1.1.1.1/'
@@ -65,7 +64,10 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
     if (needsTavily) await setKey('/api/web/providers/tavily', tavily!)
     const picked = await fetch(url + '/api/workspaces/pick', { method: 'POST', headers })
     expect(picked.status).toBe(200)
-    const { view: { boundWorkspaceId: workspaceId } } = await picked.json()
+    const { workspaceId } = await picked.json()
+    const created = await fetch(url + '/api/sessions', { method: 'POST', headers, body: JSON.stringify({ workspaceId }) })
+    expect(created.status).toBe(201)
+    const { id: sessionId } = await created.json() as SessionSummary
     const messages = new Map<string, ConversationMessage>()
     const subscribe = new WebSocket(url.replace('http:', 'ws:') + '/api/events', { headers })
     socket = subscribe
@@ -73,9 +75,10 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
     const listening = new Promise<void>(resolve => { ready = resolve })
     const finished = new Promise<void>(resolve => { finish = resolve })
     subscribe.on('error', () => {})
-    subscribe.once('open', () => subscribe.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'live-tools' })))
+    subscribe.once('open', () => subscribe.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'live-tools', sessionId })))
     subscribe.on('message', raw => {
       const frame = JSON.parse(String(raw)) as ServerFrame
+      if (!('sessionId' in frame) || frame.sessionId !== sessionId) return
       if (frame.type === 'snapshot') ready()
       if (frame.type !== 'update') return
       const { change } = frame.update
@@ -89,7 +92,7 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
     await Promise.race([listening, waitForTimeout(10_000)])
     const text = `本次验收 ${scenario.name} 工具。请直接调用 ${scenario.name} 一次，只调用这个工具，收到结果后直接回答。${scenario.prompt}`
     const accepted = await fetch(url + '/api/messages', {
-      method: 'POST', headers, body: JSON.stringify({ workspaceId, clientMessageId: 'live-tool', modelId: 'deepseek-flash', text }),
+      method: 'POST', headers, body: JSON.stringify({ sessionId, clientMessageId: 'live-tool', modelId: 'deepseek-flash', text }),
     })
     expect(accepted.status).toBe(202)
     await Promise.race([finished, waitForTimeout(180_000)])

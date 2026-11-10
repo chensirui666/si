@@ -1,23 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
-import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
+import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { initialState, mergeSubmissions, settleSubmission, type Subscribe, type Subscription } from '../chat/state'
 import type { LocalSubmission } from '../types'
+import { newSessionDraft, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend } from '../chat/drafts'
 
 type Props = {
   subscribe?: Subscribe
   getModels?: () => Promise<ModelDiscovery>
+  getSessions?: () => Promise<SessionSummary[]>
+  startSession?: (input: StartSessionRequest) => Promise<StartSessionAccepted>
+  pickWorkspace?: typeof chooseWorkspace
   getWorkspaces?: () => Promise<WorkspaceView>
   submitMessage?: (input: SubmitMessageRequest) => Promise<SubmitMessageAccepted>
   abortMessage?: (input: AbortRequest) => Promise<AbortResult>
 }
+
+type FirstSend = { input: StartSessionRequest; revision: number; sending: boolean }
 
 type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: string }
 
@@ -38,11 +44,10 @@ function useServerView<T>(load: () => Promise<T>) {
       if (request === version.current) apply(value)
     } catch (error) {
       if (request !== version.current) return
-      setView(null)
       setError(error instanceof Error ? error.message : '读取配置失败，请重试')
     }
   }, [apply, load])
-  return { view, error, apply, refresh, invalidate }
+  return { view, error, apply, refresh, invalidate, setView }
 }
 
 function FolderIcon({ add = false }: { add?: boolean }) {
@@ -51,15 +56,22 @@ function FolderIcon({ add = false }: { add?: boolean }) {
   </svg>
 }
 
-export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, submitMessage = postMessage, abortMessage = postAbort }: Props) {
+export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
   const [state, setState] = useState(initialState)
+  const { sessionId } = state
   const stateRef = useRef(state)
-  const [submissions, setSubmissions] = useState<LocalSubmission[]>([])
-  const submissionsRef = useRef(submissions)
+  const [allSubmissions, setSubmissions] = useState<LocalSubmission[]>([])
+  const submissionsRef = useRef(allSubmissions)
   const subscription = useRef<Subscription | null>(null)
-  const [abortState, setAbortState] = useState<AbortState | null>(null)
-  const abortRef = useRef(abortState)
-  const updateAbort = (next: AbortState | null) => { abortRef.current = next; setAbortState(next) }
+  const [aborts, setAborts] = useState(new Map<string, AbortState>())
+  const abortRef = useRef(aborts)
+  const updateAbort = useCallback((sessionId: string, next: AbortState | null) => {
+    const current = new Map(abortRef.current)
+    if (next) current.set(sessionId, next)
+    else current.delete(sessionId)
+    abortRef.current = current
+    setAborts(current)
+  }, [])
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>())
   const mounted = useRef(false)
   const [discovery, setDiscovery] = useState<ModelDiscovery | null>(null)
@@ -70,30 +82,121 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const requestVersion = useRef(0)
   const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces)
   const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings)
-  // undefined marks the first load, when an existing binding opens its conversation.
-  const [openedWorkspaceId, setOpenedWorkspaceId] = useState<string | null>()
+  const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions)
+  const selected = useRef<string | null>(null)
+  const initialized = useRef(false)
+  const navigation = useRef(0)
+  const opening = useRef(false)
+  const [sessionError, setSessionError] = useState<string | null>(null)
   const [picking, setPicking] = useState(false)
   const pickingRef = useRef(false)
+  const [draftWorkspaceId, setDraftWorkspaceId] = useState<string | null>(null)
+  const firstSend = useRef<FirstSend | null>(null)
+  const [firstPhase, setFirstPhase] = useState<'sending' | 'unconfirmed' | null>(null)
+  const [firstError, setFirstError] = useState<string | null>(null)
   const [pickError, setPickError] = useState<string | null>(null)
-  const boundWorkspace = workspaces?.workspaces.find(workspace => workspace.id === workspaces.boundWorkspaceId)
-  const selectedWorkspaceId = openedWorkspaceId === undefined ? workspaces?.boundWorkspaceId : openedWorkspaceId
-  const opened = !!boundWorkspace && selectedWorkspaceId === boundWorkspace.id
+  const { draft, storageUnavailable, load: loadDraft, save: saveDraft, restore: restoreDraft, read: readStorage, write: writeStorage, revision: draftRevision, clearSent: clearSentDraft } = useDrafts()
+  const session = sessions?.find(item => item.id === sessionId)
+  const workspace = workspaces?.workspaces.find(item => item.id === session?.workspaceId)
+  const pendingInput = firstSend.current?.input
+  const draftWorkspace = workspaces?.workspaces.find(item => item.id === (pendingInput?.workspaceId ?? draftWorkspaceId))
+  const isNew = sessionId === null
+  const submissions = allSubmissions.filter(item => item.sessionId === sessionId)
+
+  const openSession = useCallback((id: string | null, userAction = false) => {
+    initialized.current = true
+    if (userAction) navigation.current++
+    setSessionError(null)
+    if (selected.current === id) return
+    selected.current = id
+    opening.current = id !== null
+    loadDraft(id ?? newSessionDraft)
+    stateRef.current = { ...stateRef.current, sessionId: id, snapshot: null }
+    setState(stateRef.current)
+    subscription.current?.setSession(id)
+  }, [loadDraft])
 
   useEffect(() => {
-    if (workspaces) setOpenedWorkspaceId(previous => previous === undefined ? workspaces.boundWorkspaceId : previous)
-  }, [workspaces])
+    setDraftWorkspaceId(readStorage(recentWorkspaceKey) ?? null)
+    if (selected.current === null) loadDraft(newSessionDraft)
+    const pending = readFirstSend()
+    if (pending) {
+      firstSend.current = { input: pending, revision: draftRevision(newSessionDraft), sending: false }
+      setFirstPhase('unconfirmed')
+    }
+  }, [draftRevision, loadDraft, readStorage])
+
+  const saveCurrentDraft = useCallback((text: string) => {
+    if (sessionId === selected.current) saveDraft(sessionId ?? newSessionDraft, text)
+  }, [sessionId, saveDraft])
+
+  function chooseDraftWorkspace(id: string) {
+    navigation.current++
+    setDraftWorkspaceId(id)
+    writeStorage(recentWorkspaceKey, id)
+    setFirstError(null)
+  }
+
+  function openNewSession(workspaceId?: string) {
+    openSession(null, true)
+    if (workspaceId) chooseDraftWorkspace(workspaceId)
+  }
+
+  const finishFirstSend = useCallback((session: SessionSummary) => {
+    const pending = firstSend.current
+    if (!pending || pending.input.clientMessageId !== session.id || pending.input.workspaceId !== session.workspaceId) return
+    firstSend.current = null
+    writeFirstSend(null)
+    setFirstPhase(null)
+    setFirstError(null)
+    clearSentDraft(newSessionDraft, pending.input.text, pending.revision)
+    if (selected.current === null) openSession(session.id)
+  }, [clearSentDraft, openSession])
+
+  function attemptFirstSend(pending: FirstSend) {
+    if (pending.sending || stateRef.current.connection !== 'ready') return
+    const retrying = firstPhase === 'unconfirmed'
+    pending.sending = true
+    setFirstPhase('sending')
+    setFirstError(null)
+    void Promise.resolve().then(() => startSession(pending.input)).then(({ session: created }) => {
+      if (!mounted.current || firstSend.current !== pending) return
+      invalidateSessions()
+      setSessions(previous => previous?.some(item => item.id === created.id) ? previous : [...previous ?? [], created])
+      finishFirstSend(created)
+      void refreshSessions()
+    }, error => {
+      if (!mounted.current || firstSend.current !== pending) return
+      pending.sending = false
+      const status = error?.status
+      const authorizationRejected = status === 401 || status === 403
+      const rejected = typeof status === 'number' && status >= 400 && status < 500
+      if (rejected && !(retrying && authorizationRejected)) {
+        firstSend.current = null
+        writeFirstSend(null)
+        setFirstPhase(null)
+        setFirstError(error instanceof Error ? error.message : '首条消息被拒绝，请重试。')
+        void refreshWorkspaces()
+      } else {
+        setFirstPhase('unconfirmed')
+        if (authorizationRejected && error instanceof Error) setFirstError(error.message)
+        void refreshSessions()
+      }
+    })
+  }
 
   async function pickWorkspace() {
-    if (pickingRef.current || !workspaces || workspaces.workspaces.length) return
+    if (pickingRef.current || !workspaces) return
+    const request = navigation.current
     pickingRef.current = true
     setPicking(true)
     setPickError(null)
     try {
-      const result = await chooseWorkspace()
+      const result = await pickDirectory()
       if (!mounted.current || result.cancelled) return
-      setOpenedWorkspaceId(null)
       applyWorkspaces(result.view)
       void refreshWorkspaces()
+      if (selected.current === null && !firstSend.current && request === navigation.current) chooseDraftWorkspace(result.workspaceId)
     } catch (error) {
       if (mounted.current) setPickError(error instanceof Error ? error.message : '选择工作区失败，请重试')
     } finally {
@@ -103,8 +206,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   }
 
   const updateSubmissions = useCallback((next: LocalSubmission[]) => {
-    const merged = mergeSubmissions(stateRef.current.snapshot?.messages ?? [], next, stateRef.current.snapshot?.compactions)
-    const unresolved = merged.filter((item): item is LocalSubmission => 'state' in item)
+    const { sessionId, snapshot } = stateRef.current
+    const current = next.filter(item => item.sessionId === sessionId)
+    const merged = mergeSubmissions(snapshot?.messages ?? [], current, snapshot?.compactions)
+    const unresolved = [...next.filter(item => item.sessionId !== sessionId), ...merged.filter((item): item is LocalSubmission => 'state' in item)]
     submissionsRef.current = unresolved
     setSubmissions(unresolved)
   }, [])
@@ -140,40 +245,101 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     void refreshModels()
     void refreshWorkspaces()
     void refreshWebSettings()
-    let previousConnection = initialState.connection
+    void refreshSessions()
+    let needsRefresh = true
     const stop = subscribe(next => {
-      if (next.connection === 'ready' && previousConnection !== 'ready') {
+      if (next.sessionId !== selected.current) return
+      if (next.connection === 'disconnected' || next.connection === 'connecting') needsRefresh = true
+      if (next.connection === 'ready' && needsRefresh) {
+        needsRefresh = false
         void refreshModels()
         void refreshWorkspaces()
         void refreshWebSettings()
+        void refreshSessions()
       }
-      previousConnection = next.connection
+      if (next.connection === 'ready' && next.sessionId) {
+        if (next.snapshot) {
+          const pendingAbort = abortRef.current.get(next.sessionId)
+          if (pendingAbort && next.snapshot.running?.runId !== pendingAbort.runId) updateAbort(next.sessionId, null)
+          if (opening.current) {
+            opening.current = false
+            writeStorage(recentSessionKey, next.sessionId)
+          }
+        } else if (next.error) {
+          setSessionError(next.error)
+          void refreshSessions()
+        }
+      }
       stateRef.current = next
-      if (next.connection === 'ready' && next.snapshot && abortRef.current
-        && next.snapshot.running?.runId !== abortRef.current.runId) updateAbort(null)
       updateSubmissions(submissionsRef.current)
       setState(next)
-    }, refreshModels, refreshWorkspaces, refreshWebSettings)
+    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions)
     subscription.current = stop
+    stop.setSession(selected.current)
     return () => {
       mounted.current = false
       invalidateModels()
       invalidateWorkspaces()
       invalidateWebSettings()
+      invalidateSessions()
       stop()
       subscription.current = null
       for (const timer of timers.current) clearTimeout(timer)
       timers.current.clear()
     }
-  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, invalidateModels, invalidateWorkspaces, invalidateWebSettings, updateSubmissions])
+  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateSessions, updateSubmissions, updateAbort, writeStorage])
 
-  const canSubmit = () => opened && boundWorkspace.available && stateRef.current.connection === 'ready' && stateRef.current.snapshot !== null && stateRef.current.snapshot.running === null
-    && discoveryRef.current?.deepseek.state === 'configured' && discoveryRef.current.models.some(model => model.id === modelIdRef.current)
-    && !submissionsRef.current.some(local => local.state !== 'failed')
+  useEffect(() => {
+    if (!sessions) return
+    if (!initialized.current) {
+      initialized.current = true
+      const recent = readStorage(recentSessionKey)
+      if (!recent) return
+      if (sessions.some(item => item.id === recent)) {
+        openSession(recent)
+        return
+      }
+    } else if (!selected.current || sessions.some(item => item.id === selected.current)) return
+    openSession(null)
+    setSessionError('之前打开的会话已不可用，请选择或新建会话。')
+  }, [sessions, openSession, readStorage])
 
-  const send = (text: string, restoreDraft: () => void) => {
-    if (!text.trim() || !boundWorkspace || !canSubmit()) return false
-    const input: SubmitMessageRequest = { clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, workspaceId: boundWorkspace.id, text }
+  useEffect(() => {
+    const sent = sessions?.find(item => item.id === firstSend.current?.input.clientMessageId)
+    if (sent) finishFirstSend(sent)
+  }, [sessions, finishFirstSend])
+
+  const hasModel = () => discoveryRef.current?.deepseek.state === 'configured'
+    && discoveryRef.current.models.some(model => model.id === modelIdRef.current)
+  const canStart = () => selected.current === null && draftWorkspace?.available && !workspaceError && !pickingRef.current
+    && stateRef.current.connection === 'ready' && hasModel() && !firstSend.current
+  const canSubmit = () => !!sessionId && sessionId === selected.current && workspace?.available && !workspaceError && stateRef.current.sessionId === sessionId && stateRef.current.connection === 'ready' && stateRef.current.snapshot !== null && stateRef.current.snapshot.running === null
+    && hasModel()
+    && !submissionsRef.current.some(local => local.sessionId === sessionId && local.state !== 'failed')
+
+  const send = (text: string) => {
+    if (!text.trim()) return false
+    if (sessionId === null) {
+      if (!canStart() || !draftWorkspace) return false
+      if (text.trim() === '/compact') {
+        setFirstError('请先发送消息，有聊天记录后再压缩。')
+        return false
+      }
+      const pending = firstSend.current = {
+        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, text },
+        revision: draftRevision(newSessionDraft), sending: false,
+      }
+      writeFirstSend(pending.input)
+      attemptFirstSend(pending)
+      // Keep the text until the server accepts the first message.
+      return false
+    }
+    if (!canSubmit()) return false
+    const input: SubmitMessageRequest = { clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, sessionId, text }
+    const clearedRevision = draftRevision(sessionId) + 1
+    const syncTarget = () => {
+      if (selected.current === sessionId) subscription.current?.requestSnapshot?.()
+    }
     const local: LocalSubmission = { ...input, kind: text.trim() === '/compact' ? 'compaction' : 'message', state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
     // 同步写门禁，React 渲染前的第二次发送手势也会被拦住。
     const previous = submissionsRef.current
@@ -186,7 +352,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       timers.current.delete(timer)
       if (!mounted.current || !submissionsRef.current.some(item => item.clientMessageId === input.clientMessageId && item.state !== 'failed')) return
       updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: 'unconfirmed', errorMessage: '十秒内未确认接收，正在重新同步' }))
-      subscription.current?.requestSnapshot?.()
+      syncTarget()
     }, 10_000)
     timers.current.add(timer)
     void request.then(accepted => {
@@ -200,9 +366,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       if (!local || local.accepted) return
       updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: message }))
       if (rejected) {
-        restoreDraft()
+        restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId)
         void refreshWorkspaces()
-      } else subscription.current?.requestSnapshot?.()
+        if (error.status === 404) void refreshSessions()
+      } else syncTarget()
     }).finally(() => { clearTimeout(timer); timers.current.delete(timer) })
     return true
   }
@@ -210,45 +377,62 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions.filter(local => local.kind === 'message'))
   const waiting = submissions.some(local => local.state !== 'failed')
   const target = state.snapshot?.running?.runId
+  const abortState = sessionId ? aborts.get(sessionId) : undefined
   const activeAbort = abortState?.runId === target ? abortState : null
   const abortDisabled = !target || (activeAbort?.status === 'unconfirmed' && state.connection !== 'ready')
   const action = target || waiting ? activeAbort?.status === 'pending' ? 'aborting' : 'abort' : 'send'
   const abort = async (runId: string | undefined) => {
-    if (!runId || stateRef.current.snapshot?.running?.runId !== runId
-      || abortRef.current?.runId === runId && abortRef.current.status === 'pending') return
-    updateAbort({ runId, status: 'pending' })
+    if (!sessionId || !runId || stateRef.current.sessionId !== sessionId || stateRef.current.snapshot?.running?.runId !== runId) return
+    const previous = abortRef.current.get(sessionId)
+    if (previous?.runId === runId && previous.status === 'pending') return
+    updateAbort(sessionId, { runId, status: 'pending' })
     try {
-      await abortMessage({ runId })
-      if (!mounted.current || abortRef.current?.runId !== runId) return
-      subscription.current?.requestSnapshot?.()
+      await abortMessage({ sessionId, runId })
     } catch (error) {
-      if (!mounted.current || abortRef.current?.runId !== runId) return
-      updateAbort({ runId, status: 'unconfirmed', error: error instanceof Error ? error.message : '中止请求失败' })
-      subscription.current?.requestSnapshot?.()
+      if (!mounted.current || abortRef.current.get(sessionId)?.runId !== runId) return
+      updateAbort(sessionId, { runId, status: 'unconfirmed', error: error instanceof Error ? error.message : '中止请求失败' })
     }
+    if (mounted.current && selected.current === sessionId && abortRef.current.get(sessionId)?.runId === runId) subscription.current?.requestSnapshot?.()
   }
   const status = state.error ?? (state.slow ? '连接较慢，正在等待对话恢复…' : {
     connecting: '正在连接…', awaitingSnapshot: '正在恢复对话…',
-    ready: state.snapshot?.running?.phase === 'compaction' ? '正在压缩对话…' : state.snapshot?.running?.phase === 'tools' ? '正在执行工具…' : state.snapshot?.running ? '正在生成回答…' : waiting ? '正在确认消息接收…' : '对话已同步',
+    ready: !sessionId ? firstPhase === 'sending' ? '正在发送第一条消息…' : '新会话' : state.snapshot?.running?.phase === 'compaction' ? '正在压缩对话…' : state.snapshot?.running?.phase === 'tools' ? '正在执行工具…' : state.snapshot?.running ? '正在生成回答…' : waiting ? '正在确认消息接收…' : '对话已同步',
     disconnected: '连接已断开，正在重试…',
   }[state.connection])
+
+  const modelSelect = <select id="chat-model" aria-label="模型" value={isNew ? pendingInput?.modelId ?? modelId : modelId} onChange={event => { modelIdRef.current = event.target.value; setModelId(event.target.value) }} disabled={!discovery?.models.length || (isNew && firstPhase !== null)}>
+    {discovery?.models.length ? discovery.models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)
+      : <option value="">{modelError ? '模型查询失败' : discovery ? '无可用模型' : '正在查询模型…'}</option>}
+  </select>
 
   return (
     <div className="chat-layout">
       <aside className="chat-sidebar" aria-label="侧栏">
-        <div className="sidebar-title">Agent</div>
+        <div className="sidebar-title">SI</div>
+        <Button className="sidebar-new-session" variant="outline" aria-label="新会话" onClick={() => openNewSession()}>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+          <span>新会话</span>
+        </Button>
         <nav className="sidebar-workspaces" aria-label="工作区">
           <div className="sidebar-workspaces-heading">
             <span>工作区</span>
-            <Button variant="ghost" size="icon-sm" aria-label="添加工作区" title="添加工作区" disabled={picking || !workspaces || workspaces.workspaces.length > 0} onClick={() => { void pickWorkspace() }}>
+            <Button variant="ghost" size="icon-sm" aria-label="添加工作区" title="添加工作区" disabled={picking || !workspaces} onClick={() => { void pickWorkspace() }}>
               <FolderIcon add />
             </Button>
           </div>
-          {workspaces?.workspaces.map(workspace => <div className="sidebar-workspace" key={workspace.id}>
-            <div className="workspace-row" data-bound={workspace.id === boundWorkspace?.id} title={workspace.path}><FolderIcon /><span>{workspace.name}</span></div>
-            {workspace.id === boundWorkspace?.id && <Button className="workspace-conversation" variant={opened ? 'secondary' : 'ghost'} aria-current={opened ? 'page' : undefined} onClick={() => setOpenedWorkspaceId(workspace.id)}>当前对话</Button>}
+          {workspaces?.workspaces.map(group => <div className="sidebar-workspace" key={group.id} role="group" aria-label={group.name}>
+            <div className="workspace-row" data-bound={group.id === workspace?.id}>
+              <FolderIcon /><span title={group.path}>{group.name}</span>
+              <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label="新建会话" title={group.available ? '新建会话' : '工作区目录不可用'} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+              </Button>
+            </div>
+            {isNew && group.id === draftWorkspace?.id && <Button className="workspace-conversation" variant="secondary" aria-label="未发送的新会话" aria-current="page" onClick={() => openNewSession()}>新会话</Button>}
+            {sessions?.filter(item => item.workspaceId === group.id).map(item => <Button key={item.id} className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>{item.name}</Button>)}
           </div>)}
           {(workspaceError || pickError) && <p className="configuration-error" role="alert">{workspaceError ?? pickError}</p>}
+          {(sessionError || listError) && <p className="configuration-error" role="alert">{sessionError ?? listError}</p>}
+          {listError && <Button variant="ghost" onClick={() => { void refreshSessions() }}>重新读取会话</Button>}
         </nav>
         <SettingsDialog discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
           if (!mounted.current) return
@@ -257,33 +441,50 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         }} />
       </aside>
       <div className="chat-workspace">
-      <div className="chat-page" data-connection={state.connection}>
-      <header className="chat-header">
+      <div className="chat-page" data-new-session={isNew || undefined} data-connection={state.connection} data-session-id={sessionId ?? undefined}>
+      {!isNew && <header className="chat-header">
         <h1>聊天</h1>
         <p className="connection-status" role="status">{status}</p>
-      </header>
+      </header>}
       <main className="chat-main">
-        <MessageList messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} />
+        {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} />}
         <div className="composer-stack">
-          <div className="model-toolbar">
+          {isNew ? <>
+            <h1 className="new-session-title">SI</h1>
+            <div className="new-session-workspace">
+              <FolderIcon />
+              <select aria-label="工作区" value={draftWorkspace?.id ?? ''} disabled={picking || !workspaces || firstPhase !== null} onChange={event => {
+                if (event.target.value === 'add-workspace') void pickWorkspace()
+                else chooseDraftWorkspace(event.target.value)
+              }}>
+                <option value="" disabled>选择工作区</option>
+                {workspaces?.workspaces.map(item => <option key={item.id} value={item.id} disabled={!item.available}>{item.name}</option>)}
+                <option value="add-workspace">添加工作区…</option>
+              </select>
+            </div>
+          </> : <div className="model-toolbar">
             <label htmlFor="chat-model">模型</label>
-            <select id="chat-model" value={modelId} onChange={event => { modelIdRef.current = event.target.value; setModelId(event.target.value) }} disabled={!discovery?.models.length}>
-              {discovery?.models.length ? discovery.models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)
-                : <option value="">{modelError ? '模型查询失败' : discovery ? '无可用模型' : '正在查询模型…'}</option>}
-            </select>
-            <span className="workspace-path" title={boundWorkspace?.path}>
-              {boundWorkspace && <FolderIcon />}
-              {boundWorkspace ? <>
-                <span className="workspace-path-full">{boundWorkspace.path}</span>
-                <span className="workspace-path-name">{boundWorkspace.name}</span>
-              </> : <span>{workspaces ? '请先添加工作区' : workspaceError ? '工作区读取失败' : '正在读取工作区…'}</span>}
+            {modelSelect}
+            <span className="workspace-path" title={workspace?.path}>
+              {workspace && <FolderIcon />}
+              {workspace ? <>
+                <span className="workspace-path-full">{workspace.path}</span>
+                <span className="workspace-path-name">{workspace.name}</span>
+              </> : <span>{workspaces ? (workspaces.workspaces.length ? '请选择或新建会话' : '请先添加工作区') : workspaceError ? '工作区读取失败' : '正在读取工作区…'}</span>}
             </span>
-          </div>
-          {boundWorkspace && !boundWorkspace.available && <p className="model-error configuration-error" role="alert">工作区目录不可用</p>}
+          </div>}
+          {isNew && <p className={state.connection === 'ready' && firstPhase !== 'sending' ? 'sr-only' : 'connection-status new-session-status'} role="status">{status}</p>}
+          {isNew && firstError && <p className="configuration-error" role="alert">{firstError}</p>}
+          {isNew && firstPhase === 'unconfirmed' && <div className="new-session-retry">
+            <p className="configuration-error" role="alert">首条消息未确认接收，草稿已保留。</p>
+            <Button variant="outline" disabled={state.connection !== 'ready'} onClick={() => { if (firstSend.current) attemptFirstSend(firstSend.current) }}>重试首次发送</Button>
+          </div>}
+          {(isNew ? draftWorkspace && !draftWorkspace.available : workspace && !workspace.available) && <p className="model-error configuration-error" role="alert">工作区目录不可用</p>}
           {(modelError || discovery?.deepseek.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (discovery?.deepseek.state === 'error' ? discovery.deepseek.message : '')}</p>}
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
+          {storageUnavailable && <p className="configuration-error" role="alert">浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。</p>}
           <CompactionRecords records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
-          <MessageInput contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} onSend={send} sendDisabled={!canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
+          <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={isNew ? modelSelect : undefined} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
       </div>

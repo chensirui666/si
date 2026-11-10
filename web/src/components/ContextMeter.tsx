@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import type { ContextUsage } from '@agent-learning/agent'
+import type { ContextUsage } from '@agent-learning/server/protocol'
 
 export function ContextMeter({ usage }: { usage?: ContextUsage | null }) {
   if (usage?.tokens === undefined || !Number.isFinite(usage.tokens) || usage.tokens < 0

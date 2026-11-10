@@ -35,7 +35,7 @@ for (const method of ['逐字输入', '粘贴'] as const) {
 test('发送成功后隔离撤销历史', async ({ mount }) => {
   const component = await mount(<MessageInputHarness />)
   const textbox = component.getByRole('textbox', { name: '消息' })
-  await textbox.pressSequentially('待发送内容')
+  await textbox.fill('待发送内容')
 
   await textbox.press('ControlOrMeta+z')
   await expect(textbox).toHaveText('')
@@ -47,7 +47,7 @@ test('发送成功后隔离撤销历史', async ({ mount }) => {
 
   await textbox.press('ControlOrMeta+z')
   await expect(textbox).toHaveText('')
-  await textbox.pressSequentially('新的草稿')
+  await textbox.fill('新的草稿')
   await textbox.press('ControlOrMeta+z')
   await expect(textbox).toHaveText('')
   await expect(component.getByLabel('已提交原文')).toHaveText('["待发送内容"]')

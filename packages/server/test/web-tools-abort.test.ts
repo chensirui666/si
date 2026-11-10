@@ -7,9 +7,9 @@ import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { Credentials } from '@agent-learning/credentials'
 import { createTavilyProvider } from '../src/web-providers.js'
-import { createTools } from '../src/tools.js'
-import { createWebTools } from '../src/web-tools.js'
-import { ToolRuntime } from '../src/tool-runtime.js'
+import { createTools } from '../../coding-agent/src/tools.js'
+import { createWebTools } from '../../coding-agent/src/web-tools.js'
+import { ToolRuntime } from '../../coding-agent/src/tool-runtime.js'
 
 vi.mock('node:dns/promises', async original => {
   const dns = await original<typeof import('node:dns/promises')>()
@@ -37,9 +37,9 @@ it.each(['search', 'fetch'] as const)('Tavily %s cancellation closes a real loca
     const provider = createTavilyProvider(credentials, (_url, init) => fetch(`http://127.0.0.1:${address.port}`, init))
     const tools = createWebTools({ provider: async () => provider }, { saveTemporary: async () => { throw new Error('unused') } })
     const controller = new AbortController()
-    const context = { cwd, signal: controller.signal }
+    const context = { signal: controller.signal, recordDetails: () => {} }
     const runtime = new ToolRuntime()
-    const tool = createTools(runtime, tools).find(tool => tool.name === `web_${capability}`)!
+    const tool = createTools(runtime, tools, tmpdir()).find(tool => tool.name === `web_${capability}`)!
     const output = tool.execute(capability === 'search' ? { query: 'test' } : { urls: ['https://8.8.8.8/'] }, context).finally(() => runtime.close())
     const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted' })
     await entered.promise
@@ -59,7 +59,7 @@ it('web_fetch cancels DNS waiting without starting a provider request or retaini
   const provider = vi.fn()
   const controller = new AbortController()
   const tools = createWebTools({ provider }, { saveTemporary: vi.fn() })
-  const output = tools.web_fetch({ urls: ['https://example.com/'] }, { cwd: tmpdir(), signal: controller.signal })
+  const output = tools.web_fetch({ urls: ['https://example.com/'] }, { signal: controller.signal })
   const rejected = expect(output).rejects.toThrow()
   await entered.promise
   controller.abort()
@@ -79,7 +79,7 @@ it('web_fetch waits for an already-started real cache write before returning', a
     saveTemporary: async text => { entered.resolve(); await release.promise; path = await runtime.saveTemporary(text); return path },
   })
   try {
-    const output = tools.web_fetch({ urls: ['https://8.8.8.8/'] }, { cwd: tmpdir(), signal: controller.signal })
+    const output = tools.web_fetch({ urls: ['https://8.8.8.8/'] }, { signal: controller.signal })
     void output.then(() => { settled = true })
     await entered.promise
     controller.abort()
@@ -98,7 +98,7 @@ it.each(['search', 'fetch'] as const)('普通 %s 网络失败不被同时到达�
   const tools = createWebTools({ provider: async () => ({ id: 'test', name: 'Test', search: failure, fetch: failure }) }, { saveTemporary: vi.fn() })
   const runtime = new ToolRuntime()
   try {
-    const tool = createTools(runtime, tools).find(tool => tool.name === `web_${capability}`)!
-    await expect(tool.execute(capability === 'search' ? { query: 'test' } : { urls: ['https://8.8.8.8/'] }, { cwd: tmpdir(), signal: controller.signal })).rejects.toMatchObject({ message: expect.stringContaining('网络原始失败') })
+    const tool = createTools(runtime, tools, tmpdir()).find(tool => tool.name === `web_${capability}`)!
+    await expect(tool.execute(capability === 'search' ? { query: 'test' } : { urls: ['https://8.8.8.8/'] }, { signal: controller.signal, recordDetails: () => {} })).rejects.toMatchObject({ message: expect.stringContaining('网络原始失败') })
   } finally { await runtime.close() }
 })

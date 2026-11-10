@@ -1,9 +1,19 @@
 import { lookup } from 'node:dns/promises'
 import { BlockList, isIP } from 'node:net'
 import { addAbortListener } from 'node:events'
-import type { WebSettings } from './web-settings.js'
 import type { ToolRuntime } from './tool-runtime.js'
-import type { ExecutableTool } from '@agent-learning/agent'
+import type { JsonObject } from '@agent-learning/model'
+
+export type WebSearchHit = { title: string; url: string; description: string }
+export type WebFetchPage = { url: string; title?: string } & ({ content: string; error?: never } | { content?: never; error: string })
+export type WebProvider = {
+  id: string
+  name: string
+  search?(query: string, limit: number, signal: AbortSignal): Promise<WebSearchHit[]>
+  fetch?(urls: string[], signal: AbortSignal): Promise<WebFetchPage[]>
+}
+
+export type WebTools = Record<'web_search' | 'web_fetch', (args: JsonObject, context: { signal: AbortSignal }) => Promise<string>>
 
 const nonPublic = new BlockList()
 for (const [network, bits] of [
@@ -56,10 +66,10 @@ function safeTail(text: string, size: number) {
   return text.slice(first >= 0xdc00 && first <= 0xdfff ? start + 1 : start)
 }
 
-export function createWebTools(settings: Pick<WebSettings, 'provider'>, runtime: Pick<ToolRuntime, 'saveTemporary'>): {
-  web_search: ExecutableTool['execute']
-  web_fetch: ExecutableTool['execute']
-} {
+export function createWebTools(
+  settings: { provider(capability: 'search' | 'fetch'): Promise<WebProvider> },
+  runtime: Pick<ToolRuntime, 'saveTemporary'>,
+): WebTools {
   return {
     async web_search(args, { signal }) {
       const { query, limit = 5 } = args
@@ -94,7 +104,7 @@ export function createWebTools(settings: Pick<WebSettings, 'provider'>, runtime:
         }
       }))
       const eligible = [...new Set(entries.filter(entry => !entry.error).map(entry => entry.url))]
-      const pages = new Map<string, import('./web-providers.js').WebFetchPage>()
+      const pages = new Map<string, WebFetchPage>()
       let requestError = ''
       if (eligible.length) {
         try {

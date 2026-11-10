@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { mergeSubmissions, settleSubmission } from './state'
 import type { LocalSubmission } from '../types'
 
-const local: LocalSubmission = { kind: 'message', clientMessageId: 'local', modelId: 'deepseek-flash', text: '  原文\n', state: 'pending' }
-const accepted = { kind: 'message' as const, clientMessageId: 'local', userMessageId: 'user', acceptedSeq: 4 }
+const local: LocalSubmission = { sessionId: 'session-a', kind: 'message', clientMessageId: 'local', modelId: 'deepseek-flash', text: '  原文\n', state: 'pending' }
+const accepted = { sessionId: 'session-a', kind: 'message' as const, clientMessageId: 'local', userMessageId: 'user', acceptedSeq: 4 }
 const user = { id: 'user', clientMessageId: 'local', message: { role: 'user' as const, content: local.text, timestamp: 1 } }
 
 describe('提交接收证据', () => {
@@ -39,7 +39,7 @@ it('没有正式锚点或重启后锚点消失时，本地失败仍可见并保�
 
 it('压缩仅以对应操作记录确认接收，HTTP 回执与空快照均不凭空消除未决状态', () => {
   const command: LocalSubmission = { ...local, kind: 'compaction', text: '/compact' }
-  const receipt = { kind: 'compaction' as const, clientMessageId: 'local', compactionId: 'c1', acceptedSeq: 2 }
+  const receipt = { sessionId: 'session-a', kind: 'compaction' as const, clientMessageId: 'local', compactionId: 'c1', acceptedSeq: 2 }
   const pending = settleSubmission([command], 'local', { accepted: receipt })
   expect(mergeSubmissions([], pending, [])).toEqual(pending)
   const record = { id: 'c1', trigger: 'manual' as const, status: 'running' as const, clientMessageId: 'local', startedAt: 1 }

@@ -3,11 +3,10 @@ import { addAbortListener } from 'node:events'
 import { homedir } from 'node:os'
 import { basename, dirname, relative, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
-import type { ExecutableTool } from '@agent-learning/agent'
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type ToolRuntime } from './tool-runtime.js'
 import type { BashParams, EditParams, FindParams, GrepParams, ReadParams, WriteParams } from './tools.js'
 
-type Context = Parameters<ExecutableTool['execute']>[1]
+export type LocalToolContext = { cwd: string; signal: AbortSignal; recordFileOperation?: (path: string) => void }
 
 function nonEmpty(value: string, name: string): string {
   if (!value.trim()) throw new Error(`${name} 不能为空`)
@@ -76,7 +75,7 @@ class OutputLines {
   }
 }
 
-async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: Context) {
+async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: LocalToolContext) {
   const start = integer(offset, 'offset') - 1
   const count = limit === undefined ? Infinity : integer(limit, 'limit')
   const target = pathFrom(cwd, path)
@@ -101,7 +100,7 @@ async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, reco
   return content
 }
 
-async function write({ path, content }: WriteParams, { cwd, signal, recordFileOperation }: Context) {
+async function write({ path, content }: WriteParams, { cwd, signal, recordFileOperation }: LocalToolContext) {
   const target = pathFrom(cwd, path)
   signal.throwIfAborted()
   await mkdir(dirname(target), { recursive: true })
@@ -143,7 +142,7 @@ function withoutTrailingSpaces(text: string) {
   return { text: pieces.join('\n'), positions }
 }
 
-async function edit({ path, edits }: EditParams, { cwd, signal, recordFileOperation }: Context) {
+async function edit({ path, edits }: EditParams, { cwd, signal, recordFileOperation }: LocalToolContext) {
   const target = pathFrom(cwd, path)
   if (!edits.length || edits.some(({ oldText }) => !oldText.length)) throw new Error('edits 至少需要一项，且 oldText 不能为空')
   const original = await readText(target, signal, true)
@@ -190,7 +189,7 @@ async function edit({ path, edits }: EditParams, { cwd, signal, recordFileOperat
   return `已在 ${target} 完成 ${edits.length} 处替换`
 }
 
-function bash(runtime: ToolRuntime, { command, timeout }: BashParams, { cwd, signal }: Context) {
+function bash(runtime: ToolRuntime, { command, timeout }: BashParams, { cwd, signal }: LocalToolContext) {
   nonEmpty(command, 'command')
   if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) throw new Error('timeout 必须是正数')
   return runtime.bash(command, cwd, signal, timeout)
@@ -215,7 +214,7 @@ async function insideGit(directory: string): Promise<boolean> {
   }
 }
 
-async function find(runtime: ToolRuntime, { pattern, path = '.', limit = 1000 }: FindParams, { cwd, signal }: Context) {
+async function find(runtime: ToolRuntime, { pattern, path = '.', limit = 1000 }: FindParams, { cwd, signal }: LocalToolContext) {
   nonEmpty(pattern, 'pattern')
   integer(limit, 'limit')
   const directory = pathFrom(cwd, path)
@@ -261,7 +260,7 @@ function rgText(value: RgValue) {
   return value.text ?? Buffer.from(value.bytes ?? '', 'base64').toString('utf8')
 }
 
-async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: Context) {
+async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: LocalToolContext) {
   const { pattern, path = '.', glob, ignoreCase, literal, context = 0, limit = 100 } = params
   nonEmpty(pattern, 'pattern')
   integer(context, 'context', 0)
@@ -364,8 +363,8 @@ export function createLocalTools(runtime: ToolRuntime) {
     read,
     write,
     edit,
-    bash: (params: BashParams, context: Context) => bash(runtime, params, context),
-    find: (params: FindParams, context: Context) => find(runtime, params, context),
-    grep: (params: GrepParams, context: Context) => grep(runtime, params, context),
+    bash: (params: BashParams, context: LocalToolContext) => bash(runtime, params, context),
+    find: (params: FindParams, context: LocalToolContext) => find(runtime, params, context),
+    grep: (params: GrepParams, context: LocalToolContext) => grep(runtime, params, context),
   }
 }

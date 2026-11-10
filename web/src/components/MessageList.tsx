@@ -1,4 +1,4 @@
-import type { ActiveContent, ConversationMessage, RunningState } from '@agent-learning/agent'
+import type { ActiveContent, ConversationMessage, RunningState } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
 

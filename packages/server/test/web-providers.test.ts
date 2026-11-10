@@ -4,9 +4,9 @@ import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { Credentials } from '@agent-learning/credentials'
 import { createTavilyProvider } from '../src/web-providers.js'
-import { createWebTools } from '../src/web-tools.js'
+import { createWebTools } from '../../coding-agent/src/web-tools.js'
 import { WebSettings } from '../src/web-settings.js'
-import { ToolRuntime } from '../src/tool-runtime.js'
+import { ToolRuntime } from '../../coding-agent/src/tool-runtime.js'
 
 const roots: string[] = []
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }) })

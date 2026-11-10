@@ -5,7 +5,7 @@ import { createServer } from 'node:net'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { ConversationSnapshot, ConversationUpdate } from '@agent-learning/agent'
+import type { ConversationSnapshot, ConversationUpdate, SessionSummary, WorkspacePick } from '@agent-learning/server/protocol'
 import { expect, type Page } from '@playwright/test'
 import { WebSocket } from 'ws'
 
@@ -32,7 +32,7 @@ export async function stop(child: ChildProcess | undefined, signal: NodeJS.Signa
   try { await exited } finally { clearTimeout(deadline) }
 }
 
-export function waitForStart(child: ChildProcess): Promise<Started> {
+function waitForStart(child: ChildProcess): Promise<Started> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => fail(), 10_000)
     const cleanup = () => {
@@ -105,8 +105,8 @@ export function wsStatus(url: string, headers: Record<string, string> = {}): Pro
 }
 
 export function observe(page: Page) {
-  const snapshots: { subscriptionId: string; snapshot: ConversationSnapshot }[] = []
-  const updates: { subscriptionId: string; update: ConversationUpdate }[] = []
+  const snapshots: { subscriptionId: string; sessionId: string; snapshot: ConversationSnapshot }[] = []
+  const updates: { subscriptionId: string; sessionId: string; update: ConversationUpdate }[] = []
   let closed = 0
   const submissions: string[] = []
   page.on('request', req => { if (new URL(req.url()).pathname === '/api/messages') submissions.push(req.method()) })
@@ -116,8 +116,8 @@ export function observe(page: Page) {
     socket.on('framereceived', ({ payload }) => {
       try {
         const frame = JSON.parse(String(payload))
-        if (frame.type === 'snapshot') snapshots.push({ subscriptionId: frame.subscriptionId, snapshot: frame.snapshot })
-        if (frame.type === 'update') updates.push({ subscriptionId: frame.subscriptionId, update: frame.update })
+        if (frame.type === 'snapshot') snapshots.push({ subscriptionId: frame.subscriptionId, sessionId: frame.sessionId, snapshot: frame.snapshot })
+        if (frame.type === 'update') updates.push({ subscriptionId: frame.subscriptionId, sessionId: frame.sessionId, update: frame.update })
       } catch { /* 非 JSON 帧由真实网页处理。 */ }
     })
   })
@@ -155,6 +155,39 @@ export async function authorize(page: Page, url: string) {
 }
 
 export async function addWorkspace(page: Page) {
+  const picked = page.waitForResponse(response => new URL(response.url()).pathname === '/api/workspaces/pick')
   await page.getByRole('button', { name: '添加工作区', exact: true }).click()
-  await page.getByRole('button', { name: '当前对话', exact: true }).click()
+  const result: WorkspacePick = await (await picked).json()
+  if (result.cancelled) throw new Error('测试工作区未选中')
+  return result.workspaceId
+}
+
+export async function seedSession(page: Page, observed: ReturnType<typeof observe>, workspaceId: string) {
+  const url = new URL('/api/sessions', page.url())
+  const response = await page.request.post(url.href, { data: { workspaceId }, headers: { Origin: url.origin } })
+  expect(response.status()).toBe(201)
+  const session: SessionSummary = await response.json()
+  const opened = await openSession(page, observed, session.name)
+  expect(opened.sessionId).toBe(session.id)
+  expect(opened.snapshot).toEqual(emptySnapshot)
+  return session.id
+}
+
+export async function openSession(page: Page, observed: ReturnType<typeof observe>, name: string) {
+  const before = observed.snapshots.length
+  await page.getByRole('button', { name, exact: true }).click()
+  await ready(page, observed, before, false)
+  return observed.snapshots.at(-1)!
+}
+
+export async function expectBrowserStorage(page: Page, recent: string, workspaceId: string, drafts: Record<string, string> = {}) {
+  const expected = Object.fromEntries(Object.entries(drafts).map(([id, text]) => [`agent-learning:draft:${id}`, text]))
+  expected['agent-learning:recent-session'] = recent
+  expected['agent-learning:recent-workspace'] = workspaceId
+  await expect.poll(() => page.evaluate(expected => {
+    const keys = Object.keys(localStorage)
+    return keys.length === Object.keys(expected).length
+      && keys.every(key => localStorage.getItem(key) === expected[key])
+      && sessionStorage.length === 0
+  }, expected), { message: '浏览器仅保存会话选择和草稿' }).toBe(true)
 }

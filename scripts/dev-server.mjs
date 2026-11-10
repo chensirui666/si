@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
-const packages = ['credentials', 'model', 'agent', 'server'].map(name => `packages/${name}`)
+const packages = ['credentials', 'model', 'agent', 'coding-agent', 'server'].map(name => `packages/${name}`)
 const children = [
   spawn(process.execPath, [require.resolve('typescript/bin/tsc'), '-b', '--watch', '--preserveWatchOutput', ...packages], { stdio: 'inherit' }),
   spawn(process.execPath, ['--watch', ...packages.map(path => `--watch-path=${path}/dist`), 'packages/server/dist/main.js', '--dev'], { stdio: 'inherit' }),

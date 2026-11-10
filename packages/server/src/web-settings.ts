@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { readCredentialFile, withCredentialFileLock, writeCredentialFile, type Credentials, type CredentialStatus } from '@agent-learning/credentials'
-import type { WebProvider } from './web-providers.js'
+import type { WebProvider } from '@agent-learning/coding-agent'
 
 type WebSelection = { searchProvider: string; fetchProvider: string }
 type Capability = 'search' | 'fetch'

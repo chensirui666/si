@@ -1,4 +1,4 @@
-import type { ConversationMessage } from '@agent-learning/agent'
+import type { ConversationMessage } from '@agent-learning/server/protocol'
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import type { AssistantMessage as Message } from '@agent-learning/model'

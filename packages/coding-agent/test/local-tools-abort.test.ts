@@ -88,8 +88,8 @@ it('T1.1 正式 read 工具返回明确的中止码，晚到文件结果不会�
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   vi.mocked(fs.readFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return Buffer.from('项目名称：青禾') })
   const controller = new AbortController()
-  const read = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }).find(tool => tool.name === 'read')!
-  const output = read.execute({ path: 'note.txt' }, { cwd, signal: controller.signal })
+  const read = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, cwd).find(tool => tool.name === 'read')!
+  const output = read.execute({ path: 'note.txt' }, { signal: controller.signal, recordDetails: () => {} })
   const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted' })
   await entered.promise
   controller.abort()

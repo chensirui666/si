@@ -1,13 +1,6 @@
 import type { Credentials } from '@agent-learning/credentials'
 
-export type WebSearchHit = { title: string; url: string; description: string }
-export type WebFetchPage = { url: string; title?: string } & ({ content: string; error?: never } | { content?: never; error: string })
-export type WebProvider = {
-  id: string
-  name: string
-  search?(query: string, limit: number, signal: AbortSignal): Promise<WebSearchHit[]>
-  fetch?(urls: string[], signal: AbortSignal): Promise<WebFetchPage[]>
-}
+import type { WebFetchPage, WebProvider } from '@agent-learning/coding-agent'
 
 function object(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {}

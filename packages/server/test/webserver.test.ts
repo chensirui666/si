@@ -5,10 +5,10 @@ import { join } from 'node:path'
 import { request } from 'node:http'
 import { connect as connectTcp } from 'node:net'
 import { once } from 'node:events'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
-import { Agent, type AgentSubscriptionEvent, type ConversationSnapshot } from '@agent-learning/agent'
+import { AgentSession, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
 import { createModelStream } from '@agent-learning/model'
 
 const cleanups: (() => Promise<unknown>)[] = []
@@ -72,18 +72,20 @@ const empty = { seq: 0, messages: [], running: null, activeContent: [], compacti
 describe('主动中止入口', () => {
   it('沿用来源、授权和 JSON 校验；无效请求不交付 Agent', async () => {
     const abort = vi.fn(async () => true)
-    const app = await setup({ agent: { ...controlledAgent(), abort } })
+    const app = await setup({ createSession: () => ({ ...controlledAgent(), abort }) })
     const auth = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, auth)
     const url = app.url + '/api/abort'
     const headers = { Cookie: auth, 'Content-Type': 'application/json' }
-    const body = JSON.stringify({ runId: 'user-1' })
+    const body = JSON.stringify({ sessionId, runId: 'user-1' })
     expect((await http(url, { 'Content-Type': 'application/json' }, 'POST', body)).status).toBe(401)
     for (const invalid of [{ Origin: 'https://evil.example' }, { Host: 'evil.example' }]) {
       expect((await http(url, { ...headers, ...invalid }, 'POST', body)).status).toBe(403)
     }
     expect((await http(url, { Cookie: auth }, 'POST', body)).status).toBe(415)
     expect((await http(url, headers, 'POST', 'x'.repeat(65537))).status).toBe(413)
-    for (const value of ['{', 'null', '[]', '{}', '{"runId":0}', '{"runId":" "}', JSON.stringify({ runId: 'x'.repeat(129) }), '{"runId":"u","extra":true}']) {
+    const malformed = [{ runId: 0 }, { runId: ' ' }, { runId: 'x'.repeat(129) }, { runId: 'u', extra: true }, { runId: 'u', sessionId: ' ' }]
+    for (const value of ['{', 'null', '[]', '{}', ...malformed.map(input => JSON.stringify({ sessionId, ...input }))]) {
       expect((await http(url, headers, 'POST', value)).status).toBe(400)
     }
     expect(abort).not.toHaveBeenCalled()
@@ -92,24 +94,28 @@ describe('主动中止入口', () => {
   it.each([true, false])('等待指定运行收尾后返回同一目标和 handled=%s，无需模型或目录可用', async handled => {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
     const abort = vi.fn(async () => { entered.resolve(); await release.promise; return handled })
-    const app = await setup({ agent: { ...controlledAgent(), abort } })
-    const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+    const app = await setup({ createSession: () => ({ ...controlledAgent(), abort }) })
+    const auth = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, auth)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
     let returned = false
-    const pending = http(app.url + '/api/abort', headers, 'POST', '{"runId":"old-user"}').then(value => { returned = true; return value })
+    const pending = http(app.url + '/api/abort', headers, 'POST', JSON.stringify({ sessionId, runId: 'old-user' })).then(value => { returned = true; return value })
     await entered.promise
     expect(returned).toBe(false)
     expect(abort).toHaveBeenCalledExactlyOnceWith('old-user')
     release.resolve()
     const result = await pending
     expect(result.status).toBe(200)
-    expect(JSON.parse(result.text)).toEqual({ runId: 'old-user', handled })
+    expect(JSON.parse(result.text)).toEqual({ sessionId, runId: 'old-user', handled })
   })
 
   it('未装配中止返回 503，内部错误脱敏', async () => {
     const agent = { ...controlledAgent(), abort: undefined as undefined | (() => Promise<boolean>) }
-    const app = await setup({ agent })
-    const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
-    const send = () => http(app.url + '/api/abort', headers, 'POST', '{"runId":"user-1"}')
+    const app = await setup({ createSession: () => agent })
+    const auth = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, auth)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const send = () => http(app.url + '/api/abort', headers, 'POST', JSON.stringify({ sessionId, runId: 'user-1' }))
     expect((await send()).status).toBe(503)
     agent.abort = async () => { throw new Error('private-api-key') }
     const result = await send()
@@ -119,7 +125,7 @@ describe('主动中止入口', () => {
 
   it('HTTP 与订阅断开后已交付的中止仍收尾，重新订阅恢复实际结果', async () => {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
-    const agent = new Agent({ stream: (model, _context, options) => ({
+    const agent = new AgentSession({ resolveDirectory: async () => app.workspace, stream: (model, _context, options) => ({
       result: () => new Promise(() => {}),
       async *[Symbol.asyncIterator]() {
         const partial = { role: 'assistant' as const, api: model.api, provider: model.provider, model: model.id, content: [], stopReason: 'pending' as const, timestamp: 1 }
@@ -130,16 +136,17 @@ describe('主动中止入口', () => {
         finally { await release.promise }
       },
     }) })
-    const app = await setup({ agent })
+    const app = await setup({ createSession: () => agent })
     const auth = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, auth)
     const accepted = await agent.submit({ clientMessageId: 'local', modelId: 'deepseek-flash', text: 'stop me' })
     const socket = await connect(app.url, auth)
     const first = nextConversationFrame(socket)
-    socket.send('{"type":"subscribe","subscriptionId":"first"}')
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'first' }))
     expect((await first).snapshot.running).not.toBeNull()
     const req = request(app.url + '/api/abort', { method: 'POST', headers: { Cookie: auth, 'Content-Type': 'application/json' } })
     req.on('error', () => {})
-    req.end(JSON.stringify({ runId: accepted.kind === 'message' ? accepted.userMessageId : accepted.compactionId }))
+    req.end(JSON.stringify({ sessionId, runId: accepted.kind === 'message' ? accepted.userMessageId : accepted.compactionId }))
     await entered.promise
     req.destroy()
     socket.terminate()
@@ -152,7 +159,7 @@ describe('主动中止入口', () => {
     })
     const restored = await connect(app.url, auth)
     const next = nextConversationFrame(restored)
-    restored.send('{"type":"subscribe","subscriptionId":"restored"}')
+    restored.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'restored' }))
     expect((await next).snapshot).toMatchObject({ running: null, messages: [{}, { message: { stopReason: 'aborted' } }] })
   })
 })
@@ -160,7 +167,7 @@ function controlledAgent() {
   const active = new Set<AbortSignal>()
   return {
     active,
-    subscribe(signal: AbortSignal): AsyncIterable<AgentSubscriptionEvent> {
+    subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent> {
       active.add(signal)
       signal.addEventListener('abort', () => active.delete(signal), { once: true })
       return (async function* () {
@@ -210,12 +217,13 @@ describe('Cookie 交换与重启', () => {
     now--
     expect((await http(app.url, { Cookie: credentials })).status).toBe(401)
     now++
+    const sessionId = await pickSession(app.url, credentials)
     const socket = await connect(app.url, credentials)
     now += 30 * 86400000
     expect((await http(app.url, { Cookie: credentials })).status).toBe(401)
     expect(await rejectedHandshake(app.url, { Cookie: credentials })).toBe(401)
     const next = nextConversationFrame(socket)
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'after-expiry' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'after-expiry' }))
     expect((await next).snapshot).toEqual(empty)
   })
   it('同密钥同地址重启 Cookie 可用，启动令牌更新，换密钥重启后 Cookie 失效', async () => {
@@ -305,12 +313,13 @@ describe('阶段二模型配置', () => {
   it('成功配置和外部变化通知所有连接，不更改对话序号，关闭后可重启', async () => {
     const app = await setup()
     const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
     const a = await connect(app.url, credentials)
     const b = await connect(app.url, credentials)
     const frames: any[][] = [[], []]
     for (const [index, socket] of [a, b].entries()) {
       socket.on('message', value => frames[index]!.push(JSON.parse(String(value))))
-      socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: `models-${index}` }))
+      socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: `models-${index}` }))
     }
     await vi.waitFor(() => expect(frames.every(list => list.some(frame => frame.type === 'snapshot'))).toBe(true))
     const counts = frames.map(list => list.filter(frame => frame.type === 'models_changed').length)
@@ -368,32 +377,34 @@ describe('目标来源拒绝与握手授权', () => {
   })
 })
 
-describe('Agent 订阅转发与清理', () => {
-  it('握手不订阅，当前编号收到真实空快照，多页面共享 Agent', async () => {
+describe('会话订阅转发与清理', () => {
+  it('握手不订阅，目标编号收到真实空快照，多页面共享会话', async () => {
     const app = await setup()
     const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
     for (const subscriptionId of ['one', 'two']) {
       const socket = await connect(app.url, credentials)
       const next = nextConversationFrame(socket)
-      socket.send(JSON.stringify({ type: 'subscribe', subscriptionId }))
-      expect(await next).toEqual({ type: 'snapshot', subscriptionId, snapshot: empty })
+      socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId }))
+      expect(await next).toEqual({ type: 'snapshot', sessionId, subscriptionId, snapshot: empty })
     }
   })
   it('受控源先快照后更新，替换/取消只释放所属订阅和连接', async () => {
     const agent = controlledAgent()
-    const app = await setup({ agent })
+    const app = await setup({ createSession: () => agent })
     const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
     const socket = await connect(app.url, credentials)
     const other = await connect(app.url, credentials)
     expect(agent.active.size).toBe(0)
     const frames: any[] = []
     socket.on('message', data => { const frame = JSON.parse(String(data)); if (!frame.type.endsWith('_changed')) frames.push(frame) })
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'old' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'old' }))
     await vi.waitFor(() => expect(frames).toHaveLength(2))
     expect(frames.map(frame => frame.type)).toEqual(['snapshot', 'update'])
     expect(frames[1].update.seq).toBe(1)
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'new' }))
-    other.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'other' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'new' }))
+    other.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'other' }))
     await vi.waitFor(() => expect(agent.active.size).toBe(2))
     await vi.waitFor(() => expect(frames).toHaveLength(4))
     expect(frames.slice(2).map(frame => frame.subscriptionId)).toEqual(['new', 'new'])
@@ -405,14 +416,15 @@ describe('Agent 订阅转发与清理', () => {
     other.close()
     await vi.waitFor(() => expect(agent.active.size).toBe(0))
   })
-  it.each(['{', '{"type":"subscribe","subscriptionId":""}', '{"type":"subscribe","subscriptionId":2}', '{"type":"unknown"}'])('非法帧 %s 关闭所属连接且释放订阅', async frame => {
+  it.each(['{', '{"type":"subscribe","subscriptionId":""}', '{"type":"subscribe","subscriptionId":2}', '{"type":"subscribe","subscriptionId":"missing-target"}', '{"type":"unknown"}'])('非法帧 %s 关闭所属连接且释放订阅', async frame => {
     const agent = controlledAgent()
-    const app = await setup({ agent })
+    const app = await setup({ createSession: () => agent })
     const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
     const bad = await connect(app.url, credentials)
     const good = await connect(app.url, credentials)
-    bad.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'bad' }))
-    good.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'good' }))
+    bad.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'bad' }))
+    good.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'good' }))
     await vi.waitFor(() => expect(agent.active.size).toBe(2))
     const closed = once(bad, 'close')
     bad.send(frame)
@@ -422,8 +434,9 @@ describe('Agent 订阅转发与清理', () => {
   })
   it('发送失败只清理所属连接与订阅', async () => {
     const agent = controlledAgent()
-    const app = await setup({ agent })
+    const app = await setup({ createSession: () => agent })
     const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
     const failed = await connect(app.url, credentials)
     const good = await connect(app.url, credentials)
     const original = WebSocket.prototype.send
@@ -437,24 +450,25 @@ describe('Agent 订阅转发与清理', () => {
       return original.call(this, data, ...args as [any])
     } as any)
     const closed = once(failed, 'close')
-    failed.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'fail' }))
-    good.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'good' }))
+    failed.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'fail' }))
+    good.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'good' }))
     await closed
     await vi.waitFor(() => expect(agent.active.size).toBe(1))
     expect(good.readyState).toBe(WebSocket.OPEN)
   })
   it('发送缓冲超限只清理慢连接，其他页面仍可订阅', async () => {
     const agent = controlledAgent()
-    const app = await setup({ agent })
+    const app = await setup({ createSession: () => agent })
     const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
     const slow = await connect(app.url, credentials)
     const good = await connect(app.url, credentials)
     vi.spyOn(WebSocket.prototype, 'bufferedAmount', 'get').mockReturnValueOnce(1024 * 1024 + 1)
     const closed = once(slow, 'close')
-    slow.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'slow' }))
+    slow.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'slow' }))
     await closed
     const next = nextConversationFrame(good)
-    good.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'good' }))
+    good.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'good' }))
     expect((await next).snapshot).toEqual(empty)
     await vi.waitFor(() => expect(agent.active.size).toBe(1))
     expect(good.readyState).toBe(WebSocket.OPEN)
@@ -463,7 +477,7 @@ describe('Agent 订阅转发与清理', () => {
     let calls = 0
     let failOld!: () => void
     const agent = {
-      subscribe(signal: AbortSignal): AsyncIterable<AgentSubscriptionEvent> {
+      subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent> {
         const old = ++calls === 1
         return (async function* () {
           yield { type: 'snapshot' as const, snapshot: structuredClone(empty) }
@@ -472,13 +486,15 @@ describe('Agent 订阅转发与清理', () => {
         })()
       },
     }
-    const app = await setup({ agent })
-    const socket = await connect(app.url, await cookie(app.authUrl))
+    const app = await setup({ createSession: () => agent })
+    const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
+    const socket = await connect(app.url, credentials)
     const frames: any[] = []
     socket.on('message', data => { const frame = JSON.parse(String(data)); if (!frame.type.endsWith('_changed')) frames.push(frame) })
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'old' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'old' }))
     await vi.waitFor(() => expect(frames).toHaveLength(1))
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'new' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'new' }))
     await vi.waitFor(() => expect(frames).toHaveLength(2))
     failOld()
     await new Promise(resolve => setTimeout(resolve, 30))
@@ -494,10 +510,11 @@ describe('Agent 订阅转发与清理', () => {
       heartbeat = callback
       return { unref() {} } as any
     }) as any)
-    const app = await setup({ agent })
+    const app = await setup({ createSession: () => agent })
     const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
     const socket = await connect(app.url, credentials, {}, false)
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'heart' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'heart' }))
     await vi.waitFor(() => expect(agent.active.size).toBe(1))
     heartbeat!()
     heartbeat!()
@@ -506,7 +523,7 @@ describe('Agent 订阅转发与清理', () => {
     await closed
     await vi.waitFor(() => expect(agent.active.size).toBe(0))
     const live = await connect(app.url, credentials)
-    live.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'live' }))
+    live.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'live' }))
     await vi.waitFor(() => expect(agent.active.size).toBe(1))
     const liveClosed = once(live, 'close')
     await app.server.close()
@@ -517,9 +534,11 @@ describe('Agent 订阅转发与清理', () => {
   })
   it('非法帧关闭中的对端不回应时 close 仍立即释放全部连接', async () => {
     const agent = controlledAgent()
-    const app = await setup({ agent })
-    const socket = await connect(app.url, await cookie(app.authUrl))
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'paused' }))
+    const app = await setup({ createSession: () => agent })
+    const credentials = await cookie(app.authUrl)
+    const sessionId = await pickSession(app.url, credentials)
+    const socket = await connect(app.url, credentials)
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'paused' }))
     await vi.waitFor(() => expect(agent.active.size).toBe(1))
     socket.pause()
     socket.send('{')
@@ -555,14 +574,14 @@ describe('Agent 订阅转发与清理', () => {
 })
 
 describe('消息提交与模型生命周期', () => {
-  const baseMessage = { workspaceId: 'invalid-binding', clientMessageId: 'local-http', modelId: 'deepseek-flash', text: '  原文\n保留  ' }
+  const baseMessage = { clientMessageId: 'local-http', modelId: 'deepseek-flash', text: '  原文\n保留  ' }
 
   it('提交沿用授权和来源校验，拒绝无效输入，不写正式消息', async () => {
     const app = await setup()
     const auth = await cookie(app.authUrl)
     const headers = { Cookie: auth, 'Content-Type': 'application/json' }
-    const workspaceId = await pickWorkspace(app.url, auth)
-    const message = { ...baseMessage, workspaceId }
+    const sessionId = await pickSession(app.url, auth)
+    const message = { ...baseMessage, sessionId }
     expect((await http(app.url + '/api/messages', {}, 'POST', JSON.stringify(message))).status).toBe(401)
     expect((await http(app.url + '/api/messages', { ...headers, Origin: 'https://evil.invalid' }, 'POST', JSON.stringify(message))).status).toBe(403)
     expect((await http(app.url + '/api/messages', { Cookie: auth }, 'POST', JSON.stringify(message))).status).toBe(415)
@@ -572,21 +591,21 @@ describe('消息提交与模型生命周期', () => {
     expect((await http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ ...message, text: 'x'.repeat(65536) }))).status).toBe(413)
     const socket = await connect(app.url, auth)
     const first = nextConversationFrame(socket)
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'after-rejects' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'after-rejects' }))
     expect((await first).snapshot).toEqual(empty)
   })
 
   it('凭据未配置也先回执，随后形成正式失败回复并释放忙碌', async () => {
     const app = await setup()
     const auth = await cookie(app.authUrl)
-    const workspaceId = await pickWorkspace(app.url, auth)
-    const response = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({ ...baseMessage, workspaceId }))
+    const sessionId = await pickSession(app.url, auth)
+    const response = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({ ...baseMessage, sessionId }))
     expect(response.status).toBe(202)
     expect(JSON.parse(response.text)).toMatchObject({ clientMessageId: 'local-http', userMessageId: expect.any(String), acceptedSeq: 1 })
     const socket = await connect(app.url, auth)
     const frames: any[] = []
     socket.on('message', data => { frames.push(JSON.parse(String(data))) })
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'missing-key' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'missing-key' }))
     await vi.waitFor(() => expect(frames.find(frame => frame.type === 'snapshot')?.snapshot.messages).toHaveLength(2))
     const snapshot = frames.find(frame => frame.type === 'snapshot').snapshot
     expect(snapshot.running).toBeNull()
@@ -611,12 +630,13 @@ describe('消息提交与模型生命周期', () => {
     const auth = await cookie(app.authUrl)
     const headers = { Cookie: auth, 'Content-Type': 'application/json' }
     expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', JSON.stringify({ apiKey: 'controlled-server-key' }))).status).toBe(200)
+    const sessionId = await pickSession(app.url, auth)
     const socket = await connect(app.url, auth)
     const frames: any[] = []
     socket.on('message', data => frames.push(JSON.parse(String(data))))
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'live' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'live' }))
     await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot')).toBe(true))
-    const message = { ...baseMessage, workspaceId: await pickWorkspace(app.url, auth) }
+    const message = { ...baseMessage, sessionId }
     const response = await http(app.url + '/api/messages', headers, 'POST', JSON.stringify(message))
     expect(response.status).toBe(202)
     await vi.waitFor(() => expect(calls).toBe(1))
@@ -631,7 +651,7 @@ describe('消息提交与模型生命周期', () => {
     send({ content: 'B' })
     const restored = await connect(app.url, auth)
     const first = nextConversationFrame(restored)
-    restored.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'restored' }))
+    restored.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'restored' }))
     const snapshot = (await first).snapshot
     expect(snapshot.running?.runId).toBe(JSON.parse(response.text).userMessageId)
     expect(snapshot.messages[1].message.content).toEqual([{ type: 'thinking', thinking: '想一想' }, { type: 'text', text: 'AB' }])
@@ -650,18 +670,19 @@ it('3 MiB 原始历史快照写完后继续交付紧随增量和配置通知', a
       summary: 'earlier summary', firstKeptMessageId: 'u-large', contextLastMessageId: 'u-large', estimatedBefore: 1_000_000, estimatedAfter: 800_000 }],
   }
   const agent = {
-    async *subscribe(signal: AbortSignal): AsyncIterable<AgentSubscriptionEvent> {
+    async *subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent> {
       yield { type: 'snapshot', snapshot }
       yield { type: 'update', update: { seq: 2, change: { type: 'task', running: null } } }
       if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
     },
   }
-  const app = await setup({ agent })
+  const app = await setup({ createSession: () => agent })
   const auth = await cookie(app.authUrl)
+  const sessionId = await pickSession(app.url, auth)
   const socket = await connect(app.url, auth)
   const frames: any[] = []
   socket.on('message', data => frames.push(JSON.parse(String(data))))
-  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'large' }))
+  socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'large' }))
   await vi.waitFor(() => expect(frames.filter(frame => frame.type === 'snapshot' || frame.type === 'update')).toHaveLength(2))
   expect(frames[0].snapshot.messages[0].message.content).toBe(longText)
   expect(frames[0].snapshot.compactions).toEqual(snapshot.compactions)
@@ -673,8 +694,10 @@ it('3 MiB 原始历史快照写完后继续交付紧随增量和配置通知', a
 })
 
 it('快照发送回调未完成时等待增量并合并重复通知', async () => {
-  const app = await setup({ agent: controlledAgent() })
-  const socket = await connect(app.url, await cookie(app.authUrl))
+  const app = await setup({ createSession: controlledAgent })
+  const auth = await cookie(app.authUrl)
+  const sessionId = await pickSession(app.url, auth)
+  const socket = await connect(app.url, auth)
   const release = Promise.withResolvers<void>(), releaseNotification = Promise.withResolvers<void>()
   let firstNotification = false
   const original = WebSocket.prototype.send
@@ -692,7 +715,7 @@ it('快照发送回调未完成时等待增量并合并重复通知', async () =
   } as any)
   const frames: any[] = []
   socket.on('message', data => frames.push(JSON.parse(String(data))))
-  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'callback' }))
+  socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'callback' }))
   try {
     await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot')).toBe(true))
     firstNotification = true
@@ -711,8 +734,10 @@ it('快照发送回调未完成时等待增量并合并重复通知', async () =
 
 it('发送未完成时反复替换订阅只为最后一个订阅读取新快照', async () => {
   const agent = controlledAgent(), subscribe = vi.spyOn(agent, 'subscribe')
-  const app = await setup({ agent })
-  const socket = await connect(app.url, await cookie(app.authUrl))
+  const app = await setup({ createSession: () => agent })
+  const auth = await cookie(app.authUrl)
+  const sessionId = await pickSession(app.url, auth)
+  const socket = await connect(app.url, auth)
   const release = Promise.withResolvers<void>(), original = WebSocket.prototype.send
   vi.spyOn(WebSocket.prototype, 'send').mockImplementation(function (this: WebSocket, data: any, ...args: any[]) {
     const frame = JSON.parse(String(data))
@@ -724,10 +749,10 @@ it('发送未完成时反复替换订阅只为最后一个订阅读取新快照'
   } as any)
   const frames: any[] = []
   socket.on('message', data => frames.push(JSON.parse(String(data))))
-  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'blocked' }))
+  socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'blocked' }))
   try {
     await vi.waitFor(() => expect(frames.some(frame => frame.type === 'snapshot')).toBe(true))
-    for (let index = 0; index < 100; index++) socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: `replacement-${index}` }))
+    for (let index = 0; index < 100; index++) socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: `replacement-${index}` }))
     const pong = once(socket, 'pong')
     socket.ping('processed-replacements')
     await pong
@@ -739,10 +764,10 @@ it('发送未完成时反复替换订阅只为最后一个订阅读取新快照'
   } finally { release.resolve() }
 })
 
-async function serverSnapshot(url: string, auth: string, subscriptionId = 'snapshot') {
+async function serverSnapshot(url: string, auth: string, sessionId: string, subscriptionId = 'snapshot') {
   const socket = await connect(url, auth)
   const next = nextConversationFrame(socket)
-  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId }))
+  socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId }))
   const snapshot = (await next).snapshot as ConversationSnapshot
   socket.terminate()
   return snapshot
@@ -780,16 +805,16 @@ function summaryProvider() {
 describe('压缩的正式 HTTP/WS 生命周期', () => {
   it('没有可整理历史时返回独立命令回执和未执行记录，不新增聊天消息', async () => {
     const app = await setup()
-    const auth = await cookie(app.authUrl), workspaceId = await pickWorkspace(app.url, auth)
+    const auth = await cookie(app.authUrl), sessionId = await pickSession(app.url, auth)
     const response = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({
-      workspaceId, clientMessageId: 'empty-compact', modelId: 'deepseek-flash', text: ' /compact\n',
+      sessionId, clientMessageId: 'empty-compact', modelId: 'deepseek-flash', text: ' /compact\n',
     }))
     expect(response.status).toBe(202)
     const accepted = JSON.parse(response.text)
     expect(accepted).toMatchObject({ kind: 'compaction', clientMessageId: 'empty-compact', compactionId: expect.any(String) })
     expect(accepted.userMessageId).toBeUndefined()
     await vi.waitFor(async () => {
-      const snapshot = await serverSnapshot(app.url, auth)
+      const snapshot = await serverSnapshot(app.url, auth, sessionId)
       expect(snapshot.running).toBeNull()
       expect(snapshot.messages).toEqual([])
       expect(snapshot.compactions).toMatchObject([{ id: accepted.compactionId, status: 'skipped', clientMessageId: 'empty-compact' }])
@@ -800,36 +825,36 @@ describe('压缩的正式 HTTP/WS 生命周期', () => {
     const provider = summaryProvider()
     const app = await setup({ compaction: { triggerTokens: 100_000, keepRecentTokens: 30 }, modelOptions: { fetch: provider.fetch } })
     const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
-    const workspaceId = await pickWorkspace(app.url, auth)
+    const sessionId = await pickSession(app.url, auth)
     expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"compaction-fixture-key"}')).status).toBe(200)
     const submit = (clientMessageId: string, text: string) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({
-      workspaceId, clientMessageId, modelId: 'deepseek-flash', text,
+      sessionId, clientMessageId, modelId: 'deepseek-flash', text,
     }))
     for (let index = 0; index < 2; index++) {
       expect((await submit(`seed-${index}`, `项目青禾；仅修改临时工作区。${'earlier data '.repeat(300)}`)).status).toBe(202)
-      await vi.waitFor(async () => expect((await serverSnapshot(app.url, auth)).running).toBeNull())
+      await vi.waitFor(async () => expect((await serverSnapshot(app.url, auth, sessionId)).running).toBeNull())
     }
-    const before = await serverSnapshot(app.url, auth)
+    const before = await serverSnapshot(app.url, auth, sessionId)
     const response = await submit('manual-compact', '/compact')
     expect(response.status).toBe(202)
     const accepted = JSON.parse(response.text)
     expect(accepted.kind).toBe('compaction')
     await vi.waitFor(() => expect(provider.summaryCalls).toBe(1))
     const socket = await connect(app.url, auth), first = nextConversationFrame(socket)
-    socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'during' }))
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'during' }))
     expect((await first).snapshot).toMatchObject({ running: { kind: 'compaction', runId: accepted.compactionId }, compactions: [{ status: 'running' }] })
     expect((await submit('rejected-busy', '/compact')).status).toBe(409)
     socket.close()
     await once(socket, 'close')
     expect(provider.aborted).toBe(false)
-    expect((await http(app.url + '/api/abort', headers, 'POST', '{"runId":"stale-id"}')).text).toContain('"handled":false')
+    expect((await http(app.url + '/api/abort', headers, 'POST', JSON.stringify({ sessionId, runId: 'stale-id' }))).text).toContain('"handled":false')
     if (outcome === 'aborted') {
-      const stopped = await http(app.url + '/api/abort', headers, 'POST', JSON.stringify({ runId: accepted.compactionId }))
-      expect(JSON.parse(stopped.text)).toEqual({ runId: accepted.compactionId, handled: true })
+      const stopped = await http(app.url + '/api/abort', headers, 'POST', JSON.stringify({ sessionId, runId: accepted.compactionId }))
+      expect(JSON.parse(stopped.text)).toEqual({ sessionId, runId: accepted.compactionId, handled: true })
     } else if (outcome === 'success') {
       const crossing = await connect(app.url, auth), frames: any[] = []
       crossing.on('message', data => { const frame = JSON.parse(String(data)); if (frame.type === 'snapshot' || frame.type === 'update') frames.push(frame) })
-      crossing.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'commit-crossing' }))
+      crossing.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'commit-crossing' }))
       provider.finish()
       await vi.waitFor(() => expect(frames.some(frame => frame.snapshot?.compactions.some((record: any) => record.status === 'success')
         || frame.update?.change.type === 'compaction' && frame.update.change.record.status === 'success')).toBe(true))
@@ -839,7 +864,7 @@ describe('压缩的正式 HTTP/WS 生命周期', () => {
     } else provider.finish(true)
     let restored!: ConversationSnapshot
     await vi.waitFor(async () => {
-      restored = await serverSnapshot(app.url, auth, 'restored')
+      restored = await serverSnapshot(app.url, auth, sessionId, 'restored')
       expect(restored.running).toBeNull()
       expect(restored.compactions).toMatchObject([{ id: accepted.compactionId, status: outcome }])
     })
@@ -861,23 +886,23 @@ describe('压缩的正式 HTTP/WS 生命周期', () => {
       return { unref() {} } as any
     }) as any)
     const provider = summaryProvider()
-    const agent = new Agent({ compaction: { triggerTokens: 100_000, keepRecentTokens: 30 },
+    const agent = new AgentSession({ resolveDirectory: async () => app.workspace, compaction: { triggerTokens: 100_000, keepRecentTokens: 30 },
       stream: createModelStream({ readApiKey: async () => 'compaction-fixture-key' }, { fetch: provider.fetch }) })
     const state = (agent as unknown as { state: ConversationSnapshot }).state
     state.messages.push(
       { id: 'old-large', message: { role: 'user', content: 'x'.repeat(3 * 1024 * 1024), timestamp: 1 } },
       { id: 'recent-user', message: { role: 'user', content: 'recent '.repeat(100), timestamp: 2 } },
     )
-    const app = await setup({ agent })
-    const auth = await cookie(app.authUrl), workspaceId = await pickWorkspace(app.url, auth)
+    const app = await setup({ createSession: () => agent })
+    const auth = await cookie(app.authUrl), sessionId = await pickSession(app.url, auth)
     const accepted = await http(app.url + '/api/messages', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({
-      workspaceId, modelId: 'deepseek-flash', clientMessageId: 'slow-compact', text: '/compact',
+      sessionId, modelId: 'deepseek-flash', clientMessageId: 'slow-compact', text: '/compact',
     }))
     expect(accepted.status).toBe(202)
     await vi.waitFor(() => expect(provider.summaryCalls).toBe(1))
     const slow = await connect(app.url, auth)
     slow.pause()
-    slow.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'slow-large' }))
+    slow.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'slow-large' }))
     const serverSocket = [...(app.server as unknown as { ws: import('ws').WebSocketServer }).ws.clients][0]
     await vi.waitFor(() => expect(serverSocket.bufferedAmount).toBeGreaterThan(1024 * 1024))
     heartbeat()
@@ -886,7 +911,7 @@ describe('压缩的正式 HTTP/WS 生命周期', () => {
     expect(provider.aborted).toBe(false)
     provider.finish()
     await vi.waitFor(() => expect(state.running).toBeNull())
-    const restored = await serverSnapshot(app.url, auth)
+    const restored = await serverSnapshot(app.url, auth, sessionId)
     expect(restored.messages[0].message.content).toBe('x'.repeat(3 * 1024 * 1024))
     expect(restored.compactions).toMatchObject([{ status: 'success' }])
     expect(provider.summaryCalls).toBe(1)
@@ -896,10 +921,20 @@ describe('压缩的正式 HTTP/WS 生命周期', () => {
 async function pickWorkspace(url: string, auth: string) {
   const picked = await http(url + '/api/workspaces/pick', { Cookie: auth }, 'POST')
   expect(picked.status).toBe(200)
-  return JSON.parse(picked.text).view.boundWorkspaceId as string
+  return JSON.parse(picked.text).workspaceId as string
 }
 
-it('W1/W2: cancel does not write, aliases reuse binding, rejection prevents model and tools, restart restores only binding', async () => {
+async function createSession(url: string, auth: string, workspaceId: string) {
+  const response = await http(url + '/api/sessions', { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify({ workspaceId }))
+  expect(response.status).toBe(201)
+  return JSON.parse(response.text) as SessionSummary
+}
+
+async function pickSession(url: string, auth: string) {
+  return (await createSession(url, auth, await pickWorkspace(url, auth))).id
+}
+
+it('取消不写入登记，旧登记兼容，符号链接复用目录，重启只恢复工作区', async () => {
   let selected: string | null = null
   const requests: any[] = []
   const app = await setup({ directoryPicker: async () => selected, modelOptions: { fetch: async (_url, init) => {
@@ -911,33 +946,52 @@ it('W1/W2: cancel does not write, aliases reuse binding, rejection prevents mode
   } } })
   const auth = await cookie(app.authUrl)
   const headers = { Cookie: auth, 'Content-Type': 'application/json' }
-  const send = (workspaceId?: string) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ text: '写入', modelId: 'deepseek-flash', clientMessageId: 'workspace-test', workspaceId }))
+  const send = (sessionId?: string) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ text: '写入', modelId: 'deepseek-flash', clientMessageId: 'workspace-test', sessionId }))
   expect((await send()).status).toBe(400)
-  expect((await send('unknown')).status).toBe(409)
+  expect((await send('unknown')).status).toBe(404)
   expect((await http(app.url + '/api/workspaces/pick', {}, 'POST')).status).toBe(401)
   const cancelled = await http(app.url + '/api/workspaces/pick', headers, 'POST')
   expect(JSON.parse(cancelled.text)).toEqual({ cancelled: true })
   await expect(readFile(app.config.workspacePath)).rejects.toMatchObject({ code: 'ENOENT' })
-  selected = app.workspace
-  const bound = await pickWorkspace(app.url, auth)
+
+  const first = { id: 'old-workspace', path: app.workspace }
+  await writeFile(app.config.workspacePath, JSON.stringify({ workspaces: [first], boundWorkspaceId: first.id }), { mode: 0o600 })
   selected = join(app.workspace, '..', 'alias')
   await symlink(app.workspace, selected)
-  expect(await pickWorkspace(app.url, auth)).toBe(bound)
-  const view = { workspaces: [{ id: bound, path: app.workspace, name: 'workspace', available: true }], boundWorkspaceId: bound }
+  const duplicate = JSON.parse((await http(app.url + '/api/workspaces/pick', { Cookie: auth }, 'POST')).text)
+  expect(duplicate).toMatchObject({ cancelled: false, workspaceId: first.id, created: false })
+  const secondPath = join(app.workspace, '..', 'second')
+  await mkdir(secondPath)
+  selected = await realpath(secondPath)
+  const added = JSON.parse((await http(app.url + '/api/workspaces/pick', { Cookie: auth }, 'POST')).text)
+  expect(added).toMatchObject({ cancelled: false, workspaceId: expect.any(String), created: true })
+  const second = { id: added.workspaceId, path: selected }
+  const view = { workspaces: [{ ...first, name: 'workspace', available: true }, { ...second, name: 'second', available: true }] }
+  expect(added.view).toEqual(view)
+  expect(JSON.parse(await readFile(app.config.workspacePath, 'utf8'))).toEqual({ workspaces: [first, second] })
   expect(JSON.parse((await http(app.url + '/api/workspaces', headers)).text)).toEqual(view)
-  expect((await send('other')).status).toBe(409)
-  await rm(app.workspace, { recursive: true })
-  expect((await send(bound)).status).toBe(409)
-  expect(requests).toHaveLength(0)
-  await mkdir(app.workspace)
-  await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"test-key"}')
-  expect((await send(bound)).status).toBe(202)
+
+  const { id: sessionId } = await createSession(app.url, auth, first.id)
+  expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"test-key"}')).status).toBe(200)
+  expect((await send(sessionId)).status).toBe(202)
   await vi.waitFor(() => expect(requests).toHaveLength(2))
   expect(requests[0].messages[0].content).toContain(app.workspace)
   expect(requests[0].tools).toHaveLength(8)
   expect(requests[1].tools).toHaveLength(8)
   expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })
   expect(await readFile(join(app.workspace, 'written.txt'), 'utf8')).toBe('working-directory')
+  let history!: ConversationSnapshot
+  await vi.waitFor(async () => {
+    history = await serverSnapshot(app.url, auth, sessionId)
+    expect(history.running).toBeNull()
+    expect(history.messages).toHaveLength(4)
+  })
+  await rm(app.workspace, { recursive: true })
+  expect((await send(sessionId)).status).toBe(409)
+  expect(requests).toHaveLength(2)
+  expect(await serverSnapshot(app.url, auth, sessionId)).toEqual(history)
+  expect(JSON.parse((await http(app.url + '/api/workspaces', headers)).text).workspaces[0]).toMatchObject({ id: first.id, available: false })
+  await mkdir(app.workspace)
 
   await app.server.close()
   const restarted = new WebServer(app.config)
@@ -945,10 +999,11 @@ it('W1/W2: cancel does not write, aliases reuse binding, rejection prevents mode
   const next = await restarted.start()
   const newCookie = await cookie(next.authUrl)
   expect(JSON.parse((await http(next.url + '/api/workspaces', { Cookie: newCookie })).text)).toEqual(view)
+  expect(JSON.parse((await http(next.url + '/api/sessions', { Cookie: newCookie })).text)).toEqual({ sessions: [] })
   const socket = await connect(next.url, newCookie)
   const snapshot = nextConversationFrame(socket)
-  socket.send(JSON.stringify({ type: 'subscribe', subscriptionId: 'restarted' }))
-  expect((await snapshot).snapshot).toEqual(empty)
+  socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'restarted' }))
+  expect(await snapshot).toMatchObject({ type: 'subscription_error', sessionId, subscriptionId: 'restarted' })
 })
 
 it('P1: saves capability choices independently of the shared Tavily credential and notifies without secrets', async () => {
@@ -978,4 +1033,303 @@ it('P1: saves capability choices independently of the shared Tavily credential a
   expect(JSON.parse(await readFile(app.config.modelAuthPath, 'utf8'))).toEqual({ deepseek: { key: 'model-test-key', type: 'api_key' } })
   await vi.waitFor(() => expect(frames.some(frame => JSON.parse(frame).type === 'web_settings_changed')).toBe(true))
   expect(frames.join('')).not.toContain('test-key')
+})
+
+describe('首次发送', () => {
+  it('接受原文后才列出会话，并发和完成后的重试只运行一次', async () => {
+    const validating = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const stream = vi.fn<NonNullable<ConstructorParameters<typeof AgentSession>[0]['stream']>>((model) => ({
+      result: async () => { throw new Error('unexpected result call') },
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'done' as const, reason: 'stop' as const, message: {
+          role: 'assistant' as const, api: model.api, provider: model.provider, model: model.id,
+          content: [{ type: 'text' as const, text: '回复' }], stopReason: 'stop' as const, timestamp: 1,
+        } }
+      },
+    }))
+    const app = await setup({ createSession: resolveDirectory => new AgentSession({ stream, resolveDirectory: async () => {
+      validating.resolve()
+      await release.promise
+      return resolveDirectory()
+    } }) })
+    const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const input = { workspaceId: await pickWorkspace(app.url, auth), clientMessageId: randomUUID(), modelId: 'deepseek-flash', text: '你好' }
+    const start = (value = input) => http(app.url + '/api/sessions/start', headers, 'POST', JSON.stringify(value))
+    const list = async () => JSON.parse((await http(app.url + '/api/sessions', headers)).text).sessions
+    const socket = await connect(app.url, auth)
+    const frames: any[] = []
+    socket.on('message', data => frames.push(JSON.parse(String(data))))
+    const first = start()
+    // Race the validation gate against an early response so a missing route fails immediately.
+    try {
+      expect(await Promise.race([validating.promise.then(() => 'validating'), first.then(response => response.status)])).toBe('validating')
+      const duplicate = start()
+      expect(await list()).toEqual([])
+      const notYet = nextConversationFrame(socket)
+      socket.send(JSON.stringify({ type: 'subscribe', sessionId: input.clientMessageId, subscriptionId: 'pending' }))
+      expect(await notYet).toMatchObject({ type: 'subscription_error' })
+      expect(frames).not.toContainEqual({ type: 'sessions_changed' })
+      expect((await start({ ...input, text: '不同的原文' })).status).toBe(409)
+      release.resolve()
+
+      const [a, b] = await Promise.all([first, duplicate])
+      expect(a.status).toBe(202)
+      expect(b.status).toBe(202)
+      const accepted = JSON.parse(a.text)
+      expect(accepted).toEqual({
+        session: { id: input.clientMessageId, workspaceId: input.workspaceId, name: '会话 1', createdAt: expect.any(String) },
+        accepted: { sessionId: input.clientMessageId, clientMessageId: input.clientMessageId, kind: 'message', userMessageId: expect.any(String), acceptedSeq: 1 },
+      })
+      expect(JSON.parse(b.text)).toEqual(accepted)
+      await vi.waitFor(async () => {
+        const snapshot = await serverSnapshot(app.url, auth, input.clientMessageId)
+        expect(snapshot.messages).toMatchObject([
+          { id: accepted.accepted.userMessageId, clientMessageId: input.clientMessageId, message: { role: 'user', content: '你好' } },
+          { message: { role: 'assistant', content: [{ type: 'text', text: '回复' }] } },
+        ])
+      })
+      const after = await start()
+      expect(after.status).toBe(202)
+      expect(JSON.parse(after.text)).toEqual(accepted)
+      expect((await start({ ...input, modelId: 'deepseek-pro' })).status).toBe(409)
+      expect((await start({ ...input, text: '/compact' })).status).toBe(409)
+      expect(await list()).toEqual([accepted.session])
+      expect(frames.filter(frame => frame.type === 'sessions_changed')).toHaveLength(1)
+      expect(stream).toHaveBeenCalledTimes(1)
+    } finally { release.resolve() }
+  })
+
+  it('关闭服务时停止尚未接受首条消息的会话', async () => {
+    const validating = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const stream = vi.fn<NonNullable<ConstructorParameters<typeof AgentSession>[0]['stream']>>(() => { throw new Error('unexpected stream call') })
+    const app = await setup({ createSession: resolveDirectory => new AgentSession({ stream, resolveDirectory: async () => {
+      validating.resolve()
+      await release.promise
+      return resolveDirectory()
+    } }) })
+    const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const input = { workspaceId: await pickWorkspace(app.url, auth), clientMessageId: randomUUID(), modelId: 'deepseek-flash', text: '关闭前' }
+    const first = http(app.url + '/api/sessions/start', headers, 'POST', JSON.stringify(input)).then(response => response.status, () => 'disconnected')
+    try {
+      expect(await Promise.race([validating.promise.then(() => 'validating'), first])).toBe('validating')
+      await app.server.close()
+      release.resolve()
+      expect([503, 'disconnected']).toContain(await first)
+      const reopened = await app.server.start()
+      const reopenedCookie = await cookie(reopened.authUrl)
+      expect(JSON.parse((await http(reopened.url + '/api/sessions', { Cookie: reopenedCookie })).text)).toEqual({ sessions: [] })
+      expect(stream).not.toHaveBeenCalled()
+    } finally { release.resolve() }
+  })
+
+  it('拒绝无效首条消息和不可用目录，不留下空会话', async () => {
+    const app = await setup()
+    const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const input = { workspaceId: await pickWorkspace(app.url, auth), clientMessageId: randomUUID(), modelId: 'deepseek-flash', text: '你好' }
+    const start = (value: object) => http(app.url + '/api/sessions/start', headers, 'POST', JSON.stringify({ ...input, ...value }))
+    for (const invalid of [{ text: ' /compact ' }, { text: '  ' }, { clientMessageId: 'invalid' }, { modelId: 'invalid' }, { extra: true }]) {
+      expect((await start(invalid)).status).toBe(400)
+    }
+    expect((await start({ workspaceId: 'unknown' })).status).toBe(409)
+    await rm(app.workspace, { recursive: true })
+    expect((await start({})).status).toBe(409)
+    expect(JSON.parse((await http(app.url + '/api/sessions', headers)).text)).toEqual({ sessions: [] })
+  })
+})
+
+describe('会话路由', () => {
+  it('列出同一工作区的两个独立会话，未知订阅后用原连接打开已知会话', async () => {
+    const app = await setup()
+    const auth = await cookie(app.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const path = app.url + '/api/sessions'
+    expect((await http(path)).status).toBe(401)
+    expect((await http(path, { 'Content-Type': 'application/json' }, 'POST', '{}')).status).toBe(401)
+    expect(JSON.parse((await http(path, headers)).text)).toEqual({ sessions: [] })
+    for (const body of ['{}', '{"workspaceId":" "}', '{"workspaceId":"unknown","path":"/tmp"}']) {
+      expect((await http(path, headers, 'POST', body)).status).toBe(400)
+    }
+    const picked = await http(app.url + '/api/workspaces/pick', { Cookie: auth }, 'POST')
+    const { workspaceId } = JSON.parse(picked.text)
+    expect((await http(path, headers, 'POST', '{"workspaceId":"absent"}')).status).toBe(409)
+    const socket = await connect(app.url, auth)
+    const notification = once(socket, 'message')
+    const first = await http(path, headers, 'POST', JSON.stringify({ workspaceId }))
+    expect(first.status).toBe(201)
+    expect(JSON.parse(String((await notification)[0]))).toEqual({ type: 'sessions_changed' })
+    const second = await http(path, headers, 'POST', JSON.stringify({ workspaceId }))
+    expect(second.status).toBe(201)
+    const a = JSON.parse(first.text), b = JSON.parse(second.text)
+    expect(a).toMatchObject({ id: expect.any(String), workspaceId, name: '会话 1', createdAt: expect.any(String) })
+    expect(b).toMatchObject({ id: expect.any(String), workspaceId, name: '会话 2', createdAt: expect.any(String) })
+    expect(a.id).not.toBe(b.id)
+    expect(JSON.parse((await http(path, headers)).text)).toEqual({ sessions: [a, b] })
+    const subscribe = (sessionId: string, subscriptionId: string) => {
+      const frame = nextConversationFrame(socket)
+      socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId }))
+      return frame
+    }
+    expect(await subscribe(a.id, 'open-a')).toEqual({ type: 'snapshot', sessionId: a.id, subscriptionId: 'open-a', snapshot: empty })
+    expect(await subscribe('missing', 'unknown')).toMatchObject({ type: 'subscription_error', sessionId: 'missing', subscriptionId: 'unknown', error: expect.any(String) })
+    expect(await subscribe(b.id, 'open-b')).toEqual({ type: 'snapshot', sessionId: b.id, subscriptionId: 'open-b', snapshot: empty })
+  })
+})
+
+it('并行会话的相对路径和中止各自归属，另一会话继续完成', async () => {
+  let selected = ''
+  const requests = new Map<string, Array<{ role: string; content: string; tool_call_id?: string }[]>>()
+  const pending = new Map<string, ReadableStreamDefaultController<Uint8Array>>()
+  const aborted = new Set<string>()
+  const encoder = new TextEncoder()
+  const reply = (delta: object, finish_reason: string | null) => encoder.encode(
+    `data: ${JSON.stringify({ id: 'controlled-session', choices: [{ index: 0, delta, finish_reason }] })}\n\n`,
+  )
+  const controlledFetch: typeof fetch = async (_url, init) => {
+    const { messages } = JSON.parse(String(init?.body))
+    const name = messages.find((message: { role: string }) => message.role === 'user').content as string
+    const turns = requests.get(name) ?? []
+    turns.push(messages)
+    requests.set(name, turns)
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+      pending.set(name, controller)
+      init?.signal?.addEventListener('abort', () => {
+        aborted.add(name)
+        controller.error(new DOMException('cancelled', 'AbortError'))
+      }, { once: true })
+    } }), { headers: { 'Content-Type': 'text/event-stream' } })
+  }
+  const finish = (name: string, delta: object, reason: string) => {
+    const target = pending.get(name)!
+    target.enqueue(reply(delta, reason))
+    target.enqueue(encoder.encode('data: [DONE]\n\n'))
+    target.close()
+  }
+  const app = await setup({ directoryPicker: async () => selected, modelOptions: { fetch: controlledFetch } })
+  const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const post = (path: string, value: unknown) => http(app.url + path, headers, 'POST', JSON.stringify(value))
+  const submit = (sessionId: string, text: string) => post('/api/messages', {
+    sessionId, text, modelId: 'deepseek-flash', clientMessageId: 'shared-client-id',
+  })
+  expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"session-fixture-key"}')).status).toBe(200)
+  const aPath = app.workspace, bPath = join(app.workspace, '..', 'workspace-b')
+  await mkdir(bPath)
+  await Promise.all([writeFile(join(aPath, 'note.txt'), '青禾独有'), writeFile(join(bPath, 'note.txt'), '白榆独有')])
+  selected = aPath
+  const a = await pickSession(app.url, auth)
+  const aResponse = await submit(a, '项目青禾')
+  expect(aResponse.status).toBe(202)
+  const { userMessageId: aRun } = JSON.parse(aResponse.text)
+  expect(JSON.parse(aResponse.text)).toMatchObject({ sessionId: a, clientMessageId: 'shared-client-id' })
+  await vi.waitFor(() => expect(pending.has('项目青禾')).toBe(true))
+  const observer = await connect(app.url, auth)
+  const observe = (sessionId: string) => {
+    const frame = nextConversationFrame(observer)
+    observer.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: sessionId }))
+    return frame
+  }
+  expect(await observe(a)).toMatchObject({ type: 'snapshot', sessionId: a, snapshot: { running: { runId: aRun } } })
+
+  selected = await realpath(bPath)
+  const b = await pickSession(app.url, auth)
+  expect(await observe(b)).toMatchObject({ type: 'snapshot', sessionId: b, snapshot: empty })
+  const bResponse = await submit(b, '项目白榆')
+  expect(bResponse.status).toBe(202)
+  const { userMessageId: bRun } = JSON.parse(bResponse.text)
+  expect(JSON.parse(bResponse.text)).toMatchObject({ sessionId: b, clientMessageId: 'shared-client-id' })
+  await vi.waitFor(() => expect(pending.has('项目白榆')).toBe(true))
+  const [aPending, bPending] = await Promise.all([serverSnapshot(app.url, auth, a), serverSnapshot(app.url, auth, b)])
+  expect(aPending.running).toMatchObject({ runId: aRun })
+  expect(bPending.running).toMatchObject({ runId: bRun })
+  expect((await submit(a, '同一会话第二条')).status).toBe(409)
+  expect((await submit('不存在', '不能投递')).status).toBe(404)
+  expect((await post('/api/abort', { sessionId: '不存在', runId: aRun })).status).toBe(404)
+  const mismatch = await post('/api/abort', { sessionId: b, runId: aRun })
+  expect(JSON.parse(mismatch.text)).toEqual({ sessionId: b, runId: aRun, handled: false })
+  expect(aborted.size).toBe(0)
+
+  for (const name of ['项目白榆', '项目青禾']) {
+    finish(name, { tool_calls: [{ index: 0, id: 'read-note', type: 'function', function: { name: 'read', arguments: '{"path":"note.txt"}' } }] }, 'tool_calls')
+    await vi.waitFor(() => expect(requests.get(name)).toHaveLength(2))
+  }
+  await vi.waitFor(() => expect([...requests.values()].map(turns => turns.length)).toEqual([2, 2]))
+  for (const [name, directory, ownResult, otherResult] of [
+    ['项目青禾', aPath, '青禾独有', '白榆独有'],
+    ['项目白榆', selected, '白榆独有', '青禾独有'],
+  ] as const) {
+    const [, followup] = requests.get(name)!
+    expect(followup![0]!.content).toContain(directory)
+    expect(followup!.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'read-note', content: expect.stringContaining(ownResult) })
+    expect(JSON.stringify(followup)).not.toContain(otherResult)
+  }
+  pending.get('项目青禾')!.enqueue(reply({ content: '青禾进行中' }, null))
+  await vi.waitFor(async () => expect((await serverSnapshot(app.url, auth, a)).messages.at(-1)?.message).toMatchObject({
+    role: 'assistant', content: [{ type: 'text', text: '青禾进行中' }],
+  }))
+  const stopped = await post('/api/abort', { sessionId: a, runId: aRun })
+  expect(JSON.parse(stopped.text)).toEqual({ sessionId: a, runId: aRun, handled: true })
+  expect([...aborted]).toEqual(['项目青禾'])
+  const aStopped = await serverSnapshot(app.url, auth, a)
+  expect(aStopped.running).toBeNull()
+  expect(aStopped.messages.at(-1)?.message).toMatchObject({
+    role: 'assistant', stopReason: 'aborted', content: [{ type: 'text', text: '青禾进行中' }],
+  })
+  expect((await serverSnapshot(app.url, auth, b)).running).toMatchObject({ runId: bRun })
+  finish('项目白榆', { content: '白榆完成' }, 'stop')
+  await vi.waitFor(async () => {
+    const bDone = await serverSnapshot(app.url, auth, b)
+    expect(bDone.running).toBeNull()
+    expect(bDone.messages.at(-1)?.message).toMatchObject({
+      role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '白榆完成' }],
+    })
+  })
+})
+
+it('服务关闭同时停止两个会话并等待各自收尾', async () => {
+  const tasks = Array.from({ length: 2 }, () => ({
+    entered: Promise.withResolvers<void>(),
+    cancelled: Promise.withResolvers<void>(),
+    finish: Promise.withResolvers<void>(),
+  }))
+  let created = 0
+  const app = await setup({
+    createSession(resolveDirectory) {
+      const task = tasks[created++]!
+      return new AgentSession({ resolveDirectory, stream: (model, _context, options) => ({
+        result: () => new Promise(() => {}),
+        async *[Symbol.asyncIterator]() {
+          const partial = { role: 'assistant' as const, api: model.api, provider: model.provider, model: model.id, content: [], stopReason: 'pending' as const, timestamp: 1 }
+          yield { type: 'start' as const, partial }
+          const signal = options!.signal!
+          task.entered.resolve()
+          if (!signal.aborted) await once(signal, 'abort')
+          task.cancelled.resolve()
+          await task.finish.promise
+          yield { type: 'error' as const, reason: 'aborted' as const, error: { ...partial, stopReason: 'aborted' as const } }
+        },
+      }) })
+    },
+  })
+  const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const workspaceId = await pickWorkspace(app.url, auth)
+  const sessions = await Promise.all([createSession(app.url, auth, workspaceId), createSession(app.url, auth, workspaceId)])
+  expect(sessions.map(session => session.name).sort()).toEqual(['会话 1', '会话 2'])
+  try {
+    const replies = await Promise.all(sessions.map(({ id: sessionId }) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({
+      sessionId, clientMessageId: 'closing', modelId: 'deepseek-flash', text: '等待关闭',
+    }))))
+    expect(replies.map(reply => reply.status)).toEqual([202, 202])
+    await Promise.all(tasks.map(task => task.entered.promise))
+    let closed = false
+    const closing = app.server.close().then(() => { closed = true })
+    await Promise.all(tasks.map(task => task.cancelled.promise))
+    expect(closed).toBe(false)
+    const rejected = await http(app.url + '/api/sessions', headers, 'POST', JSON.stringify({ workspaceId }))
+    expect(rejected.status).toBe(503)
+    tasks[0]!.finish.resolve()
+    await new Promise(resolve => setImmediate(resolve))
+    expect(closed).toBe(false)
+    tasks[1]!.finish.resolve()
+    await closing
+    expect(closed).toBe(true)
+  } finally { for (const task of tasks) task.finish.resolve() }
 })

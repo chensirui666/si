@@ -1,18 +1,18 @@
-import type { CompactionRecord, ConversationMessage, ConversationSnapshot } from '@agent-learning/agent'
+import type { CompactionRecord, ConversationMessage, ConversationSnapshot, ServerFrame } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelMessage } from '@agent-learning/model'
-import type { ServerFrame } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 
 export type ConnectionState = 'connecting' | 'awaitingSnapshot' | 'ready' | 'disconnected'
 export type ChatState = {
+  sessionId: string | null
   connection: ConnectionState
   snapshot: ConversationSnapshot | null
   slow: boolean
   error: string | null
 }
-export type Subscription = (() => void) & { requestSnapshot?: () => void }
-export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void) => Subscription
-export const initialState: ChatState = { connection: 'connecting', snapshot: null, slow: false, error: null }
+export type Subscription = (() => void) & { requestSnapshot?: () => void; setSession: (sessionId: string | null) => void }
+export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void) => Subscription
+export const initialState: ChatState = { sessionId: null, connection: 'connecting', snapshot: null, slow: false, error: null }
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const sequence = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
@@ -128,12 +128,15 @@ function validSnapshot(value: unknown): value is ConversationSnapshot {
 
 export function applyFrame(state: ChatState, frame: unknown, subscriptionId: string): { state: ChatState; resubscribe: boolean } {
   const unchanged = { state, resubscribe: false }
-  if (!record(frame) || frame.subscriptionId !== subscriptionId) return unchanged
+  if (!state.sessionId || !record(frame) || frame.sessionId !== state.sessionId || frame.subscriptionId !== subscriptionId) return unchanged
+  if (frame.type === 'subscription_error' && typeof frame.error === 'string') {
+    return { state: { ...state, connection: 'ready', snapshot: null, slow: false, error: frame.error }, resubscribe: false }
+  }
   if (frame.type === 'snapshot') {
     if (!validSnapshot(frame.snapshot)) return unchanged
     if (state.connection === 'ready' && state.snapshot && frame.snapshot.seq <= state.snapshot.seq) return unchanged
     const valid = frame as Extract<ServerFrame, { type: 'snapshot' }>
-    return { state: { connection: 'ready', snapshot: valid.snapshot, slow: false, error: null }, resubscribe: false }
+    return { state: { ...state, connection: 'ready', snapshot: valid.snapshot, slow: false, error: null }, resubscribe: false }
   }
   if (frame.type !== 'update' || state.connection !== 'ready' || !state.snapshot || !record(frame.update) || !sequence(frame.update.seq)) return unchanged
   if (frame.update.seq <= state.snapshot.seq) return unchanged

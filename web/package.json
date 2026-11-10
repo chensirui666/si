@@ -33,7 +33,6 @@
     "tailwind-merge": "3.7.0"
   },
   "devDependencies": {
-    "@agent-learning/agent": "0.1.0",
     "@agent-learning/model": "0.1.0",
     "@agent-learning/server": "0.1.0",
     "@playwright/experimental-ct-react": "1.62.1",

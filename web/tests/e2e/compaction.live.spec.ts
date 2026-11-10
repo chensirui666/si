@@ -2,13 +2,13 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { CompactionRecord, ConversationSnapshot } from '@agent-learning/agent'
+import type { CompactionRecord, ConversationSnapshot } from '@agent-learning/server/protocol'
 import { createModelStream, findModel, type AssistantMessage, type ModelContext, type Tool } from '@agent-learning/model'
 import { WebServer } from '@agent-learning/server'
 import { expect, test, type Page } from '@playwright/test'
-import { buildModelHistory } from '../../../packages/agent/src/compaction'
+import { buildModelHistory } from '../../../packages/coding-agent/src/compaction'
 import { readLiveKey } from './live-key'
-import { addWorkspace, authorize, observe, ready, saveKey } from './test-utils'
+import { addWorkspace, authorize, observe, openSession, ready, saveKey, seedSession } from './test-utils'
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' })
 
@@ -16,7 +16,7 @@ type Success = Extract<CompactionRecord, { status: 'success' }>
 type WireRequest = {
   model: string
   max_tokens: number
-  messages: { role: string; content: string | null; reasoning_content?: string }[]
+  messages: { role: string; content: string | null; reasoning_content?: string; tool_calls?: { id: string }[]; tool_call_id?: string }[]
   tools?: { type: string; function: Tool }[]
 }
 
@@ -99,8 +99,7 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
     ])
     const observed = observe(page)
     await authorize(page, (await server.start()).authUrl)
-    await ready(page, observed)
-    await addWorkspace(page)
+    await seedSession(page, observed, await addWorkspace(page))
     await saveKey(page, key)
 
     const first = await submit(page, observed, `我们要继续同一项交付任务。两项必须一直记住的早期事实：交付编号是 ${deliveryId}，发布地区是${region}。约束：仅操作当前临时工作区；禁止在其他目录写文件。最终待完成产物是 output.json，键为 deliveryId、region、project、owner、batch；在我明确要求生成产物前不要写文件。初始输出格式约定为 Markdown，稍后可能更正。现在先用 read 读取 index.txt，根据线索继续 read 找出项目名称。读完仅回答“线索已确认”，不要复述两项早期事实。以下是没有业务意义且不需要记住的旧日志：\n${randomBytes(9000).toString('hex')}`)
@@ -246,6 +245,109 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
     throw error
   } finally {
     key = ''
+    await Promise.allSettled([context.clearCookies(), server.close()])
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续，压缩只影响目标会话', async ({ page, context }, testInfo) => {
+  test.setTimeout(900_000)
+  const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
+  test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE')
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-feature8-live-'))
+  const cwd = join(temporary, 'workspace')
+  const codeA = `QH-${randomUUID().slice(0, 8)}`, codeB = `BY-${randomUUID().slice(0, 8)}`
+  const contentA = '项目名称：青禾', contentB = '项目名称：白榆'
+  const requests: WireRequest[] = []
+  const server = new WebServer({
+    port: 0, directoryPicker: async () => cwd, compaction: { triggerTokens: 20_000, keepRecentTokens: 400 },
+    browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
+    workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
+    modelOptions: { fetch: async (url, init) => {
+      requests.push(JSON.parse(String(init?.body)))
+      return globalThis.fetch(url, init)
+    } },
+  })
+  try {
+    await mkdir(cwd)
+    await Promise.all([writeFile(join(cwd, 'a.txt'), contentA), writeFile(join(cwd, 'b.txt'), contentB)])
+    const observed = observe(page)
+    await authorize(page, (await server.start()).authUrl)
+    const workspaceId = await addWorkspace(page)
+    const a = await seedSession(page, observed, workspaceId)
+    await saveKey(page, await readLiveKey(keyFile!))
+    const verifyRead = async (filename: string, content: string, code: string, order: string) => {
+      const start = requests.length
+      await submit(page, observed, `请记住本会话专用代号 ${code}。只调用 read 读取 ${filename}，记住实际工具结果，读完只回复“已记录”。之后我问“按原约定给出结果”时，不使用工具，按约定${order}。`)
+      const [first, continuation] = requests.slice(start)
+      expect(requests.length - start).toBe(2)
+      expect(first?.tools).toHaveLength(8)
+      const callId = continuation?.messages.at(-2)?.tool_calls?.[0]?.id
+      expect(callId).toBeTruthy()
+      expect(continuation?.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: callId, content })
+      return callId
+    }
+    const recall = '按原约定给出结果。不要调用工具。'
+    const verifyRecall = async (code: string, content: string, otherCode: string, otherContent: string, first: string, last: string) => {
+      const start = requests.length
+      const result = await submit(page, observed, recall)
+      expect(requests.length - start).toBe(1)
+      const input = requests[start]!
+      expect(JSON.stringify(input.messages)).toContain(code)
+      expect(JSON.stringify(input.messages)).toContain(content)
+      expect(JSON.stringify(input.messages)).not.toContain(otherCode)
+      expect(JSON.stringify(input.messages)).not.toContain(otherContent)
+      const answer = textOf(result.message!)
+      expect(answer).toContain(first)
+      expect(answer).toContain(last)
+      expect(answer.indexOf(first)).toBeLessThan(answer.indexOf(last))
+      return { input, answer }
+    }
+    const toolA = await verifyRead('a.txt', contentA, codeA, '先输出代号再输出文件原文')
+    const b = await seedSession(page, observed, workspaceId)
+    const toolB = await verifyRead('b.txt', contentB, codeB, '先输出文件原文再输出代号')
+    await openSession(page, observed, '会话 1')
+    const aRecalled = await verifyRecall(codeA, contentA, codeB, contentB, codeA, contentA)
+    expect(aRecalled.input.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: toolA, content: contentA }))
+    await openSession(page, observed, '会话 2')
+    const bRecalled = await verifyRecall(codeB, contentB, codeA, contentA, contentB, codeB)
+    expect(bRecalled.input.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: toolB, content: contentB }))
+    const bBefore = await refresh(page, observed)
+
+    await openSession(page, observed, '会话 1')
+    await submit(page, observed, `只回复“收到”。以下随机样本属于近期数据，无需记住或复述。\n${randomBytes(1600).toString('hex')}`)
+    const aBefore = await refresh(page, observed)
+    const summaryRequest = requests.length
+    const manual = await submit(page, observed, '/compact')
+    const aAfter = await refresh(page, observed)
+    const record = requireSuccess(aAfter, manual.accepted.compactionId!)
+    expect(aAfter.messages).toEqual(aBefore.messages)
+    expect(record.summary).toContain(codeA)
+    expect(record.summary).toContain('青禾')
+    expect(record.summary).not.toContain(codeB)
+    expect(record.fileOperations?.readFiles).toEqual([join(await realpath(cwd), 'a.txt')])
+    expect(requests[summaryRequest]?.tools ?? []).toHaveLength(0)
+    expect(JSON.stringify(requests[summaryRequest]?.messages)).toContain(contentA)
+    const aResumed = await verifyRecall(codeA, '青禾', codeB, contentB, codeA, contentA)
+    expect(aResumed.input.messages[1]?.content).toContain(record.summary)
+    expect(aResumed.input.messages.some(message => message.role === 'user' && message.content?.includes('以下随机样本属于近期数据'))).toBe(true)
+    expect(aResumed.input.messages.some(message => message.role === 'tool' && message.tool_call_id === toolA)).toBe(false)
+    const bAfter = await openSession(page, observed, '会话 2')
+    expect(bAfter.sessionId).toBe(b)
+    expect(bAfter.snapshot).toEqual(bBefore)
+    const bResumed = await verifyRecall(codeB, contentB, codeA, contentA, contentB, codeB)
+    expect(JSON.stringify(bResumed.input.messages)).not.toContain(record.summary)
+    expect(bResumed.input.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: toolB, content: contentB }))
+
+    await testInfo.attach('feature8-live-evidence', {
+      contentType: 'application/json',
+      body: JSON.stringify({
+        a, b, toolA, toolB, recordId: record.id, summaryInputTokens: record.summaryUsage?.input,
+        sessionA: { code: codeA, toolResult: contentA, before: aRecalled.answer, after: aResumed.answer, requestRoles: aResumed.input.messages.map(message => message.role), usedSummary: true },
+        sessionB: { code: codeB, toolResult: contentB, before: bRecalled.answer, after: bResumed.answer, requestRoles: bResumed.input.messages.map(message => message.role), unchangedByACompaction: true },
+      }),
+    })
+  } finally {
     await Promise.allSettled([context.clearCookies(), server.close()])
     await rm(temporary, { recursive: true, force: true })
   }

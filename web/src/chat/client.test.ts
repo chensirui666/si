@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { abortMessage, deleteApiKey, getModels, saveApiKey, subscribe } from './client'
-import type { ChatState } from './state'
+import type { ChatState, Subscription } from './state'
 
 class Socket extends EventTarget {
   static instances: Socket[] = []
   readyState = 0
-  sent: { type: string; subscriptionId: string }[] = []
+  sent: { type: string; subscriptionId: string; sessionId?: string }[] = []
   constructor(readonly url: string) { super(); Socket.instances.push(this) }
   send(text: string) { this.sent.push(JSON.parse(text)) }
   open() { this.readyState = 1; this.dispatchEvent(new Event('open')) }
@@ -15,28 +15,30 @@ class Socket extends EventTarget {
   get id() { return this.sent.at(-1)!.subscriptionId }
 }
 
+const sessionId = 'session-a'
 const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 
 it.each([true, false])('abort validates the target and handled=%s with same-origin credentials', async handled => {
-  const fetcher = vi.fn(async () => Response.json({ runId: 'user-1', handled }))
+  const fetcher = vi.fn(async () => Response.json({ sessionId, runId: 'user-1', handled }))
   vi.stubGlobal('fetch', fetcher)
-  expect(await abortMessage({ runId: 'user-1' })).toEqual({ runId: 'user-1', handled })
-  expect(fetcher).toHaveBeenCalledWith('/api/abort', expect.objectContaining({ method: 'POST', credentials: 'same-origin', body: '{"runId":"user-1"}' }))
+  expect(await abortMessage({ sessionId, runId: 'user-1' })).toEqual({ sessionId, runId: 'user-1', handled })
+  expect(fetcher).toHaveBeenCalledWith('/api/abort', expect.objectContaining({ method: 'POST', credentials: 'same-origin', body: JSON.stringify({ sessionId, runId: 'user-1' }) }))
 })
 
 it.each([
-  [200, { runId: 'wrong', handled: true }], [200, { runId: 'user-1', handled: 'true' }],
-  [202, { runId: 'user-1', handled: true }], [500, { error: '服务不可用' }], [401, null], [403, null],
+  [200, { sessionId: 'other', runId: 'user-1', handled: true }],
+  [200, { sessionId, runId: 'wrong', handled: true }], [200, { sessionId, runId: 'user-1', handled: 'true' }],
+  [202, { sessionId, runId: 'user-1', handled: true }], [500, { error: '服务不可用' }], [401, null], [403, null],
 ] as const)('abort rejects invalid or unsuccessful receipt %s %j', async (status, body) => {
   vi.stubGlobal('fetch', async () => Response.json(body, { status }))
-  await expect(abortMessage({ runId: 'user-1' })).rejects.toThrow()
+  await expect(abortMessage({ sessionId, runId: 'user-1' })).rejects.toThrow()
 })
 let online = true
 let states: ChatState[]
-let stop: (() => void) | undefined
+let stop: Subscription | undefined
 const current = () => states.at(-1)!
 const socket = () => Socket.instances.at(-1)!
-const snapshot = (ws = socket(), seq = 0) => ws.frame({ type: 'snapshot', subscriptionId: ws.id, snapshot: { ...empty, seq } })
+const snapshot = (ws = socket(), seq = 0) => ws.frame({ type: 'snapshot', sessionId, subscriptionId: ws.id, snapshot: { ...empty, seq } })
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -48,17 +50,43 @@ beforeEach(() => {
   Socket.instances = []
 })
 afterEach(() => { stop?.(); stop = undefined; vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
-function start() { stop = subscribe(state => { states.push(state) }) }
+function start() { stop = subscribe(state => { states.push(state) }); stop.setSession(sessionId) }
 
 describe('browser subscription', () => {
+  it('切换会话后同时校验会话和订阅编号，忽略 A 的迟到更新', () => {
+    start(); socket().open(); snapshot()
+    const ws = socket()
+    const previous = ws.id
+    stop!.setSession('session-b')
+    expect(ws.id).not.toBe(previous)
+    expect(current()).toMatchObject({ sessionId: 'session-b', connection: 'awaitingSnapshot', snapshot: null })
+    ws.frame({ type: 'snapshot', sessionId: 'session-b', subscriptionId: ws.id, snapshot: empty })
+    ws.frame({ type: 'update', sessionId, subscriptionId: previous, update: { seq: 1, change: { type: 'task', running: null } } })
+    ws.frame({ type: 'update', sessionId, subscriptionId: ws.id, update: { seq: 1, change: { type: 'task', running: null } } })
+    expect(current().snapshot?.seq).toBe(0)
+    ws.frame({ type: 'update', sessionId: 'session-b', subscriptionId: ws.id, update: { seq: 1, change: { type: 'task', running: null } } })
+    expect(current().snapshot?.seq).toBe(1)
+  })
+
+  it('会话不存在时保持原连接，继续打开其他会话', () => {
+    start(); socket().open()
+    const ws = socket()
+    ws.frame({ type: 'subscription_error', sessionId, subscriptionId: ws.id, error: '会话不存在' })
+    expect(current()).toMatchObject({ sessionId, snapshot: null, error: '会话不存在' })
+    stop!.setSession('session-b')
+    ws.frame({ type: 'snapshot', sessionId: 'session-b', subscriptionId: ws.id, snapshot: empty })
+    expect(current()).toMatchObject({ sessionId: 'session-b', connection: 'ready', snapshot: empty, error: null })
+    expect(Socket.instances).toEqual([ws])
+  })
+
   it('握手后仍等待当前编号的有效快照，旧编号和不完整快照不能使页面就绪', () => {
     start()
     expect(current().connection).toBe('connecting')
     expect(socket().url).toBe('ws://localhost:3000/api/events')
     socket().open()
     expect(current().connection).toBe('awaitingSnapshot')
-    socket().frame({ type: 'snapshot', subscriptionId: 'old', snapshot: empty })
-    socket().frame({ type: 'snapshot', subscriptionId: socket().id, snapshot: { seq: 0 } })
+    socket().frame({ type: 'snapshot', sessionId, subscriptionId: 'old', snapshot: empty })
+    socket().frame({ type: 'snapshot', sessionId, subscriptionId: socket().id, snapshot: { seq: 0 } })
     expect(current().connection).toBe('awaitingSnapshot')
     snapshot()
     expect(current()).toMatchObject({ connection: 'ready', snapshot: empty, slow: false, error: null })
@@ -71,14 +99,14 @@ describe('browser subscription', () => {
     const ws = socket()
     const old = ws.id
     const accepted = { type: 'accepted', user: { id: 'user-1', message: { role: 'user', content: 'hello', timestamp: 1 } }, running: { kind: 'task' as const, runId: 'user-1', assistantMessageId: 'assistant-1', phase: 'model', activeTools: [] } }
-    ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
-    ws.frame({ type: 'update', subscriptionId: old, update: { seq: 1, change: accepted } })
+    ws.frame({ type: 'update', sessionId, subscriptionId: old, update: { seq: 1, change: accepted } })
+    ws.frame({ type: 'update', sessionId, subscriptionId: old, update: { seq: 1, change: accepted } })
     expect(current().snapshot?.messages).toHaveLength(1)
     expect(current().snapshot?.seq).toBe(1)
-    ws.frame({ type: 'update', subscriptionId: old, update: { seq: 3, change: accepted } })
+    ws.frame({ type: 'update', sessionId, subscriptionId: old, update: { seq: 3, change: accepted } })
     expect(ws.id).not.toBe(old)
     expect(current().connection).toBe('awaitingSnapshot')
-    ws.frame({ type: 'snapshot', subscriptionId: old, snapshot: empty })
+    ws.frame({ type: 'snapshot', sessionId, subscriptionId: old, snapshot: empty })
     expect(current().connection).toBe('awaitingSnapshot')
     snapshot(ws, 3)
     expect(current().connection).toBe('ready')
@@ -139,7 +167,7 @@ describe('browser subscription', () => {
     const next = socket()
     next.open(); snapshot(next)
     old.open(); old.error(); old.close()
-    old.frame({ type: 'snapshot', subscriptionId: next.id, snapshot: { ...empty, seq: 9 } })
+    old.frame({ type: 'snapshot', sessionId, subscriptionId: next.id, snapshot: { ...empty, seq: 9 } })
     expect(current().snapshot?.seq).toBe(0)
     expect(current().connection).toBe('ready')
   })
@@ -202,6 +230,7 @@ describe('model configuration client', () => {
     const workspacesChanged = vi.fn()
     const webSettingsChanged = vi.fn()
     stop = subscribe(state => states.push(state), changed, workspacesChanged, webSettingsChanged)
+    stop.setSession(sessionId)
     socket().open(); snapshot()
     const ws = socket()
     const id = ws.id
@@ -229,11 +258,11 @@ it.each([
 })
 
 it('提交保留完整原文，只发送一次请求并校验 202 回执', async () => {
-  const accepted = { kind: 'message' as const, clientMessageId: 'local', userMessageId: 'user', acceptedSeq: 1 }
+  const accepted = { sessionId, kind: 'message' as const, clientMessageId: 'local', userMessageId: 'user', acceptedSeq: 1 }
   const fetch = vi.fn().mockResolvedValue({ status: 202, ok: true, json: async () => accepted })
   vi.stubGlobal('fetch', fetch)
   const { submitMessage } = await import('./client')
-  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', workspaceId: 'workspace-1', text: '  原文\n\n' }
+  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', sessionId, text: '  原文\n\n' }
   await expect(submitMessage(input)).resolves.toEqual(accepted)
   expect(fetch.mock.calls).toEqual([['/api/messages', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }]])
   fetch.mockResolvedValue({ status: 202, ok: true, json: async () => ({ ...accepted, clientMessageId: 'wrong' }) })
@@ -244,7 +273,7 @@ it('明确拒绝带状态码，网络失败保持接收状态未知且没有自�
   const fetch = vi.fn().mockResolvedValue({ status: 409, ok: false, json: async () => ({ error: '正在生成' }) })
   vi.stubGlobal('fetch', fetch)
   const { submitMessage } = await import('./client')
-  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', workspaceId: 'workspace-1', text: 'hello' }
+  const input = { clientMessageId: 'local', modelId: 'deepseek-flash', sessionId, text: 'hello' }
   await expect(submitMessage(input)).rejects.toMatchObject({ status: 409, message: '正在生成' })
   fetch.mockRejectedValue(new Error('network'))
   await expect(submitMessage(input)).rejects.toMatchObject({ message: '网络请求失败，未确认接收' })
@@ -254,6 +283,7 @@ it('明确拒绝带状态码，网络失败保持接收状态未知且没有自�
 it('主动重取快照保留清理函数接口，换编号并设置准备超时', () => {
   const subscription = subscribe(state => states.push(state))
   stop = subscription
+  subscription.setSession(sessionId)
   socket().open(); snapshot()
   const old = socket().id
   subscription.requestSnapshot?.()
@@ -266,13 +296,13 @@ it('主动重取快照保留清理函数接口，换编号并设置准备超时'
 it.each([413, 415])('HTTP %s 是明确拒绝而非接收未知', async status => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status, ok: false, json: async () => ({ error: status === 413 ? '消息过长' : '需要 JSON 请求' }) }))
   const { submitMessage } = await import('./client')
-  await expect(submitMessage({ clientMessageId: 'local', modelId: 'deepseek-flash', workspaceId: 'workspace-1', text: 'a'.repeat(70_000) })).rejects.toMatchObject({ status })
+  await expect(submitMessage({ clientMessageId: 'local', modelId: 'deepseek-flash', sessionId, text: 'a'.repeat(70_000) })).rejects.toMatchObject({ status })
 })
 
 it('W3/W3.5 漏失结果先重订阅，重连与停止后旧连接不能改写结果', () => {
   start(); socket().open(); snapshot()
   const ws = socket(), oldId = ws.id
-  ws.frame({ type: 'update', subscriptionId: oldId, update: { seq: 2, change: { type: 'task', running: null } } })
+  ws.frame({ type: 'update', sessionId, subscriptionId: oldId, update: { seq: 2, change: { type: 'task', running: null } } })
   expect(current().connection).toBe('awaitingSnapshot')
   expect(current().snapshot?.seq).toBe(0)
   ws.close()
@@ -280,25 +310,25 @@ it('W3/W3.5 漏失结果先重订阅，重连与停止后旧连接不能改写�
   const next = socket(); next.open()
   const assistant = { id: 'a', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1, stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'read-1', name: 'read', arguments: { path: 'note.txt' } }] } }
   const result = { id: 'r', toolCall: { assistantMessageId: 'a', contentIndex: 0 }, message: { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', timestamp: 2, isError: false, content: [{ type: 'text', text: '项目名称：青禾' }] } }
-  next.frame({ type: 'snapshot', subscriptionId: next.id, snapshot: { ...empty, seq: 3, messages: [assistant, result] } })
+  next.frame({ type: 'snapshot', sessionId, subscriptionId: next.id, snapshot: { ...empty, seq: 3, messages: [assistant, result] } })
   expect(current().connection).toBe('ready')
   const restored = current()
-  ws.frame({ type: 'update', subscriptionId: oldId, update: { seq: 4, change: { type: 'task', running: { kind: 'task' as const, runId: 'u', assistantMessageId: 'a', phase: 'tools', activeTools: [{ assistantMessageId: 'a', contentIndex: 0 }] } } } })
+  ws.frame({ type: 'update', sessionId, subscriptionId: oldId, update: { seq: 4, change: { type: 'task', running: { kind: 'task' as const, runId: 'u', assistantMessageId: 'a', phase: 'tools', activeTools: [{ assistantMessageId: 'a', contentIndex: 0 }] } } } })
   expect(current()).toBe(restored)
   const count = states.length
   stop?.()
-  next.frame({ type: 'snapshot', subscriptionId: next.id, snapshot: empty })
+  next.frame({ type: 'snapshot', sessionId, subscriptionId: next.id, snapshot: empty })
   vi.advanceTimersByTime(30_000)
   expect(states).toHaveLength(count)
   expect(Socket.instances).toHaveLength(2)
 })
 
 it('压缩与普通消息按各自类型校验接收回执', async () => {
-  const receipt = { kind: 'compaction', clientMessageId: 'draft', compactionId: 'c1', acceptedSeq: 2 }
+  const receipt = { sessionId, kind: 'compaction', clientMessageId: 'draft', compactionId: 'c1', acceptedSeq: 2 }
   const fetch = vi.fn().mockResolvedValue({ status: 202, ok: true, json: async () => receipt })
   vi.stubGlobal('fetch', fetch)
   const { submitMessage } = await import('./client')
-  const input = { clientMessageId: 'draft', modelId: 'deepseek-flash', workspaceId: 'w', text: ' /compact ' }
+  const input = { clientMessageId: 'draft', modelId: 'deepseek-flash', sessionId, text: ' /compact ' }
   await expect(submitMessage(input)).resolves.toEqual(receipt)
   await expect(submitMessage({ ...input, text: '普通问题' })).rejects.toThrow('提交回执无效')
   fetch.mockResolvedValue({ status: 202, ok: true, json: async () => ({ kind: 'message', clientMessageId: 'draft', userMessageId: 'u', acceptedSeq: 2 }) })

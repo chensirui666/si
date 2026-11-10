@@ -1,14 +1,21 @@
 import { getEventListeners } from 'node:events'
 import { describe, expect, it } from 'vitest'
 import { Type } from 'typebox'
-import { Agent } from '../src/index.js'
-import type { ExecutableTool } from '../src/index.js'
+import { AgentSession } from '../src/agent-session.js'
+import type { ExecutableTool } from '@agent-learning/agent'
 import type { AssistantMessage, ModelContext, ModelEvent, ModelEventStream, ToolCall } from '@agent-learning/model'
 
-describe('Agent 初始订阅', () => {
+const workspaceDirectory = '/workspace-with-spaces /project'
+
+function createSession({ tools, ...options }: Omit<ConstructorParameters<typeof AgentSession>[0], 'resolveDirectory' | 'tools'>
+  & { tools?: ExecutableTool[] } = {}) {
+  return new AgentSession({ ...options, resolveDirectory: async () => workspaceDirectory, tools: () => tools ?? [] })
+}
+
+describe('AgentSession 初始订阅', () => {
   it('首先提供真实空快照', async () => {
     const controller = new AbortController()
-    const iterator = new Agent().subscribe(controller.signal)[Symbol.asyncIterator]()
+    const iterator = createSession().subscribe(controller.signal)[Symbol.asyncIterator]()
 
     expect(await iterator.next()).toEqual({
       done: false,
@@ -22,8 +29,8 @@ describe('Agent 初始订阅', () => {
     expect(await iterator.next()).toEqual({ done: true, value: undefined })
   })
 
-  it('修改快照不会改变 Agent 或其他订阅的状态', async () => {
-    const agent = new Agent()
+  it('修改快照不会改变 AgentSession 或其他订阅的状态', async () => {
+    const agent = createSession()
     const controller = new AbortController()
     const first = agent.subscribe(controller.signal)[Symbol.asyncIterator]()
     const firstEvent = (await first.next()).value
@@ -48,7 +55,7 @@ describe('Agent 初始订阅', () => {
   })
 
   it('取消一个订阅不会结束另一个订阅', async () => {
-    const agent = new Agent()
+    const agent = createSession()
     const firstController = new AbortController()
     const secondController = new AbortController()
     const first = agent.subscribe(firstController.signal)[Symbol.asyncIterator]()
@@ -73,7 +80,7 @@ describe('Agent 初始订阅', () => {
   it('预取消信号不产生快照或遗留监听', async () => {
     const controller = new AbortController()
     controller.abort()
-    const iterator = new Agent().subscribe(controller.signal)[Symbol.asyncIterator]()
+    const iterator = createSession().subscribe(controller.signal)[Symbol.asyncIterator]()
 
     expect(await iterator.next()).toEqual({ done: true, value: undefined })
     expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
@@ -81,7 +88,7 @@ describe('Agent 初始订阅', () => {
 
   it('等待更新时取消会结束所有等待并移除监听', async () => {
     const controller = new AbortController()
-    const iterator = new Agent().subscribe(controller.signal)[Symbol.asyncIterator]()
+    const iterator = createSession().subscribe(controller.signal)[Symbol.asyncIterator]()
     await iterator.next()
     const firstPending = iterator.next()
     const secondPending = iterator.next()
@@ -95,7 +102,7 @@ describe('Agent 初始订阅', () => {
 
   it.each(['读取前', '收到快照后', '等待更新中'])('%s return 会立刻释放订阅', async (stage) => {
     const controller = new AbortController()
-    const iterator = new Agent().subscribe(controller.signal)[Symbol.asyncIterator]()
+    const iterator = createSession().subscribe(controller.signal)[Symbol.asyncIterator]()
     if (stage !== '读取前') await iterator.next()
     const pending = stage === '等待更新中' ? iterator.next() : undefined
 
@@ -132,7 +139,7 @@ function controlled() {
 }
 const assistant = (): AssistantMessage => ({ role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', content: [], stopReason: 'pending', timestamp: 1 })
 const input = { clientMessageId: 'local-1', modelId: 'deepseek-flash', text: '  你好\n第二行  ' }
-async function snapshot(agent: Agent) {
+async function snapshot(agent: AgentSession) {
   const controller = new AbortController()
   const event = (await agent.subscribe(controller.signal).next()).value
   controller.abort()
@@ -141,17 +148,17 @@ async function snapshot(agent: Agent) {
 }
 async function until(predicate: () => Promise<boolean>) {
   for (let i = 0; i < 100; i++) { if (await predicate()) return; await new Promise(resolve => setImmediate(resolve)) }
-  throw new Error('Agent did not consume expected event')
+  throw new Error('AgentSession did not consume expected event')
 }
 
-describe('Agent 提交与运行', () => {
+describe('AgentSession 提交与运行', () => {
   it('原子接收原文、回执和忙碌状态，拒绝并发且不调用第二次模型', async () => {
     const queue = controlled()
     let calls = 0
-    const agent = new Agent({ stream: () => { calls++; return queue.output } })
+    const agent = createSession({ stream: () => { calls++; return queue.output } })
     const first = agent.submit(input)
     const second = agent.submit({ ...input, clientMessageId: 'local-2' })
-    await expect(second).rejects.toMatchObject({ status: 409 })
+    await expect(second).rejects.toMatchObject({ code: 'busy' })
     const receipt = await first
     const current = await snapshot(agent)
     expect(receipt).toEqual({ kind: 'message', clientMessageId: 'local-1', userMessageId: current.messages[0]?.id, acceptedSeq: 1 })
@@ -163,14 +170,14 @@ describe('Agent 提交与运行', () => {
   })
 
   it.each([{ ...input, text: ' \n ' }, { ...input, modelId: 'unknown' }, { ...input, clientMessageId: '' }])('无效提交不改变正式状态', async value => {
-    const agent = new Agent({ stream: () => { throw new Error('must not call') } })
-    await expect(agent.submit(value)).rejects.toMatchObject({ status: 400 })
+    const agent = createSession({ stream: () => { throw new Error('must not call') } })
+    await expect(agent.submit(value)).rejects.toMatchObject({ code: 'invalid' })
     expect(await snapshot(agent)).toEqual({ seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null })
   })
 
   it('事件独立累积，不读取已领先的 shared partial；切点后更新连续且副本独立', async () => {
     const queue = controlled()
-    const agent = new Agent({ stream: () => queue.output })
+    const agent = createSession({ stream: () => queue.output })
     await agent.submit(input)
     const partial = assistant()
     partial.content = [{ type: 'text', text: 'AB' }]
@@ -203,7 +210,7 @@ describe('Agent 提交与运行', () => {
   it('工具参数中途快照只保留已消费原文，取消订阅不取消模型', async () => {
     const queue = controlled()
     let signal: AbortSignal | undefined
-    const agent = new Agent({ stream: (_model, _context, options) => { signal = options?.signal; return queue.output } })
+    const agent = createSession({ stream: (_model, _context, options) => { signal = options?.signal; return queue.output } })
     await agent.submit(input)
     const partial = assistant()
     queue.push({ type: 'start', partial })
@@ -225,7 +232,7 @@ describe('Agent 提交与运行', () => {
     const first = controlled(), second = controlled(), third = controlled()
     const queues = [first, second, third]
     const contexts: ModelContext[] = []
-    const agent = new Agent({ stream: (_model, context) => { contexts.push(context); return queues.shift()!.output } })
+    const agent = createSession({ stream: (_model, context) => { contexts.push(context); return queues.shift()!.output } })
     await agent.submit(input)
     first.push({ type: 'error', reason: 'error', error: { ...assistant(), content: [{ type: 'text', text: '半截' }], stopReason: 'error', errorMessage: '失败' } })
     await until(async () => (await snapshot(agent)).running === null)
@@ -242,7 +249,7 @@ describe('Agent 提交与运行', () => {
 
   it('准备请求抛错或流意外结束也产生脱敏失败回复并释放忙碌', async () => {
     for (const stream of [() => { throw new Error('secret-provider-message') }, () => ({ async *[Symbol.asyncIterator]() {}, result: () => Promise.reject(new Error('unused')) })]) {
-      const agent = new Agent({ stream })
+      const agent = createSession({ stream })
       await agent.submit(input)
       await until(async () => (await snapshot(agent)).running === null)
       const current = await snapshot(agent)
@@ -251,9 +258,9 @@ describe('Agent 提交与运行', () => {
     }
   })
 
-  it('关闭 Agent 主动取消当前生成并等候收尾，之后不再接收', async () => {
+  it('关闭 AgentSession 主动取消当前生成并等候收尾，之后不再接收', async () => {
     const queue = controlled()
-    const agent = new Agent({ stream: (_model, _context, options) => {
+    const agent = createSession({ stream: (_model, _context, options) => {
       options!.signal!.addEventListener('abort', () => queue.push({ type: 'error', reason: 'aborted', error: { ...assistant(), stopReason: 'aborted' } }), { once: true })
       return queue.output
     } })
@@ -270,7 +277,7 @@ describe('Agent 提交与运行', () => {
     const released = new Promise<void>(resolve => { release = resolve })
     let firstCleaning = false, calls = 0
     let secondSignal: AbortSignal | undefined
-    const agent = new Agent({ stream: (_model, _context, options) => {
+    const agent = createSession({ stream: (_model, _context, options) => {
       if (calls++ === 0) return {
         result: first.output.result,
         [Symbol.asyncIterator]() {
@@ -288,7 +295,7 @@ describe('Agent 提交与运行', () => {
     await agent.submit(input)
     first.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => firstCleaning)
-    await expect(agent.submit(input)).rejects.toMatchObject({ status: 409 })
+    await expect(agent.submit(input)).rejects.toMatchObject({ code: 'busy' })
     release()
     await until(async () => (await snapshot(agent)).running === null)
     const next = await agent.submit(input)
@@ -313,28 +320,25 @@ function withTools(execute: ExecutableTool['execute'], executionMode?: Executabl
   const queues = [first, answer]
   const contexts: ModelContext[] = []
   const tool = { executionMode, name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }), execute }
-  const agent = new Agent({ tools: [tool], stream: (_model, context) => {
+  const agent = createSession({ tools: [tool], stream: (_model, context) => {
     contexts.push(context)
     return queues.shift()!.output
   } })
   return { agent, first, answer, contexts }
 }
 
-const workspaceInput = { ...input, cwd: '/workspace-with-spaces /project' }
-
-describe('Agent 一批工具与最终回答', () => {
+describe('AgentSession 一批工具与最终回答', () => {
   it('完整首轮结束后才执行，回填并保持忙碌直到最终回答结束', async () => {
     const executions: string[] = []
     let release!: () => void
     const waitForRelease = new Promise<void>(resolve => { release = resolve })
-    const { agent, first, answer, contexts } = withTools(async (args, { cwd, signal }) => {
-      expect(cwd).toBe(workspaceInput.cwd)
+    const { agent, first, answer, contexts } = withTools(async (args, { signal }) => {
       expect(signal.aborted).toBe(false)
       executions.push(String(args.path))
       await waitForRelease
       return '文件内容'
     })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     const partial = assistant()
     const call = toolCall('read-1')
     first.push({ type: 'start', partial })
@@ -346,7 +350,7 @@ describe('Agent 一批工具与最终回答', () => {
     await until(async () => (await snapshot(agent)).seq === 5)
     expect(executions).toEqual([])
     expect(contexts[0].tools?.map(({ name }) => name)).toEqual(['read'])
-    expect(contexts[0].systemPrompt).toContain(workspaceInput.cwd)
+    expect(contexts[0].systemPrompt).toContain(workspaceDirectory)
     const request = { ...partial, stopReason: 'toolUse' as const, content: [{ type: 'thinking' as const, thinking: '先读取' }, call] }
     first.push({ type: 'done', reason: 'toolUse', message: request })
     await until(async () => (await snapshot(agent)).running?.phase === 'tools')
@@ -369,7 +373,7 @@ describe('Agent 一批工具与最终回答', () => {
     expect(contexts[1].tools).toEqual(contexts[0].tools)
     expect(contexts[1].messages).toEqual(answering.messages.map(entry => entry.message))
     expect(executions).toEqual(['read-1'])
-    await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: 409 })
+    await expect(agent.submit(input)).rejects.toMatchObject({ code: 'busy' })
 
     answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop', content: [{ type: 'text', text: '已读取' }] } })
     await until(async () => (await snapshot(agent)).running === null)
@@ -386,7 +390,7 @@ describe('Agent 一批工具与最终回答', () => {
       if (path === 'fails') throw new Error('已有部分结果')
       return path
     })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     const calls = [
       toolCall('first'),
       toolCall('invalid', { argumentsError: '工具参数不是有效的 JSON 对象' }),
@@ -421,7 +425,7 @@ describe('Agent 一批工具与最终回答', () => {
       await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
       throw new Error('取消前已有部分结果')
     }, 'sequential')
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     first.push({ type: 'done', reason: 'toolUse', message: {
       ...assistant(), stopReason: 'toolUse', content: [toolCall('first'), toolCall('later')],
     } })
@@ -449,7 +453,7 @@ describe('Agent 一批工具与最终回答', () => {
       executed.push(String(args.path))
       return '不应执行'
     })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     const message = { ...assistant(), stopReason: reason, content: [toolCall('first'), toolCall(invalidId)] }
     first.push(reason === 'aborted' || reason === 'error'
       ? { type: 'error', reason, error: { ...message, errorMessage: '未完成' } }
@@ -460,21 +464,21 @@ describe('Agent 一批工具与最终回答', () => {
     expect((await snapshot(agent)).messages[1]?.message).toMatchObject({
       role: 'assistant', content: message.content, errorMessage: expect.any(String),
     })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     expect(contexts[1].messages.map(item => item.role)).toEqual(['user', 'user'])
     answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
   })
 })
 
-describe('Agent 主动中止', () => {
+describe('AgentSession 主动中止', () => {
   it.each(['aborted', 'stop'] as const)('重复中止等待同次模型清理，保留 %s 实际终态并允许继续', async reason => {
     let release!: () => void
     const cleanup = new Promise<void>(resolve => { release = resolve })
     let cleaning = false
     let signal!: AbortSignal
     let calls = 0
-    const agent = new Agent({ stream: (_model, _context, options) => {
+    const agent = createSession({ stream: (_model, _context, options) => {
       signal = options!.signal!
       const output = controlled()
       calls++
@@ -499,7 +503,7 @@ describe('Agent 主动中止', () => {
     await until(async () => cleaning)
     expect(signal.aborted).toBe(true)
     expect(ended).toBe(false)
-    await expect(agent.submit(input)).rejects.toMatchObject({ status: 409 })
+    await expect(agent.submit(input)).rejects.toMatchObject({ code: 'busy' })
     release()
     expect(await aborting).toBe(true)
     expect(await again).toBe(true)
@@ -526,7 +530,7 @@ describe('Agent 主动中止', () => {
       await finishing
       throw new Error('取消前已有部分结果')
     }, 'sequential')
-    const accepted = await agent.submit(workspaceInput)
+    const accepted = await agent.submit(input)
     const complete = { ...assistant(), stopReason: 'toolUse' as const, content: [toolCall('first'), toolCall('second'), toolCall('third')] }
     first.push({ type: 'done', reason: 'toolUse', message: complete })
     await until(async () => executed.length === count)
@@ -541,7 +545,7 @@ describe('Agent 主动中止', () => {
     expect(current.messages.at(-1)?.message).toMatchObject({ stopReason: 'aborted' })
     expect(contexts).toHaveLength(1)
     expect(executed).toEqual(['first', 'second', 'third'].slice(0, count))
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     expect(contexts[1].messages.map(message => message.role)).toEqual(['user', 'assistant', ...Array(count).fill('toolResult'), 'user'])
     answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
@@ -554,7 +558,7 @@ describe('Feature6 连续决策与同批调度', () => {
   function loop(execute: ExecutableTool['execute'], executionMode?: ExecutableTool['executionMode']) {
     const queues = [controlled(), controlled(), controlled(), controlled()]
     const contexts: ModelContext[] = []
-    const agent = new Agent({ tools: [{ name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }), executionMode, execute }],
+    const agent = createSession({ tools: [{ name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }), executionMode, execute }],
       stream: (_model, context) => { contexts.push(context); return queues[contexts.length - 1].output } })
     const done = (index: number, calls: ToolCall[] = [], reason: 'stop' | 'length' | 'toolUse' = calls.length ? 'toolUse' : 'stop') => {
       queues[index].push({ type: 'done', reason, message: { ...assistant(), stopReason: reason, content: calls.length ? calls : [{ type: 'text', text: '青禾' }] } })
@@ -565,7 +569,7 @@ describe('Feature6 连续决策与同批调度', () => {
   it('A1/A5.3 连续两轮读取，跨轮相同编号正确回填，每轮都可调用工具', async () => {
     const paths: string[] = []
     const { agent, contexts, done } = loop(async args => { paths.push(String(args.path)); return args.path === 'index.txt' ? '下一条线索在 note.txt' : '项目名称：青禾' })
-    const receipt = await agent.submit(workspaceInput)
+    const receipt = await agent.submit(input)
     done(0, [toolCall('read-1', { arguments: { path: 'index.txt' } })])
     await until(async () => contexts.length === 2)
     expect(contexts[1].messages.at(-1)).toMatchObject({ role: 'toolResult', content: [{ text: '下一条线索在 note.txt' }] })
@@ -574,7 +578,7 @@ describe('Feature6 连续决策与同批调度', () => {
     expect(paths).toEqual(['index.txt', 'note.txt'])
     expect(contexts.every(context => context.tools?.length === 1)).toBe(true)
     expect(contexts[2].messages.at(-1)).toMatchObject({ content: [{ text: '项目名称：青禾' }] })
-    await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: 409 })
+    await expect(agent.submit(input)).rejects.toMatchObject({ code: 'busy' })
     expect((await snapshot(agent)).running?.runId).toBe(receipt.userMessageId)
     done(2)
     await until(async () => (await snapshot(agent)).running === null)
@@ -591,7 +595,7 @@ describe('Feature6 连续决策与同批调度', () => {
     const controller = new AbortController()
     const subscription = agent.subscribe(controller.signal)
     await subscription.next()
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     done(0, [toolCall('0'), toolCall('1')])
     await until(async () => started.length === 2)
     expect((await snapshot(agent)).running?.activeTools).toHaveLength(2)
@@ -618,7 +622,7 @@ describe('Feature6 连续决策与同批调度', () => {
     const wait = Promise.withResolvers<string>()
     const paths: string[] = []
     const { agent, contexts, done } = loop(async args => { paths.push(String(args.path)); return args.path === '0' ? wait.promise : '后读' }, 'sequential')
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     done(0, [toolCall('0'), toolCall('1')])
     await until(async () => paths.length === 1)
     expect(paths).toEqual(['0'])
@@ -634,11 +638,11 @@ describe('Feature6 连续决策与同批调度', () => {
     const started: string[] = []
     const queues = [controlled(), controlled()]
     let requests = 0
-    const agent = new Agent({ tools: [
+    const agent = createSession({ tools: [
       { name: 'write', description: '写', parameters: Type.Object({}), executionMode: 'sequential', execute: async () => { started.push('write'); return wait.promise } },
       { name: 'read', description: '读', parameters: Type.Object({}), execute: async () => { started.push('read'); return '项目名称：青禾' } },
     ], stream: () => queues[requests++].output })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     queues[0].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [toolCall('write', { name: 'write', arguments: {} }), toolCall('read', { arguments: {} })] } })
     await until(async () => started.length === 1)
     expect(started).toEqual(['write'])
@@ -652,7 +656,7 @@ describe('Feature6 连续决策与同批调度', () => {
   it('A4 截断整批零执行，回填失败后允许完整新调用', async () => {
     const paths: string[] = []
     const { agent, contexts, done } = loop(async args => { paths.push(String(args.path)); return '项目名称：青禾' })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     done(0, [toolCall('0'), toolCall('1')], 'length')
     await until(async () => contexts.length === 2)
     expect(paths).toEqual([])
@@ -669,7 +673,7 @@ describe('Feature6 连续决策与同批调度', () => {
 
   it('A4.1 纯文字截断保留内容并结束，不自动重试', async () => {
     const { agent, contexts, done } = loop(async () => { throw new Error('不应执行') })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     done(0, [], 'length')
     await until(async () => (await snapshot(agent)).running === null)
     expect(contexts).toHaveLength(1)
@@ -678,7 +682,7 @@ describe('Feature6 连续决策与同批调度', () => {
 
   it('A5.2 toolUse 没有调用明确结束', async () => {
     const { agent, contexts, done } = loop(async () => { throw new Error('不应执行') })
-    await agent.submit(workspaceInput)
+    await agent.submit(input)
     done(0, [], 'toolUse')
     await until(async () => (await snapshot(agent)).running === null)
     expect(contexts).toHaveLength(1)
@@ -694,7 +698,7 @@ describe('Feature6 连续决策与同批调度', () => {
       if (path === 'error') throw new Error('普通失败')
       return waits[Number(path)].promise
     })
-    const receipt = await agent.submit(workspaceInput)
+    const receipt = await agent.submit(input)
     done(0, [toolCall('ok'), toolCall('error'), toolCall('0'), toolCall('1')])
     await until(async () => started.length === 4 && (await snapshot(agent)).messages.length === 4)
     let ended = false
@@ -702,7 +706,7 @@ describe('Feature6 连续决策与同批调度', () => {
     waits[0].reject(Object.assign(new Error('甲已有输出'), { code: 'interrupted' }))
     await until(async () => (await snapshot(agent)).messages.length === 5)
     expect(ended).toBe(false)
-    await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: mode === 'abort' ? 409 : 503 })
+    await expect(agent.submit(input)).rejects.toMatchObject({ code: mode === 'abort' ? 'busy' : 'closed' })
     expect(contexts).toHaveLength(1)
     waits[1].reject(Object.assign(new Error('乙已有输出'), { code: 'interrupted' }))
     await ending
@@ -710,7 +714,7 @@ describe('Feature6 连续决策与同批调度', () => {
     expect(results.map(entry => entry.toolErrorCode)).toEqual([undefined, undefined, 'interrupted', 'interrupted'])
     expect(results.map(entry => entry.message)).toMatchObject([{ isError: false }, { isError: true, content: [{ text: '普通失败' }] }, { content: [{ text: '甲已有输出' }] }, { content: [{ text: '乙已有输出' }] }])
     expect((await snapshot(agent)).running).toBeNull()
-    if (mode === 'abort') { await agent.submit(workspaceInput); done(1); await until(async () => (await snapshot(agent)).running === null) }
-    else await expect(agent.submit(workspaceInput)).rejects.toMatchObject({ status: 503 })
+    if (mode === 'abort') { await agent.submit(input); done(1); await until(async () => (await snapshot(agent)).running === null) }
+    else await expect(agent.submit(input)).rejects.toMatchObject({ code: 'closed' })
   })
 })

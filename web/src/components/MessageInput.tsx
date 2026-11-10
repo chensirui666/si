@@ -33,6 +33,10 @@ type MessageInputProps = {
   abortDisabled?: boolean
   onAbort?: () => void
   contextMeter?: ReactNode
+  footerControl?: ReactNode
+  commandsEnabled?: boolean
+  draft?: { text: string }
+  onDraftChange?: (text: string) => void
 }
 
 const initialConfig = {
@@ -44,17 +48,30 @@ function $readDraft() {
   return $getRoot().getChildren().map((paragraph) => paragraph.getTextContent()).join('\n')
 }
 
+function $writeDraft(text: string) {
+  const root = $getRoot()
+  root.clear()
+  for (const line of text.split('\n')) {
+    const paragraph = $createParagraphNode()
+    if (line) paragraph.append($createTextNode(line))
+    root.append(paragraph)
+  }
+}
+
+const restoreTag = 'restore-session-draft'
+
 export function MessageInput(props: MessageInputProps) {
+  const initialDraft = props.draft?.text
   return (
-    <LexicalComposer initialConfig={initialConfig}>
+    <LexicalComposer initialConfig={{ ...initialConfig, editorState: initialDraft ? () => $writeDraft(initialDraft) : undefined }}>
       <Composer {...props} />
     </LexicalComposer>
   )
 }
 
-function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter }: MessageInputProps) {
+function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, footerControl, commandsEnabled = true, draft, onDraftChange }: MessageInputProps) {
   const [editor] = useLexicalComposerContext()
-  const [canSend, setCanSend] = useState(false)
+  const [canSend, setCanSend] = useState(Boolean(draft?.text.trim()))
   const draftRevision = useRef(0)
   const [menuOpen, setMenuOpen] = useState(false)
   const menu = useRef(false)
@@ -71,11 +88,11 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     const atEnd = $isRangeSelection(selection) && selection.isCollapsed()
       && selection.anchor.getNode() === $getRoot().getLastDescendant()
       && selection.anchor.offset === selection.anchor.getNode().getTextContentSize()
-    const visible = editor.getRootElement() === document.activeElement && !composingRef.current && !editor.isComposing()
+    const visible = commandsEnabled && editor.getRootElement() === document.activeElement && !composingRef.current && !editor.isComposing()
       && /^[ \t]*\/[a-z]*$/.test(text) && '/compact'.startsWith(text.trimStart()) && atEnd && dismissedText.current !== text
     menu.current = visible
     setMenuOpen(visible)
-  }, [editor])
+  }, [commandsEnabled, editor])
   const complete = useCallback(() => {
     editor.update(() => {
       const text = $readDraft()
@@ -92,14 +109,8 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     let clearedRevision: number | undefined
     const restoreDraft = () => editor.update(() => {
       if (clearedRevision !== draftRevision.current || $readDraft() !== '') return
-      const root = $getRoot()
-      root.clear()
-      for (const line of text.split('\n')) {
-        const paragraph = $createParagraphNode()
-        if (line) paragraph.append($createTextNode(line))
-        root.append(paragraph)
-      }
-      if (editor.getRootElement() === document.activeElement) root.selectEnd()
+      $writeDraft(text)
+      if (editor.getRootElement() === document.activeElement) $getRoot().selectEnd()
       else $addUpdateTag(SKIP_DOM_SELECTION_TAG)
     }, { discrete: true, tag: SKIP_SCROLL_INTO_VIEW_TAG })
 
@@ -127,15 +138,25 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     })
   }, [editor, onSend, sendDisabled])
 
-  useEffect(() => editor.registerUpdateListener(({ editorState, prevEditorState }) => {
+  useEffect(() => editor.registerUpdateListener(({ editorState, prevEditorState, tags }) => {
     const text = editorState.read($readDraft)
     if (text !== prevEditorState.read($readDraft)) {
       draftRevision.current++
+      if (!tags.has(restoreTag)) onDraftChange?.(text)
       if (text !== dismissedText.current) dismissedText.current = undefined
     }
     setCanSend(Boolean(text.trim()))
     editorState.read(refreshMenu)
-  }), [editor, refreshMenu])
+  }), [editor, refreshMenu, onDraftChange])
+
+  useEffect(() => {
+    if (draft === undefined || editor.getEditorState().read($readDraft) === draft.text) return
+    editor.update(() => {
+      $writeDraft(draft.text)
+      if (editor.getRootElement() === document.activeElement) $getRoot().selectEnd()
+      else $addUpdateTag(SKIP_DOM_SELECTION_TAG)
+    }, { discrete: true, tag: [restoreTag, SKIP_SCROLL_INTO_VIEW_TAG] })
+  }, [draft, editor])
 
   useEffect(() => {
     const startComposition = () => { composingRef.current = true; closeMenu() }
@@ -219,7 +240,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
             aria-multiline="true"
             aria-controls={menuOpen ? 'compact-menu' : undefined}
             aria-activedescendant={menuOpen ? 'compact-option' : undefined}
-            aria-autocomplete="list"
+            aria-autocomplete={commandsEnabled ? 'list' : undefined}
             aria-placeholder="输入消息…"
             placeholder={<div className="message-placeholder">输入消息…</div>}
           />
@@ -229,6 +250,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       <HistoryPlugin />
       <div className="composer-actions">
         {contextMeter}
+        {footerControl}
         <Button className="send-button" size="icon" type="button" aria-label={label} title={label}
           disabled={action === 'send' ? sendDisabled || !canSend : action === 'aborting' || abortDisabled || !onAbort}
           onClick={() => { if (action === 'send') submit(editor.read($readDraft)); else if (action === 'abort') onAbort?.() }}>

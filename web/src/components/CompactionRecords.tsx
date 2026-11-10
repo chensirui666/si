@@ -1,4 +1,4 @@
-import type { CompactionRecord, ConversationMessage } from '@agent-learning/agent'
+import type { CompactionRecord, ConversationMessage } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { MarkdownText } from './markdown/MarkdownText'
 

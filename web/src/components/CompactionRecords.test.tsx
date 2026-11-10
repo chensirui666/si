@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { expect, it } from 'vitest'
 import { CompactionRecords } from './CompactionRecords'
-import type { CompactionRecord } from '@agent-learning/agent'
+import type { CompactionRecord } from '@agent-learning/server/protocol'
 
 const success: CompactionRecord = { id: 'c1', trigger: 'manual', status: 'success', startedAt: 1, finishedAt: 2, summary: '项目青禾', firstKeptMessageId: 'u1', contextLastMessageId: 'a1', estimatedBefore: 1000, estimatedAfter: 400, summaryUsage: { input: 800, output: 20 }, followupMessageId: 'a2' }
 it('压缩结果区分估算、后续实际输入与摘要消耗，历史仍可展开', () => {

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, expect } from '@playwright/test'
-import { addWorkspace, authorize, freeVitePort, emptySnapshot, httpStatus, observe, ready, saveKey, startBackend, startVite, stop, waitForStart, wsStatus } from './test-utils'
+import { addWorkspace, authorize, expectBrowserStorage, freeVitePort, emptySnapshot, httpStatus, observe, openSession, ready, saveKey, seedSession, startBackend, startVite, stop, wsStatus } from './test-utils'
 import { startModelServer } from './model-server'
 
 for (const mode of ['node', 'vite'] as const) {
@@ -22,8 +22,8 @@ for (const mode of ['node', 'vite'] as const) {
       const origin = mode === 'node' ? backend.result.url : `http://127.0.0.1:${vitePort}`
       const observed = observe(page)
       await authorize(page, mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl)
-      await ready(page, observed)
-      await addWorkspace(page)
+      const workspaceId = await addWorkspace(page)
+      await seedSession(page, observed, workspaceId)
       await saveKey(page, 'controlled-stage3-key')
 
       const editor = page.getByRole('textbox', { name: '消息', exact: true })
@@ -70,7 +70,7 @@ for (const mode of ['node', 'vite'] as const) {
       const beforeReload = observed.snapshots.length
       await page.reload()
       await ready(page, observed, beforeReload, false)
-      await expect(editor).toHaveText('')
+      await expect(editor).toHaveText('另一个页面的草稿')
       await expect(messages).toContainText('第一段已经到达。')
       expect(observed.snapshots.at(-1)!.snapshot.running).toEqual(running)
       await editor.fill('断线期间保留的新草稿')
@@ -108,15 +108,17 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(send).toBeEnabled()
       await page.screenshot({ path: testInfo.outputPath(`${mode}-stage3-chat.png`), fullPage: true })
 
-      const beforeRestart = observed.snapshots.length
+      const oldSession = observed.snapshots.at(-1)!.sessionId
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
       backend = await startBackend(secretPath, port, provider.baseURL, vitePort)
-      await ready(page, observed, beforeRestart)
+      await expect(page.getByRole('alert')).toHaveText('之前打开的会话已不可用，请选择或新建会话。')
+      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
+      expect(await seedSession(page, observed, workspaceId)).not.toBe(oldSession)
       await expect(messages.getByRole('listitem')).toHaveCount(0)
       await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('DeepSeek Flash')
-      await expect(editor).toHaveText('后端重启期间仍保留的草稿')
-      await expect(send).toBeEnabled()
+      await expect(editor).toHaveText('')
+      await expect(send).toBeDisabled()
       expect(JSON.parse(await readFile(modelPath, 'utf8')).deepseek.key).toBe('controlled-stage3-key')
       expect(provider.exchanges).toHaveLength(2)
       expect(observed.submissions).toEqual(['POST', 'POST'])
@@ -147,8 +149,8 @@ for (const mode of ['node', 'vite'] as const) {
       const observed = observe(page)
       try { await page.goto(mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl) }
       catch { throw new Error('阶段二授权导航失败，临时令牌已省略') }
-      await ready(page, observed)
-      await addWorkspace(page)
+      const workspaceId = await addWorkspace(page)
+      const sessionId = await seedSession(page, observed, workspaceId)
       const model = page.getByRole('combobox', { name: '模型', exact: true })
       await expect(model).toHaveText('无可用模型')
       const editor = page.getByRole('textbox', { name: '消息', exact: true })
@@ -174,7 +176,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(keyInput).toHaveValue('')
       await expect(otherModel).toHaveText('DeepSeek Flash')
       expect(JSON.parse(await readFile(modelPath, 'utf8')).deepseek.key).toBe('stage2-e2e-first-fake-key')
-      expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual({ local: {}, session: {} })
+      await expectBrowserStorage(page, sessionId, workspaceId, { [sessionId]: '设置变化期间保留的草稿' })
       await keyInput.fill('stage2-e2e-replacement-fake-key')
       await dialog.getByRole('button', { name: '保存', exact: true }).click()
       await expect(keyInput).toHaveValue('')
@@ -192,11 +194,13 @@ for (const mode of ['node', 'vite'] as const) {
       await page.screenshot({ path: testInfo.outputPath(`${mode}-settings.png`), fullPage: true })
       await page.keyboard.press('Escape')
 
-      const beforeRestart = observed.snapshots.length
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
       backend = await startBackend(secretPath, port, '', vitePort)
-      await ready(page, observed, beforeRestart)
+      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
+      await expect(second.getByRole('alert')).toHaveText('之前打开的会话已不可用，请选择或新建会话。')
+      const createdSession = await seedSession(page, observed, workspaceId)
+      expect((await openSession(second, otherObserved, '会话 1')).sessionId).toBe(createdSession)
       await expect(model).toHaveText('DeepSeek Flash')
       await expect(otherModel).toHaveText('DeepSeek Flash')
       await settings.click()
@@ -223,7 +227,7 @@ for (const mode of ['node', 'vite'] as const) {
       await writeFile(modelPath, '{}', { mode: 0o600 })
       await expect(page.getByRole('alert')).toHaveCount(0)
       await expect(second.getByRole('alert')).toHaveCount(0)
-      await expect(editor).toHaveText('设置变化期间保留的草稿')
+      await expect(editor).toHaveText('')
       expect(observed.snapshots.every(frame => JSON.stringify(frame.snapshot) === JSON.stringify(emptySnapshot))).toBe(true)
       expect(observed.submissions).toEqual([])
       expect(otherObserved.submissions).toEqual([])
@@ -268,7 +272,6 @@ for (const mode of ['node', 'vite'] as const) {
         if (new URL(response.url()).searchParams.has('token') && response.status() === 303) redirects++
       })
       try { await page.goto(authUrl) } catch { throw new Error('授权导航失败，临时令牌已省略') }
-      await ready(page, observed)
       expect(redirects).toBe(1)
       const cleanUrl = new URL(page.url())
       expect(cleanUrl.origin).toBe(origin)
@@ -296,6 +299,9 @@ for (const mode of ['node', 'vite'] as const) {
       }
       expect(await wsStatus(origin, { ...headers, Origin: 'https://untrusted.invalid' })).toBe(403)
 
+      expect(observed.snapshots).toHaveLength(0)
+      const workspaceId = await addWorkspace(page)
+      const sessionId = await seedSession(page, observed, workspaceId)
       const editor = page.getByRole('textbox', { name: '消息', exact: true })
       const messages = page.getByRole('region', { name: '消息列表' })
       await editor.fill('阶段一草稿')
@@ -308,13 +314,13 @@ for (const mode of ['node', 'vite'] as const) {
       const secondObserved = observe(second)
       await second.goto(origin)
       await ready(second, secondObserved)
-      await expect(second.getByRole('textbox', { name: '消息', exact: true })).toHaveText('')
+      await expect(second.getByRole('textbox', { name: '消息', exact: true })).toHaveText('阶段一草稿')
       await second.close()
 
       const beforeReload = observed.snapshots.length
       await page.reload()
       await ready(page, observed, beforeReload)
-      await expect(editor).toHaveText('')
+      await expect(editor).toHaveText('阶段一草稿')
       await editor.fill('联网恢复前的草稿')
       await context.setOffline(true)
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
@@ -326,24 +332,15 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(editor).toHaveText('离线期间继续编辑的草稿')
       await expect(editor).toBeFocused()
 
-      const beforeDisconnect = observed.snapshots.length
-      const beforeClosed = observed.closed
-      const listeningAgain = waitForStart(backend.child)
-      backend.child.send({ type: 'restart-listener' })
-      await listeningAgain
-      await ready(page, observed, beforeDisconnect)
-      expect(observed.closed).toBeGreaterThan(beforeClosed)
-      await expect(editor).toHaveText('离线期间继续编辑的草稿')
-      expect(observed.snapshots.at(-1)?.subscriptionId === observed.snapshots[beforeDisconnect - 1]?.subscriptionId).toBe(false)
-
-      const beforeRestart = observed.snapshots.length
+      expect(observed.snapshots.at(-1)?.sessionId).toBe(sessionId)
+      expect(observed.snapshots.at(-1)?.subscriptionId).not.toBe(observed.snapshots[beforeOnline - 1]?.subscriptionId)
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
       await editor.fill('后端重启期间的草稿')
       backend = await startBackend(secretPath, port, '', vitePort)
-      await ready(page, observed, beforeRestart)
-      await expect(editor).toHaveText('后端重启期间的草稿')
-      await expect(editor).toBeFocused()
+      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
+      expect(await seedSession(page, observed, workspaceId)).not.toBe(sessionId)
+      await expect(editor).toHaveText('')
       expect(await httpStatus(origin + '/api/events', headers)).toBe(404)
       expect((await context.cookies(origin)).find(value => value.name === cookie.name)?.value === cookie.value).toBe(true)
       expect(observed.submissions).toEqual([])

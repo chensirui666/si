@@ -1,6 +1,8 @@
 import { test, expect } from '@playwright/experimental-ct-react'
+import type { StartSessionRequest } from '@agent-learning/server/protocol'
 import { ChatPageHarness } from '../test/ChatPageHarness'
 import { MessageInputHarness } from '../test/MessageInputHarness'
+import { draftKey, newSessionDraft, recentSessionKey } from '../chat/drafts'
 import { Button } from '../components/ui/button'
 
 test.beforeEach(async ({ page }) => {
@@ -371,7 +373,7 @@ test('HTTP 回执先到时旧空闲快照不能开放发送，正式消息与结
   let input: { clientMessageId: string; modelId: string; text: string } | undefined
   await page.route('**/api/messages', async route => {
     input = route.request().postDataJSON()
-    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ kind: 'message' as const, clientMessageId: input!.clientMessageId, userMessageId: 'user', acceptedSeq: 5 }) })
+    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ sessionId: 'session-a', kind: 'message' as const, clientMessageId: input!.clientMessageId, userMessageId: 'user', acceptedSeq: 5 }) })
   })
   await mount(<ChatPageHarness modelConfigured />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
@@ -429,7 +431,7 @@ for (const withHistory of [false, true]) {
       if (call === 1) await route.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: '输入无效' }) })
       else {
         second = route.request().postDataJSON()
-        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ kind: 'message' as const, clientMessageId: second!.clientMessageId, userMessageId: 'user-b', acceptedSeq: 1 }) })
+        await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ sessionId: 'session-a', kind: 'message' as const, clientMessageId: second!.clientMessageId, userMessageId: 'user-b', acceptedSeq: 1 }) })
       }
     })
     await mount(<ChatPageHarness messages={withHistory ? ['历史 F'] : []} modelConfigured />)
@@ -457,41 +459,177 @@ for (const withHistory of [false, true]) {
   })
 }
 
-test('选择工作区后进入当前对话才可发送，目录失效保留草稿', async ({ mount, page }) => {
-  let view = { workspaces: [] as { id: string; path: string; name: string; available: boolean }[], boundWorkspaceId: null as string | null }
-  const workspace = { id: 'workspace-1', path: '/tmp/青禾', name: '青禾', available: true }
-  let selection = 0
+const workspace = { id: 'workspace-1', path: '/tmp/青禾', name: '青禾', available: true }
+const sessionA = { id: 'session-a', workspaceId: workspace.id, name: '会话 1', createdAt: '2026-11-09T08:00:00Z' }
+const sessionB = { ...sessionA, id: 'session-b', name: '会话 2' }
+
+test('新会话居中，键盘打开草稿，工作区入口共用一份草稿且首次发送才出现历史', async ({ mount, page }) => {
+  let view = { workspaces: [] as typeof workspace[] }
+  const otherWorkspace = { ...workspace, id: 'workspace-2', path: '/tmp/白榆', name: '白榆' }
+  const sessions: typeof sessionA[] = []
+  const starts: StartSessionRequest[] = []
+  let pickerCalls = 0
+  let emptySessionRequests = 0
   await page.route('**/api/workspaces', route => route.fulfill({ json: view }))
   await page.route('**/api/workspaces/pick', route => {
-    if (++selection === 1) return route.fulfill({ json: { cancelled: true } })
-    view = { workspaces: [workspace], boundWorkspaceId: workspace.id }
-    return route.fulfill({ json: { cancelled: false, view } })
+    if (++pickerCalls === 1) return route.fulfill({ json: { cancelled: true } })
+    const chosen = pickerCalls === 2 ? workspace : otherWorkspace
+    view = { workspaces: [...view.workspaces, chosen] }
+    return route.fulfill({ json: { cancelled: false, workspaceId: chosen.id, created: true, view } })
   })
-  let submitted: unknown
-  await page.route('**/api/messages', route => {
-    submitted = route.request().postDataJSON()
-    return route.fulfill({ status: 409, json: { error: '工作区目录已失效' } })
+  await page.route('**/api/sessions', route => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { sessions } })
+    emptySessionRequests++
+    return route.fulfill({ status: 405 })
+  })
+  await page.route('**/api/sessions/start', route => {
+    const input: StartSessionRequest = route.request().postDataJSON()
+    starts.push(input)
+    const session = { ...sessionA, id: input.clientMessageId, workspaceId: input.workspaceId }
+    sessions.push(session)
+    return route.fulfill({ status: 202, json: {
+      session,
+      accepted: { kind: 'message', sessionId: session.id, clientMessageId: input.clientMessageId, userMessageId: 'first-user', acceptedSeq: 1 },
+    } })
   })
   await mount(<ChatPageHarness modelConfigured useWorkspaceApi />)
+  const heading = page.getByRole('heading', { name: 'SI', exact: true })
+  const workspaceSelect = page.getByRole('combobox', { name: '工作区', exact: true })
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const send = page.getByRole('button', { name: '发送', exact: true })
-  const add = page.getByRole('button', { name: '添加工作区' })
-  const conversation = page.getByRole('button', { name: '当前对话' })
-  await editor.fill('保留原文\n第二行')
+  const add = page.getByRole('button', { name: '添加工作区', exact: true })
+  const newSession = page.getByRole('button', { name: '新会话', exact: true })
+  const draftRow = page.getByRole('button', { name: '未发送的新会话', exact: true })
+  const groupA = page.getByRole('group', { name: '青禾', exact: true })
+  const groupB = page.getByRole('group', { name: '白榆', exact: true })
+  const model = page.getByRole('combobox', { name: '模型', exact: true })
+  await expect(heading).toBeVisible()
+  const headingBox = (await heading.boundingBox())!
+  const editorBox = (await editor.boundingBox())!
+  const workspaceBox = (await workspaceSelect.boundingBox())!
+  const modelBox = (await model.boundingBox())!
+  const sendBox = (await send.boundingBox())!
+  expect(headingBox.x + headingBox.width / 2).toBeCloseTo(editorBox.x + editorBox.width / 2, 0)
+  expect(headingBox.y + headingBox.height).toBeLessThan(workspaceBox.y)
+  expect(workspaceBox.y + workspaceBox.height).toBeLessThan(editorBox.y)
+  expect(workspaceBox.x).toBeLessThan(editorBox.x + editorBox.width / 2)
+  expect(modelBox.x + modelBox.width).toBeLessThan(sendBox.x)
+  expect(modelBox.y + modelBox.height / 2).toBeCloseTo(sendBox.y + sendBox.height / 2, 0)
+
+  const original = '  保留原文\n第二行  '
+  await editor.fill(original)
   await expect(send).toBeDisabled()
+  const addOption = { label: '添加工作区…' }
+  await workspaceSelect.selectOption(addOption)
+  await expect.poll(() => pickerCalls).toBe(1)
+  await expect(workspaceSelect).toBeEnabled()
+  await expect(workspaceSelect).not.toHaveValue('add-workspace')
+  await expect(groupA).toHaveCount(0)
+  await workspaceSelect.selectOption(addOption)
+  await expect(workspaceSelect).toHaveValue(workspace.id)
   await add.click()
-  await expect(conversation).toHaveCount(0)
-  await expect(add).toBeEnabled()
-  await add.click()
-  await expect(page.getByRole('navigation', { name: '工作区' }).getByText('青禾', { exact: true })).toBeVisible()
-  await expect(add).toBeDisabled()
-  await expect(send).toBeDisabled()
-  await conversation.click()
-  await expect(page.getByText('/tmp/青禾', { exact: true })).toBeVisible()
+  await expect(workspaceSelect).toHaveValue(otherWorkspace.id)
+  await expect(groupB.getByRole('button', { name: '未发送的新会话' })).toHaveCount(1)
+  await groupA.getByRole('button', { name: '新建会话', exact: true }).press('Enter')
+  await expect(workspaceSelect).toHaveValue(workspace.id)
+  await expect(groupA.getByRole('button', { name: '未发送的新会话' })).toHaveCount(1)
+  await newSession.press('Enter')
+  await newSession.press('Enter')
+  await expect(draftRow).toHaveCount(1)
+  await expect(draftRow).toHaveText('新会话')
+  await expect.poll(() => editor.evaluate(el => Array.from(el.children, node => node.textContent).join('\n'))).toBe(original)
+  const readDraft = () => page.evaluate(key => localStorage.getItem(key), draftKey(newSessionDraft))
+  await expect.poll(readDraft).toBe(original)
+  expect(starts).toHaveLength(0)
+  expect(emptySessionRequests).toBe(0)
+
+  await workspaceSelect.selectOption(otherWorkspace.id)
   await expect(send).toBeEnabled()
-  view = { ...view, workspaces: [{ ...workspace, available: false }] }
-  await send.click()
-  await expect.poll(() => submitted).toMatchObject({ text: '保留原文\n第二行', workspaceId: 'workspace-1' })
-  await expect(editor).toHaveText(/保留原文.*第二行/s)
-  await expect(send).toBeDisabled()
+  await editor.press('Enter')
+  const history = groupB.getByRole('button', { name: '会话 1', exact: true })
+  await expect(history).toHaveAttribute('aria-current', 'page')
+  expect(starts).toEqual([{ workspaceId: otherWorkspace.id, modelId: 'deepseek-flash', clientMessageId: expect.any(String), text: original }])
+  await expect(draftRow).toHaveCount(0)
+  await expect(heading).toHaveCount(0)
+  await expect.poll(readDraft).toBeNull()
+  await page.evaluate(input => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      sessionId: input.clientMessageId, connection: 'ready', slow: false, error: null,
+      snapshot: {
+        seq: 1, running: null, compactions: [], contextUsage: null, activeContent: [],
+        messages: [{ id: 'first-user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }],
+      },
+    } }))
+  }, starts[0])
+  await expect(page.getByRole('region', { name: '消息列表' }).locator('.message-text')).toHaveText(original)
+
+  await newSession.press('Enter')
+  await expect(workspaceSelect).toHaveValue(otherWorkspace.id)
+  await expect(editor).toHaveText('')
+  await editor.fill('下一段草稿')
+  await history.click()
+  await expect(history).toHaveAttribute('aria-current', 'page')
+  await expect(editor).toHaveText('')
+  await groupB.getByRole('button', { name: '新建会话', exact: true }).press('Enter')
+  await expect(editor).toHaveText('下一段草稿')
+  await expect(draftRow).toHaveCount(1)
+  expect(starts).toHaveLength(1)
+})
+
+test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', async ({ mount, page }) => {
+  await page.setViewportSize({ width: 390, height: 700 })
+  await mount(<ChatPageHarness modelConfigured sessions={[]} />)
+  const workspaceSelect = page.getByRole('combobox', { name: '工作区', exact: true })
+  const model = page.getByRole('combobox', { name: '模型', exact: true })
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  await expect(page.getByRole('heading', { name: 'SI', exact: true })).toBeInViewport({ ratio: 1 })
+  await workspaceSelect.selectOption(workspace.id)
+  await editor.fill('手机草稿\n第二行')
+  await expect(workspaceSelect).toBeInViewport({ ratio: 1 })
+  await expect(model).toBeInViewport({ ratio: 1 })
+  await expect(editor).toBeInViewport({ ratio: 1 })
+  await expect(send).toBeInViewport({ ratio: 1 })
+  await expect(send).toBeEnabled()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && document.documentElement.scrollHeight <= innerHeight)).toBe(true)
+})
+
+test('切换两段会话后恢复草稿的空格和换行', async ({ mount, page }) => {
+  await mount(<ChatPageHarness modelConfigured sessions={[sessionA, sessionB]} />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const a = page.getByRole('button', { name: '会话 1', exact: true })
+  const b = page.getByRole('button', { name: '会话 2', exact: true })
+  const text = '  先跑测试\n再整理结果  '
+  const readDraft = () => editor.evaluate(el => Array.from(el.children, node => node.textContent).join('\n'))
+  await a.click()
+  await editor.fill(text)
+  await expect.poll(() => page.evaluate(key => localStorage.getItem(key), draftKey(sessionA.id))).toBe(text)
+  await b.click()
+  await expect(editor).toHaveText('')
+  await editor.fill('检查 README')
+  await a.click()
+  await expect.poll(readDraft).toBe(text)
+  await b.click()
+  await expect(editor).toHaveText('检查 README')
+  await expect.poll(() => page.evaluate(key => localStorage.getItem(key), recentSessionKey)).toBe(sessionB.id)
+})
+
+test('浏览器存储不可用时来回切换仍可继续编辑本页草稿', async ({ mount, page }) => {
+  await page.evaluate(() => {
+    const deny = () => { throw new DOMException('拒绝', 'SecurityError') }
+    Storage.prototype.getItem = deny
+    Storage.prototype.setItem = deny
+    Storage.prototype.removeItem = deny
+  })
+  await mount(<ChatPageHarness modelConfigured sessions={[sessionA, sessionB]} />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const a = page.getByRole('button', { name: '会话 1', exact: true })
+  const b = page.getByRole('button', { name: '会话 2', exact: true })
+  await a.click()
+  await editor.fill('本页保留')
+  await b.click()
+  await expect(editor).toHaveText('')
+  await a.click()
+  await expect(editor).toHaveText('本页保留')
+  await expect(page.getByText('浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。')).toBeVisible()
 })

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, expect } from '@playwright/test'
-import { addWorkspace, authorize, freeVitePort, observe, ready, saveKey, startBackend, startVite, stop } from './test-utils'
+import { addWorkspace, authorize, freeVitePort, observe, saveKey, seedSession, startBackend, startVite, stop } from './test-utils'
 import { startModelServer } from './model-server'
 
 for (const mode of ['node', 'vite'] as const) {
@@ -18,8 +18,7 @@ for (const mode of ['node', 'vite'] as const) {
       if (vitePort) vite = await startVite(Number(new URL(backend.result.url).port), vitePort)
       const observed = observe(page)
       await authorize(page, mode === 'node' ? backend.result.authUrl : backend.result.devAuthUrl)
-      await ready(page, observed)
-      await addWorkspace(page)
+      await seedSession(page, observed, await addWorkspace(page))
       await saveKey(page, 'controlled-stage3-key')
       const editor = page.getByRole('textbox', { name: '消息', exact: true })
       const originalEditor = await editor.elementHandle()

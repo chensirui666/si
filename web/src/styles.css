@@ -164,18 +164,32 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 .chat-layout { height: 100%; display: flex; }
 .chat-sidebar { width: 200px; flex: none; display: flex; flex-direction: column; gap: 16px; padding: 20px 12px 16px; background: var(--surface); border-right: 1px solid var(--border); }
 .sidebar-title { padding-inline: 12px; font-family: "EB Garamond", serif; font-size: 24px; line-height: 32px; }
+.sidebar-new-session { width: 100%; }
 .sidebar-workspaces { display: grid; gap: 4px; min-width: 0; overflow: auto; }
 .sidebar-workspaces-heading { display: flex; align-items: center; justify-content: space-between; padding-left: 12px; color: var(--secondary-text); font-size: 13px; }
 .workspace-row { display: flex; align-items: center; gap: 8px; padding: 6px 12px; min-width: 0; }
 .workspace-row svg, .workspace-path svg { width: 16px; height: 16px; flex: none; }
-.workspace-row[data-bound="true"] svg { color: #3569cf; }
+.workspace-row[data-bound="true"] > svg { color: #3569cf; }
 .workspace-row span, .workspace-path span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-add-session { margin-left: auto; flex: none; }
 .workspace-conversation { width: 100%; justify-content: flex-start; padding-left: 36px; }
 .workspace-conversation[aria-current="page"] { background: var(--interaction); }
 .settings-trigger { margin-top: auto; justify-content: flex-start; }
 .chat-workspace { flex: 1; min-width: 0; }
 .chat-page { width: 100%; }
 .composer-stack { flex: none; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.chat-page[data-new-session] .chat-main { overflow: auto; padding-block: 24px; }
+.chat-page[data-new-session] .composer-stack { margin-block: auto; }
+.new-session-title { margin: 0 0 20px; text-align: center; font-family: "EB Garamond", serif; font-size: 44px; line-height: 1.1; font-weight: 600; }
+.new-session-workspace { display: flex; align-items: center; gap: 4px; align-self: flex-start; max-width: 100%; padding-inline: 8px; }
+.new-session-workspace svg { width: 16px; height: 16px; flex: none; }
+.new-session-workspace select, .chat-page[data-new-session] .composer-actions select { min-width: 0; max-width: 100%; padding: 6px; border: 1px solid transparent; border-radius: 6px; background: var(--background); color: var(--foreground); font: inherit; font-size: 13px; text-overflow: ellipsis; }
+.new-session-workspace select:focus-visible, .chat-page[data-new-session] .composer-actions select:focus-visible { outline: 2px solid var(--foreground); outline-offset: 2px; }
+.chat-page[data-new-session] .message-editor { min-height: 56px; }
+.chat-page[data-new-session] .composer-actions { align-items: center; gap: 8px; }
+.chat-page[data-new-session] .composer-actions select { max-width: 70%; }
+.new-session-status { text-align: left; }
+.new-session-retry { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .model-toolbar { display: flex; align-items: center; gap: 8px; min-height: 36px; color: var(--secondary-text); font-size: 13px; }
 .model-toolbar select, .web-provider-selections select { max-width: 100%; padding: 6px 8px; border: 1px solid var(--control-border); border-radius: 8px; background: var(--background); color: var(--foreground); font: inherit; }
 .model-toolbar select:disabled, .web-provider-selections select:disabled { color: var(--secondary-text); background: var(--surface); }
@@ -219,9 +233,11 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 @media (max-width: 600px) {
   .chat-sidebar { width: 64px; padding: 16px 8px; }
   .sidebar-title { display: none; }
+  .sidebar-new-session span { display: none; }
   .sidebar-workspaces-heading { flex-direction: column; padding: 0; }
   .workspace-row { flex-direction: column; gap: 0; align-items: stretch; padding: 4px 0; text-align: center; font-size: 11px; }
   .workspace-row svg { align-self: center; }
+  .workspace-add-session { margin: 0 auto; }
   .workspace-conversation { justify-content: center; padding: 0; font-size: 11px; }
   .model-toolbar label { flex: none; }
   .model-toolbar select { max-width: 54%; }
@@ -233,7 +249,8 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
   .settings-nav { flex-direction: row; align-items: flex-start; }
 }
 @media (pointer: coarse) {
-  .sidebar-workspaces-heading button { width: 44px; height: 44px; }
+  .sidebar-workspaces-heading button, .workspace-add-session { width: 44px; height: 44px; }
+  .sidebar-new-session { min-height: 44px; }
   .workspace-conversation { min-height: 44px; }
 }
 @media (max-height: 500px) {

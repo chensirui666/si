@@ -20,7 +20,7 @@ it('实际开发入口监听全部后端依赖并重启，退出释放监听与�
   for (const name of await readdir(join(root, 'node_modules'))) {
     if (name !== '@agent-learning') await symlink(join(root, 'node_modules', name), join(directory, 'node_modules', name))
   }
-  for (const name of ['credentials', 'model', 'agent', 'server']) {
+  for (const name of ['credentials', 'model', 'agent', 'coding-agent', 'server']) {
     await symlink(join(directory, 'packages', name), join(directory, 'node_modules/@agent-learning', name))
   }
   const reservation = createServer()
@@ -40,7 +40,7 @@ it('实际开发入口监听全部后端依赖并重启，退出释放监听与�
   try {
     await waitFor(() => output.includes('打开聊天：'))
     await waitFor(() => output.includes('Watching for file changes'))
-    for (const name of ['credentials', 'model', 'agent', 'server']) {
+    for (const name of ['credentials', 'model', 'agent', 'coding-agent', 'server']) {
       const file = join(directory, `packages/${name}/src/${name === 'server' ? 'main' : 'index'}.ts`)
       const original = await readFile(file, 'utf8')
       const count = output.split('打开聊天：').length

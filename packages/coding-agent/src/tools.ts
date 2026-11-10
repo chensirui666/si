@@ -2,7 +2,8 @@ import { Type, type Static, type TSchema } from 'typebox'
 import { Check } from 'typebox/value'
 import type { ExecutableTool } from '@agent-learning/agent'
 import type { Tool } from '@agent-learning/model'
-import { createLocalTools } from './local-tools.js'
+import { createLocalTools, type LocalToolContext } from './local-tools.js'
+import type { WebTools } from './web-tools.js'
 import type { ToolRuntime } from './tool-runtime.js'
 
 const readParameters = Type.Object({
@@ -77,22 +78,22 @@ export type GrepParams = Static<typeof grepParameters>
 export type WebSearchParams = Static<typeof webSearchParameters>
 export type WebFetchParams = Static<typeof webFetchParameters>
 
-type WebTools = Record<'web_search' | 'web_fetch', ExecutableTool['execute']>
-type Context = Parameters<ExecutableTool['execute']>[1]
-
 function executable<Schema extends TSchema>(
   declaration: Tool<Schema>,
-  execute: (params: Static<Schema>, context: Context) => Promise<string>,
+  execute: (params: Static<Schema>, context: LocalToolContext) => Promise<string>,
+  cwd: string,
+  fileKind?: 'read' | 'modified',
 ): ExecutableTool {
   return {
     ...declaration,
-    async execute(args, context) {
+    async execute(args, { signal, recordDetails }) {
       try {
-        context.signal.throwIfAborted()
+        signal.throwIfAborted()
         if (!Check(declaration.parameters, args)) throw new Error(`${declaration.name} 工具参数不符合声明`)
-        return await execute(args, context)
+        return await execute(args, { cwd, signal,
+          ...(fileKind && { recordFileOperation: path => recordDetails({ kind: fileKind, path }) }),
+        })
       } catch (error) {
-        const signal = context.signal
         if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError' && error.cause === signal.reason))) {
           throw Object.assign(new Error(error instanceof Error ? error.message : '任务已取消', { cause: error }), { code: 'interrupted' })
         }
@@ -102,16 +103,16 @@ function executable<Schema extends TSchema>(
   }
 }
 
-export function createTools(runtime: ToolRuntime, web: WebTools): ExecutableTool[] {
+export function createTools(runtime: ToolRuntime, web: WebTools, cwd: string): ExecutableTool[] {
   const local = createLocalTools(runtime)
   return [
-    executable(declarations.read, local.read),
-    executable(declarations.bash, local.bash),
-    executable(declarations.edit, local.edit),
-    executable(declarations.write, local.write),
-    executable(declarations.find, local.find),
-    executable(declarations.grep, local.grep),
-    executable(declarations.web_search, web.web_search),
-    executable(declarations.web_fetch, web.web_fetch),
+    executable(declarations.read, local.read, cwd, 'read'),
+    executable(declarations.bash, local.bash, cwd),
+    executable(declarations.edit, local.edit, cwd, 'modified'),
+    executable(declarations.write, local.write, cwd, 'modified'),
+    executable(declarations.find, local.find, cwd),
+    executable(declarations.grep, local.grep, cwd),
+    executable(declarations.web_search, web.web_search, cwd),
+    executable(declarations.web_fetch, web.web_fetch, cwd),
   ]
 }

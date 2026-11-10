@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react'
-import type { ActiveContent, ConversationMessage, RunningState } from '@agent-learning/agent'
+import type { ActiveContent, ConversationMessage, RunningState } from '@agent-learning/server/protocol'
 import type { AssistantMessage as Message, ToolCall } from '@agent-learning/model'
 import { MarkdownText } from './markdown/MarkdownText'
 

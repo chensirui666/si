@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path'
 import { WebServer } from '@agent-learning/server'
 import { expect, test, type Page } from '@playwright/test'
 import { parseLiveKey, readLiveKey } from './live-key'
-import { addWorkspace, authorize, observe, ready, saveKey, startBackend, stop } from './test-utils'
+import { expectBrowserStorage, addWorkspace, authorize, observe, saveKey, seedSession, startBackend, stop } from './test-utils'
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' })
 
@@ -28,11 +28,11 @@ test('真实 DeepSeek 设置、两轮历史、流式进度与无效 Key 恢复',
     backend = await startBackend(join(temporary, 'browser-auth.json'))
     const observed = observe(page)
     await authorize(page, backend.result.authUrl)
-    await ready(page, observed)
-    await addWorkspace(page)
+    const workspaceId = await addWorkspace(page)
+    const sessionId = await seedSession(page, observed, workspaceId)
     await saveKey(page, key)
     expect(JSON.parse(await readFile(join(temporary, 'auth.json'), 'utf8')).deepseek.key === key).toBe(true)
-    expect(await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }))).toEqual({ local: {}, session: {} })
+    await expectBrowserStorage(page, sessionId, workspaceId)
 
     const code = `memo-${randomUUID().slice(0, 8)}`
     const first = await complete(page, observed, `请记住口令 ${code}。只回答“记住了”，不要复述口令。`)
@@ -108,8 +108,7 @@ test('真实 DeepSeek 生成中止保留内容和草稿，同一对话可继续'
     backend = await startBackend(join(temporary, 'browser-auth.json'))
     const observed = observe(page)
     await authorize(page, backend.result.authUrl)
-    await ready(page, observed)
-    await addWorkspace(page)
+    await seedSession(page, observed, await addWorkspace(page))
     await saveKey(page, key)
     const editor = page.getByRole('textbox', { name: '消息', exact: true })
     await editor.fill('不要使用工具。请从1开始依次写到1000，每个数字单独一行并附上中文读法，不要省略或汇总。')
@@ -154,8 +153,7 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
     await mkdir(cwd)
     const observed = observe(page)
     await authorize(page, (await server.start()).authUrl)
-    await ready(page, observed)
-    await addWorkspace(page)
+    await seedSession(page, observed, await addWorkspace(page))
     await saveKey(page, await readLiveKey(keyFile!))
     const messages = page.getByRole('region', { name: '消息列表' })
     for (const name of ['青禾', '白榆']) {
@@ -207,8 +205,7 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
     ])
     const observed = observe(page)
     await authorize(page, (await server.start()).authUrl)
-    await ready(page, observed)
-    await addWorkspace(page)
+    await seedSession(page, observed, await addWorkspace(page))
     await saveKey(page, await readLiveKey(keyFile!))
     const result = await complete(page, observed, scenario === 'loop'
       ? '请根据 index.txt 的线索找到项目名称。请先用 read 读取 index.txt，再根据真实结果继续使用 read，最后只回答项目名称。'

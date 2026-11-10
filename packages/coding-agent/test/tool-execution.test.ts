@@ -24,12 +24,12 @@ afterEach(async () => {
 })
 
 function tool(name: string) {
-  const tools = createTools(runtime, { web_search: async () => 'search', web_fetch: async () => 'fetch' })
+  const tools = createTools(runtime, { web_search: async () => 'search', web_fetch: async () => 'fetch' }, cwd)
   return tools.find(tool => tool.name === name)!.execute
 }
 
 function context(signal = new AbortController().signal) {
-  return { cwd, signal }
+  return { signal, recordDetails: (_details: unknown) => {} }
 }
 
 it('reads UTF-8 lines from task cwd and from an absolute path', async () => {
@@ -44,12 +44,12 @@ it('reads UTF-8 lines from task cwd and from an absolute path', async () => {
 it('records the resolved path of an empty read and omits a failed read', async () => {
   const path = join(cwd, 'empty.txt')
   await writeFile(path, '')
-  const paths: string[] = []
-  const execution = { ...context(), recordFileOperation: (path: string) => paths.push(path) }
+  const details: unknown[] = []
+  const execution = { ...context(), recordDetails: (value: unknown) => details.push(value) }
   const read = tool('read')
   expect(await read({ path: 'nested/../empty.txt' }, execution)).toBe('')
   await expect(read({ path: 'empty.txt', offset: 2 }, execution)).rejects.toThrow('offset')
-  expect(paths).toEqual([path])
+  expect(details).toEqual([{ kind: 'read', path }])
 })
 
 it('shows the next offset for a caller-limited read and preserves a final newline at EOF', async () => {
