@@ -1,13 +1,14 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
 import type { ExecutableTool } from '@agent-learning/agent'
 import type { ConversationSnapshot } from '../src/types.js'
 import { createTools } from '../src/tools.js'
 import { ToolRuntime } from '../src/tool-runtime.js'
+import { estimateContextTokens } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelEventStream } from '@agent-learning/model'
 
 const tool: ExecutableTool = { name: 'read', description: '读取', parameters: Type.Object({}), execute: async () => '实际结果' }
@@ -35,8 +36,7 @@ async function state(agent: AgentSession): Promise<ConversationSnapshot> {
   return event.snapshot
 }
 async function idle(agent: AgentSession) {
-  for (let i = 0; i < 100; i++) { if (!(await state(agent)).running) return; await new Promise(resolve => setImmediate(resolve)) }
-  throw new Error('still running')
+  await vi.waitFor(async () => expect((await state(agent)).running).toBeNull(), { interval: 5 })
 }
 function setup(summary = reply('目标：继续任务；事实：项目青禾。', { usage: { input: 900, output: 30 } }), triggerTokens = 5000) {
   const contexts: ModelContext[] = []
@@ -288,7 +288,7 @@ describe('AgentSession compaction', () => {
     expect((await state(agent)).messages).toEqual(before)
     expect((await state(agent)).compactions.at(-1)).toMatchObject({ status: 'aborted' })
     expect((await state(agent)).running).toBeNull()
-    expect(signalB?.aborted).toBe(false)
+    await vi.waitFor(() => expect(signalB?.aborted).toBe(false), { interval: 5 })
     expect((await state(b)).running?.runId).toBe(receiptB.userMessageId)
     releaseB.resolve()
     await idle(b)
@@ -482,5 +482,133 @@ describe('AgentSession compaction', () => {
     expect(snapshot.messages.slice(0, before.length)).toEqual(before)
     expect(snapshot.messages.at(-1)?.message).toMatchObject({ stopReason: 'error' })
     expect(snapshot.compactions.filter(record => record.status === 'success')).toEqual([])
+  })
+})
+
+async function projectFixture(run: (cwd: string, path: string) => Promise<void>) {
+  const cwd = await mkdtemp(join(tmpdir(), 'agent-project-compaction-'))
+  const path = join(cwd, 'AGENTS.md')
+  try {
+    await writeFile(path, 'project-rule-original')
+    await run(cwd, path)
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+}
+
+describe('项目说明与压缩', () => {
+  it('手动摘要只整理聊天，下一条普通请求仍有说明和摘要', async () => {
+    await projectFixture(async cwd => {
+      const contexts: ModelContext[] = []
+      const agent = new AgentSession({
+        resolveDirectory: async () => cwd, tools: () => [tool],
+        compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
+        stream: (_m, context) => { contexts.push(context); return output(context.tools ? reply() : reply('旧任务摘要')) },
+      })
+      await seed(agent)
+      const before = await state(agent)
+      await agent.submit({ ...input, text: '/compact' }); await idle(agent)
+      const after = await state(agent)
+      expect(after.messages).toEqual(before.messages)
+      expect(after.compactions[0]).toMatchObject({ trigger: 'manual', status: 'success' })
+      expect(contexts[2].systemPrompt).toBeTruthy()
+      expect(JSON.stringify(contexts[2])).not.toContain('project-rule-original')
+      expect(contexts[2].tools).toBeUndefined()
+      await agent.submit({ ...input, text: '继续' }); await idle(agent)
+      const next = contexts[3]
+      expect(next.systemPrompt).toBe(contexts[0].systemPrompt)
+      expect(next.systemPrompt).toContain('project-rule-original')
+      expect(JSON.stringify(next.messages)).toContain('旧任务摘要')
+      expect(JSON.stringify(next.messages)).toContain('继续')
+    })
+  })
+
+  it('只有加入新版说明才触发自动压缩，后续请求带完整说明和摘要', async () => {
+    await projectFixture(async (cwd, path) => {
+      const contexts: ModelContext[] = []
+      const triggerTokens = 3000
+      const agent = new AgentSession({
+        resolveDirectory: async () => cwd, tools: () => [tool],
+        compaction: { triggerTokens, keepRecentTokens: 100 },
+        stream: (_m, context) => { contexts.push(context); return output(context.tools ? reply() : reply('已整理的旧聊天')) },
+      })
+      await seed(agent)
+      const before = await state(agent)
+      expect(contexts).toHaveLength(2)
+      expect(before.contextUsage!.tokens!).toBeLessThan(triggerTokens)
+      const expanded = 'project-rule-expanded\n' + 'z'.repeat(8000)
+      await writeFile(path, expanded)
+      await agent.submit({ ...input, text: '继续' }); await idle(agent)
+      expect(contexts).toHaveLength(4)
+      const [summary, next] = contexts.slice(2)
+      expect(summary.tools).toBeUndefined()
+      expect(JSON.stringify(summary)).not.toContain('project-rule-')
+      expect(next.systemPrompt).toContain(expanded)
+      expect(JSON.stringify(next.messages)).toContain('已整理的旧聊天')
+      const after = await state(agent)
+      expect(after.compactions[0]).toMatchObject({ trigger: 'auto', status: 'success' })
+      expect(after.contextUsage?.breakdown.systemTokens).toBe(estimateContextTokens(next).systemTokens)
+    })
+  })
+
+  it('超限压缩期间改写说明，恢复请求刷新一次且不重跑已完成工具', async () => {
+    await projectFixture(async (cwd, path) => {
+      const contexts: ModelContext[] = []
+      let running = false, calls = 0
+      const execute = vi.fn(async () => '已完成的工具结果')
+      const agent = new AgentSession({
+        resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }],
+        compaction: { triggerTokens: 10_000, keepRecentTokens: 100 },
+        stream: (_m, context) => {
+          if (!running) return output(reply())
+          contexts.push(context)
+          if (!context.tools) return {
+            result: async () => reply('恢复摘要'),
+            async *[Symbol.asyncIterator]() {
+              await writeFile(path, 'project-rule-recovered')
+              yield { type: 'done', reason: 'stop', message: reply('恢复摘要') }
+            },
+          }
+          calls++
+          if (calls === 1) return output(reply('', { stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'kept', name: 'read', arguments: {} }] }))
+          if (calls === 2) return output(reply('', { stopReason: 'error', errorCode: 'context_overflow' }))
+          return output(reply('已继续'))
+        },
+      })
+      await seed(agent)
+      running = true
+      await agent.submit({ ...input, text: '继续任务' }); await idle(agent)
+      expect(contexts).toHaveLength(4)
+      expect(contexts[1].systemPrompt).toContain('project-rule-original')
+      expect(JSON.stringify(contexts[2])).not.toContain('project-rule-')
+      expect(contexts[3].systemPrompt).toContain('project-rule-recovered')
+      expect(contexts[3].systemPrompt).not.toContain('project-rule-original')
+      expect(JSON.stringify(contexts[3].messages)).toContain('恢复摘要')
+      expect(contexts[3].messages.at(-1)).toMatchObject({ role: 'toolResult', toolCallId: 'kept' })
+      expect(execute).toHaveBeenCalledTimes(1)
+      expect((await state(agent)).compactions).toMatchObject([{ trigger: 'overflow', status: 'success' }])
+    })
+  })
+
+  it('说明自身超限提示精简，并保留已接受的任务和工具成功结果', async () => {
+    await projectFixture(async (cwd, path) => {
+      const execute = vi.fn(async () => {
+        await writeFile(path, 'x'.repeat(4_200_000))
+        return '已修改说明'
+      })
+      const stream = vi.fn(() => output(reply('', { stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'kept', name: 'read', arguments: {} }] })))
+      const agent = new AgentSession({ resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }], stream })
+      await agent.submit({ ...input, text: '更新项目说明' }); await idle(agent)
+      expect(stream).toHaveBeenCalledTimes(1)
+      expect(execute).toHaveBeenCalledTimes(1)
+      const after = await state(agent)
+      expect(after.compactions).toEqual([])
+      expect(after.messages.map(entry => entry.message)).toMatchObject([
+        { role: 'user', content: '更新项目说明' },
+        { role: 'assistant', stopReason: 'toolUse' },
+        { role: 'toolResult', toolCallId: 'kept', isError: false, content: [{ text: '已修改说明' }] },
+        { role: 'assistant', stopReason: 'error', errorMessage: expect.stringContaining('请精简项目说明') },
+      ])
+    })
   })
 })

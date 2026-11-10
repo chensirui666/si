@@ -142,6 +142,7 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
   const modelRequests: { messages: { role: string; tool_calls?: { id: string }[]; tool_call_id?: string; content?: string }[]; tools?: unknown[] }[] = []
   const server = new WebServer({
     port: 0, directoryPicker: async () => cwd,
+    globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
@@ -159,7 +160,7 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
     for (const name of ['青禾', '白榆']) {
       await writeFile(join(cwd, 'note.txt'), `项目名称：${name}\n`)
       const before = modelRequests.length
-      const result = await complete(page, observed, '请现在用 read 读取工作区的 note.txt，最后只回答文件里当前写的项目名称。每次重新读文件。')
+      const result = await complete(page, observed, '本条消息只调用一次 read 读取工作区当前的 note.txt。收到这次工具结果后，直接回答其中的项目名称。')
       expect(textOf(result.message)).toContain(name)
       expect(modelRequests).toHaveLength(before + 2)
       expect(modelRequests[before]?.tools).toHaveLength(8)
@@ -193,6 +194,7 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
   const requests: { messages: { role: string; content?: string; tool_calls?: { id: string; function: { name: string; arguments: string } }[]; tool_call_id?: string }[]; tools?: unknown[] }[] = []
   const server = new WebServer({
     port: 0, directoryPicker: async () => cwd,
+    globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => { requests.push(JSON.parse(String(init?.body))); return globalThis.fetch(url, init) } },

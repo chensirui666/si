@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 const options = {
   port: Number(process.argv[2]),
   browserSecretPath: process.argv[3],
+  globalContextDirectory: join(dirname(process.argv[3]), 'global-context'),
   modelAuthPath: join(dirname(process.argv[3]), 'auth.json'),
   ...(process.argv[4] ? { devOrigin: 'http://127.0.0.1:' + process.argv[4] } : {}),
   workspacePath: join(dirname(process.argv[3]), 'workspaces.json'),

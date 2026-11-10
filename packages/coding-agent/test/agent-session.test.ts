@@ -1,9 +1,15 @@
 import { getEventListeners } from 'node:events'
-import { describe, expect, it } from 'vitest'
+import * as fs from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
+import { buildSystemPrompt } from '../src/system-prompt.js'
 import type { ExecutableTool } from '@agent-learning/agent'
 import type { AssistantMessage, ModelContext, ModelEvent, ModelEventStream, ToolCall } from '@agent-learning/model'
+
+vi.mock('node:fs/promises', { spy: true })
 
 const workspaceDirectory = '/workspace-with-spaces /project'
 
@@ -147,8 +153,7 @@ async function snapshot(agent: AgentSession) {
   return event.snapshot
 }
 async function until(predicate: () => Promise<boolean>) {
-  for (let i = 0; i < 100; i++) { if (await predicate()) return; await new Promise(resolve => setImmediate(resolve)) }
-  throw new Error('AgentSession did not consume expected event')
+  await vi.waitFor(async () => expect(await predicate()).toBe(true), { interval: 5 })
 }
 
 describe('AgentSession 提交与运行', () => {
@@ -164,7 +169,7 @@ describe('AgentSession 提交与运行', () => {
     expect(receipt).toEqual({ kind: 'message', clientMessageId: 'local-1', userMessageId: current.messages[0]?.id, acceptedSeq: 1 })
     expect(current.messages[0]?.message).toMatchObject({ role: 'user', content: '  你好\n第二行  ' })
     expect(current.running?.runId).toBe(receipt.userMessageId)
-    expect(calls).toBe(1)
+    await until(async () => calls === 1)
     queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
   })
@@ -238,10 +243,12 @@ describe('AgentSession 提交与运行', () => {
     await until(async () => (await snapshot(agent)).running === null)
     expect((await snapshot(agent)).messages).toHaveLength(2)
     await agent.submit(input)
+    await until(async () => contexts.length === 2)
     expect(contexts[1]?.messages.map(message => message.role)).toEqual(['user', 'user'])
     second.push({ type: 'done', reason: 'stop', message: { ...assistant(), content: [{ type: 'text', text: '成功' }], stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
     await agent.submit(input)
+    await until(async () => contexts.length === 3)
     expect(contexts[2]?.messages.map(message => message.role)).toEqual(['user', 'user', 'assistant', 'user'])
     third.push({ type: 'done', reason: 'length', message: { ...assistant(), stopReason: 'length' } })
     await until(async () => (await snapshot(agent)).running === null)
@@ -260,11 +267,14 @@ describe('AgentSession 提交与运行', () => {
 
   it('关闭 AgentSession 主动取消当前生成并等候收尾，之后不再接收', async () => {
     const queue = controlled()
+    let started = false
     const agent = createSession({ stream: (_model, _context, options) => {
+      started = true
       options!.signal!.addEventListener('abort', () => queue.push({ type: 'error', reason: 'aborted', error: { ...assistant(), stopReason: 'aborted' } }), { once: true })
       return queue.output
     } })
     await agent.submit(input)
+    await until(async () => started)
     await agent.close()
     expect((await snapshot(agent)).running).toBeNull()
     expect((await snapshot(agent)).messages[1]?.message).toMatchObject({ stopReason: 'aborted' })
@@ -299,6 +309,7 @@ describe('AgentSession 提交与运行', () => {
     release()
     await until(async () => (await snapshot(agent)).running === null)
     const next = await agent.submit(input)
+    await until(async () => secondSignal !== undefined)
     const beforeClose = await snapshot(agent)
     const closing = agent.close()
     const cancelled = secondSignal!.aborted
@@ -465,6 +476,7 @@ describe('AgentSession 一批工具与最终回答', () => {
       role: 'assistant', content: message.content, errorMessage: expect.any(String),
     })
     await agent.submit(input)
+    await until(async () => contexts.length === 2)
     expect(contexts[1].messages.map(item => item.role)).toEqual(['user', 'user'])
     answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
@@ -497,6 +509,7 @@ describe('AgentSession 主动中止', () => {
       } }
     } })
     const accepted = await agent.submit(input)
+    await until(async () => (await snapshot(agent)).messages.length >= 2)
     let ended = false
     const aborting = agent.abort(accepted.userMessageId).then(value => { ended = true; return value })
     const again = agent.abort(accepted.userMessageId)
@@ -514,6 +527,7 @@ describe('AgentSession 主动中止', () => {
     ])
     await agent.submit(input)
     expect(await agent.abort(accepted.userMessageId)).toBe(false)
+    await until(async () => calls === 2)
     expect(signal.aborted).toBe(false)
     await agent.close()
   })
@@ -546,6 +560,7 @@ describe('AgentSession 主动中止', () => {
     expect(contexts).toHaveLength(1)
     expect(executed).toEqual(['first', 'second', 'third'].slice(0, count))
     await agent.submit(input)
+    await until(async () => contexts.length === 2)
     expect(contexts[1].messages.map(message => message.role)).toEqual(['user', 'assistant', ...Array(count).fill('toolResult'), 'user'])
     answer.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
     await until(async () => (await snapshot(agent)).running === null)
@@ -717,4 +732,98 @@ describe('Feature6 连续决策与同批调度', () => {
     if (mode === 'abort') { await agent.submit(input); done(1); await until(async () => (await snapshot(agent)).running === null) }
     else await expect(agent.submit(input)).rejects.toMatchObject({ code: 'closed' })
   })
+})
+
+describe('每轮项目说明', () => {
+  const done = () => {
+    const queue = controlled()
+    queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    return queue.output
+  }
+
+  it('无工具时也有一份当前说明，改写、优先文件新增和删除会替换旧说明', async () => {
+    const cwd = await fs.mkdtemp(join(tmpdir(), 'agent-context-refresh-'))
+    const current = join(cwd, 'AGENTS.md'), preferred = join(cwd, 'AGENTS.override.md')
+    const contexts: ModelContext[] = []
+    const agent = new AgentSession({ resolveDirectory: async () => cwd, stream: (_model, context) => {
+      contexts.push(context)
+      return done()
+    } })
+    try {
+      await fs.writeFile(current, 'project-rule-09')
+      const expected = Array<string>(7).fill('project-rule-09')
+      for (const next of [...expected, 'project-rule-edited', 'project-rule-new', 'project-rule-edited']) {
+        if (contexts.length === 7) await fs.writeFile(current, next)
+        if (contexts.length === 8) await fs.writeFile(preferred, next)
+        if (contexts.length === 9) await fs.unlink(preferred)
+        await agent.submit(input)
+        await vi.waitFor(async () => expect((await snapshot(agent)).running).toBeNull())
+        const request = contexts.at(-1)!
+        expect(request.systemPrompt?.match(/project-rule-[^\n]+/g)).toEqual([next])
+        expect(request.systemPrompt).toContain('<project_context>')
+        expect(JSON.stringify(request.messages)).not.toContain('project-rule-')
+      }
+      expect(contexts).toHaveLength(10)
+      expect(JSON.stringify((await snapshot(agent)).messages)).not.toContain('project-rule-')
+    } finally {
+      await agent.close()
+      await fs.rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('读取期间中止会关闭文件，跳过模型调用并允许继续发送', async () => {
+    const cwd = await fs.mkdtemp(join(tmpdir(), 'agent-context-abort-'))
+    const path = join(cwd, 'AGENTS.md')
+    await fs.writeFile(path, '项目说明')
+    const release = Promise.withResolvers<void>()
+    const entered = vi.fn(), closed = vi.fn()
+    const { open } = await vi.importActual<typeof fs>('node:fs/promises')
+    vi.mocked(fs.open).mockImplementation(async (candidate, ...args) => {
+      const handle = await open(candidate, ...args)
+      if (candidate !== path) return handle
+      const read = handle.read.bind(handle), close = handle.close.bind(handle)
+      handle.read = (async (buffer: Buffer, offset: number, length: number, position: number | null) => {
+        entered()
+        await release.promise
+        return read(buffer, offset, length, position)
+      }) as typeof handle.read
+      handle.close = async () => { await close(); closed() }
+      return handle
+    })
+    const stream = vi.fn(done)
+    const agent = new AgentSession({ stream, resolveDirectory: async () => cwd })
+    try {
+      const receipt = await agent.submit(input)
+      if (receipt.kind !== 'message') throw new Error('missing message receipt')
+      await vi.waitFor(() => expect(entered).toHaveBeenCalled())
+      const aborted = agent.abort(receipt.userMessageId)
+      expect(closed).not.toHaveBeenCalled()
+      release.resolve()
+      await expect(aborted).resolves.toBe(true)
+      expect(closed).toHaveBeenCalledTimes(1)
+      expect(stream).not.toHaveBeenCalled()
+      expect(await snapshot(agent)).toMatchObject({ running: null, messages: [
+        { message: { role: 'user', content: input.text } },
+        { message: { role: 'assistant', stopReason: 'aborted' } },
+      ] })
+      await agent.submit({ ...input, text: '继续' })
+      await vi.waitFor(async () => expect((await snapshot(agent)).running).toBeNull())
+      expect(stream).toHaveBeenCalledTimes(1)
+    } finally {
+      release.resolve()
+      await agent.close()
+      vi.mocked(fs.open).mockReset()
+      await fs.rm(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+it('系统提示词中的目录与来源路径保留边界', () => {
+  const cwd = '/project</cwd>\n"folder"'
+  const prompt = buildSystemPrompt(cwd, [{
+    name: 'read', description: '读取', parameters: Type.Object({}), execute: async () => '',
+  }], undefined, [{ path: join(cwd, 'AGENTS.md'), content: '项目说明' }])
+  expect(prompt.match(/<\/cwd>/g)).toHaveLength(1)
+  expect(prompt).toContain('<project_instructions path="/project&lt;/cwd&gt;&#10;&quot;folder&quot;/AGENTS.md">')
+  expect(prompt).toContain('<cwd>\n/project&lt;/cwd&gt;&#10;&quot;folder&quot;\n</cwd>')
 })

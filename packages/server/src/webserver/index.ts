@@ -1,7 +1,9 @@
 import { createServer, validateHeaderValue, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { existsSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
-import { extname, resolve, sep } from 'node:path'
+import { homedir } from 'node:os'
+import { extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
@@ -23,6 +25,8 @@ type SessionTarget = {
 
 type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
 
+const siRoot = fileURLToPath(new URL('../../../../', import.meta.url))
+
 export type WebServerOptions = {
   port?: number
   webRoot?: string
@@ -31,6 +35,7 @@ export type WebServerOptions = {
   devOrigin?: `http://127.0.0.1:${number}`
   workspacePath?: string
   webSettingsPath?: string
+  globalContextDirectory?: string
   directoryPicker?: DirectoryPicker
   webProviders?: WebProvider[]
   createSession?: (resolveDirectory: () => Promise<string>) => SessionTarget
@@ -115,6 +120,8 @@ export class WebServer {
       resolveDirectory: id => this.workspaces.resolveDirectory(id),
       createSession: this.options.createSession ?? (resolveDirectory => new AgentSession({
         resolveDirectory, stream, tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+        globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
+        documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
       })),
       closeTools: () => runtime.close(),
       onStarted: () => this.notify('sessions_changed'),

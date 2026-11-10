@@ -67,6 +67,16 @@ const declarations = {
   web_fetch: { name: 'web_fetch', description: '获取指定网页的正文。', parameters: webFetchParameters },
 } satisfies Record<string, Tool>
 
+export type CodingTool = ExecutableTool & { promptSnippet?: string }
+
+const promptSnippets: Record<string, string> = {
+  bash: '在当前工作目录执行 Bash 命令。',
+  edit: '通过精确匹配原文来修改文件，一次调用可修改同一文件中多处互不重叠的内容。',
+  grep: '搜索文件内容，返回文件路径、行号、命中文本及可选的上下文。',
+  web_search: '搜索网页，返回标题、链接和相关片段。',
+  web_fetch: '获取指定公网网页的正文。',
+}
+
 export const defaultTools: Tool[] = Object.values(declarations)
 
 export type ReadParams = Static<typeof readParameters>
@@ -83,9 +93,10 @@ function executable<Schema extends TSchema>(
   execute: (params: Static<Schema>, context: LocalToolContext) => Promise<string>,
   cwd: string,
   fileKind?: 'read' | 'modified',
-): ExecutableTool {
+): CodingTool {
   return {
     ...declaration,
+    promptSnippet: promptSnippets[declaration.name],
     async execute(args, { signal, recordDetails }) {
       try {
         signal.throwIfAborted()
@@ -103,7 +114,7 @@ function executable<Schema extends TSchema>(
   }
 }
 
-export function createTools(runtime: ToolRuntime, web: WebTools, cwd: string): ExecutableTool[] {
+export function createTools(runtime: ToolRuntime, web: WebTools, cwd: string): CodingTool[] {
   const local = createLocalTools(runtime)
   return [
     executable(declarations.read, local.read, cwd, 'read'),

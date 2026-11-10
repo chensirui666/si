@@ -13,6 +13,7 @@ test('未发送的新会话共用一份草稿，首次发送使用最后选中�
   const folders = ['workspace-a', 'workspace-b'].map(name => join(temporary, name))
   const server = new WebServer({
     port: 0,
+    globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'),
     modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'),

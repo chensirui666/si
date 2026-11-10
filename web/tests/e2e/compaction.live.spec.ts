@@ -77,6 +77,7 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
   const requests: WireRequest[] = []
   const server = new WebServer({
     port: 0, directoryPicker: async () => cwd, compaction: budget,
+    globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
@@ -261,6 +262,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
   const requests: WireRequest[] = []
   const server = new WebServer({
     port: 0, directoryPicker: async () => cwd, compaction: { triggerTokens: 20_000, keepRecentTokens: 400 },
+    globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
