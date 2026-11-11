@@ -266,15 +266,34 @@ it.each(['find', 'grep'] as const)('T1.2 %s 中止保留已产生的部分结果
   const bin = join(cwd, 'bin')
   await mkdir(bin)
   const row = name === 'find' ? 'src/note.txt\\000' : JSON.stringify({ type: 'match', data: { path: { text: join(cwd, 'note.txt') }, lines: { text: '项目名称：青禾' }, line_number: 1 } }) + '\\n'
-  await writeFile(join(bin, name === 'find' ? 'fd' : 'rg'), '#!/bin/bash\n[ "$1" = --version ] && exit 0\nprintf \'%b\' \'' + row + '\'\ntouch ready\nwhile :; do :; done\n', { mode: 0o700 })
+  await writeFile(join(bin, name === 'find' ? 'fd' : 'rg'), '#!/bin/bash\n[ "$1" = --version ] && exit 0\nprintf \'%b\' \'' + row + '\'\nwhile :; do :; done\n', { mode: 0o700 })
   vi.stubEnv('PATH', bin + ':' + process.env.PATH)
+  const ready = Promise.withResolvers<void>()
+  const delimiter = name === 'find' ? 0 : 10
+  const run = runtime.run.bind(runtime)
+  vi.spyOn(runtime, 'run').mockImplementation((command, args, options) => {
+    const stdout = options.stdout
+    if (!stdout) return run(command, args, options)
+    return run(command, args, {
+      ...options,
+      stdout(chunk) {
+        const result = stdout(chunk)
+        if (chunk.includes(delimiter)) ready.resolve()
+        return result
+      },
+    })
+  })
   const controller = new AbortController()
   const output = tool(name)({ pattern: '*.txt' }, context(controller.signal))
   const outcome = output.catch(error => error)
-  await vi.waitFor(async () => { await readFile(join(cwd, 'ready')) })
-  controller.abort()
-  const error = await outcome
-  expect(error).toMatchObject({ code: 'interrupted', message: expect.stringContaining('note.txt') })
+  try {
+    await Promise.race([ready.promise, output.then(() => { throw new Error('工具未输出匹配项就已结束') })])
+    controller.abort()
+    expect(await outcome).toMatchObject({ code: 'interrupted', message: expect.stringContaining('note.txt') })
+  } finally {
+    controller.abort()
+    await outcome
+  }
 })
 
 it('处理工具输出抛错时仍杀死进程，不能让后续取消失效', async () => {
