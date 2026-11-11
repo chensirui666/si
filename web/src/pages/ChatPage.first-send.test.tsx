@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { SessionSummary } from '@agent-learning/server/protocol'
 import { ChatPage } from './ChatPage'
@@ -19,8 +19,8 @@ afterEach(() => { localStorage.clear(); sessionStorage.clear() })
 
 const firstText = '  读取目录里的文件\n保留这行  '
 async function chooseAndType() {
-  const select = await screen.findByRole('combobox', { name: '工作区' })
-  fireEvent.change(select, { target: { value: stardust.id } })
+  const workspace = await screen.findByRole('group', { name: stardust.name })
+  fireEvent.click(within(workspace).getByRole('button', { name: '新建会话' }))
   const editor = screen.getByRole('textbox', { name: '消息' })
   await act(async () => {
     editor.focus()

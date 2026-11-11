@@ -790,7 +790,7 @@ function summaryProvider() {
   })}\n\ndata: [DONE]\n\n`)
   const controlledFetch: typeof fetch = async (_url, init) => {
     const body = JSON.parse(String(init?.body))
-    if (String(body.messages[0]?.content).startsWith('你负责整理对话摘要')) {
+    if (String(body.messages[0]?.content).startsWith('你是一名上下文摘要助手。')) {
       summaryCalls++
       return new Response(new ReadableStream<Uint8Array>({ start(controller) {
         summary = controller
@@ -1678,7 +1678,7 @@ describe('Feature 10 会话库', () => {
   it('15 新摘要的写入失败不替换原摘要，也不影响下一轮使用原上下文', async () => {
     let failCompaction = false
     const storage = writes(data => failCompaction && data.compaction?.status === 'success')
-    const provider = controlledStream(context => context.tools?.length || !context.systemPrompt?.startsWith('你负责整理')
+    const provider = controlledStream(context => context.tools?.length || !context.systemPrompt?.startsWith('你是一名上下文摘要助手。')
       ? [{ type: 'text', text: '已记录。'.repeat(30) }] : [{ type: 'text', text: '旧事实是青禾。' }])
     const app = await setup({
       sessionPath: ':memory:',

@@ -1,6 +1,6 @@
 # Feature1 实施计划
 
-**目标：** 按 [Feature1 技术设计](./feature1-基本聊天页面.md) 实现本地输入、发送、展示，并逐项记录八组验收的真实结果。
+**目标：** 按 [Feature1 技术设计](../../../docs/里程碑1/feature1/feature1-基本聊天页面.md) 实现本地输入、发送、展示，并逐项记录八组验收的真实结果。
 
 **结构：** `App → ChatPage → MessageInput / MessageList`。Lexical 持有草稿；ChatPage 持有用户消息。沿用 React、TypeScript、Vite、Tailwind CSS 与 shadcn/ui，不建立 Agent 核心或后端。
 

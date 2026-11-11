@@ -10,6 +10,16 @@
 
 说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。下面是使用八种工具且没有项目说明时的原文。摘要请求使用独立的摘要提示词。
 
+展开 `this.configuration` 后，请求数据如下。
+
+```ts
+const context: ModelContext = {
+  systemPrompt: this.configuration.systemPrompt, // 包含本轮项目说明、工作目录，以及按实际工具组装的清单和规则。
+  ...(this.configuration.tools ? { tools: this.configuration.tools } : {}), // 有工具时传入可调用的工具声明。
+  messages: buildModelHistory(this.state.messages, this.latestCompaction()), // 本轮对话历史，压缩后带上摘要和保留的原文。
+}
+```
+
 ## 原文
 
 ```text

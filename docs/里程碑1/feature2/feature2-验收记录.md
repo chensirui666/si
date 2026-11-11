@@ -12,7 +12,7 @@
 - Node.js `v24.16.0`，npm `11.13.0`，TypeScript `5.9.3`，Playwright `1.62.1` / Chromium。
 - 根 npm workspace 管理四个后端包及 web，根 package-lock.json 取代 web 独立锁。逐项比较旧锁已有依赖，版本变化为 0；新增运行依赖 ws 固定为 `8.22.1`。
 
-实施依据：[阶段一设计](./feature2-阶段一-打开授权与订阅.md)、[实施计划](./feature2-阶段一-实施计划.md)、[总体契约](./feature2-单会话流式聊天技术设计.md)。实施方案、关键边界与风险已在实施前获用户确认。
+实施依据：[阶段一设计](./feature2-阶段一-打开授权与订阅.md)、[实施计划](../../../planning/里程碑1/feature2/feature2-阶段一-实施计划.md)、[总体契约](./feature2-单会话流式聊天技术设计.md)。实施方案、关键边界与风险已在实施前获用户确认。
 
 ## 最终命令与结果
 
@@ -112,7 +112,7 @@ Vite 使用 strictPort、127.0.0.1:5173，/auth 重写到后端根，/api 代理
 
 worktree 清理待完成：Codex 的归档工具返回 `The task's primary checkout cannot be removed.`，因为此聊天当前仍以该 worktree 为主工作目录。尝试切回主目录时，附加工具确认主目录不是受管理 worktree；自动操作 Codex 自身界面也被工具禁止。因此保留这个干净 worktree 和已合并分支，待使用者将此聊天切回主目录后再清理。没有强行删除目录或修改应用内部状态。
 
-依据：[阶段二设计](./feature2-阶段二-凭据配置与本地模型发现.md)与[实施计划](./feature2-阶段二-实施计划.md)。实施前使用者明确选择“按文档方案继续”。
+依据：[阶段二设计](./feature2-阶段二-凭据配置与本地模型发现.md)与[实施计划](../../../planning/里程碑1/feature2/feature2-阶段二-实施计划.md)。实施前使用者明确选择“按文档方案继续”。
 
 ### 交付行为
 
@@ -166,7 +166,7 @@ worktree 清理待完成：Codex 的归档工具返回 `The task's primary check
 
 2026-11-04，从干净 `main`（02830b1）新建 Codex managed worktree `/Users/stardust/.codex/worktrees/feature2-stage3/agent learning`，分支 `codex/feature2-stage3`。用户本轮明确要求按阶段三文档继续实现并完成全部校验。主 checkout 保持不变；本轮保留 worktree 供审阅，不合并或推送。
 
-依据：[阶段三设计](./feature2-阶段三-提交生成与实时展示.md)、[实施计划](./feature2-阶段三-实施计划.md)及总体契约。使用 Node.js v24.16.0、npm 11.13.0、TypeScript 5.9.3、Playwright 1.62.1 / Chromium。依赖增加 OpenAI SDK 7.50.0 和 mdast/micromark GFM 解析所需包，固定在根 lock；没有移入工具执行框架或整套 dsh UI。
+依据：[阶段三设计](./feature2-阶段三-提交生成与实时展示.md)、[实施计划](../../../planning/里程碑1/feature2/feature2-阶段三-实施计划.md)及总体契约。使用 Node.js v24.16.0、npm 11.13.0、TypeScript 5.9.3、Playwright 1.62.1 / Chromium。依赖增加 OpenAI SDK 7.50.0 和 mdast/micromark GFM 解析所需包，固定在根 lock；没有移入工具执行框架或整套 dsh UI。
 
 ### 实际功能
 

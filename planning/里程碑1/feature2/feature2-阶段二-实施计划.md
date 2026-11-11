@@ -2,7 +2,7 @@
 
 **Goal:** 在授权网页完成 DeepSeek Key 增改删、本地模型发现和多页面同步，完成阶段二全部自动验收。
 
-**Spec:** [阶段二设计](./feature2-阶段二-凭据配置与本地模型发现.md)及[总体设计](./feature2-单会话流式聊天技术设计.md)。使用者已确认按现有方案继续。
+**Spec:** [阶段二设计](../../../docs/里程碑1/feature2/feature2-阶段二-凭据配置与本地模型发现.md)及[总体设计](../../../docs/里程碑1/feature2/feature2-单会话流式聊天技术设计.md)。使用者已确认按现有方案继续。
 
 **Architecture:** Credentials 复用现有安全文件读写，Model 根据凭据状态提供本地目录，WebServer 复用授权和 WebSocket，ChatPage 独立维护模型状态。保持 Agent 与聊天发送行为。
 

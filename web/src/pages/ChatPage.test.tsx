@@ -165,12 +165,12 @@ it('查询模型并响应配置通知与重连，旧查询不能覆盖新配置�
     .mockResolvedValueOnce(missing).mockResolvedValue(configured)
   render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={subscribe} getModels={getModels} />)
   await act(async () => { changed() })
-  expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('无可用模型')
+  expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('无可用模型')
   await act(async () => { resolveOld(configured) })
-  expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('无可用模型')
+  expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('无可用模型')
   await act(async () => { listener({ sessionId: target, connection: 'disconnected', snapshot: empty, slow: false, error: null }) })
   await act(async () => { listener({ sessionId: target, connection: 'ready', snapshot: empty, slow: false, error: null }) })
-  expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('DeepSeek Flash')
+  expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('DeepSeek Flash')
   expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
 })
 
@@ -195,7 +195,7 @@ it('晚到的配置保存结果后重新查询当前文件，避免恢复旧模�
   const source = controlled()
   try {
     render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
-    await screen.findByRole('option', { name: '无可用模型' })
+    await screen.findByText('无可用模型')
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
     fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
     fireEvent.click(screen.getByRole('button', { name: 'DeepSeek' }))
@@ -204,7 +204,7 @@ it('晚到的配置保存结果后重新查询当前文件，避免恢复旧模�
     await act(async () => { resolveSave(configured) })
     expect(getModels).toHaveBeenCalledTimes(2)
     fireEvent.click(screen.getByRole('button', { name: '关闭设置' }))
-    expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('无可用模型')
+    expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('无可用模型')
   } finally { save.mockRestore() }
 })
 
@@ -215,7 +215,7 @@ it('初始模型查询尚未完成时保存失败，仍接收查询结果且关�
   const source = controlled()
   try {
     render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
-    expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('正在查询模型…')
+    expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('正在查询模型…')
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
     fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
     fireEvent.click(screen.getByRole('button', { name: 'DeepSeek' }))
@@ -224,7 +224,7 @@ it('初始模型查询尚未完成时保存失败，仍接收查询结果且关�
     expect(await screen.findByRole('alert')).toHaveTextContent('无法写入模型凭据文件')
     await act(async () => { resolveInitial(configured) })
     fireEvent.click(screen.getByRole('button', { name: '关闭设置' }))
-    expect(screen.getByRole('combobox', { name: '模型' })).toHaveDisplayValue('DeepSeek Flash')
+    expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('DeepSeek Flash')
     expect(getModels).toHaveBeenCalledOnce()
   } finally { save.mockRestore() }
 })

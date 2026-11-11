@@ -1,9 +1,12 @@
-import { useRef, useState, type FormEvent } from 'react'
+import { useRef, useState, type ComponentProps, type FormEvent } from 'react'
+import { SettingsIcon } from 'lucide-react'
 import type { ModelDiscovery } from '@agent-learning/model'
 import type { WebSettingsView } from '@agent-learning/server/protocol'
 import { deleteApiKey, saveApiKey, deleteWebApiKey, saveWebApiKey, saveWebSettings } from '../chat/client'
 import { Button } from './ui/button'
-import { Dialog, DialogContent, DialogDescription, DialogTitle, DialogTrigger } from './ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
+import { Input } from './ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select'
 
 type ProviderFormState = {
   apiKey: string
@@ -12,6 +15,9 @@ type ProviderFormState = {
 }
 
 type Props = {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onCloseAutoFocus: (event: Event) => void
   discovery: ModelDiscovery | null
   onChange: (discovery: ModelDiscovery) => void
   webSettings?: WebSettingsView | null
@@ -21,8 +27,13 @@ type Props = {
 
 type Screen = 'models' | 'providers' | 'edit' | 'web'
 
-export function SettingsDialog({ discovery, onChange, webSettings, webSettingsError, onWebSettingsChange }: Props) {
-  const [open, setOpen] = useState(false)
+export function SettingsButton(props: ComponentProps<typeof Button>) {
+  return <Button className="settings-trigger" type="button" variant="ghost" aria-haspopup="dialog" {...props}>
+    <SettingsIcon aria-hidden="true" />设置
+  </Button>
+}
+
+export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, webSettings, webSettingsError, onWebSettingsChange }: Props) {
   const [screen, setScreen] = useState<Screen>('models')
   const [webProviderId, setWebProviderId] = useState('')
   const [form, setForm] = useState<ProviderFormState>({ apiKey: '', status: 'idle' })
@@ -44,7 +55,7 @@ export function SettingsDialog({ discovery, onChange, webSettings, webSettingsEr
   }
 
   function changeOpen(next: boolean) {
-    setOpen(next)
+    onOpenChange(next)
     navigate('models')
   }
 
@@ -102,7 +113,7 @@ export function SettingsDialog({ discovery, onChange, webSettings, webSettingsEr
     return <form className="provider-form" onSubmit={save}>
       <h3>{name}</h3>
       <label htmlFor="provider-key">API Key</label>
-      <div className="provider-key-field"><input id="provider-key" type="password" value={form.apiKey} autoComplete="off" spellCheck={false} disabled={busy} placeholder={hasKey ? '输入新的 API Key 以替换' : '输入 API Key'} onChange={event => setForm(previous => ({ ...previous, apiKey: event.target.value, errorMessage: undefined }))} /></div>
+      <div className="provider-key-field"><Input id="provider-key" type="password" value={form.apiKey} autoComplete="off" spellCheck={false} disabled={busy} placeholder={hasKey ? '输入新的 API Key 以替换' : '输入 API Key'} onChange={event => setForm(previous => ({ ...previous, apiKey: event.target.value, errorMessage: undefined }))} /></div>
       <p className="settings-help">已有 Key 不会回填。保存成功或关闭编辑后会清空输入。</p>
       <div className="provider-actions">
         <Button type="submit" disabled={busy || !form.apiKey.trim()}>{form.status === 'saving' ? '保存中…' : '保存'}</Button>
@@ -112,8 +123,7 @@ export function SettingsDialog({ discovery, onChange, webSettings, webSettingsEr
   }
 
   return <Dialog open={open} onOpenChange={changeOpen}>
-    <DialogTrigger asChild><Button className="settings-trigger" variant="ghost">设置</Button></DialogTrigger>
-    <DialogContent>
+    <DialogContent onCloseAutoFocus={onCloseAutoFocus}>
       <DialogTitle className="settings-title">设置</DialogTitle>
       <DialogDescription className="settings-description">管理本机模型和网页工具。保存只检查本地配置，远端有效性需在使用时验证。</DialogDescription>
       <div className="settings-layout">
@@ -132,12 +142,15 @@ export function SettingsDialog({ discovery, onChange, webSettings, webSettingsEr
                 {([
                   { field: 'searchProvider', capability: 'search', label: '网页搜索' },
                   { field: 'fetchProvider', capability: 'fetch', label: '网页获取' },
-                ] as const).map(({ field, capability, label }) => <label key={field}>
-                  {label}
-                  <select value={webSettings[field]} disabled={busy} onChange={event => updateSelection(field, event.target.value)}>
-                    {webSettings.providers.filter(provider => provider.capabilities.includes(capability)).map(provider => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
-                  </select>
-                </label>)}
+                ] as const).map(({ field, capability, label }) => <div key={field}>
+                  <label htmlFor={field}>{label}</label>
+                  <Select value={webSettings[field]} disabled={busy} onValueChange={value => updateSelection(field, value)}>
+                    <SelectTrigger id={field}><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {webSettings.providers.filter(provider => provider.capabilities.includes(capability)).map(provider => <SelectItem key={provider.id} value={provider.id}>{provider.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>)}
               </div>
               {webSettings.providers.map(provider => <div className="provider-row" key={provider.id}>
                 <div>

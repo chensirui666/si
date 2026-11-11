@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type { AssistantMessage, ModelMessage, ToolCall } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from '../src/compaction.js'
@@ -38,10 +39,13 @@ describe('effective model history', () => {
   it('replaces only earlier messages with one user-role summary and preserves the raw history', () => {
     const entries = [user('u1', 'superseded raw fact'), user('u2', 'current task'), assistant('a2', [{ type: 'text', text: 'progress' }])]
     const before = structuredClone(entries)
-    const history = buildModelHistory(entries, previous)
+    const fileOperations = { readFiles: ['/read.ts'], modifiedFiles: ['/modified.ts'] }
+    const history = buildModelHistory(entries, { ...previous, fileOperations })
+    const promptDocument = readFileSync(new URL('../../../docs/prompts/compaction/content.md', import.meta.url), 'utf8')
+    const template = promptDocument.split('```text\n')[1].split('\n```')[0]
+    const summary = `${previous.summary}\n\n工具确认的文件操作（readFiles 仅读，modifiedFiles 已改）：${JSON.stringify(fileOperations)}`
     expect(history).toHaveLength(3)
-    expect(history[0]).toMatchObject({ role: 'user', timestamp: 1 })
-    expect(serialized(history)).toContain('项目名称：青禾')
+    expect(history[0]).toEqual({ role: 'user', timestamp: 1, content: template.replace('${summary}', () => summary) })
     expect(serialized(history)).not.toContain('superseded raw fact')
     expect(history.slice(1)).toEqual(entries.slice(1).map(entry => entry.message))
     ;(history[1] as { content: string }).content = 'mutated copy'
@@ -123,7 +127,8 @@ describe('summary context', () => {
     const before = structuredClone(entries)
     const context = createSummaryContext(ready(prepareCompaction(entries, undefined, 10, true)))
     const text = serialized(context.messages)
-    expect(context.systemPrompt).toContain('摘要')
+    const promptDocument = readFileSync(new URL('../../../docs/prompts/compaction/systemPrompt.md', import.meta.url), 'utf8')
+    expect(context.systemPrompt).toBe(promptDocument.split('```text\n')[1].split('\n```')[0])
     expect(context.tools).toBeUndefined()
     expect(text).toContain('只修改临时目录')
     expect(text).toContain('index.txt 已读取')

@@ -354,6 +354,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
     const bBefore = await refresh(page, observed)
 
     await openSession(page, observed, '会话 1')
+    await submit(page, observed, `以下是可省略的旧运行日志，后续摘要无需记录。只回复“收到”。\n${randomBytes(1200).toString('hex')}`)
     await submit(page, observed, `只回复“收到”。以下随机样本属于近期数据，无需记住或复述。\n${randomBytes(1600).toString('hex')}`)
     const aBefore = await refresh(page, observed)
     const summaryRequest = requests.length

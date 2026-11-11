@@ -55,6 +55,6 @@ npm --prefix web run test:e2e
 
 ChatPage 管工作区和会话选择，并把草稿、提交回执和中止状态归到发起它们的会话。chat/client 管 HTTP、WebSocket 与重连，chat/state 校验会话、订阅编号和连续序号。全局设置和列表变更单独触发查询。SettingsDialog 使用 Radix Dialog 管理键盘和焦点。MessageInput 内的 Lexical 管选区和撤销，切换会话时装入目标草稿，同一会话内的流式更新保留输入框和阅读位置。
 
-类型通过各包公开入口以 import type 引用，浏览器不加载后端实现。Model 类型归 Model，快照归 Coding Agent，网络帧归 Server/protocol。视觉继续遵守 design.md 的 760px 居中内容列、白底、14/24px 正文和紧凑输入。
+类型通过各包公开入口以 import type 引用，浏览器不加载后端实现。Model 类型归 Model，快照归 Coding Agent，网络帧归 Server/protocol。视觉继续遵守[视觉设计规范](../docs/design.md)中的 760px 居中内容列、白底、14/24px 正文和紧凑输入。
 
-最新中止验收见 [Feature5 验收记录](../planning/里程碑1/feature5/feature5-验收记录.md)；历史结果见 [Feature2 验收记录](../planning/里程碑1/feature2/feature2-验收记录.md) 与 [Feature1 验收记录](../planning/里程碑1/feature1/feature1-验收记录.md)。
+最新中止验收见 [Feature5 验收记录](../docs/里程碑1/feature5/feature5-验收记录.md)；历史结果见 [Feature2 验收记录](../docs/里程碑1/feature2/feature2-验收记录.md) 与 [Feature1 验收记录](../docs/里程碑1/feature1/feature1-验收记录.md)。

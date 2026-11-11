@@ -1,16 +1,24 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ModelDiscovery } from '@agent-learning/model'
 import { deleteApiKey, saveApiKey } from '../chat/client'
-import { SettingsDialog } from './SettingsDialog'
+import { SettingsButton, SettingsDialog } from './SettingsDialog'
 
 vi.mock('../chat/client', () => ({ saveApiKey: vi.fn(), deleteApiKey: vi.fn() }))
 const missing: ModelDiscovery = { models: [], deepseek: { state: 'missing' } }
 const configured: ModelDiscovery = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], deepseek: { state: 'configured' } }
 function Harness({ initial = missing }: { initial?: ModelDiscovery }) {
   const [discovery, setDiscovery] = useState(initial)
-  return <SettingsDialog discovery={discovery} onChange={setDiscovery} />
+  const [open, setOpen] = useState(false)
+  const trigger = useRef<HTMLButtonElement>(null)
+  return <>
+    <SettingsButton ref={trigger} onClick={() => setOpen(true)} />
+    <SettingsDialog discovery={discovery} onChange={setDiscovery} open={open} onOpenChange={setOpen} onCloseAutoFocus={event => {
+      event.preventDefault()
+      trigger.current?.focus()
+    }} />
+  </>
 }
 async function openEditor(configured = false) {
   fireEvent.click(screen.getByRole('button', { name: '设置' }))

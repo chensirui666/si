@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { ArrowUpIcon, SquareIcon } from 'lucide-react'
 import { LexicalComposer } from '@lexical/react/LexicalComposer'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
 import { ContentEditable } from '@lexical/react/LexicalContentEditable'
@@ -227,9 +228,9 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     <div className="message-input">
       {menuOpen && <div className="command-menu" role="listbox" aria-label="命令" id="compact-menu">
         <div className="command-menu-label">命令</div>
-        <button type="button" role="option" aria-selected="true" id="compact-option" onMouseDown={event => event.preventDefault()} onClick={complete}>
+        <Button variant="ghost" type="button" role="option" aria-selected="true" id="compact-option" onMouseDown={event => event.preventDefault()} onClick={complete}>
           <span>/compact</span><span>压缩较早的对话内容</span>
-        </button>
+        </Button>
       </div>}
       <PlainTextPlugin
         contentEditable={
@@ -249,14 +250,12 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       />
       <HistoryPlugin />
       <div className="composer-actions">
-        {contextMeter}
         {footerControl}
+        {contextMeter}
         <Button className="send-button" size="icon" type="button" aria-label={label} title={label}
           disabled={action === 'send' ? sendDisabled || !canSend : action === 'aborting' || abortDisabled || !onAbort}
           onClick={() => { if (action === 'send') submit(editor.read($readDraft)); else if (action === 'abort') onAbort?.() }}>
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
-            {action === 'send' ? <path d="M8 13V3M3 8l5-5 5 5" /> : <rect x="4" y="4" width="8" height="8" rx="1" fill="currentColor" stroke="none" />}
-          </svg>
+          {action === 'send' ? <ArrowUpIcon aria-hidden="true" /> : <SquareIcon aria-hidden="true" fill="currentColor" />}
         </Button>
       </div>
     </div>

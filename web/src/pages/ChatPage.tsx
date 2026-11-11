@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { FolderOpenIcon, FolderPlusIcon, PlusIcon } from 'lucide-react'
 import type { ModelDiscovery } from '@agent-learning/model'
 import type { AbortRequest, AbortResult, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
-import { SettingsDialog } from '../components/SettingsDialog'
+import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
 import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
 import { Button } from '../components/ui/button'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
+import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger } from '../components/ui/sidebar'
 import { initialState, mergeSubmissions, settleSubmission, type Subscribe, type Subscription } from '../chat/state'
 import type { LocalSubmission } from '../types'
 import { newSessionDraft, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend } from '../chat/drafts'
@@ -48,12 +51,6 @@ function useServerView<T>(load: () => Promise<T>) {
     }
   }, [apply, load])
   return { view, error, apply, refresh, invalidate, setView }
-}
-
-function FolderIcon({ add = false }: { add?: boolean }) {
-  return <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <path d={add ? 'M10 5H3v11h14v-5M15 3v6m-3-3h6' : 'M2 15V5a1 1 0 0 1 1-1h4l2 2h7a1 1 0 0 1 1 1v1M2 15l2-6h14l-2 7H3a1 1 0 0 1-1-1Z'} />
-  </svg>
 }
 
 export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
@@ -101,6 +98,9 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     return () => clearTimeout(timer)
   }, [saveNotice])
   const [pickError, setPickError] = useState<string | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const settingsButton = useRef<HTMLButtonElement>(null)
+  const sidebarButton = useRef<HTMLButtonElement>(null)
   const { draft, storageUnavailable, load: loadDraft, save: saveDraft, restore: restoreDraft, read: readStorage, write: writeStorage, revision: draftRevision, clearSent: clearSentDraft } = useDrafts()
   const session = sessions?.find(item => item.id === sessionId)
   const workspace = workspaces?.workspaces.find(item => item.id === session?.workspaceId)
@@ -416,46 +416,67 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     disconnected: '连接已断开，正在重试…',
   }[state.connection])
 
-  const modelSelect = <select id="chat-model" aria-label="模型" value={isNew ? pendingInput?.modelId ?? modelId : modelId} onChange={event => { modelIdRef.current = event.target.value; setModelId(event.target.value) }} disabled={!discovery?.models.length || (isNew && firstPhase !== null)}>
-    {discovery?.models.length ? discovery.models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)
-      : <option value="">{modelError ? '模型查询失败' : discovery ? '无可用模型' : '正在查询模型…'}</option>}
-  </select>
+  const selectedModel = isNew ? pendingInput?.modelId ?? modelId : modelId
+  const modelSelect = <Select value={discovery?.models.length ? selectedModel : ''}
+    onValueChange={value => { modelIdRef.current = value; setModelId(value) }}
+    disabled={!discovery?.models.length || (isNew && firstPhase !== null)}>
+    <SelectTrigger aria-label="模型" className="composer-model">
+      <SelectValue placeholder={modelError ? '模型查询失败' : discovery ? '无可用模型' : '正在查询模型…'} />
+    </SelectTrigger>
+    <SelectContent align="end">{discovery?.models.map(model => <SelectItem key={model.id} value={model.id}>{model.name}</SelectItem>)}</SelectContent>
+  </Select>
 
   return (
-    <div className="chat-layout">
-      <aside className="chat-sidebar" aria-label="侧栏">
+    <SidebarProvider>
+      <SidebarTrigger ref={sidebarButton} />
+      <Sidebar>
         <div className="sidebar-title">SI</div>
-        <Button className="sidebar-new-session" variant="outline" aria-label="新会话" onClick={() => openNewSession()}>
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-          <span>新会话</span>
-        </Button>
+        <SidebarDismiss>
+          <Button className="sidebar-new-session" variant="outline" aria-label="新会话" onClick={() => openNewSession()}>
+            <PlusIcon aria-hidden="true" />
+            <span>新会话</span>
+          </Button>
+        </SidebarDismiss>
         <nav className="sidebar-workspaces" aria-label="工作区">
           <div className="sidebar-workspaces-heading">
             <span>工作区</span>
             <Button variant="ghost" size="icon-sm" aria-label="添加工作区" title="添加工作区" disabled={picking || !workspaces} onClick={() => { void pickWorkspace() }}>
-              <FolderIcon add />
+              <FolderPlusIcon aria-hidden="true" />
             </Button>
           </div>
           {workspaces?.workspaces.map(group => <div className="sidebar-workspace" key={group.id} role="group" aria-label={group.name}>
             <div className="workspace-row" data-bound={group.id === workspace?.id}>
-              <FolderIcon /><span title={group.path}>{group.name}</span>
-              <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label="新建会话" title={group.available ? '新建会话' : '工作区目录不可用'} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
-              </Button>
+              <FolderOpenIcon aria-hidden="true" /><span title={group.path}>{group.name}</span>
+              <SidebarDismiss>
+                <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label="新建会话" title={group.available ? '新建会话' : '工作区目录不可用'} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
+                  <PlusIcon aria-hidden="true" />
+                </Button>
+              </SidebarDismiss>
             </div>
-            {isNew && group.id === draftWorkspace?.id && <Button className="workspace-conversation" variant="secondary" aria-label="未发送的新会话" aria-current="page" onClick={() => openNewSession()}>新会话</Button>}
-            {sessions?.filter(item => item.workspaceId === group.id).map(item => <Button key={item.id} className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>{item.name}</Button>)}
+            {isNew && group.id === draftWorkspace?.id && <SidebarDismiss>
+              <Button className="workspace-conversation" variant="secondary" aria-label="未发送的新会话" aria-current="page" onClick={() => openNewSession()}>新会话</Button>
+            </SidebarDismiss>}
+            {sessions?.filter(item => item.workspaceId === group.id).map(item => <SidebarDismiss key={item.id}>
+              <Button className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>
+                <span title={item.name}>{item.name}</span>
+              </Button>
+            </SidebarDismiss>)}
           </div>)}
-          {(workspaceError || pickError) && <p className="configuration-error" role="alert">{workspaceError ?? pickError}</p>}
-          {(sessionError || listError) && <p className="configuration-error" role="alert">{sessionError ?? listError}</p>}
-          {listError && <Button variant="ghost" onClick={() => { void refreshSessions() }}>重新读取会话</Button>}
         </nav>
-        <SettingsDialog discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
-          if (!mounted.current) return
-          applyWebSettings(result)
-          void refreshWebSettings()
-        }} />
-      </aside>
+        <SidebarDismiss>
+          <SettingsButton ref={settingsButton} aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)} />
+        </SidebarDismiss>
+      </Sidebar>
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} onCloseAutoFocus={event => {
+        event.preventDefault()
+        const trigger = settingsButton.current
+        if (trigger && !trigger.closest('[hidden]')) trigger.focus()
+        else sidebarButton.current?.focus()
+      }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
+        if (!mounted.current) return
+        applyWebSettings(result)
+        void refreshWebSettings()
+      }} />
       <div className="chat-workspace">
       <div className="chat-page" data-new-session={isNew || undefined} data-connection={state.connection} data-session-id={sessionId ?? undefined}>
       {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert">{saveNotice.text}</p>}
@@ -466,31 +487,26 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       <main className="chat-main">
         {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures} />}
         <div className="composer-stack">
-          {isNew ? <>
+          {isNew && <>
             <h1 className="new-session-title">SI</h1>
             <div className="new-session-workspace">
-              <FolderIcon />
-              <select aria-label="工作区" value={draftWorkspace?.id ?? ''} disabled={picking || !workspaces || firstPhase !== null} onChange={event => {
-                if (event.target.value === 'add-workspace') void pickWorkspace()
-                else chooseDraftWorkspace(event.target.value)
+              <FolderOpenIcon aria-hidden="true" />
+              <Select value={draftWorkspace?.id ?? ''} disabled={picking || !workspaces || firstPhase !== null} onValueChange={value => {
+                if (value === 'add-workspace') void pickWorkspace()
+                else chooseDraftWorkspace(value)
               }}>
-                <option value="" disabled>选择工作区</option>
-                {workspaces?.workspaces.map(item => <option key={item.id} value={item.id} disabled={!item.available}>{item.name}</option>)}
-                <option value="add-workspace">添加工作区…</option>
-              </select>
+                <SelectTrigger aria-label="工作区"><SelectValue placeholder="选择工作区" /></SelectTrigger>
+                <SelectContent>
+                  {workspaces?.workspaces.map(item => <SelectItem key={item.id} value={item.id} disabled={!item.available}>{item.name}</SelectItem>)}
+                  <SelectItem value="add-workspace">添加工作区…</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-          </> : <div className="model-toolbar">
-            <label htmlFor="chat-model">模型</label>
-            {modelSelect}
-            <span className="workspace-path" title={workspace?.path}>
-              {workspace && <FolderIcon />}
-              {workspace ? <>
-                <span className="workspace-path-full">{workspace.path}</span>
-                <span className="workspace-path-name">{workspace.name}</span>
-              </> : <span>{workspaces ? (workspaces.workspaces.length ? '请选择或新建会话' : '请先添加工作区') : workspaceError ? '工作区读取失败' : '正在读取工作区…'}</span>}
-            </span>
-          </div>}
+          </>}
           {isNew && <p className={state.connection === 'ready' && firstPhase !== 'sending' ? 'sr-only' : 'connection-status new-session-status'} role="status">{status}</p>}
+          {(workspaceError || pickError) && <p className="configuration-error" role="alert">{workspaceError ?? pickError}</p>}
+          {(sessionError || listError) && <p className="configuration-error" role="alert">{sessionError ?? listError}</p>}
+          {listError && <Button variant="ghost" className="self-start" onClick={() => { void refreshSessions() }}>重新读取会话</Button>}
           {isNew && firstError && <p className="configuration-error" role="alert">{firstError}</p>}
           {isNew && firstPhase === 'unconfirmed' && <div className="new-session-retry">
             <p className="configuration-error" role="alert">首条消息未确认接收，草稿已保留。</p>
@@ -501,11 +517,11 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
           {storageUnavailable && <p className="configuration-error" role="alert">浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。</p>}
           <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
-          <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={isNew ? modelSelect : undefined} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
+          <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={modelSelect} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
       </div>
       </div>
-    </div>
+    </SidebarProvider>
   )
 }

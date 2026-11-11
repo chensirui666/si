@@ -699,6 +699,6 @@ interface Agent {
 | `web/package.json`、`web/tsconfig.json` | 修改 | 网页构建与检查 | 独立页面检查 → 作为 workspace 成员引用各包公开类型，并支持本阶段验收 |
 | `README.md`、`web/README.md` | 修改 | 启动说明 | 仅前端运行说明 → 补充日常单服务、开发双进程及授权入口 |
 | `web/tests/e2e/chat.spec.ts` | 修改 | 实际入口验收 | 本地发送与刷新清空 → 先验证授权、两种入口及空快照重连，聊天案例在阶段三更新 |
-| `planning/里程碑1/feature2/feature2-验收记录.md` | 新增 | 实施后的证据 | 记录本阶段实际结果、脱敏日志与未验证项，实施后产生 |
+| `docs/里程碑1/feature2/feature2-验收记录.md` | 新增 | 实施后的证据 | 记录本阶段实际结果、脱敏日志与未验证项，实施后产生 |
 
 实施时将现有网页依赖迁移到根 `package-lock.json`，校验后移除 `web/package-lock.json`，各模块不另建锁文件。本轮只记录迁移计划，不修改真实配置或安装依赖。

@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript、原生 HTTP、ws、OpenAI SDK、React、Lexical、mdast/micromark GFM、Vitest、Playwright。
 
-**Spec:** [阶段三设计](./feature2-阶段三-提交生成与实时展示.md)与[总体设计](./feature2-单会话流式聊天技术设计.md)。用户本轮明确要求继续实现文档定义的功能；本计划仅拆解既定方案。
+**Spec:** [阶段三设计](../../../docs/里程碑1/feature2/feature2-阶段三-提交生成与实时展示.md)与[总体设计](../../../docs/里程碑1/feature2/feature2-单会话流式聊天技术设计.md)。用户本轮明确要求继续实现文档定义的功能；本计划仅拆解既定方案。
 
 ## Global Constraints
 

@@ -2,7 +2,7 @@
 
 当前状态：已合并 main，主目录 **422 项校验通过，无失败或跳过**；本次 worktree 与分支已清理。前半部分保留首次 worktree 验收，main 复验见末节。
 
-2026-11-08，基于 `main 2859034`，在 `.worktrees/feature6`、`codex/feature6` 实现。Node.js `v24.16.0`、npm `11.13.0`，macOS，Chromium。依据为[ReAct循环技术设计](./feature6-ReAct循环技术设计.md)，实施计划见[实施计划](./feature6-实施计划.md)。原目录已有的未提交规划保持原样，新实现只在独立 worktree。
+2026-11-08，基于 `main 2859034`，在 `.worktrees/feature6`、`codex/feature6` 实现。Node.js `v24.16.0`、npm `11.13.0`，macOS，Chromium。依据为[ReAct循环技术设计](./feature6-ReAct循环技术设计.md)，实施计划见[实施计划](../../../planning/里程碑1/feature6/feature6-实施计划.md)。原目录已有的未提交规划保持原样，新实现只在独立 worktree。
 
 ## 交付结果
 

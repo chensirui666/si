@@ -61,4 +61,4 @@ npm --prefix packages/model test
 
 测试在临时路径保存、替换和删除假 Key，发现测试不访问网络。流测试通过真实 SDK 读取受控 fetch Response/SSE，覆盖三类内容、十二类事件、五种终止、工具声明转换、工具参数、当前 Key、取消、断流和五分钟滚动超时，不访问用户配置或真实服务商。完整网页与真实 DeepSeek 验收由 Server/E2E 执行。
 
-真实工具验收从 Feature4 的正式服务入口执行，运行命令和凭据设置见 [项目 README](../../README.md#校验)。
+真实工具验收从 Feature4 的正式服务入口执行，运行命令和凭据设置见 [开发指南](../../docs/development.md#校验)。

@@ -463,6 +463,43 @@ const workspace = { id: 'workspace-1', path: '/tmp/青禾', name: '青禾', avai
 const sessionA = { id: 'session-a', workspaceId: workspace.id, name: '会话 1', createdAt: '2026-11-09T08:00:00Z' }
 const sessionB = { ...sessionA, id: 'session-b', name: '会话 2' }
 
+test('侧栏不横滚，收起后保留草稿和容量，展开后可以继续切换会话', async ({ mount, page }) => {
+  const longName = '很长的会话标题'.repeat(12)
+  await mount(<ChatPageHarness modelConfigured sessions={[{ ...sessionA, name: longName }, sessionB]} />)
+  const sidebar = page.getByRole('complementary', { name: '侧栏' })
+  const toggle = page.getByRole('button', { name: '收起侧边栏' })
+  const workspaces = sidebar.getByRole('navigation', { name: '工作区' })
+  await expect(toggle).toBeVisible({ timeout: 1500 })
+  await sidebar.getByRole('button', { name: longName }).click()
+  await expect(sidebar.getByRole('button', { name: '新建会话' })).toBeInViewport({ ratio: 1 })
+  expect(await workspaces.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
+
+  const editor = page.getByRole('textbox', { name: '消息' })
+  await editor.fill('侧栏收起前的草稿')
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+    connection: 'ready', slow: false, error: null,
+    snapshot: { seq: 1, messages: [], activeContent: [], running: null, compactions: [],
+      contextUsage: { tokens: 50, contextWindow: 100, breakdown: { systemTokens: 20, toolsTokens: 10, messageTokens: 20 } } },
+  } })))
+  const model = page.getByRole('combobox', { name: '模型', exact: true })
+  const meter = page.getByRole('button', { name: '对话容量 50%' })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  expect((await model.boundingBox())!.x).toBeLessThan((await meter.boundingBox())!.x)
+  expect((await meter.boundingBox())!.x).toBeLessThan((await send.boundingBox())!.x)
+  await expect(page.getByText('/tmp/workspace', { exact: true })).toHaveCount(0)
+
+  await toggle.press('Enter')
+  const reopen = page.getByRole('button', { name: '展开侧边栏' })
+  await expect(reopen).toBeFocused()
+  await expect(sidebar).toBeHidden()
+  await expect(editor).toHaveText('侧栏收起前的草稿')
+  await expect(meter).toBeVisible()
+  await reopen.press('Enter')
+  await expect(sidebar.getByRole('button', { name: longName })).toHaveAttribute('aria-current', 'page')
+  await sidebar.getByRole('button', { name: '会话 2' }).click()
+  await expect(editor).toHaveText('')
+})
+
 test('新会话居中，键盘打开草稿，工作区入口共用一份草稿且首次发送才出现历史', async ({ mount, page }) => {
   let view = { workspaces: [] as typeof workspace[] }
   const otherWorkspace = { ...workspace, id: 'workspace-2', path: '/tmp/白榆', name: '白榆' }
@@ -519,19 +556,22 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   const original = '  保留原文\n第二行  '
   await editor.fill(original)
   await expect(send).toBeDisabled()
-  const addOption = { label: '添加工作区…' }
-  await workspaceSelect.selectOption(addOption)
+  const chooseWorkspace = async (name: string) => {
+    await workspaceSelect.click()
+    await page.getByRole('option', { name, exact: true }).click()
+  }
+  await chooseWorkspace('添加工作区…')
   await expect.poll(() => pickerCalls).toBe(1)
   await expect(workspaceSelect).toBeEnabled()
-  await expect(workspaceSelect).not.toHaveValue('add-workspace')
+  await expect(workspaceSelect).toHaveText('选择工作区')
   await expect(groupA).toHaveCount(0)
-  await workspaceSelect.selectOption(addOption)
-  await expect(workspaceSelect).toHaveValue(workspace.id)
+  await chooseWorkspace('添加工作区…')
+  await expect(workspaceSelect).toHaveText(workspace.name)
   await add.click()
-  await expect(workspaceSelect).toHaveValue(otherWorkspace.id)
+  await expect(workspaceSelect).toHaveText(otherWorkspace.name)
   await expect(groupB.getByRole('button', { name: '未发送的新会话' })).toHaveCount(1)
   await groupA.getByRole('button', { name: '新建会话', exact: true }).press('Enter')
-  await expect(workspaceSelect).toHaveValue(workspace.id)
+  await expect(workspaceSelect).toHaveText(workspace.name)
   await expect(groupA.getByRole('button', { name: '未发送的新会话' })).toHaveCount(1)
   await newSession.press('Enter')
   await newSession.press('Enter')
@@ -543,7 +583,7 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   expect(starts).toHaveLength(0)
   expect(emptySessionRequests).toBe(0)
 
-  await workspaceSelect.selectOption(otherWorkspace.id)
+  await chooseWorkspace(otherWorkspace.name)
   await expect(send).toBeEnabled()
   await editor.press('Enter')
   const history = groupB.getByRole('button', { name: '会话 1', exact: true })
@@ -564,7 +604,7 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   await expect(page.getByRole('region', { name: '消息列表' }).locator('.message-text')).toHaveText(original)
 
   await newSession.press('Enter')
-  await expect(workspaceSelect).toHaveValue(otherWorkspace.id)
+  await expect(workspaceSelect).toHaveText(otherWorkspace.name)
   await expect(editor).toHaveText('')
   await editor.fill('下一段草稿')
   await history.click()
@@ -584,7 +624,35 @@ test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', as
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const send = page.getByRole('button', { name: '发送', exact: true })
   await expect(page.getByRole('heading', { name: 'SI', exact: true })).toBeInViewport({ ratio: 1 })
-  await workspaceSelect.selectOption(workspace.id)
+  const sidebarToggle = page.getByRole('button', { name: '展开侧边栏' })
+  await sidebarToggle.press('Enter')
+  const sidebar = page.getByRole('dialog', { name: '侧栏' })
+  await expect(sidebar).toBeVisible()
+  const settings = sidebar.getByRole('button', { name: '设置' })
+  await settings.click()
+  const settingsDialog = page.getByRole('dialog', { name: '设置' })
+  await expect(settingsDialog).toBeVisible()
+  await expect(page.getByRole('dialog', { name: '侧栏', includeHidden: true })).toHaveCount(0)
+  await page.keyboard.press('Escape')
+  await expect(settingsDialog).toBeHidden()
+  await expect(sidebarToggle).toBeFocused()
+  await sidebarToggle.click()
+  await settings.click()
+  await settingsDialog.getByRole('button', { name: '编辑', exact: true }).click()
+  const key = settingsDialog.getByLabel('API Key')
+  await key.fill('unsaved-test-key')
+  await page.setViewportSize({ width: 844, height: 390 })
+  await expect(key).toHaveValue('unsaved-test-key')
+  await page.setViewportSize({ width: 390, height: 700 })
+  await expect(key).toHaveValue('unsaved-test-key')
+  await page.keyboard.press('Escape')
+  await expect(settingsDialog).toBeHidden()
+  await expect(sidebarToggle).toBeFocused()
+  await sidebarToggle.click()
+  await sidebar.getByRole('button', { name: '新会话', exact: true }).click()
+  await expect(sidebar).toBeHidden()
+  await workspaceSelect.click()
+  await page.getByRole('option', { name: 'workspace', exact: true }).click()
   await editor.fill('手机草稿\n第二行')
   await expect(workspaceSelect).toBeInViewport({ ratio: 1 })
   await expect(model).toBeInViewport({ ratio: 1 })
@@ -642,7 +710,8 @@ test('02 首发保存被拒绝时保留草稿，顶部提示三秒后消失', as
     status: 507, json: { code: 'save_rejected', error: '磁盘空间不足，未保存' },
   }))
   await mount(<ChatPageHarness useWorkspaceApi modelConfigured />)
-  await page.getByRole('combobox', { name: '工作区', exact: true }).selectOption(workspace.id)
+  await page.getByRole('combobox', { name: '工作区', exact: true }).click()
+  await page.getByRole('option', { name: workspace.name, exact: true }).click()
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   await editor.fill('读取 README.md')
   await page.getByRole('button', { name: '发送', exact: true }).click()

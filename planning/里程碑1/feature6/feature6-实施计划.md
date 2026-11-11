@@ -5,7 +5,7 @@
 **Goal:** 一次提交可连续依据真实工具结果决策，支持同批并行、截断恢复及准确中止展示。
 **Architecture:** 沿用现有 Agent / Model / Tools / WebServer / 网页分工；不新增协调层或依赖。
 **Tech Stack:** TypeScript、Node.js、React、Vitest、Playwright。
-**Spec:** [ReAct循环技术设计](./feature6-ReAct循环技术设计.md)
+**Spec:** [ReAct循环技术设计](../../../docs/里程碑1/feature6/feature6-ReAct循环技术设计.md)
 
 ## Global Constraints
 
@@ -53,6 +53,6 @@
 - [x] Run: npm test（提供可用测试凭据时同时跑 live）；npm --prefix packages/server run test:tools:live（DeepSeek/Tavily 条件允许时）。Expected: 全部通过，未具备条件单独记录。
 - [x] 独立整分支审查，修复重要问题并回归；git diff --check。更新验收记录及限制说明，不合并主分支。
 
-首次交付：根测试 414 项、独立真实工具 7 项全部通过，审查两项问题已修复。详细证据及执行判断见[验收记录](./feature6-验收记录.md)。保留 worktree，未提交、合并或推送。
+首次交付：根测试 414 项、独立真实工具 7 项全部通过，审查两项问题已修复。详细证据及执行判断见[验收记录](../../../docs/里程碑1/feature6/feature6-验收记录.md)。保留 worktree，未提交、合并或推送。
 
 main 合并与复验完成：根测试 415 项、独立真实工具 7 项全部通过，无失败或跳过。复验定位并修复延迟选区同步抢焦点，新增一项回归；真实模型用例按实际路径及写入参数验收。worktree 与分支已清理，未推送。

@@ -1,5 +1,5 @@
 import type { ChildProcess } from 'node:child_process'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, expect } from '@playwright/test'
@@ -43,7 +43,10 @@ for (const mode of ['node', 'vite'] as const) {
       expect(first.authorized).toBe(true)
       expect(first.body).toMatchObject({ model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'high' })
       expect(first.body.tools).toHaveLength(8)
-      expect(first.body.messages).toEqual([expect.objectContaining({ role: 'system', content: expect.stringContaining('工作目录') }), { role: 'user', content: original }])
+      expect(first.body.messages).toEqual([
+        expect.objectContaining({ role: 'system', content: expect.stringContaining(`<cwd>\n${await realpath(temporary)}\n</cwd>`) }),
+        { role: 'user', content: original },
+      ])
       first.delta({ role: 'assistant', reasoning_content: '先分析原文。' })
       first.delta({ content: '**第一段**已经到达。' })
       await expect(messages).toContainText('第一段已经到达。')
@@ -237,6 +240,7 @@ for (const mode of ['node', 'vite'] as const) {
       expect(otherObserved.submissions).toEqual([])
       await page.screenshot({ path: testInfo.outputPath(`${mode}-stage2-ready.png`), fullPage: true })
       await page.setViewportSize({ width: 390, height: 700 })
+      await page.getByRole('button', { name: '展开侧边栏' }).click()
       await settings.click()
       await expect(dialog).toBeInViewport({ ratio: 1 })
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node.js 24、TypeScript 5.9.3、npm workspace、node:http、ws、React、Vite、Vitest、Playwright。
 
-**Spec:** [阶段一文档](./feature2-阶段一-打开授权与订阅.md)，共享契约见[总体设计](./feature2-单会话流式聊天技术设计.md)。
+**Spec:** [阶段一文档](../../../docs/里程碑1/feature2/feature2-阶段一-打开授权与订阅.md)，共享契约见[总体设计](../../../docs/里程碑1/feature2/feature2-单会话流式聊天技术设计.md)。
 
 ## Global Constraints
 

@@ -2,7 +2,7 @@
 
 状态：**已实现、合并主干并完成主目录复验**。2026-11-05 以提交 `cd2a9d7` 快进合并到 `main`；根测试 279 项、四工具真实模型案例 4 项全部通过，无跳过，见[验收记录](./feature3-验收记录.md)。本次 `.worktrees/feature3` 与 `codex/feature3` 已清理。
 
-对应[里程碑1第三步](../README.md#第三步建立工具定义与调用接收)。前置能力见 [Feature2 总体技术设计](../feature2/feature2-单会话流式聊天技术设计.md)及其[验收记录](../feature2/feature2-验收记录.md)。
+对应[里程碑1第三步](../../../planning/里程碑1/README.md#第三步建立工具定义与调用接收)。前置能力见 [Feature2 总体技术设计](../feature2/feature2-单会话流式聊天技术设计.md)及其[验收记录](../feature2/feature2-验收记录.md)。
 
 ## 1. 总结
 

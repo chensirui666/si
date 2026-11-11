@@ -35,22 +35,23 @@ for (const method of ['逐字输入', '粘贴'] as const) {
 test('发送成功后隔离撤销历史', async ({ mount }) => {
   const component = await mount(<MessageInputHarness />)
   const textbox = component.getByRole('textbox', { name: '消息' })
-  await textbox.fill('待发送内容')
+  const firstDraft = 'first draft'
+  await textbox.pressSequentially(firstDraft)
 
   await textbox.press('ControlOrMeta+z')
   await expect(textbox).toHaveText('')
   await textbox.press('ControlOrMeta+Shift+z')
-  await expect(textbox).toHaveText('待发送内容')
+  await expect(textbox).toHaveText(firstDraft)
   await textbox.press('Enter')
   await expect(textbox).toHaveText('')
-  await expect(component.getByLabel('已提交原文')).toHaveText('["待发送内容"]')
+  await expect(component.getByLabel('已提交原文')).toHaveText(JSON.stringify([firstDraft]))
 
   await textbox.press('ControlOrMeta+z')
   await expect(textbox).toHaveText('')
-  await textbox.fill('新的草稿')
+  await textbox.pressSequentially('second draft')
   await textbox.press('ControlOrMeta+z')
   await expect(textbox).toHaveText('')
-  await expect(component.getByLabel('已提交原文')).toHaveText('["待发送内容"]')
+  await expect(component.getByLabel('已提交原文')).toHaveText(JSON.stringify([firstDraft]))
 })
 
 test('外部门禁切换保留编辑器、原文、焦点与撤销，恢复后可提交原草稿', async ({ mount }) => {
