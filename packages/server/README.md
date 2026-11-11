@@ -20,7 +20,7 @@ npm --prefix packages/server test
 
 连接成功后尚未订阅。`subscribe` 指定 `sessionId` 和 `subscriptionId`，快照和更新同时返回这两个编号。替换订阅先释放旧观察者。找不到会话或无法完整读取时返回带编号的 `subscription_error`，原连接可继续订阅。非法帧关闭所属连接（1008），源错误关闭所属连接（1011）。同一连接等待一帧发送回调完成，再发送下一帧，避免正常大快照被紧随的更新误判为慢连接；配置通知按种类合并，同一连接最多按变更种类各保留一条通知。发送失败则清理；每 2 秒检查超过 1MiB 的积压和心跳：前两轮无 Pong 时发送 Ping，第三轮仍未响应则清理，收到 Pong 清零。清理页面连接不取消后台任务。已有 WS 不会仅因 Cookie 到期被强制关闭。
 
-`AGENT_LEARNING_SERVER_PORT` 可指定监听端口（1–65535）。`AGENT_LEARNING_BROWSER_AUTH_FILE`、`AGENT_LEARNING_MODEL_AUTH_FILE` 仅供自动校验隔离签名与模型文件路径；不设置时仍固定使用 `~/.agent-learning/browser-auth.json`、`~/.agent-learning/auth.json`。环境变量不能提供 Key。进程内 WebServerOptions 的 `browserSecretPath/modelAuthPath` 可注入临时路径，另可注入临时端口、受控时钟和会话工厂，以测试真实 HTTP/WS；测试不会访问默认用户文件。
+`AGENT_LEARNING_SERVER_PORT` 可指定监听端口（1–65535）。`AGENT_LEARNING_BROWSER_AUTH_FILE`、`AGENT_LEARNING_MODEL_AUTH_FILE` 仅供自动校验隔离签名与模型文件路径；不设置时仍固定使用 `~/.agent-learning/browser-auth.json`、`~/.agent-learning/auth.json`。环境变量不能提供 Key。开发入口测试通过 `AGENT_LEARNING_SESSION_FILE` 指向临时会话库。进程内 WebServerOptions 的 `browserSecretPath/modelAuthPath` 可注入临时路径，另可注入临时端口、受控时钟和会话工厂，以测试真实 HTTP/WS；测试不会访问默认用户文件。
 
 阶段二提供 `GET /api/models`、`PUT /api/providers/deepseek`（JSON `{apiKey:string}`）与 `DELETE /api/providers/deepseek`。成功均返回 ModelDiscovery，无 Key；配置通知 `{type:'models_changed'}` 发送给所有连接，不占用 会话序号。错误采用 JSON `{error:string}`；输入错误 400、请求过大 413、媒体类型错误 415、文件更新失败 500，授权和来源仍分别是 401/403。保存、替换、删除与外部文件变化均刷新，文件坏掉仍可授权进入设置。
 
