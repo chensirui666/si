@@ -18,7 +18,7 @@ test('Feature9 live 20：网页首发使用项目说明里的随机标记', asyn
   const cwd = join(await realpath(temporary), 'workspace')
   const path = join(cwd, 'AGENTS.md')
   const marker = 'project-' + randomUUID()
-  const task = '按项目说明回答项目标记。只输出标记。'
+  const task = '项目标记已提供在本轮项目说明里。直接使用说明中的值，只输出标记。不要调用工具。'
   const instruction = '项目标记为 ' + marker + '。回答项目标记时，直接使用这份说明里的值。'
   const source = `<project_instructions path=${JSON.stringify(path)}>\n${instruction}\n</project_instructions>`
   const expectedContext = `<project_context>\n${source}\n</project_context>`

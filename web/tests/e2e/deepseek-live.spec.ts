@@ -47,13 +47,14 @@ test('真实 DeepSeek 设置、两轮历史、流式进度与无效 Key 恢复',
 
     await saveKey(page, 'invalid-stage3-live-key')
     expect(JSON.parse(await readFile(join(temporary, 'auth.json'), 'utf8')).deepseek.key === 'invalid-stage3-live-key').toBe(true)
-    const failed = await complete(page, observed, '只回答“验证无效凭据”。', true)
+    const recoveryPrompt = '只回答“恢复成功”。'
+    const failed = await complete(page, observed, recoveryPrompt, true)
     expect(failed.message.stopReason).toBe('error')
     expect(Boolean(failed.message.errorMessage)).toBe(true)
     const failureText = await page.getByRole('region', { name: '消息列表' }).getByRole('listitem').last().innerText()
     expect(/失败|错误|无效|认证|401|authentication/i.test(failureText)).toBe(true)
     await saveKey(page, key)
-    const recovered = await complete(page, observed, '只回答“恢复成功”。')
+    const recovered = await complete(page, observed, recoveryPrompt)
     expect(textOf(recovered.message)).toContain('恢复成功')
     expect(recovered.message.stopReason).toBe('stop')
     await expect(page.getByRole('region', { name: '消息列表' }).getByRole('listitem').last()).toContainText('恢复成功')
