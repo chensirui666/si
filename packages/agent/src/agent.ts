@@ -28,7 +28,7 @@ export class Agent {
     return this.run(input)
   }
 
-  private async loop({ model, context, tools = [], signal, prepareContext }: AgentRunInput): Promise<AgentResult> {
+  private async loop({ model, context, tools = [], signal, prepareContext, saveToolCheckpoint }: AgentRunInput): Promise<AgentResult> {
     if (tools.length) context = {
       ...context,
       tools: tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
@@ -55,6 +55,7 @@ export class Agent {
           ? failure('模型未返回可处理的工具调用。')
           : complete
         afterReply = true
+        if (saveToolCheckpoint) await saveToolCheckpoint({ type: 'assistant', message: response })
         signal.throwIfAborted()
         if (!context.tools?.length || !tools.length) return failure('本次请求未提供工具，工具调用未执行。')
         const ids = calls.map(({ call }) => call.id)
@@ -62,7 +63,13 @@ export class Agent {
           return failure('工具调用编号缺失或重复，本批工具未执行。')
         }
 
-        const execute = async ({ call, contentIndex }: typeof calls[number]): Promise<ToolResultMessage> => {
+        const publishResult = async (outcome: Extract<AgentEvent, { type: 'tool_result' }> & { executed: boolean }) => {
+          if (saveToolCheckpoint) await saveToolCheckpoint(outcome)
+          const { executed: _executed, ...event } = outcome
+          this.emit(event)
+          return event.result
+        }
+        const execute = async ({ call, contentIndex }: typeof calls[number]) => {
           signal.throwIfAborted()
           const truncated = response.stopReason === 'length'
           if (!truncated) this.emit({ type: 'tool_start', contentIndex })
@@ -70,11 +77,13 @@ export class Agent {
           let isError = false
           let errorCode: string | undefined
           const details: unknown[] = []
+          let executed = false
           try {
             if (truncated) throw new Error('本批工具未执行：本轮回复截断，请重新提供完整的工具调用。')
             if (call.argumentsError) throw new Error(call.argumentsError)
             const tool = tools.find(({ name }) => name === call.name)
             if (!tool) throw new Error(`未知工具：${call.name}`)
+            executed = true
             text = await tool.execute(call.arguments, { signal, recordDetails: detail => { details.push(detail) } })
           } catch (error) {
             isError = true
@@ -85,16 +94,22 @@ export class Agent {
             role: 'toolResult', toolCallId: call.id, toolName: call.name,
             content: [{ type: 'text', text }], isError, timestamp: Date.now(),
           }
-          this.emit({ type: 'tool_result', contentIndex, result, details, ...(errorCode && { errorCode }) })
-          return result
+          return { type: 'tool_result' as const, contentIndex, result, details, executed, ...(errorCode && { errorCode }) }
         }
         const results: ToolResultMessage[] = []
         if (calls.some(({ call }) => tools.find(tool => tool.name === call.name)?.executionMode === 'sequential')) {
-          for (const call of calls) results.push(await execute(call))
+          for (const call of calls) results.push(await publishResult(await execute(call)))
+        } else if (saveToolCheckpoint) {
+          const settled = await Promise.allSettled(calls.map(execute))
+          for (const outcome of settled) {
+            if (outcome.status === 'fulfilled') results.push(await publishResult(outcome.value))
+          }
+          const rejected = settled.find(outcome => outcome.status === 'rejected')
+          if (rejected) throw rejected.reason
         } else {
-          for (const result of await Promise.allSettled(calls.map(execute))) {
-            if (result.status === 'rejected') throw result.reason
-            results.push(result.value)
+          for (const outcome of await Promise.allSettled(calls.map(call => execute(call).then(publishResult)))) {
+            if (outcome.status === 'rejected') throw outcome.reason
+            results.push(outcome.value)
           }
         }
         signal.throwIfAborted()

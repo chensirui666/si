@@ -94,6 +94,12 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const firstSend = useRef<FirstSend | null>(null)
   const [firstPhase, setFirstPhase] = useState<'sending' | 'unconfirmed' | null>(null)
   const [firstError, setFirstError] = useState<string | null>(null)
+  const [saveNotice, setSaveNotice] = useState<{ sessionId: string | null; text: string } | null>(null)
+  useEffect(() => {
+    if (!saveNotice) return
+    const timer = setTimeout(() => setSaveNotice(null), 3000)
+    return () => clearTimeout(timer)
+  }, [saveNotice])
   const [pickError, setPickError] = useState<string | null>(null)
   const { draft, storageUnavailable, load: loadDraft, save: saveDraft, restore: restoreDraft, read: readStorage, write: writeStorage, revision: draftRevision, clearSent: clearSentDraft } = useDrafts()
   const session = sessions?.find(item => item.id === sessionId)
@@ -107,7 +113,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     initialized.current = true
     if (userAction) navigation.current++
     setSessionError(null)
-    if (selected.current === id) return
+    if (selected.current === id) {
+      if (id && userAction && stateRef.current.error) subscription.current?.requestSnapshot?.()
+      return
+    }
     selected.current = id
     opening.current = id !== null
     loadDraft(id ?? newSessionDraft)
@@ -170,12 +179,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       pending.sending = false
       const status = error?.status
       const authorizationRejected = status === 401 || status === 403
-      const rejected = typeof status === 'number' && status >= 400 && status < 500
+      const saveRejected = error?.code === 'save_rejected'
+      const rejected = saveRejected || typeof status === 'number' && status >= 400 && status < 500
       if (rejected && !(retrying && authorizationRejected)) {
         firstSend.current = null
         writeFirstSend(null)
         setFirstPhase(null)
-        setFirstError(error instanceof Error ? error.message : '首条消息被拒绝，请重试。')
+        const text = error instanceof Error ? error.message : '首条消息被拒绝，请重试。'
+        if (saveRejected) setSaveNotice({ sessionId: null, text })
+        else setFirstError(text)
         void refreshWorkspaces()
       } else {
         setFirstPhase('unconfirmed')
@@ -360,11 +372,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { accepted, state: 'pending', errorMessage: undefined }))
     }, error => {
       if (!mounted.current) return
-      const rejected = typeof error?.status === 'number' && error.status >= 400 && error.status < 500
+      const saveRejected = error?.code === 'save_rejected'
+      const rejected = saveRejected || typeof error?.status === 'number' && error.status >= 400 && error.status < 500
       const message = error instanceof Error ? error.message : '提交异常，未确认接收'
       const local = submissionsRef.current.find(item => item.clientMessageId === input.clientMessageId)
       if (!local || local.accepted) return
-      updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: message }))
+      if (saveRejected) {
+        updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== input.clientMessageId))
+        setSaveNotice({ sessionId, text: message })
+      } else updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: message }))
       if (rejected) {
         restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId)
         void refreshWorkspaces()
@@ -442,12 +458,13 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       </aside>
       <div className="chat-workspace">
       <div className="chat-page" data-new-session={isNew || undefined} data-connection={state.connection} data-session-id={sessionId ?? undefined}>
+      {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert">{saveNotice.text}</p>}
       {!isNew && <header className="chat-header">
         <h1>聊天</h1>
         <p className="connection-status" role="status">{status}</p>
       </header>}
       <main className="chat-main">
-        {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} />}
+        {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures} />}
         <div className="composer-stack">
           {isNew ? <>
             <h1 className="new-session-title">SI</h1>
@@ -483,7 +500,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
           {(modelError || discovery?.deepseek.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (discovery?.deepseek.state === 'error' ? discovery.deepseek.message : '')}</p>}
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
           {storageUnavailable && <p className="configuration-error" role="alert">浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。</p>}
-          <CompactionRecords records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
+          <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
           <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={isNew ? modelSelect : undefined} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>

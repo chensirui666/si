@@ -633,3 +633,50 @@ test('浏览器存储不可用时来回切换仍可继续编辑本页草稿', as
   await expect(editor).toHaveText('本页保留')
   await expect(page.getByText('浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。')).toBeVisible()
 })
+
+test('02 首发保存被拒绝时保留草稿，顶部提示三秒后消失', async ({ mount, page }) => {
+  await page.clock.install()
+  await page.route('**/api/workspaces', route => route.fulfill({ json: { workspaces: [workspace] } }))
+  await page.route('**/api/sessions', route => route.fulfill({ json: { sessions: [] } }))
+  await page.route('**/api/sessions/start', route => route.fulfill({
+    status: 507, json: { code: 'save_rejected', error: '磁盘空间不足，未保存' },
+  }))
+  await mount(<ChatPageHarness useWorkspaceApi modelConfigured />)
+  await page.getByRole('combobox', { name: '工作区', exact: true }).selectOption(workspace.id)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.fill('读取 README.md')
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  const notice = page.locator('.save-notice')
+  await expect(notice).toHaveText('磁盘空间不足，未保存')
+  expect((await notice.boundingBox())?.y).toBeLessThan(24)
+  await expect(editor).toHaveText('读取 README.md')
+  await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
+  await page.clock.runFor(3000)
+  await expect(notice).toHaveCount(0)
+  await expect(editor).toHaveText('读取 README.md')
+})
+
+test('28 历史读取失败时不能发送，收到完整快照后恢复', async ({ mount, page }) => {
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  await expect(page.locator('.chat-page')).toHaveAttribute('data-session-id', 'session-a')
+  await editor.fill('继续')
+  await expect(send).toBeEnabled()
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', snapshot: null, slow: false, error: '无法读取完整会话历史，请重试',
+    } }))
+  })
+  await expect(page.getByRole('alert')).toContainText('无法读取完整会话历史')
+  await expect(send).toBeDisabled()
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null,
+      snapshot: { seq: 1, running: null, activeContent: [], compactions: [], contextUsage: null,
+        messages: [{ id: 'saved', message: { role: 'user', content: '完整原文', timestamp: 1 } }] },
+    } }))
+  })
+  await expect(page.getByRole('region', { name: '消息列表' })).toContainText('完整原文')
+  await expect(send).toBeEnabled()
+})

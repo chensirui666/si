@@ -10,6 +10,10 @@ export type AgentRunInput = {
   context: ModelContext
   tools?: ExecutableTool[]
   signal: AbortSignal
+  saveToolCheckpoint?(checkpoint:
+    | { type: 'assistant'; message: AssistantMessage }
+    | (Extract<AgentEvent, { type: 'tool_result' }> & { executed: boolean })
+  ): void | Promise<void>
   prepareContext?(context: ModelContext): ModelContext | { error: string } | Promise<ModelContext | { error: string }>
 }
 

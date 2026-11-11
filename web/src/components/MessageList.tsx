@@ -1,15 +1,18 @@
-import type { ActiveContent, ConversationMessage, RunningState } from '@agent-learning/server/protocol'
+import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
+import { SaveFailureNotice } from './SaveFailureNotice'
 
 type MessageRow =
   | { type: 'user'; id: string; text: string; local?: LocalSubmission }
   | { type: 'assistant'; id: string; userId: string; messages: AssistantEntry[] }
 
-export function MessageList({ messages, activeContent = [], running = null }: {
+export function MessageList({ messages, activeContent = [], running = null, runs = [], saveFailures = [] }: {
   messages: readonly (ConversationMessage | LocalSubmission)[]
   activeContent?: readonly ActiveContent[]
   running?: RunningState
+  runs?: readonly RunRecord[]
+  saveFailures?: readonly SaveFailure[]
 }) {
   const rows: MessageRow[] = []
   const toolResults = new Map<string, Map<number, ConversationMessage>>()
@@ -39,9 +42,15 @@ export function MessageList({ messages, activeContent = [], running = null }: {
     <div className="message-list-frame">
       <section className="message-list" role="region" aria-label="消息列表" tabIndex={0}>
         <ol className="message-items">
-          {rows.map(row => <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.id} data-message-id={row.id}>
+          {rows.map((row, index) => {
+            const runId = row.type === 'assistant' ? row.userId : row.id
+            const run = runs.find(item => item.id === runId)
+            const failure = saveFailures.find(item => item.runId === runId)
+            const next = rows[index + 1]
+            const endsTurn = row.type === 'assistant' || next?.type !== 'assistant' || next.userId !== runId
+            return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.id} data-message-id={row.id} data-run-status={run?.status}>
             {row.type === 'assistant'
-              ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults}
+              ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure}
                 running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
               : <>
                 <div className="message-text">{row.text}<br /></div>
@@ -50,7 +59,9 @@ export function MessageList({ messages, activeContent = [], running = null }: {
                   {row.local.errorMessage && <p>{row.local.errorMessage}</p>}
                 </div>}
               </>}
-          </li>)}
+            {endsTurn && run?.status === 'interrupted' && <p className="message-ending" role="status">已中断</p>}
+            {endsTurn && failure && <SaveFailureNotice failure={failure} />}
+          </li>})}
         </ol>
       </section>
     </div>

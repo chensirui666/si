@@ -7,10 +7,11 @@ import { request } from 'node:http'
 import { connect as connectTcp } from 'node:net'
 import { once } from 'node:events'
 import { randomBytes, randomUUID } from 'node:crypto'
+import { Type } from 'typebox'
 import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
-import { AgentSession, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
-import { createModelStream } from '@agent-learning/model'
+import { AgentSession, SessionStore, SessionWriteError, SessionReadError, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
+import { createModelStream, type ModelContext, type AssistantMessage, type ModelEvent } from '@agent-learning/model'
 
 vi.mock('node:fs/promises', { spy: true })
 
@@ -25,7 +26,7 @@ async function setup(options: Partial<ConstructorParameters<typeof WebServer>[0]
   await writeFile(join(webRoot, 'assets/app.js'), 'console.log("app")')
   const workspace = await realpath(await mkdir(join(dir, 'workspace')).then(() => join(dir, 'workspace')))
   const config = { port: 0, webRoot, globalContextDirectory: join(dir, 'global-context'), workspacePath: join(dir, 'private/workspaces.json'),
-    webSettingsPath: join(dir, 'private/settings.json'), directoryPicker: async () => workspace, browserSecretPath: join(dir, 'private/browser-auth.json'), modelAuthPath: join(dir, 'private/auth.json'), ...options }
+    webSettingsPath: join(dir, 'private/settings.json'), ...(!options.createSession && { sessionPath: join(dir, 'private/sessions.sqlite') }), directoryPicker: async () => workspace, browserSecretPath: join(dir, 'private/browser-auth.json'), modelAuthPath: join(dir, 'private/auth.json'), ...options }
   const server = new WebServer(config)
   const started = await server.start()
   cleanups.push(() => server.close())
@@ -564,7 +565,7 @@ describe('会话订阅转发与清理', () => {
   })
   it('端口冲突启动失败、签名初始化失败均安全清理', async () => {
     const app = await setup()
-    const conflict = new WebServer({ ...app.config, port: Number(new URL(app.url).port) })
+    const conflict = new WebServer({ ...app.config, port: Number(new URL(app.url).port), sessionPath: app.config.sessionPath + '.other' })
     await expect(conflict.start()).rejects.toThrow(/启动|占用|listen|EADDRINUSE/)
     await conflict.close()
     const old = await readFile(app.config.browserSecretPath)
@@ -644,7 +645,10 @@ describe('消息提交与模型生命周期', () => {
     const response = await http(app.url + '/api/messages', headers, 'POST', JSON.stringify(message))
     expect(response.status).toBe(202)
     await vi.waitFor(() => expect(calls).toBe(1))
-    expect((await http(app.url + '/api/messages', headers, 'POST', JSON.stringify(message))).status).toBe(409)
+    const duplicate = await http(app.url + '/api/messages', headers, 'POST', JSON.stringify(message))
+    expect(duplicate.status).toBe(202)
+    expect(JSON.parse(duplicate.text)).toEqual(JSON.parse(response.text))
+    expect((await http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ ...message, text: 'different' }))).status).toBe(409)
     expect(calls).toBe(1)
     send({ reasoning_content: '想一想' })
     send({ content: 'A' })
@@ -938,7 +942,7 @@ async function pickSession(url: string, auth: string) {
   return (await createSession(url, auth, await pickWorkspace(url, auth))).id
 }
 
-it('取消不写入登记，旧登记兼容，符号链接复用目录，重启只恢复工作区', async () => {
+it('取消不写入登记，旧登记兼容，符号链接复用目录，目录不可用时保留历史，重启恢复会话', async () => {
   let selected: string | null = null
   const requests: any[] = []
   const app = await setup({ directoryPicker: async () => selected, modelOptions: { fetch: async (_url, init) => {
@@ -950,7 +954,7 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，重启�
   } } })
   const auth = await cookie(app.authUrl)
   const headers = { Cookie: auth, 'Content-Type': 'application/json' }
-  const send = (sessionId?: string) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ text: '写入', modelId: 'deepseek-flash', clientMessageId: 'workspace-test', sessionId }))
+  const send = (sessionId?: string) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({ text: '写入', modelId: 'deepseek-flash', clientMessageId: randomUUID(), sessionId }))
   expect((await send()).status).toBe(400)
   expect((await send('unknown')).status).toBe(404)
   expect((await http(app.url + '/api/workspaces/pick', {}, 'POST')).status).toBe(401)
@@ -1009,19 +1013,25 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，重启�
   expect(requests).toHaveLength(2)
   expect(await serverSnapshot(app.url, auth, sessionId)).toEqual(history)
   expect(JSON.parse((await http(app.url + '/api/workspaces', headers)).text).workspaces[0]).toMatchObject({ id: first.id, available: false })
-  await mkdir(app.workspace)
 
   await app.server.close()
   const restarted = new WebServer(app.config)
   cleanups.push(() => restarted.close())
   const next = await restarted.start()
   const newCookie = await cookie(next.authUrl)
-  expect(JSON.parse((await http(next.url + '/api/workspaces', { Cookie: newCookie })).text)).toEqual(view)
-  expect(JSON.parse((await http(next.url + '/api/sessions', { Cookie: newCookie })).text)).toEqual({ sessions: [] })
+  expect(JSON.parse((await http(next.url + '/api/workspaces', { Cookie: newCookie })).text)).toEqual({
+    workspaces: view.workspaces.map(workspace => workspace.id === first.id ? { ...workspace, available: false } : workspace),
+  })
+  expect(JSON.parse((await http(next.url + '/api/sessions', { Cookie: newCookie })).text)).toEqual({ sessions: [expect.objectContaining({ id: sessionId, workspaceId: first.id })] })
   const socket = await connect(next.url, newCookie)
   const snapshot = nextConversationFrame(socket)
   socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'restarted' }))
-  expect(await snapshot).toMatchObject({ type: 'subscription_error', sessionId, subscriptionId: 'restarted' })
+  expect(await snapshot).toMatchObject({ type: 'snapshot', sessionId, subscriptionId: 'restarted',
+    snapshot: { messages: history.messages, running: null, runs: [expect.objectContaining({ status: 'completed' })] } })
+  const unavailable = await http(next.url + '/api/messages', { Cookie: newCookie, 'Content-Type': 'application/json' },
+    'POST', JSON.stringify({ sessionId, text: '继续', modelId: 'deepseek-flash', clientMessageId: randomUUID() }))
+  expect(unavailable.status).toBe(409)
+  expect(requests).toHaveLength(2)
 })
 
 it('P1: saves capability choices independently of the shared Tavily credential and notifies without secrets', async () => {
@@ -1424,4 +1434,298 @@ it('首发按绑定工作区选说明，真实 edit 后续轮刷新，同目录�
   expect(requests[4][0].content).toContain('项目说明 B 新版')
   expect(requests[4].filter(message => message.role === 'user').map(message => message.content)).toEqual(['首发 B', '继续 B'])
   expect(requests[5].filter(message => message.role === 'user').map(message => message.content)).toEqual(['会话 C 私有消息', '继续 C'])
+})
+
+describe('Feature 10 会话库', () => {
+  const answer = [{ type: 'text', text: '已完成本轮' }] as const
+  const modelId = 'deepseek-flash'
+  type Write = Parameters<SessionStore['save']>[1]
+  type Content = AssistantMessage['content']
+
+  function controlledStream(reply: (context: ModelContext) => readonly Content[number][]) {
+    const calls: ModelContext[] = []
+    const stream: NonNullable<ConstructorParameters<typeof AgentSession>[0]['stream']> = (model, context) => {
+      calls.push(structuredClone(context))
+      const content = [...reply(context)]
+      const stopReason = content.some(block => block.type === 'toolCall') ? 'toolUse' : 'stop'
+      const message: AssistantMessage = { role: 'assistant', model: model.id, provider: model.provider, api: model.api,
+        content, stopReason, timestamp: Date.now(), usage: { input: 120 } }
+      return {
+        result: async () => message,
+        async *[Symbol.asyncIterator](): AsyncGenerator<ModelEvent> {
+          yield { type: 'start', partial: { ...message, stopReason: 'pending', content: [] } }
+          yield { type: 'done', reason: stopReason, message }
+        },
+      }
+    }
+    return { stream, calls }
+  }
+
+  function writes(shouldFail: (data: Write) => boolean = () => false) {
+    const original = SessionStore.prototype.save
+    const saved: Write[] = []
+    const attempted: Write[] = []
+    let store!: SessionStore
+    vi.spyOn(SessionStore.prototype, 'save').mockImplementation(function (this: SessionStore, id, data) {
+      store = this
+      attempted.push(structuredClone(data))
+      if (shouldFail(data)) throw new SessionWriteError('storage-full')
+      original.call(this, id, data)
+      saved.push(structuredClone(data))
+    })
+    return { saved, attempted, load: (id: string) => store.loadSession(id) }
+  }
+
+  async function client(app: { url: string; authUrl: string }) {
+    const auth = await cookie(app.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const post = (path: string, data: object) => http(app.url + path, headers, 'POST', JSON.stringify(data))
+    return {
+      auth,
+      first: (workspaceId: string, text: string, clientMessageId = randomUUID()) => post('/api/sessions/start', { workspaceId, clientMessageId, modelId, text }),
+      send: (sessionId: string, text: string, clientMessageId = randomUUID()) => post('/api/messages', { sessionId, clientMessageId, modelId, text }),
+      abort: (sessionId: string, runId: string) => post('/api/abort', { sessionId, runId }),
+      list: async () => JSON.parse((await http(app.url + '/api/sessions', headers)).text).sessions as SessionSummary[],
+      snapshot: (id: string) => serverSnapshot(app.url, auth, id),
+      idle: async (id: string) => {
+        let snapshot!: ConversationSnapshot
+        await vi.waitFor(async () => { snapshot = await serverSnapshot(app.url, auth, id); expect(snapshot.running).toBeNull() })
+        return snapshot
+      },
+    }
+  }
+
+  it('01/03/04/05 先提交首发三项才调用模型，保存拒绝不启动，重启重试返回原回执和空会话', async () => {
+    const storage = writes(data => data.run?.status === 'running' && data.run.text === '磁盘拒绝')
+    const provider = controlledStream(() => {
+      expect(storage.saved[0]).toMatchObject({
+        summary: { id: expect.any(String) },
+        run: { status: 'running' }, messages: [{ message: { role: 'user', content: '记住代号青禾' } }],
+      })
+      return answer
+    })
+    const dir = await mkdtemp(join(tmpdir(), 'feature10-retry-'))
+    cleanups.push(() => rm(dir, { recursive: true, force: true }))
+    const app = await setup({
+      sessionPath: join(dir, 'sessions.sqlite'),
+      createSession: (resolveDirectory, persistence) => new AgentSession({ resolveDirectory, persistence, stream: provider.stream }),
+    })
+    const ui = await client(app)
+    const workspaceId = await pickWorkspace(app.url, ui.auth)
+    const rejected = await ui.first(workspaceId, '磁盘拒绝')
+    expect(rejected.status).toBe(507)
+    expect(JSON.parse(rejected.text)).toMatchObject({ code: 'save_rejected' })
+    expect(await ui.list()).toEqual([])
+    expect(provider.calls).toHaveLength(0)
+    const clientId = randomUUID()
+    const first = await ui.first(workspaceId, '记住代号青禾', clientId)
+    expect(first.status).toBe(202)
+    const { session, accepted } = JSON.parse(first.text)
+    expect(storage.load(clientId)?.runs[0]?.id).toBe(accepted.userMessageId)
+    const settled = await ui.idle(session.id)
+    expect(settled.runs?.[0]).toMatchObject({ status: 'completed' })
+    const before = storage.load(session.id)
+    expect((await ui.send(session.id, '磁盘拒绝')).status).toBe(507)
+    expect(storage.load(session.id)).toEqual(before)
+    expect(await ui.snapshot(session.id)).toEqual(settled)
+    expect(provider.calls).toHaveLength(1)
+
+    const emptySession = await createSession(app.url, ui.auth, workspaceId)
+    await app.server.close()
+    const restarted = new WebServer(app.config)
+    cleanups.push(() => restarted.close())
+    const reopened = await client(await restarted.start())
+    expect(await reopened.list()).toEqual([session, emptySession])
+    expect(await reopened.snapshot(emptySession.id)).toMatchObject({ messages: [], running: null })
+    const replayed = await reopened.first(workspaceId, '记住代号青禾', clientId)
+    expect(replayed.status).toBe(202)
+    expect(JSON.parse(replayed.text)).toEqual(JSON.parse(first.text))
+    expect((await reopened.first(workspaceId, '另一条原文', clientId)).status).toBe(409)
+    expect((await reopened.snapshot(session.id)).messages).toEqual(settled.messages)
+    expect(provider.calls).toHaveLength(1)
+  })
+
+  it.each(['tool-call', 'sequential', 'parallel', 'parallel-fail', 'tool-error', 'abort'] as const)(
+    '06–10/13/16 工具保存关口与收尾 %s', async scenario => {
+      const gates = Array.from({ length: 3 }, () => Promise.withResolvers<void>())
+      const stopped = Promise.withResolvers<void>()
+      const started: string[] = [], completed: string[] = []
+      const calls = ['A', 'B', 'C'].map(id => ({ type: 'toolCall' as const, id, name: 'probe', arguments: { id } }))
+      const provider = controlledStream(context => context.messages.at(-1)?.role === 'user' ? calls : answer)
+      const storage = writes(data => {
+        const message = data.messages?.[0]?.message
+        return scenario === 'tool-call' && message?.role === 'assistant' && message.stopReason === 'toolUse'
+          || (scenario === 'sequential' || scenario === 'parallel-fail') && message?.role === 'toolResult' && message.toolCallId === 'B'
+      })
+      const app = await setup({
+        sessionPath: ':memory:',
+        createSession: (resolveDirectory, persistence) => new AgentSession({
+          resolveDirectory, persistence, stream: provider.stream,
+          tools: cwd => [{
+            name: 'probe', description: '验证工具写入时序', parameters: Type.Object({ id: Type.String() }),
+            executionMode: scenario === 'sequential' ? 'sequential' : 'parallel',
+            execute: async ({ id }, { signal }) => {
+              signal.addEventListener('abort', () => stopped.resolve(), { once: true })
+              const name = String(id)
+              expect(storage.saved.some(data => data.messages?.[0]?.message.role === 'assistant')).toBe(true)
+              started.push(name)
+              await gates[['A', 'B', 'C'].indexOf(name)]!.promise
+              if (scenario === 'tool-error' && name === 'A') throw new Error('文件不存在')
+              await writeFile(join(cwd, name), '实际执行')
+              completed.push(name)
+              return name
+            },
+          }],
+        }),
+      })
+      const ui = await client(app)
+      const workspaceId = await pickWorkspace(app.url, ui.auth)
+      try {
+        const response = await ui.first(workspaceId, '执行三个工具')
+        expect(response.status).toBe(202)
+        const { session, accepted } = JSON.parse(response.text)
+        const savedCalls = () => storage.load(session.id)?.messages.flatMap(({ message }) => message.role === 'toolResult' ? [message.toolCallId] : [])
+        const socket = await connect(app.url, ui.auth)
+        const notifications: string[] = []
+        socket.on('message', data => {
+          const message = JSON.parse(String(data)).update?.change?.message?.message
+          if (message?.role === 'toolResult') notifications.push(message.toolCallId)
+        })
+        const subscribed = nextConversationFrame(socket)
+        socket.send(JSON.stringify({ type: 'subscribe', sessionId: session.id, subscriptionId: 'tool-checkpoints' }))
+        await subscribed
+        if (scenario === 'tool-call') {
+          const done = await ui.idle(session.id)
+          expect(done.saveFailures).toEqual([expect.objectContaining({ stage: 'tool-call' })])
+          expect(storage.load(session.id)?.messages).toHaveLength(1)
+          expect(started).toEqual([])
+          await expect(readFile(join(app.workspace, 'A'))).rejects.toMatchObject({ code: 'ENOENT' })
+        } else if (scenario === 'sequential') {
+          await vi.waitFor(() => expect(started).toEqual(['A']))
+          gates[0]!.resolve()
+          await vi.waitFor(() => expect(started).toEqual(['A', 'B']))
+          expect(savedCalls()).toEqual(['A'])
+          gates[1]!.resolve()
+        } else {
+          await vi.waitFor(() => expect(started).toEqual(['A', 'B', 'C']))
+          gates[2]!.resolve()
+          await vi.waitFor(() => expect(completed).toEqual(['C']))
+          expect(savedCalls()).toEqual([])
+          expect(notifications).toEqual([])
+          expect((await ui.snapshot(session.id)).messages.map(entry => entry.message.role)).toEqual(['user', 'assistant'])
+          if (scenario === 'abort') {
+            const stop = ui.abort(session.id, accepted.userMessageId)
+            await stopped.promise
+            gates[0]!.resolve()
+            gates[1]!.resolve()
+            expect(JSON.parse((await stop).text).handled).toBe(true)
+          } else {
+            gates[0]!.resolve()
+            gates[1]!.resolve()
+          }
+        }
+
+        const snapshot = await ui.idle(session.id)
+        const order = scenario === 'tool-call' ? [] : scenario === 'sequential' || scenario === 'parallel-fail' ? ['A'] : ['A', 'B', 'C']
+        expect(savedCalls()).toEqual(order)
+        await vi.waitFor(() => expect(notifications).toEqual(order))
+        expect(provider.calls).toHaveLength(scenario === 'parallel' || scenario === 'tool-error' ? 2 : 1)
+        if (scenario === 'abort') expect(snapshot.runs?.[0]?.status).toBe('aborted')
+        if (scenario === 'sequential' || scenario === 'parallel-fail') {
+          expect(snapshot.saveFailures).toEqual([{ runId: accepted.userMessageId, stage: 'tool-result', reason: 'storage-full',
+            toolCall: { assistantMessageId: snapshot.messages[1]?.id, contentIndex: 1 } }])
+          expect(snapshot.runs?.[0]?.status).toBe('failed')
+          expect(await readFile(join(app.workspace, 'B'), 'utf8')).toBe('实际执行')
+          expect(started.includes('C')).toBe(scenario === 'parallel-fail')
+          expect((await ui.snapshot(session.id)).saveFailures).toEqual(snapshot.saveFailures)
+        }
+        if (scenario === 'tool-error') {
+          expect(provider.calls[1]?.messages).toContainEqual(expect.objectContaining({ role: 'toolResult', toolCallId: 'A', isError: true,
+            content: [{ type: 'text', text: '文件不存在' }] }))
+        }
+      } finally { for (const gate of gates) gate.resolve() }
+    },
+  )
+
+  it.each([1, 2])('11/12 最终文字事务重试，模拟 %i 次写入失败', async failureCount => {
+    let attempts = 0
+    const storage = writes(data => data.messages?.[0]?.message.role === 'assistant' && ++attempts <= failureCount)
+    const provider = controlledStream(() => answer)
+    const app = await setup({
+      sessionPath: ':memory:',
+      createSession: (resolveDirectory, persistence) => new AgentSession({ resolveDirectory, persistence, stream: provider.stream }),
+    })
+    const ui = await client(app)
+    const workspaceId = await pickWorkspace(app.url, ui.auth)
+    const { session } = JSON.parse((await ui.first(workspaceId, '核对启动命令')).text)
+    const snapshot = await ui.idle(session.id)
+    expect(snapshot.messages.at(-1)?.message.content).toEqual(answer)
+    expect(attempts).toBe(2)
+    expect(provider.calls).toHaveLength(1)
+    const history = storage.load(session.id)
+    if (failureCount === 1) {
+      expect(history?.messages).toHaveLength(2)
+      expect(history?.runs[0].status).toBe('completed')
+      expect(snapshot.saveFailures).toBeUndefined()
+    } else {
+      expect(history?.messages).toHaveLength(1)
+      expect(history?.runs[0].status).toBe('running')
+      expect(snapshot.saveFailures).toEqual([expect.objectContaining({ stage: 'answer' })])
+      expect(snapshot.runs?.[0]?.status).toBe('failed')
+    }
+  })
+
+  it('15 新摘要的写入失败不替换原摘要，也不影响下一轮使用原上下文', async () => {
+    let failCompaction = false
+    const storage = writes(data => failCompaction && data.compaction?.status === 'success')
+    const provider = controlledStream(context => context.tools?.length || !context.systemPrompt?.startsWith('你负责整理')
+      ? [{ type: 'text', text: '已记录。'.repeat(30) }] : [{ type: 'text', text: '旧事实是青禾。' }])
+    const app = await setup({
+      sessionPath: ':memory:',
+      createSession: (resolveDirectory, persistence) => new AgentSession({ resolveDirectory, persistence, stream: provider.stream,
+        compaction: { triggerTokens: 20_000, keepRecentTokens: 30 } }),
+    })
+    const ui = await client(app)
+    const id = await pickSession(app.url, ui.auth)
+    for (const prompt of ['旧事实青禾'.repeat(100), '第一段近期'.repeat(100), '/compact']) {
+      expect((await ui.send(id, prompt)).status).toBe(202)
+      await ui.idle(id)
+    }
+    const previous = storage.load(id)?.compactions[0]
+    expect(previous).toMatchObject({ status: 'success' })
+    expect((await ui.send(id, '另一段近期'.repeat(100))).status).toBe(202)
+    await ui.idle(id)
+    failCompaction = true
+    expect((await ui.send(id, '/compact')).status).toBe(202)
+    const failed = await ui.idle(id)
+    expect(failed.saveFailures).toEqual([expect.objectContaining({ stage: 'compaction' })])
+    expect(failed.compactions.map(record => record.status)).toEqual(['success', 'failed'])
+    expect(storage.load(id)?.compactions[0]).toMatchObject({ id: previous?.id, status: 'success' })
+    expect((await ui.send(id, '继续原会话')).status).toBe(202)
+    await ui.idle(id)
+    expect(provider.calls.at(-1)?.messages[0]).toMatchObject({ content: expect.stringContaining('旧事实是青禾。') })
+  })
+
+  it('28 历史读取失败只返回错误，重新订阅可取得同一段完整记录', async () => {
+    const app = await setup()
+    const ui = await client(app)
+    const id = await pickSession(app.url, ui.auth)
+    await app.server.close()
+    const restarted = new WebServer(app.config)
+    cleanups.push(() => restarted.close())
+    const next = await restarted.start()
+    const reopened = await client(next)
+    expect((await reopened.list()).map(item => item.id)).toEqual([id])
+    const load = vi.spyOn(SessionStore.prototype, 'loadSession')
+    load.mockImplementationOnce(() => { throw new SessionReadError('无法读取完整会话历史，请重试') })
+    const socket = await connect(next.url, reopened.auth)
+    const first = nextConversationFrame(socket)
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId: id, subscriptionId: 'failed-read' }))
+    expect(await first).toEqual({ type: 'subscription_error', sessionId: id, subscriptionId: 'failed-read', error: '无法读取完整会话历史，请重试' })
+    load.mockImplementationOnce(() => { throw new SessionReadError('无法读取完整会话历史，请重试') })
+    expect((await reopened.send(id, '不能在半份历史上发送')).status).toBe(500)
+    const second = nextConversationFrame(socket)
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId: id, subscriptionId: 'retry-read' }))
+    expect(await second).toMatchObject({ type: 'snapshot', subscriptionId: 'retry-read', snapshot: { messages: [], running: null } })
+  })
 })

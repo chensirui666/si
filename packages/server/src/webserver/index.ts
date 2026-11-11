@@ -7,8 +7,8 @@ import { extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
-  AgentSession, SessionSubmitError, Sessions, ToolRuntime, createTools, createWebTools,
-  type SessionSubscriptionEvent, type WebProvider,
+  AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools,
+  type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, discoverModels } from '@agent-learning/model'
@@ -34,11 +34,12 @@ export type WebServerOptions = {
   modelAuthPath?: string
   devOrigin?: `http://127.0.0.1:${number}`
   workspacePath?: string
+  sessionPath?: string
   webSettingsPath?: string
   globalContextDirectory?: string
   directoryPicker?: DirectoryPicker
   webProviders?: WebProvider[]
-  createSession?: (resolveDirectory: () => Promise<string>) => SessionTarget
+  createSession?: (resolveDirectory: () => Promise<string>, persistence?: SessionPersistence) => SessionTarget
   modelOptions?: Parameters<typeof createModelStream>[1]
   compaction?: { triggerTokens: number; keepRecentTokens: number }
   now?: () => number
@@ -92,7 +93,8 @@ function validFrame(value: unknown): value is ClientFrame {
 }
 
 export class WebServer {
-  private sessions: Sessions<SessionTarget>
+  private sessions!: Sessions<SessionTarget>
+  private store?: SessionStore
   private server?: Server
   private ws?: WebSocketServer
   private heartbeat?: ReturnType<typeof setInterval>
@@ -110,7 +112,6 @@ export class WebServer {
     this.credentials = new Credentials(options.modelAuthPath)
     this.workspaces = new Workspaces(options.workspacePath)
     this.webSettings = new WebSettings(options.webProviders ?? [createTavilyProvider(this.credentials)], this.credentials, options.webSettingsPath)
-    this.sessions = this.createSessions()
   }
   private createSessions() {
     const runtime = new ToolRuntime()
@@ -118,8 +119,9 @@ export class WebServer {
     const stream = createModelStream(this.credentials, this.options.modelOptions)
     return new Sessions<SessionTarget>({
       resolveDirectory: id => this.workspaces.resolveDirectory(id),
-      createSession: this.options.createSession ?? (resolveDirectory => new AgentSession({
-        resolveDirectory, stream, tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+      store: this.store,
+      createSession: this.options.createSession ?? ((resolveDirectory, persistence) => new AgentSession({
+        resolveDirectory, persistence, stream, tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
       })),
@@ -129,13 +131,16 @@ export class WebServer {
   }
   async start(): Promise<{ url: string; authUrl: string; devAuthUrl?: string }> {
     if (this.server) throw new Error('服务已经启动')
-    if (this.closing) {
-      await this.closing
-      this.sessions = this.createSessions()
-    }
+    if (this.closing) await this.closing
     const secret = await loadOrCreateBrowserSecret(this.options.browserSecretPath)
+    if (this.server) throw new Error('服务已经启动')
     this.auth = new BrowserAuth(secret, this.options.now)
     this.closing = undefined
+    if (!this.options.createSession || this.options.sessionPath) {
+      this.store = SessionStore.open(this.options.sessionPath ?? join(homedir(), '.agent-learning', 'sessions.sqlite'))
+    }
+    try { this.sessions = this.createSessions() }
+    catch (error) { this.store?.close(); this.store = undefined; throw error }
     const server = this.server = createServer((req, res) => { void this.handleHttp(req, res).catch(() => {
       if (!res.headersSent) this.respond(res, 500, '服务暂时不可用')
       else res.destroy()
@@ -214,7 +219,8 @@ export class WebServer {
       return
     }
     if (url.pathname === '/api/sessions' && req.method === 'GET') {
-      this.json(res, 200, { sessions: this.sessions.list() })
+      try { this.json(res, 200, { sessions: this.sessions.list() }) }
+      catch (error) { this.sessionError(res, error, '无法读取会话列表，请重试') }
       return
     }
     if (url.pathname === '/api/sessions' && req.method === 'POST') {
@@ -320,6 +326,12 @@ export class WebServer {
       this.json(res, 409, { error: error.message })
     } else if (error instanceof SessionSubmitError) {
       this.json(res, { invalid: 400, busy: 409, closed: 503 }[error.code], { error: error.message })
+    } else if (error instanceof SessionWriteError) {
+      this.json(res, error.reason === 'unconfirmed' ? 500 : 507, {
+        error: error.message, code: error.reason === 'unconfirmed' ? 'save_unconfirmed' : 'save_rejected',
+      })
+    } else if (error instanceof SessionReadError) {
+      this.json(res, 500, { error: error.message })
     } else if (error instanceof InputError) {
       this.json(res, error.status, { error: error.message })
     } else this.json(res, 500, { error: fallback })
@@ -450,8 +462,9 @@ export class WebServer {
             if (signal.aborted) break
             await send(event)
           }
-        } catch {
-          if (!signal.aborted) { cleanup(); client.close(1011, 'Subscription unavailable') }
+        } catch (error) {
+          if (!signal.aborted && error instanceof SessionReadError) await send({ type: 'subscription_error', error: error.message })
+          else if (!signal.aborted) { cleanup(); client.close(1011, 'Subscription unavailable') }
         }
       })()
     })
@@ -471,8 +484,10 @@ export class WebServer {
       const ws = this.ws
       this.server = undefined
       this.ws = undefined
-      try { await this.sessions.close() }
+      try { await this.sessions?.close() }
       finally {
+        this.store?.close()
+        this.store = undefined
         if (ws) await new Promise<void>(done => ws.close(() => done()))
         if (server?.listening) await new Promise<void>((done, reject) => { server.close(error => error ? reject(error) : done()); server.closeAllConnections() })
       }

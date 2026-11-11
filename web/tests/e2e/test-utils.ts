@@ -43,9 +43,9 @@ function waitForStart(child: ChildProcess): Promise<Started> {
     }
     const fail = () => { cleanup(); reject(new Error('测试后端未能启动；请先运行根 npm run build')) }
     const message = (data: unknown) => {
-      const value = data as { type: string; result: Started }
+      const value = data as { type: string; result: Started; error?: string }
       if (value.type === 'started') { cleanup(); resolve(value.result) }
-      else if (value.type === 'error') fail()
+      else if (value.type === 'error') { cleanup(); reject(new Error(value.error ?? '测试后端启动失败')) }
     }
     child.on('message', message)
     child.once('error', fail)
@@ -55,7 +55,7 @@ function waitForStart(child: ChildProcess): Promise<Started> {
 
 export async function startBackend(secretPath: string, port = 0, modelBaseURL = '', vitePort?: number) {
   const child = fork(fixturePath, [String(port), secretPath, vitePort ? String(vitePort) : ''], {
-    env: { ...process.env, AGENT_LEARNING_E2E_MODEL_BASE_URL: modelBaseURL },
+    env: { ...process.env, TMPDIR: dirname(secretPath), AGENT_LEARNING_E2E_MODEL_BASE_URL: modelBaseURL },
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
   try { return { child, result: await waitForStart(child) } }

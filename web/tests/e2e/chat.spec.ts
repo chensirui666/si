@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, expect } from '@playwright/test'
-import { addWorkspace, authorize, expectBrowserStorage, freeVitePort, emptySnapshot, httpStatus, observe, openSession, ready, saveKey, seedSession, startBackend, startVite, stop, wsStatus } from './test-utils'
+import { addWorkspace, authorize, expectBrowserStorage, freeVitePort, emptySnapshot, httpStatus, observe, ready, saveKey, seedSession, startBackend, startVite, stop, wsStatus } from './test-utils'
 import { startModelServer } from './model-server'
 
 for (const mode of ['node', 'vite'] as const) {
@@ -111,14 +111,16 @@ for (const mode of ['node', 'vite'] as const) {
       const oldSession = observed.snapshots.at(-1)!.sessionId
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
+      const beforeRestart = observed.snapshots.length
       backend = await startBackend(secretPath, port, provider.baseURL, vitePort)
-      await expect(page.getByRole('alert')).toHaveText('之前打开的会话已不可用，请选择或新建会话。')
-      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
-      expect(await seedSession(page, observed, workspaceId)).not.toBe(oldSession)
-      await expect(messages.getByRole('listitem')).toHaveCount(0)
+      await ready(page, observed, beforeRestart, false)
+      expect(observed.snapshots.at(-1)?.sessionId).toBe(oldSession)
+      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toBeVisible()
+      await expect(messages.getByRole('listitem')).toHaveCount(4)
+      await expect(messages).toContainText('第二轮已收到历史。')
       await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('DeepSeek Flash')
-      await expect(editor).toHaveText('')
-      await expect(send).toBeDisabled()
+      await expect(editor).toHaveText('后端重启期间仍保留的草稿')
+      await expect(send).toBeEnabled()
       expect(JSON.parse(await readFile(modelPath, 'utf8')).deepseek.key).toBe('controlled-stage3-key')
       expect(provider.exchanges).toHaveLength(2)
       expect(observed.submissions).toEqual(['POST', 'POST'])
@@ -196,11 +198,13 @@ for (const mode of ['node', 'vite'] as const) {
 
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
+      const beforeRestart = observed.snapshots.length
+      const otherBeforeRestart = otherObserved.snapshots.length
       backend = await startBackend(secretPath, port, '', vitePort)
-      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
-      await expect(second.getByRole('alert')).toHaveText('之前打开的会话已不可用，请选择或新建会话。')
-      const createdSession = await seedSession(page, observed, workspaceId)
-      expect((await openSession(second, otherObserved, '会话 1')).sessionId).toBe(createdSession)
+      await Promise.all([ready(page, observed, beforeRestart), ready(second, otherObserved, otherBeforeRestart)])
+      expect(observed.snapshots.at(-1)?.sessionId).toBe(sessionId)
+      expect(otherObserved.snapshots.at(-1)?.sessionId).toBe(sessionId)
+      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toBeVisible()
       await expect(model).toHaveText('DeepSeek Flash')
       await expect(otherModel).toHaveText('DeepSeek Flash')
       await settings.click()
@@ -227,7 +231,7 @@ for (const mode of ['node', 'vite'] as const) {
       await writeFile(modelPath, '{}', { mode: 0o600 })
       await expect(page.getByRole('alert')).toHaveCount(0)
       await expect(second.getByRole('alert')).toHaveCount(0)
-      await expect(editor).toHaveText('')
+      await expect(editor).toHaveText('设置变化期间保留的草稿')
       expect(observed.snapshots.every(frame => JSON.stringify(frame.snapshot) === JSON.stringify(emptySnapshot))).toBe(true)
       expect(observed.submissions).toEqual([])
       expect(otherObserved.submissions).toEqual([])
@@ -337,10 +341,12 @@ for (const mode of ['node', 'vite'] as const) {
       await stop(backend.child, 'SIGKILL')
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
       await editor.fill('后端重启期间的草稿')
+      const beforeRestart = observed.snapshots.length
       backend = await startBackend(secretPath, port, '', vitePort)
-      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
-      expect(await seedSession(page, observed, workspaceId)).not.toBe(sessionId)
-      await expect(editor).toHaveText('')
+      await ready(page, observed, beforeRestart)
+      expect(observed.snapshots.at(-1)?.sessionId).toBe(sessionId)
+      await expect(page.getByRole('button', { name: '会话 1', exact: true })).toBeVisible()
+      await expect(editor).toHaveText('后端重启期间的草稿')
       expect(await httpStatus(origin + '/api/events', headers)).toBe(404)
       expect((await context.cookies(origin)).find(value => value.name === cookie.name)?.value === cookie.value).toBe(true)
       expect(observed.submissions).toEqual([])

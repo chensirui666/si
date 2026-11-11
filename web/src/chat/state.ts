@@ -1,4 +1,4 @@
-import type { CompactionRecord, ConversationMessage, ConversationSnapshot, ServerFrame } from '@agent-learning/server/protocol'
+import type { CompactionRecord, ConversationMessage, ConversationSnapshot, RunRecord, SaveFailure, ServerFrame } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelMessage } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 
@@ -49,7 +49,7 @@ function compactionRecord(value: unknown): value is CompactionRecord {
     || (value.fileOperations !== undefined && (value.status !== 'success' || !fileOperations(value.fileOperations)))) return false
   if (value.status === 'running') return true
   if (!finite(value.finishedAt)) return false
-  if (['failed', 'aborted', 'skipped'].includes(value.status as string)) return typeof value.reason === 'string'
+  if (['failed', 'aborted', 'skipped', 'interrupted'].includes(value.status as string)) return typeof value.reason === 'string'
   return value.status === 'success' && typeof value.summary === 'string' && !!value.summary.trim()
     && typeof value.firstKeptMessageId === 'string' && typeof value.contextLastMessageId === 'string'
     && nonnegative(value.estimatedBefore) && nonnegative(value.estimatedAfter) && value.estimatedAfter < value.estimatedBefore
@@ -114,6 +114,21 @@ function validRelations(messages: ConversationMessage[], running: ConversationSn
   return true
 }
 
+function runRecord(value: unknown): value is RunRecord {
+  return record(value) && ['id', 'sessionId', 'clientMessageId', 'modelId'].every(key => typeof value[key] === 'string' && value[key] !== '')
+    && (value.kind === 'task' || value.kind === 'compaction')
+    && ['running', 'completed', 'failed', 'aborted', 'interrupted'].includes(value.status as string)
+    && finite(value.startedAt) && (value.finishedAt === undefined || finite(value.finishedAt))
+    && (value.restored === undefined || value.restored === true)
+}
+
+function saveFailure(value: unknown): value is SaveFailure {
+  return record(value) && typeof value.runId === 'string' && value.runId.length > 0
+    && ['tool-call', 'tool-result', 'answer', 'compaction', 'finish'].includes(value.stage as string)
+    && ['storage-full', 'write-failed', 'unconfirmed'].includes(value.reason as string)
+    && (value.toolCall === undefined || value.stage === 'tool-result' && toolPosition(value.toolCall))
+}
+
 function validSnapshot(value: unknown): value is ConversationSnapshot {
   return record(value) && sequence(value.seq) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
@@ -121,6 +136,8 @@ function validSnapshot(value: unknown): value is ConversationSnapshot {
       && (block.type === 'text' || block.type === 'thinking' || (block.type === 'toolCall' && typeof block.argumentsText === 'string')))
     && Array.isArray(value.compactions) && value.compactions.every(compactionRecord)
     && new Set(value.compactions.map(item => item.id)).size === value.compactions.length
+    && (value.runs === undefined || Array.isArray(value.runs) && value.runs.every(runRecord))
+    && (value.saveFailures === undefined || Array.isArray(value.saveFailures) && value.saveFailures.every(saveFailure))
     && contextUsage(value.contextUsage)
     && (value.running === null || !record(value.running) || value.running.kind !== 'compaction' || value.compactions.some(item => item.id === (value.running as Record<string, unknown>).runId))
     && validRelations(value.messages as ConversationMessage[], value.running as ConversationSnapshot['running'])
@@ -133,7 +150,7 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     return { state: { ...state, connection: 'ready', snapshot: null, slow: false, error: frame.error }, resubscribe: false }
   }
   if (frame.type === 'snapshot') {
-    if (!validSnapshot(frame.snapshot)) return unchanged
+    if (!validSnapshot(frame.snapshot) || frame.snapshot.runs?.some(run => run.sessionId !== state.sessionId)) return unchanged
     if (state.connection === 'ready' && state.snapshot && frame.snapshot.seq <= state.snapshot.seq) return unchanged
     const valid = frame as Extract<ServerFrame, { type: 'snapshot' }>
     return { state: { ...state, connection: 'ready', snapshot: valid.snapshot, slow: false, error: null }, resubscribe: false }
@@ -142,12 +159,19 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   if (frame.update.seq <= state.snapshot.seq) return unchanged
   if (frame.update.seq !== state.snapshot.seq + 1) return { state, resubscribe: true }
   if (frame.update.contextUsage !== undefined && !contextUsage(frame.update.contextUsage)) return { state, resubscribe: true }
+  const { run, saveFailure: failure } = frame.update
+  if (run !== undefined && (!runRecord(run) || run.sessionId !== state.sessionId)
+    || failure !== undefined && (!saveFailure(failure) || failure.runId !== state.snapshot.running?.runId)) return { state, resubscribe: true }
+  const metadata = {
+    ...(run && { runs: [...(state.snapshot.runs ?? []).filter(item => item.id !== run.id), run] }),
+    ...(failure && { saveFailures: [...state.snapshot.saveFailures ?? [], failure] }),
+  }
   const capacity = frame.update.contextUsage === undefined ? state.snapshot.contextUsage : frame.update.contextUsage as ConversationSnapshot['contextUsage']
   const change = frame.update.change
   if (!record(change)) return { state, resubscribe: true }
   if (change.type === 'model') {
     const snapshot = applyModel(state.snapshot, change.messageId, change.event)
-    return snapshot ? { state: { ...state, snapshot: { ...snapshot, seq: frame.update.seq, contextUsage: capacity } }, resubscribe: false } : { state, resubscribe: true }
+    return snapshot ? { state: { ...state, snapshot: { ...snapshot, ...metadata, seq: frame.update.seq, contextUsage: capacity } }, resubscribe: false } : { state, resubscribe: true }
   }
   const valid = frame as Extract<ServerFrame, { type: 'update' }>
   const update = valid.update.change
@@ -156,7 +180,7 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     const messages = [...state.snapshot.messages, update.user]
     if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, seq: valid.update.seq, messages, running: update.running, contextUsage: capacity,
+      ...state.snapshot, ...metadata, seq: valid.update.seq, messages, running: update.running, contextUsage: capacity,
     } }, resubscribe: false }
   }
   if (update.type === 'compaction') {
@@ -164,7 +188,7 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     const compactions = state.snapshot.compactions.some(item => item.id === update.record.id)
       ? state.snapshot.compactions.map(item => item.id === update.record.id ? update.record : item)
       : [...state.snapshot.compactions, update.record]
-    const snapshot = { ...state.snapshot, seq: valid.update.seq, compactions, running: update.running, contextUsage: capacity }
+    const snapshot = { ...state.snapshot, ...metadata, seq: valid.update.seq, compactions, running: update.running, contextUsage: capacity }
     if (!validSnapshot(snapshot)) return { state, resubscribe: true }
     return { state: { ...state, snapshot }, resubscribe: false }
   }
@@ -178,7 +202,7 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     }
     if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, seq: valid.update.seq, running: update.running, messages, contextUsage: capacity,
+      ...state.snapshot, ...metadata, seq: valid.update.seq, running: update.running, messages, contextUsage: capacity,
     } }, resubscribe: false }
   }
   return unchanged

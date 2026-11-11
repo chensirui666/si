@@ -25,7 +25,7 @@ test('Feature9 live 20：网页首发使用项目说明里的随机标记', asyn
   let correctContext = false
   const requests: { model: string; messages: { role: string; content: string }[] }[] = []
   const server = new WebServer({
-    port: 0, directoryPicker: async () => cwd, globalContextDirectory: join(temporary, 'global'),
+    port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, globalContextDirectory: join(temporary, 'global'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {

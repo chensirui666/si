@@ -3,7 +3,7 @@ import type { WorkspaceRegistration } from '../workspaces.js'
 
 export type {
   ActiveContent, CompactionRecord, ContextUsage, ConversationMessage, ConversationSnapshot,
-  ConversationUpdate, ModelFrame, RunningState, SessionSummary, SubmissionAccepted,
+  ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure, SessionSummary, SubmissionAccepted,
 } from '@agent-learning/coding-agent'
 export type { WorkspaceView } from '../workspaces.js'
 export type { WebSettingsView } from '../web-settings.js'

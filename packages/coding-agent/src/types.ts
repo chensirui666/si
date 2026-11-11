@@ -35,7 +35,7 @@ export type CompactionRecord = {
   summaryUsage?: ModelUsage
 } & (
   | { status: 'running' }
-  | { status: 'failed' | 'aborted' | 'skipped'; finishedAt: number; reason: string }
+  | { status: 'failed' | 'aborted' | 'skipped' | 'interrupted'; finishedAt: number; reason: string }
   | {
     status: 'success'; finishedAt: number; summary: string
     firstKeptMessageId: string; contextLastMessageId: string
@@ -58,11 +58,15 @@ export type ConversationSnapshot = {
   activeContent: ActiveContent[]
   compactions: CompactionRecord[]
   contextUsage: ContextUsage | null
+  runs?: RunRecord[]
+  saveFailures?: SaveFailure[]
 }
 
 export type ConversationUpdate = {
   seq: number
   contextUsage?: ContextUsage | null
+  run?: RunRecord
+  saveFailure?: SaveFailure
   change:
     | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }
@@ -90,3 +94,22 @@ export type ModelFrame =
 export type SessionSubscriptionEvent =
   | { type: 'snapshot'; snapshot: ConversationSnapshot }
   | { type: 'update'; update: ConversationUpdate }
+
+export type RunRecord = {
+  id: string
+  sessionId: string
+  clientMessageId: string
+  modelId: string
+  kind: 'task' | 'compaction'
+  status: 'running' | 'completed' | 'failed' | 'aborted' | 'interrupted'
+  startedAt: number
+  finishedAt?: number
+  restored?: true
+}
+
+export type SaveFailure = {
+  runId: string
+  stage: 'tool-call' | 'tool-result' | 'answer' | 'compaction' | 'finish'
+  reason: 'storage-full' | 'write-failed' | 'unconfirmed'
+  toolCall?: ToolLocation
+}

@@ -22,8 +22,33 @@ function effectiveEntries(entries: ConversationMessage[], latest?: LatestCompact
     && !(entry.toolCall && invalid.has(entry.toolCall.assistantMessageId)))
 }
 
-export function buildModelHistory(entries: ConversationMessage[], latest?: LatestCompaction): ModelMessage[] {
-  const messages = effectiveEntries(entries, latest).map(entry => entry.message)
+function modelMessages(entries: ConversationMessage[], recoverTools: boolean): ModelMessage[] {
+  if (!recoverTools) return entries.map(entry => entry.message)
+  const results = new Map<string, Map<number, ModelMessage>>()
+  for (const { toolCall, message } of entries) {
+    if (!toolCall) continue
+    const batch = results.get(toolCall.assistantMessageId) ?? new Map()
+    batch.set(toolCall.contentIndex, message)
+    results.set(toolCall.assistantMessageId, batch)
+  }
+  return entries.flatMap(({ id, message }): ModelMessage[] => {
+    if (message.role === 'toolResult') return []
+    if (message.role !== 'assistant') return [message]
+    const calls = message.content.flatMap((call, index) => call.type === 'toolCall' ? [{ call, index }] : [])
+    if (!calls.length) return [message]
+    if (calls.some(({ call }) => !call.id.trim()) || new Set(calls.map(({ call }) => call.id)).size !== calls.length) {
+      return [{ ...message, content: message.content.filter(block => block.type !== 'toolCall') }]
+    }
+    const batch = results.get(id)
+    return [message, ...calls.map(({ call, index }): ModelMessage => batch?.get(index) ?? {
+      role: 'toolResult', toolCallId: call.id, toolName: call.name, timestamp: message.timestamp, isError: true,
+      content: [{ type: 'text', text: '这条工具调用没有已保存的结果，实际结果未知。文件等外部状态可能已经改变；如需继续操作，先检查当前状态。' }],
+    })]
+  })
+}
+
+export function buildModelHistory(entries: ConversationMessage[], latest?: LatestCompaction, recoverTools = false): ModelMessage[] {
+  const messages = modelMessages(effectiveEntries(entries, latest), recoverTools)
   if (latest) {
     const files = latest.fileOperations ? `\n\n工具确认的文件操作（readFiles 仅读，modifiedFiles 已改）：${JSON.stringify(latest.fileOperations)}` : ''
     messages.unshift({
@@ -36,7 +61,7 @@ export function buildModelHistory(entries: ConversationMessage[], latest?: Lates
 
 export function prepareCompaction(
   entries: ConversationMessage[], latest: LatestCompaction | undefined,
-  keepRecentTokens: number, includeThinking: boolean,
+  keepRecentTokens: number, includeThinking: boolean, recoverTools = false,
 ): CompactionPreparation {
   const effective = effectiveEntries(entries, latest)
   const last = effective.at(-1)
@@ -67,7 +92,7 @@ export function prepareCompaction(
   const modifiedFiles = [...modified].sort()
   return {
     status: 'ready', ...(latest && { previousSummary: latest.summary }),
-    messagesToSummarize: structuredClone(effective.slice(0, firstKept).map(entry => entry.message)),
+    messagesToSummarize: structuredClone(modelMessages(effective.slice(0, firstKept), recoverTools)),
     firstKeptMessageId, contextLastMessageId: last.id,
     ...(readFiles.length || modifiedFiles.length ? { fileOperations: { readFiles, modifiedFiles } } : {}),
   }

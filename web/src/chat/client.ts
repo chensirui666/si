@@ -244,6 +244,11 @@ async function postSubmission(path: string, input: SubmitMessageRequest | StartS
   catch { throw new Error('网络请求失败，未确认接收') }
   let value: unknown
   try { value = await response.json() } catch { value = null }
+  const code = record(value) ? value.code : undefined
+  if (code === 'save_rejected' || code === 'save_unconfirmed') {
+    const message = record(value) && typeof value.error === 'string' ? value.error : '会话保存失败'
+    throw Object.assign(new Error(message), { status: response.status, code })
+  }
   if (response.status >= 400 && response.status < 500) {
     const message = response.status === 401 ? '授权已失效，请重新打开启动链接' : response.status === 403 ? '访问来源不可信，请从启动链接进入'
       : record(value) && typeof value.error === 'string' ? value.error : response.status === 409 ? '正在生成，请等待回答结束' : `消息提交被拒绝（HTTP ${response.status}）`

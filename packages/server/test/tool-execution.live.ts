@@ -34,7 +34,7 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
   const cwd = join(temporary, 'workspace')
   const requests: { messages: { role: string; content: string; tool_calls?: { id: string }[]; tool_call_id?: string }[]; tools?: unknown[] }[] = []
   const server = new WebServer({
-    port: 0, directoryPicker: async () => cwd,
+    port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
     globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),

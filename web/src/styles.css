@@ -328,3 +328,6 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 .compaction-record .markdown-text { font-size: 12px; }
 .compaction-history { margin-bottom: 8px; }
 .composer-actions { align-items: center; gap: 8px; }
+
+.save-notice { position: fixed; inset: 16px auto auto 50%; z-index: 5; transform: translateX(-50%); width: max-content; max-width: calc(100vw - 32px); margin: 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--background); color: #b42318; font-size: 13px; box-shadow: 0 2px 12px rgb(0 0 0 / 8%); }
+.tool-block-locked { display: flex; align-items: center; gap: 8px; min-height: 28px; font-size: 13px; }

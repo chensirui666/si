@@ -163,3 +163,30 @@ test('W4 两轮读取使用相同调用编号，整次结束才收起并保留�
   await process.locator(':scope > summary').click();
   await expect(process).toHaveAttribute('open');
 });
+
+test('结果保存失败的工具卡不可展开，并在本轮说明磁盘原因', async ({ mount }) => {
+  const messages: ConversationMessage[] = [
+    { id: 'u', message: { role: 'user', content: '修改文件', timestamp: 1 } },
+    { id: 'a', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+      timestamp: 2, stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'edit', name: 'edit', arguments: { path: 'README.md' } }] } },
+  ]
+  const component = await mount(<MessageList messages={messages}
+    saveFailures={[{ runId: 'u', stage: 'tool-result', reason: 'storage-full', toolCall: { assistantMessageId: 'a', contentIndex: 0 } }]} />)
+  await component.locator('.process-group > summary').click()
+  const tool = component.locator('.tool-block')
+  await expect(tool).toContainText('工具已执行，结果未保存')
+  await expect(tool.locator('[data-state="error"]')).toHaveText('Error')
+  await expect(tool.locator('summary')).toHaveCount(0)
+  await expect(component.getByRole('alert')).toContainText('磁盘空间不足')
+})
+
+test('12 流式回答仍可读，轮末提示未保存', async ({ mount }) => {
+  const messages: ConversationMessage[] = [
+    { id: 'u', message: { role: 'user', content: '核对启动命令', timestamp: 1 } },
+    { id: 'a', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+      timestamp: 2, stopReason: 'stop', content: [{ type: 'text', text: '启动命令已核对' }] } },
+  ]
+  const component = await mount(<MessageList messages={messages} saveFailures={[{ runId: 'u', stage: 'answer', reason: 'write-failed' }]} />)
+  await expect(component.getByText('启动命令已核对', { exact: true })).toBeVisible()
+  await expect(component.getByRole('alert')).toContainText('回答已生成，但未保存')
+})

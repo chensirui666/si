@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebServer } from '@agent-learning/server'
@@ -12,7 +12,7 @@ test('未发送的新会话共用一份草稿，首次发送使用最后选中�
   const provider = await startModelServer()
   const folders = ['workspace-a', 'workspace-b'].map(name => join(temporary, name))
   const server = new WebServer({
-    port: 0,
+    port: 0, sessionPath: join(temporary, 'sessions.sqlite'),
     globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'),
     modelAuthPath: join(temporary, 'auth.json'),
@@ -247,6 +247,144 @@ test('Feature8 运行中的会话可切换、并行与独立中止，重开页�
       body: JSON.stringify({ a, b, runA, runB, bothRunningBeforeAbort: true, aAborted: true, bCompleted: true, bRestoredAfterReopen: true }),
     })
   } finally {
+    await Promise.allSettled([stop(backend?.child), provider.close()])
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+test('Feature10 22/23/25：服务正常重启后从侧栏回看，由用户主动续聊', async ({ page }) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-feature10-restart-'))
+  const secret = join(temporary, 'browser-auth.json')
+  const provider = await startModelServer()
+  let backend: Awaited<ReturnType<typeof startBackend>> | undefined
+  try {
+    backend = await startBackend(secret, 0, provider.baseURL)
+    const observed = observe(page)
+    await authorize(page, backend.result.authUrl)
+    const workspaceId = await addWorkspace(page)
+    await saveKey(page, 'controlled-feature10-key')
+    const editor = page.getByRole('textbox', { name: '消息', exact: true })
+    const send = page.getByRole('button', { name: '发送', exact: true })
+    const list = page.getByRole('region', { name: '消息列表' })
+    await editor.fill('记住代号青禾')
+    await send.click()
+    await ready(page, observed, 0, false)
+    const { sessionId } = observed.snapshots.at(-1)!
+    await expect.poll(() => provider.exchanges.length).toBe(1)
+    provider.exchanges[0]!.delta({ content: '已记住青禾' })
+    provider.exchanges[0]!.finish()
+    await expect(list).toContainText('已记住青禾')
+    await expect.poll(() => observed.updates.at(-1)?.update.run?.status).toBe('completed')
+
+    const port = Number(new URL(backend.result.url).port)
+    await stop(backend.child)
+    expect(backend.child.exitCode).toBe(0)
+    backend = await startBackend(secret, port, provider.baseURL)
+    const before = observed.snapshots.length
+    await page.reload()
+    await ready(page, observed, before, false)
+    await page.getByRole('button', { name: '新会话', exact: true }).click()
+    const restored = await openSession(page, observed, '会话 1')
+    expect(restored.sessionId).toBe(sessionId)
+    expect(restored.snapshot.runs).toMatchObject([{ status: 'completed' }])
+    await expect(list.locator('.message-text, .markdown-text')).toHaveText(['记住代号青禾', '已记住青禾'])
+    expect(provider.exchanges).toHaveLength(1)
+    const sessions = await (await page.request.get(backend.result.url + '/api/sessions')).json() as SessionList
+    expect(sessions.sessions).toMatchObject([{ id: sessionId, workspaceId }])
+
+    await editor.fill('刚才的代号是什么？')
+    await send.click()
+    await expect.poll(() => provider.exchanges.length).toBe(2)
+    const resumed = provider.exchanges[1]!
+    expect(resumed.body.messages.slice(1)).toMatchObject([
+      { role: 'user', content: '记住代号青禾' },
+      { role: 'assistant', content: '已记住青禾' },
+      { role: 'user', content: '刚才的代号是什么？' },
+    ])
+    resumed.delta({ content: '代号是青禾' })
+    resumed.finish()
+    await expect(list).toContainText('代号是青禾')
+    await expect.poll(() => observed.updates.at(-1)?.update.run?.status).toBe('completed')
+    expect(observed.updates.at(-1)?.sessionId).toBe(sessionId)
+  } finally {
+    await Promise.allSettled([stop(backend?.child), provider.close()])
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+test('Feature10 18/19/24/26：强制结束进程后只恢复已保存工具结果，接续时核对外部状态', async ({ page }) => {
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-feature10-crash-'))
+  const secret = join(temporary, 'browser-auth.json')
+  const release = join(temporary, 'release-crash-test')
+  const provider = await startModelServer()
+  let backend: Awaited<ReturnType<typeof startBackend>> | undefined
+  try {
+    await writeFile(join(temporary, 'note.txt'), '已记录的结果 A')
+    backend = await startBackend(secret, 0, provider.baseURL)
+    const observed = observe(page)
+    await authorize(page, backend.result.authUrl)
+    await addWorkspace(page)
+    await saveKey(page, 'controlled-feature10-key')
+    const editor = page.getByRole('textbox', { name: '消息', exact: true })
+    const send = page.getByRole('button', { name: '发送', exact: true })
+    await editor.fill('读取 A，然后执行 B')
+    await send.click()
+    await ready(page, observed, 0, false)
+    const { sessionId } = observed.snapshots.at(-1)!
+    await expect.poll(() => provider.exchanges.length).toBe(1)
+    const call = (index: number, id: string, name: string, args: object) => ({
+      index, id, type: 'function', function: { name, arguments: JSON.stringify(args) },
+    })
+    provider.exchanges[0]!.delta({ tool_calls: [call(0, 'A', 'read', { path: 'note.txt' })] })
+    provider.exchanges[0]!.finish('tool_calls')
+    await expect.poll(() => provider.exchanges.length).toBe(2)
+    const second = provider.exchanges[1]!
+    expect(second.body.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'A', content: '已记录的结果 A' })
+    second.delta({ tool_calls: [call(0, 'B', 'bash', {
+      command: "printf changed > effect.txt; while [ ! -e release-crash-test ]; do sleep 0.05; done",
+    })] })
+    second.finish('tool_calls')
+    await expect.poll(() => readFile(join(temporary, 'effect.txt'), 'utf8').catch(() => '')).toBe('changed')
+    await expect(startBackend(secret, 0, provider.baseURL)).rejects.toThrow('会话库已被占用')
+    await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
+
+    const port = Number(new URL(backend.result.url).port)
+    await stop(backend.child, 'SIGKILL')
+    expect(backend.child.signalCode).toBe('SIGKILL')
+    await writeFile(release, '')
+    backend = await startBackend(secret, port, provider.baseURL)
+    const before = observed.snapshots.length
+    await page.reload()
+    await ready(page, observed, before, false)
+    const restored = observed.snapshots.at(-1)!
+    expect(restored.sessionId).toBe(sessionId)
+    expect(restored.snapshot.running).toBeNull()
+    expect(restored.snapshot.runs).toMatchObject([{ status: 'interrupted' }])
+    expect(restored.snapshot.messages.filter(entry => entry.message.role === 'toolResult')).toMatchObject([{ message: { toolCallId: 'A' } }])
+    await expect(page.getByText('已中断', { exact: true })).toBeVisible()
+    const process = page.locator('.process-group')
+    await process.locator(':scope > summary').click()
+    await expect(process.locator('.tool-status')).toHaveText(['成功', '结果未知'])
+    expect(provider.exchanges).toHaveLength(2)
+
+    await editor.fill('请继续')
+    await send.click()
+    await expect.poll(() => provider.exchanges.length).toBe(3)
+    const resumed = provider.exchanges[2]!
+    expect(resumed.body.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: 'A', content: '已记录的结果 A' }))
+    expect(resumed.body.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: 'B',
+      content: expect.stringMatching(/结果未知.*外部状态可能已经改变.*先检查当前状态/) }))
+    resumed.delta({ content: '先核对文件当前内容' })
+    resumed.finish()
+    await expect(page.getByRole('region', { name: '消息列表' })).toContainText('先核对文件当前内容')
+    await expect.poll(() => observed.updates.at(-1)?.update.run?.status).toBe('completed')
+    const count = observed.snapshots.length
+    await page.reload()
+    await ready(page, observed, count, false)
+    expect(observed.snapshots.at(-1)?.snapshot.messages.filter(entry => entry.message.role === 'toolResult')).toHaveLength(1)
+    expect(provider.exchanges).toHaveLength(3)
+  } finally {
+    await writeFile(release, '')
     await Promise.allSettled([stop(backend?.child), provider.close()])
     await rm(temporary, { recursive: true, force: true })
   }

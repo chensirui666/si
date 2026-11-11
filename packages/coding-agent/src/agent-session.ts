@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto'
 import { Agent } from '@agent-learning/agent'
-import type { AgentRunInput } from '@agent-learning/agent'
+import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
 import { estimateContextTokens, findModel, stream } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelEvent, ModelInfo } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
+import { SessionWriteError, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
 import { buildSystemPrompt } from './system-prompt.js'
 import type { CodingTool } from './tools.js'
-import type { CompactionRecord, SubmissionAccepted, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, RunningState } from './types.js'
+import type { CompactionRecord, SubmissionAccepted, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure } from './types.js'
 
 export class SessionSubmitError extends Error {
   constructor(readonly code: 'invalid' | 'busy' | 'closed', message: string) { super(message) }
@@ -30,8 +31,12 @@ export class AgentSession {
   private projectContext?: { cwd: string; files: ProjectContextFile[] }
   private sample?: { modelId: string; config: string; messages: string[]; input: number; estimate: number }
   private gateSample?: typeof this.sample
+  private readonly storedRuns = new Map<string, StoredRun>()
+  private readonly savedMessages = new Set<string>()
+  private failure?: SaveFailure
 
   constructor(private readonly options: {
+    persistence?: SessionPersistence
     stream?: typeof stream
     tools?: (cwd: string) => CodingTool[]
     documentationRoot?: string
@@ -40,6 +45,18 @@ export class AgentSession {
     compaction?: { triggerTokens: number; keepRecentTokens: number }
   }) {
     this.agent = new Agent({ stream: options.stream })
+    const history = options.persistence?.history
+    if (history) {
+      this.state.messages = history.messages
+      this.state.compactions = history.compactions.map(record => record.status === 'running'
+        ? { ...record, status: 'interrupted', finishedAt: Date.now(), reason: '服务中断，压缩未完成。' } : record)
+      for (const entry of history.messages) this.savedMessages.add(entry.id)
+      for (const run of history.runs) this.storedRuns.set(run.clientMessageId, run)
+      this.state.seq = history.runs.at(-1)?.acceptedSeq ?? 0
+      if (history.runs.length) this.state.runs = history.runs.map(run => ({
+        ...this.publicRun(run), restored: true, status: run.status === 'running' ? 'interrupted' : run.status,
+      }))
+    }
     const budget = options.compaction
     if (budget && (!Number.isSafeInteger(budget.triggerTokens) || !Number.isSafeInteger(budget.keepRecentTokens)
       || budget.keepRecentTokens <= 0 || budget.triggerTokens <= budget.keepRecentTokens)) {
@@ -49,13 +66,17 @@ export class AgentSession {
 
   async submit(input: { clientMessageId: string; modelId: string; text: string }): Promise<SubmissionAccepted> {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
-    const cwd = await this.options.resolveDirectory()
-    if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
     const model = typeof input?.modelId === 'string' ? findModel(input.modelId) : undefined
     if (!model || typeof input.text !== 'string' || !input.text.trim()
       || typeof input.clientMessageId !== 'string' || !input.clientMessageId.trim() || input.clientMessageId.length > 128) {
       throw new SessionSubmitError('invalid', '请提交有效原文、支持的模型和临时编号')
     }
+    const previous = this.replay(input)
+    if (previous) return previous
+    const cwd = await this.options.resolveDirectory()
+    if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+    const concurrent = this.replay(input)
+    if (concurrent) return concurrent
     if (this.state.running) throw new SessionSubmitError('busy', '正在生成，请等待本次回答结束')
     this.model = model
     const tools = this.options.tools?.(cwd) ?? []
@@ -64,27 +85,80 @@ export class AgentSession {
       systemPrompt: buildSystemPrompt(cwd, tools, this.options.documentationRoot, this.projectContext?.cwd === cwd ? this.projectContext.files : []),
       ...(declarations.length ? { tools: declarations } : {}),
     }
-    const controller = this.controller = new AbortController()
+    const controller = new AbortController()
     if (input.text.trim() === '/compact') {
       const record = this.newCompaction('manual', input.clientMessageId)
       const running = { kind: 'compaction' as const, runId: record.id, phase: 'compaction' as const }
+      const run = this.saveStart(input, record.id, 'compaction', { compaction: record })
+      this.controller = controller
+      this.state.compactions.push(record)
       this.state.running = running
-      this.publish({ type: 'compaction', record, running })
+      this.publish({ type: 'compaction', record, running }, run && this.publicRun(run))
       const acceptedSeq = this.state.seq
       this.task = Promise.resolve().then(async () => {
-        try { await this.compact(model, 'manual', running, controller.signal, record) }
-        finally { this.finish(controller.signal) }
+        let status: RunRecord['status'] = 'failed'
+        try {
+          await this.compact(model, 'manual', running, controller.signal, record)
+          status = this.storedRuns.get(input.clientMessageId)?.status ?? 'completed'
+        } catch (error) {
+          if (!(error instanceof SessionWriteError)) throw error
+        } finally { this.finish(controller.signal, status) }
       })
       return { kind: 'compaction', clientMessageId: input.clientMessageId, compactionId: record.id, acceptedSeq }
     }
     const user = { id: randomUUID(), clientMessageId: input.clientMessageId, message: { role: 'user' as const, content: input.text, timestamp: Date.now() } }
     const running = { kind: 'task' as const, runId: user.id, assistantMessageId: randomUUID(), phase: 'model' as const, activeTools: [] }
+    const run = this.saveStart(input, user.id, 'task', { messages: [user] })
+    this.controller = controller
     this.state.messages.push(user)
     this.state.running = running
-    this.publish({ type: 'accepted', user, running })
+    this.publish({ type: 'accepted', user, running }, run && this.publicRun(run))
     const acceptedSeq = this.state.seq
     this.task = Promise.resolve().then(() => this.runTask(model, running, cwd, tools, controller.signal))
     return { kind: 'message', clientMessageId: input.clientMessageId, userMessageId: user.id, acceptedSeq }
+  }
+
+  private replay(input: { clientMessageId: string; text: string; modelId: string }) {
+    const previous = this.storedRuns.get(input.clientMessageId)
+    if (!previous) return
+    if (previous.text !== input.text || previous.modelId !== input.modelId) {
+      throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
+    }
+    return submissionReceipt(previous)
+  }
+
+  private publicRun({ text: _text, acceptedSeq: _acceptedSeq, ...run }: StoredRun): RunRecord {
+    return run
+  }
+
+  private saveStart(input: { clientMessageId: string; text: string; modelId: string }, id: string, kind: RunRecord['kind'],
+    data: { messages?: ConversationMessage[]; compaction?: CompactionRecord }) {
+    const storage = this.options.persistence
+    if (!storage) return
+    const run: StoredRun = {
+      ...input, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
+    }
+    this.save({ ...data, run, summary: this.storedRuns.size === 0 ? storage.first?.() : undefined })
+    return run
+  }
+
+  private save(data: Parameters<SessionPersistence['store']['save']>[1]) {
+    const storage = this.options.persistence
+    if (!storage) return
+    storage.store.save(storage.summary.id, { runId: data.run?.id ?? this.state.running?.runId, ...data })
+    if (data.run) this.storedRuns.set(data.run.clientMessageId, data.run)
+    for (const message of data.messages ?? []) this.savedMessages.add(message.id)
+  }
+
+  private noteFailure(error: unknown, stage: SaveFailure['stage'], toolCall?: SaveFailure['toolCall']) {
+    if (!(error instanceof SessionWriteError)) throw error
+    const runId = this.state.running!.runId
+    this.failure ??= { runId, stage, reason: error.reason, ...(toolCall && { toolCall }) }
+    this.sample = this.gateSample = undefined
+  }
+
+  private historyMessages() {
+    return this.options.persistence ? this.state.messages.filter(entry => this.savedMessages.has(entry.id)) : this.state.messages
   }
 
   private latestCompaction() {
@@ -92,7 +166,7 @@ export class AgentSession {
   }
 
   private context(): ModelContext {
-    return { ...this.configuration, messages: buildModelHistory(this.state.messages, this.latestCompaction()) }
+    return { ...this.configuration, messages: buildModelHistory(this.historyMessages(), this.latestCompaction(), !!this.options.persistence) }
   }
 
   private estimate(context: ModelContext) {
@@ -124,7 +198,6 @@ export class AgentSession {
 
   private newCompaction(trigger: CompactionRecord['trigger'], clientMessageId?: string): CompactionRecord {
     const record: CompactionRecord = { id: randomUUID(), trigger, status: 'running', startedAt: Date.now(), ...(clientMessageId && { clientMessageId }) }
-    this.state.compactions.push(record)
     return record
   }
 
@@ -132,12 +205,17 @@ export class AgentSession {
     const record = initial ?? this.newCompaction(trigger)
     const working: NonNullable<RunningState> = { ...running, phase: 'compaction' }
     this.state.running = working
-    if (!initial) this.publish({ type: 'compaction', record, running: working })
+    if (!initial) {
+      try { this.save({ compaction: record }) }
+      catch (error) { this.noteFailure(error, 'compaction'); throw error }
+      this.state.compactions.push(record)
+      this.publish({ type: 'compaction', record, running: working })
+    }
     let final: CompactionRecord
     let summaryUsage: AssistantMessage['usage']
     try {
       signal.throwIfAborted()
-      const preparation = prepareCompaction(this.state.messages, this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000, Boolean(this.configuration.tools?.length))
+      const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000, Boolean(this.configuration.tools?.length), !!this.options.persistence)
       if (preparation.status === 'skipped') {
         final = { ...record, status: 'skipped', finishedAt: Date.now(), reason: preparation.reason === 'already_compacted' ? '刚压缩完成，尚无新内容。' : '没有可压缩的较早内容。' }
       } else {
@@ -161,13 +239,12 @@ export class AgentSession {
           ...(summaryUsage && { summaryUsage }),
           ...(preparation.fileOperations && { fileOperations: preparation.fileOperations }),
         }
-        const next = { ...this.configuration, messages: buildModelHistory(this.state.messages, candidate) }
+        const next = { ...this.configuration, messages: buildModelHistory(this.historyMessages(), candidate, !!this.options.persistence) }
         candidate.estimatedAfter = this.estimate(next)
         if (candidate.estimatedAfter >= candidate.estimatedBefore) throw new Error('摘要未有效缩短输入，保留原上下文。')
         if (candidate.estimatedAfter + model.maxTokens > model.contextWindow) throw new Error('压缩后仍预计超出模型容量，保留原上下文。')
         signal.throwIfAborted()
         final = candidate
-        this.gateSample = undefined
       }
     } catch (error) {
       final = { ...record, status: signal.aborted ? 'aborted' : 'failed', finishedAt: Date.now(),
@@ -175,22 +252,77 @@ export class AgentSession {
         ...(summaryUsage && { summaryUsage }),
       }
     }
-    this.state.compactions[this.state.compactions.findIndex(item => item.id === record.id)] = final
-    this.publish({ type: 'compaction', record: final, running: working })
+    const index = this.state.compactions.findIndex(item => item.id === record.id)
+    const manualRun = record.clientMessageId ? this.storedRuns.get(record.clientMessageId) : undefined
+    const status = final.status === 'success' || final.status === 'skipped' ? 'completed' : final.status === 'aborted' ? 'aborted' : 'failed'
+    const run = manualRun && this.endedRun(manualRun, status)
+    try { this.save({ compaction: final, run }) }
+    catch (error) {
+      this.noteFailure(error, 'compaction')
+      const failed: CompactionRecord = { ...record, status: 'failed', finishedAt: Date.now(), reason: '压缩记录未保存，保留上一次有效上下文。' }
+      this.state.compactions[index] = failed
+      this.publish({ type: 'compaction', record: failed, running: working })
+      throw error
+    }
+    if (final.status === 'success') this.gateSample = undefined
+    this.state.compactions[index] = final
+    this.publish({ type: 'compaction', record: final, running: working }, run && this.publicRun(run))
     return final.status === 'success'
   }
 
-  private finish(signal: AbortSignal) {
-    if (this.controller?.signal !== signal) return
-    this.controller = undefined
-    this.task = undefined
-    this.updateTask(null)
+  private endedRun(run: StoredRun, status: RunRecord['status']): StoredRun {
+    return { ...run, status, finishedAt: Date.now() }
   }
 
-  private publish(change: ConversationUpdate['change']) {
+  private finish(signal: AbortSignal, status: RunRecord['status'], entry?: ConversationMessage,
+    compaction?: Extract<CompactionRecord, { status: 'success' }>) {
+    if (this.controller?.signal !== signal) return
+    const current = this.state.runs?.find(run => run.id === this.state.running?.runId)
+    const stored = current && this.storedRuns.get(current.clientMessageId)
+    let run = stored
+    if (stored?.status === 'running') {
+      run = this.endedRun(stored, this.failure ? 'failed' : status)
+      const followup = entry && this.followup(compaction, entry)
+      const data = { run, messages: entry && [entry], compaction: followup }
+      const plainAnswer = entry?.message.role === 'assistant' && ['stop', 'length'].includes(entry.message.stopReason)
+        && entry.message.content.some(block => block.type === 'text' && block.text.length > 0)
+      try {
+        try { this.save(data) }
+        catch (error) {
+          if (!plainAnswer || !(error instanceof SessionWriteError) || error.reason === 'unconfirmed') throw error
+          this.save(data)
+        }
+        if (followup) this.applyFollowup(followup)
+      } catch (error) {
+        this.noteFailure(error, plainAnswer ? 'answer' : 'finish')
+        run = this.endedRun(stored, 'failed')
+      }
+    }
+    this.controller = undefined
+    this.task = undefined
+    this.state.running = null
+    this.publish({ type: 'task', running: null }, run && this.publicRun(run), this.failure)
+    this.failure = undefined
+  }
+
+  private followup(compaction: Extract<CompactionRecord, { status: 'success' }> | undefined, entry: ConversationMessage) {
+    return compaction && compaction.followupMessageId === undefined
+      && entry.message.role === 'assistant' && entry.message.usage?.input !== undefined
+      ? { ...compaction, followupMessageId: entry.id } : undefined
+  }
+
+  private applyFollowup(compaction: Extract<CompactionRecord, { status: 'success' }>) {
+    const index = this.state.compactions.findIndex(record => record.id === compaction.id)
+    this.state.compactions[index] = compaction
+    this.publish({ type: 'compaction', record: compaction, running: this.state.running })
+  }
+
+  private publish(change: ConversationUpdate['change'], run?: RunRecord, saveFailure?: SaveFailure) {
+    if (run) this.state.runs = [...(this.state.runs ?? []).filter(item => item.id !== run.id), run]
+    if (saveFailure) this.state.saveFailures = [...this.state.saveFailures ?? [], saveFailure]
     const refresh = change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error'
     if (refresh) this.refreshUsage()
-    const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
+    const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(run && { run }), ...(saveFailure && { saveFailure }), ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
     for (const listener of this.listeners) listener(structuredClone(update))
   }
 
@@ -207,6 +339,9 @@ export class AgentSession {
     let attemptedInput: string | undefined
     let usedCompaction: ReturnType<typeof this.latestCompaction>
     let activeTools: typeof running.activeTools = []
+    let terminalEntry: ConversationMessage | undefined
+    let savedToolResult: ConversationMessage | undefined
+    let status: RunRecord['status'] = 'failed'
 
     const modelPhase = () => this.updateTask({ ...running, assistantMessageId: messageId, phase: 'model', activeTools: [] })
     const currentTask = () => ({ ...running, assistantMessageId: messageId, phase: 'tools' as const, activeTools })
@@ -270,9 +405,12 @@ export class AgentSession {
           }
         }
         this.publish({ type: 'model', messageId, event: frame })
-        if (usedCompaction && usedCompaction.followupMessageId === undefined && terminal?.usage?.input !== undefined) {
-          usedCompaction.followupMessageId = messageId
-          this.publish({ type: 'compaction', record: usedCompaction, running: this.state.running })
+        if (terminal) {
+          terminalEntry = { id: messageId, message: terminal }
+          if (!this.options.persistence) {
+            const followup = this.followup(usedCompaction, terminalEntry)
+            if (followup) this.applyFollowup(followup)
+          }
         }
         if (frame.type === 'done') {
           recovered = false
@@ -291,35 +429,70 @@ export class AgentSession {
       activeTools = activeTools.filter(item => item.contentIndex !== event.contentIndex)
       const assistantIndex = this.state.messages.findIndex(entry => entry.id === messageId)
       const preceding = this.state.messages.filter(entry => entry.toolCall?.assistantMessageId === messageId && entry.toolCall.contentIndex < event.contentIndex).length
-      const fileOperation = event.details.find(isFileOperation)
-      this.updateTask(currentTask(), {
-        id: randomUUID(), toolCall, message: event.result,
-        ...(event.errorCode === 'interrupted' && { toolErrorCode: event.errorCode }),
-        ...(fileOperation && { fileOperation }),
-      }, assistantIndex + 1 + preceding)
+      this.updateTask(currentTask(), savedToolResult ?? this.toolResult(messageId, event), assistantIndex + 1 + preceding)
+      savedToolResult = undefined
     })
 
+    const saveReply = (entry: ConversationMessage) => {
+      const followup = this.followup(usedCompaction, entry)
+      this.save({ messages: [entry], compaction: followup })
+      if (followup) this.applyFollowup(followup)
+      terminalEntry = undefined
+    }
+    const saveToolCheckpoint: AgentRunInput['saveToolCheckpoint'] = checkpoint => {
+      if (checkpoint.type === 'assistant') {
+        try { saveReply({ id: messageId, message: checkpoint.message }) }
+        catch (error) { this.noteFailure(error, 'tool-call'); throw error }
+      } else {
+        const result = this.toolResult(messageId, checkpoint)
+        try { this.save({ messages: [result] }) }
+        catch (error) { this.noteFailure(error, 'tool-result', checkpoint.executed ? result.toolCall : undefined); throw error }
+        savedToolResult = result
+      }
+    }
     try {
-      const options = { model, tools, signal, prepareContext }
+      const options = { model, tools, signal, prepareContext, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined }
       let result = await this.agent.run({ ...options, context: this.context() })
       while (result.type === 'response' && result.message.stopReason === 'error' && result.message.errorCode === 'context_overflow'
         && !recovered && !signal.aborted) {
         recovered = true
-        if (!await this.compact(model, 'overflow', { ...running, assistantMessageId: messageId }, signal)) return
+        if (this.options.persistence && terminalEntry) {
+          try { saveReply(terminalEntry) }
+          catch (error) { this.noteFailure(error, 'finish'); throw error }
+        }
+        if (!await this.compact(model, 'overflow', { ...running, assistantMessageId: messageId }, signal)) {
+          if (signal.aborted) status = 'aborted'
+          return
+        }
         signal.throwIfAborted()
         advanceRound = true
         result = await this.agent.continue({ ...options, context: this.context() })
       }
+      if (this.failure) { terminalEntry = undefined; return }
       if (result.type === 'failure') {
-        this.fail(model, result.afterReply ? randomUUID() : messageId, result.message, result.reason === 'aborted')
+        status = result.reason === 'aborted' ? 'aborted' : 'failed'
+        terminalEntry = this.fail(model, result.afterReply ? randomUUID() : messageId, result.message, status === 'aborted')
+      } else {
+        status = result.message.stopReason === 'aborted' ? 'aborted' : result.message.stopReason === 'error' ? 'failed' : 'completed'
       }
     } catch {
+      if (this.failure) { terminalEntry = undefined; return }
       const current = this.state.messages.find(entry => entry.id === messageId)?.message
       if (current?.role === 'assistant' && current.stopReason !== 'pending') messageId = randomUUID()
-      this.fail(model, messageId, signal.aborted ? '本次生成已取消' : '模型调用意外中断，请重新发送', signal.aborted)
+      status = signal.aborted ? 'aborted' : 'failed'
+      terminalEntry = this.fail(model, messageId, signal.aborted ? '本次生成已取消' : '模型调用意外中断，请重新发送', signal.aborted)
     } finally {
       unsubscribe()
-      this.finish(signal)
+      this.finish(signal, status, terminalEntry, usedCompaction)
+    }
+  }
+
+  private toolResult(messageId: string, event: Extract<AgentEvent, { type: 'tool_result' }>): ConversationMessage {
+    const fileOperation = event.details.find(isFileOperation)
+    return {
+      id: randomUUID(), toolCall: { assistantMessageId: messageId, contentIndex: event.contentIndex }, message: event.result,
+      ...(event.errorCode === 'interrupted' && { toolErrorCode: event.errorCode }),
+      ...(fileOperation && { fileOperation }),
     }
   }
 
@@ -335,6 +508,7 @@ export class AgentSession {
     const event: ModelFrame = { type: 'error', reason, error }
     this.apply(messageId, event)
     this.publish({ type: 'model', messageId, event })
+    return { id: messageId, message: error }
   }
 
   private frame(event: ModelEvent): ModelFrame {

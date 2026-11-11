@@ -65,7 +65,7 @@ function requireSuccess(snapshot: ConversationSnapshot, id: string): Success {
   return record
 }
 
-test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测输入下降并继续真实文件任务', async ({ page, context }, testInfo) => {
+test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继续真实文件任务', async ({ page, context }, testInfo) => {
   test.setTimeout(1_200_000)
   const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
   test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE；不读取未指定的真实凭据')
@@ -75,8 +75,8 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
   const model = findModel('deepseek-flash')!
   const budget = { triggerTokens: 20_000, keepRecentTokens: 400 }
   const requests: WireRequest[] = []
-  const server = new WebServer({
-    port: 0, directoryPicker: async () => cwd, compaction: budget,
+  const createServer = (port = 0) => new WebServer({
+    port, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, compaction: budget,
     globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
@@ -85,6 +85,7 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
       return globalThis.fetch(url, init)
     } },
   })
+  let server = createServer()
   const evidence: { recordId: string; trigger: string; actualBefore: number; actualAfter: number; summaryInput: number; summaryOutput?: number }[] = []
   try {
     await mkdir(cwd)
@@ -99,8 +100,10 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
       writeFile(join(cwd, 'progress.txt'), `批次编号：${batchId}\n以下为无业务意义的运行日志，不需要记住：\n${randomBytes(4000).toString('hex')}\n末尾状态：已准备。`),
     ])
     const observed = observe(page)
-    await authorize(page, (await server.start()).authUrl)
-    await seedSession(page, observed, await addWorkspace(page))
+    const firstBoot = await server.start()
+    await authorize(page, firstBoot.authUrl)
+    const workspaceId = await addWorkspace(page)
+    const a = await seedSession(page, observed, workspaceId)
     await saveKey(page, key)
 
     const first = await submit(page, observed, `我们要继续同一项交付任务。两项必须一直记住的早期事实：交付编号是 ${deliveryId}，发布地区是${region}。约束：仅操作当前临时工作区；禁止在其他目录写文件。最终待完成产物是 output.json，键为 deliveryId、region、project、owner、batch；在我明确要求生成产物前不要写文件。初始输出格式约定为 Markdown，稍后可能更正。现在先用 read 读取 index.txt，根据线索继续 read 找出项目名称。读完仅回答“线索已确认”，不要复述两项早期事实。以下是没有业务意义且不需要记住的旧日志：\n${randomBytes(9000).toString('hex')}`)
@@ -192,7 +195,41 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
     expect(prior?.id).toBe(firstRecord.id)
     await compare(secondSnapshot, secondRecord, prior)
 
+    const b = await seedSession(page, observed, workspaceId)
+    const otherCode = `OTHER-${randomUUID().slice(0, 8)}`
+    await writeFile(join(cwd, 'other.txt'), otherCode)
+    await submit(page, observed, '这是另一段会话。请用 read 读取 other.txt，记住独立代号，读完只回复“收到”。')
+    const otherSnapshot = await refresh(page, observed)
+    expect(otherSnapshot.compactions).toEqual([])
+    expect(otherSnapshot.messages).toContainEqual(expect.objectContaining({
+      message: expect.objectContaining({ role: 'toolResult', toolName: 'read', isError: false, content: [{ type: 'text', text: otherCode }] }),
+    }))
+    expect(JSON.stringify(otherSnapshot.messages)).not.toContain(deliveryId)
+
+    const requestsBeforeRestart = requests.length
+    await server.close()
+    server = createServer(Number(new URL(firstBoot.url).port))
+    const restarted = await server.start()
+    const beforeRestore = observed.snapshots.length
+    await authorize(page, restarted.authUrl)
+    await ready(page, observed, beforeRestore, false)
+    const restoredB = observed.snapshots.at(-1)!
+    expect(restoredB.sessionId).toBe(b)
+    expect(restoredB.snapshot.messages).toEqual(otherSnapshot.messages)
+    expect(restoredB.snapshot.compactions).toEqual([])
+    const restoredA = await openSession(page, observed, '会话 1')
+    expect(restoredA.sessionId).toBe(a)
+    expect(restoredA.snapshot.messages).toEqual(secondSnapshot.messages)
+    expect(restoredA.snapshot.compactions).toEqual(secondSnapshot.compactions)
+    expect(requests).toHaveLength(requestsBeforeRestart)
+
     const recalled = await submit(page, observed, '不要使用工具。请根据已经记住的信息回答最早的交付编号、目前负责人、已更正的项目名和最终输出格式、工具读到的批次编号。简短回答，不要重新读文件。')
+    const resumedInput = requests[requestsBeforeRestart]!.messages
+    expect(resumedInput[1]?.content).toContain(secondRecord.summary)
+    const recentUser = recent.find(message => message.role === 'user')
+    expect(recentUser).toBeDefined()
+    expect(resumedInput).toContainEqual(expect.objectContaining({ role: 'user', content: recentUser?.content }))
+    expect(JSON.stringify(resumedInput)).not.toContain(otherCode)
     const answer = textOf(recalled.message!)
     for (const fact of [deliveryId, '柳青', '白榆', 'JSON', batchId]) expect(answer).toContain(fact)
     const finished = await submit(page, observed, '现在继续最早未完成的交付任务。请使用 write 在当前工作区创建 output.json，内容必须是合法 JSON 对象，键严格为 deliveryId、region、project、owner、batch，值取已经记住的早期事实、最新更正和真实工具结果。不要重新读文件，不要在其他目录写入。收到真实写入成功结果后，只回答“交付已完成”。')
@@ -232,7 +269,7 @@ test('Feature7 live case68: 同网页会话手动和自动压缩两次，实测�
       model: { id: model.id, contextWindow: model.contextWindow, maxTokens: model.maxTokens }, testBudget: budget,
       comparisons: evidence, successfulCompactions: finalSnapshot.compactions.filter(record => record.status === 'success').length,
       actualReadResults: reads.length, actualWriteResults: 1, actualTools: toolResults.map(result => result.toolName), finalFileVerified: true, systemAndToolsUnchanged: true,
-      comparisonRepliesExcludedFromHistory: true,
+      comparisonRepliesExcludedFromHistory: true, restoredSessions: [a, b], restartModelRequests: 0, resumedUsingLatestSummary: true,
     }
     const evidencePath = testInfo.outputPath('feature7-live-evidence.json')
     await writeFile(evidencePath, JSON.stringify(report, null, 2))
@@ -261,7 +298,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
   const contentA = '项目名称：青禾', contentB = '项目名称：白榆'
   const requests: WireRequest[] = []
   const server = new WebServer({
-    port: 0, directoryPicker: async () => cwd, compaction: { triggerTokens: 20_000, keepRecentTokens: 400 },
+    port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, compaction: { triggerTokens: 20_000, keepRecentTokens: 400 },
     globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
