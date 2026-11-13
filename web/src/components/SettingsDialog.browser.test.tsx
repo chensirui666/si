@@ -112,3 +112,38 @@ test('切换英文后，已有错误摘要更新并保留诊断原文', async ({
   await page.keyboard.press('Escape')
   await expect(page.getByRole('alert')).toHaveText('Could not load the chat · Provider quota exceeded')
 })
+
+test('默认权限保存失败后，显示重读确认的原值', async ({ mount, page }) => {
+  await page.route('**/api/settings/permission', route => route.request().method() === 'PUT'
+    ? route.fulfill({ status: 500, json: { error: '写入失败' } })
+    : route.fulfill({ json: { defaultPermissionMode: 'normal' } }))
+  await mount(<ChatPageHarness />)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  const dialog = page.getByRole('dialog')
+  const mode = dialog.getByRole('combobox', { name: '权限', exact: true })
+  await expect(mode).toHaveText('普通', { timeout: 2000 })
+  await mode.click()
+  await page.getByRole('option', { name: '只读', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('写入失败')
+  await expect(mode).toHaveText('普通')
+})
+
+test('默认权限保存回执断开后，按重读结果显示已保存的值', async ({ mount, page }) => {
+  let mode = 'normal'
+  await page.route('**/api/settings/permission', route => {
+    if (route.request().method() === 'PUT') {
+      mode = route.request().postDataJSON().defaultPermissionMode
+      return route.abort()
+    }
+    return route.fulfill({ json: { defaultPermissionMode: mode } })
+  })
+  await mount(<ChatPageHarness />)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  const dialog = page.getByRole('dialog')
+  const permission = dialog.getByRole('combobox', { name: '权限', exact: true })
+  await expect(permission).toHaveText('普通')
+  await permission.click()
+  await page.getByRole('option', { name: '只读', exact: true }).click()
+  await expect(permission).toHaveText('只读')
+  await expect(dialog.getByRole('alert')).toHaveCount(0)
+})

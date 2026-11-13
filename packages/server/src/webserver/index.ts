@@ -7,8 +7,8 @@ import { extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
-  AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools,
-  type ConversationMessage, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
+  AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, isPermissionMode,
+  type ConversationMessage, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, defaultSelection, discoverModels, isModelProvider, type AssistantMessage, type ModelSelection, type ToolCall } from '@agent-learning/model'
@@ -18,11 +18,11 @@ import { WebSettings } from '../web-settings.js'
 import { isSettingsObject, readSettingsFile, updateSettingsFile } from '../settings-file.js'
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
-import type { ClientFrame, LanguageSettings, ServerFrame, StartSessionAccepted, StartSessionRequest } from './protocol.js'
+import type { ClientFrame, LanguageSettings, PermissionSettings, SessionPermission, ServerFrame, StartSessionAccepted, StartSessionRequest } from './protocol.js'
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
-} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'selectModel'>>
+} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'selectModel' | 'selectPermissionMode'>>
 
 type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
 
@@ -75,7 +75,7 @@ export type WebServerOptions = {
   globalContextDirectory?: string
   directoryPicker?: DirectoryPicker
   webProviders?: WebProvider[]
-  createSession?: (resolveDirectory: () => Promise<string>, persistence?: SessionPersistence) => SessionTarget
+  createSession?: (resolveDirectory: () => Promise<string>, persistence?: SessionPersistence, permissionMode?: PermissionMode) => SessionTarget
   modelOptions?: Parameters<typeof createModelStream>[1]
   compaction?: { triggerTokens: number; keepRecentTokens: number }
   now?: () => number
@@ -113,7 +113,8 @@ async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspa
   const value = await readJson(req)
   const targetLabel = target === 'sessionId' ? '会话' : '工作区'
   const targetId = value && typeof value === 'object' ? (value as Record<string, unknown>)[target] : undefined
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => ![target, 'text', 'modelId', 'provider', 'reasoningEffort', 'clientMessageId'].includes(key))
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => ![target, 'text', 'modelId', 'provider', 'reasoningEffort', 'clientMessageId'].includes(key)
+    && !(target === 'workspaceId' && key === 'permissionMode'))
     || !validId(targetId)
     || !('text' in value) || typeof value.text !== 'string' || !value.text.trim()
     || !('modelId' in value) || !validId(value.modelId)
@@ -122,7 +123,9 @@ async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspa
     || !('clientMessageId' in value) || !validId(value.clientMessageId)) {
     throw new InputError(400, `请提交原文、模型、有效临时编号和${targetLabel}编号`)
   }
-  return { targetId, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text,
+  const permissionMode = 'permissionMode' in value ? value.permissionMode : undefined
+  if (permissionMode !== undefined && !isPermissionMode(permissionMode)) throw new InputError(400, '权限模式无效')
+  return { targetId, permissionMode, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text,
     ...('provider' in value && { provider: value.provider as string }),
     ...('reasoningEffort' in value && { reasoningEffort: value.reasoningEffort as ModelSelection['reasoningEffort'] }), } }
 }
@@ -160,8 +163,9 @@ export class WebServer {
     return new Sessions<SessionTarget>({
       resolveDirectory: id => this.workspaces.resolveDirectory(id),
       store: this.store,
-      createSession: this.options.createSession ?? ((resolveDirectory, persistence) => new AgentSession({
-        resolveDirectory, persistence, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+      getDefaultPermissionMode: () => this.readDefaultPermissionMode(),
+      createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode) => new AgentSession({
+        resolveDirectory, persistence, permissionMode, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
       })),
@@ -304,17 +308,39 @@ export class WebServer {
     }
     if (url.pathname === '/api/sessions/start' && req.method === 'POST') {
       try {
-        const { targetId: workspaceId, message } = await messageInput(req, 'workspaceId')
-        const input: StartSessionRequest = { workspaceId, ...message }
+        const { targetId: workspaceId, message, permissionMode } = await messageInput(req, 'workspaceId')
+        const input: StartSessionRequest = { workspaceId, ...message, ...(permissionMode !== undefined && { permissionMode }) }
         if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.clientMessageId)) {
           throw new InputError(400, '首次发送需要有效的 UUID 临时编号')
         }
-        const { session, accepted } = await this.sessions.start(input, target => this.submit(target, message))
+        const { session, accepted } = await this.sessions.start(input, target => this.submit(target, { ...message, ...(permissionMode !== undefined && { permissionMode }) }))
         const response: StartSessionAccepted = { session, accepted: { ...accepted, sessionId: session.id } }
         this.json(res, 202, response)
       } catch (error) {
         this.sessionError(res, error, '暂时无法发送首条消息')
       }
+      return
+    }
+    const permissionSession = /^\/api\/sessions\/([^/]+)\/permission$/.exec(url.pathname)?.[1]
+    if (permissionSession && req.method === 'PUT') {
+      try {
+        let id: string
+        try { id = decodeURIComponent(permissionSession) }
+        catch { throw new InputError(400, '会话编号无效') }
+        if (!validId(id)) throw new InputError(400, '会话编号无效')
+        const value = await readJson(req)
+        if (!isSettingsObject(value) || Object.keys(value).length !== 1 || !isPermissionMode(value.permissionMode)) {
+          throw new InputError(400, '权限模式无效')
+        }
+        const session = this.target(id)
+        if (!session.selectPermissionMode) throw new InputError(503, '当前会话无法切换权限')
+        session.selectPermissionMode(value.permissionMode)
+        this.json(res, 200, { permissionMode: value.permissionMode } satisfies SessionPermission)
+      } catch (error) { this.sessionError(res, error, '无法保存会话权限') }
+      return
+    }
+    if (url.pathname === '/api/settings/permission' && (req.method === 'GET' || req.method === 'PUT')) {
+      await this.handlePermissionSettings(req, res)
       return
     }
     if (url.pathname === '/api/settings/language' && (req.method === 'GET' || req.method === 'PUT')) {
@@ -455,6 +481,29 @@ export class WebServer {
       res.off('close', disconnect)
       this.selection = undefined
     }
+  }
+
+  private async readDefaultPermissionMode(): Promise<PermissionMode> {
+    const { defaultPermissionMode = 'normal' } = await readSettingsFile(this.options.webSettingsPath)
+    if (!isPermissionMode(defaultPermissionMode)) throw new Error('默认权限设置无效')
+    return defaultPermissionMode
+  }
+
+  private async handlePermissionSettings(req: IncomingMessage, res: ServerResponse) {
+    try {
+      if (req.method === 'GET') {
+        this.json(res, 200, { defaultPermissionMode: await this.readDefaultPermissionMode() } satisfies PermissionSettings)
+        return
+      }
+      const value = await readJson(req)
+      if (!isSettingsObject(value) || Object.keys(value).length !== 1 || !isPermissionMode(value.defaultPermissionMode)) {
+        throw new InputError(400, '默认权限模式无效')
+      }
+      const { defaultPermissionMode } = value
+      await updateSettingsFile(this.options.webSettingsPath, file => { file.defaultPermissionMode = defaultPermissionMode })
+      this.json(res, 200, { defaultPermissionMode } satisfies PermissionSettings)
+      this.notify('permission_settings_changed')
+    } catch (error) { this.sessionError(res, error, '无法读取或保存默认权限，请检查本机设置文件。') }
   }
 
   private async handleLanguageSettings(req: IncomingMessage, res: ServerResponse) {

@@ -2,6 +2,7 @@ import { sameSelection, type ModelSelection } from '@agent-learning/model'
 import { randomUUID } from 'node:crypto'
 import { SessionSubmitError, type AgentSession } from './agent-session.js'
 import { runSelection, submissionReceipt, type SessionPersistence, type SessionStore } from './session-store.js'
+import type { PermissionMode } from './permissions.js'
 import type { SubmissionAccepted } from './types.js'
 
 export type SessionSummary = {
@@ -22,7 +23,8 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
 
   constructor(private readonly options: {
     resolveDirectory(workspaceId: string): Promise<string>
-    createSession(resolveDirectory: () => Promise<string>, persistence?: SessionPersistence): T
+    createSession(resolveDirectory: () => Promise<string>, persistence?: SessionPersistence, permissionMode?: PermissionMode): T
+    getDefaultPermissionMode?(): Promise<PermissionMode>
     store?: SessionStore
     closeTools?(): Promise<void>
     onStarted?(): void
@@ -41,13 +43,14 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
 
   async create(workspaceId: string): Promise<SessionSummary> {
     const resolveDirectory = await this.validateWorkspace(workspaceId)
+    const permissionMode = await this.options.getDefaultPermissionMode?.() ?? 'normal'
     this.ensureOpen()
     let id: string
     do { id = randomUUID() } while (this.sessions.has(id) || this.starts.has(id))
     const summary = this.newSummary(id, workspaceId)
     const store = this.options.store
-    const session = this.options.createSession(resolveDirectory, store && { summary, store })
-    store?.save(id, { summary })
+    const session = this.options.createSession(resolveDirectory, store && { summary, store }, permissionMode)
+    store?.save(id, { summary, permissionMode })
     this.sessions.set(id, { summary, session })
     return summary
   }
@@ -57,7 +60,7 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     const id = input.clientMessageId
     const previous = this.starts.get(id)
     if (previous) {
-      if (previous.input.workspaceId !== input.workspaceId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text) {
+      if (previous.input.workspaceId !== input.workspaceId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text || previous.input.permissionMode !== input.permissionMode) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
       return previous.result
@@ -66,7 +69,7 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     if (history) {
       const run = history.runs[0]
       if (run?.kind !== 'task' || run.clientMessageId !== id || history.summary.workspaceId !== input.workspaceId
-        || run.text !== input.text || !sameSelection(runSelection(run), runSelection(input))) {
+        || run.text !== input.text || run.firstPermissionMode !== input.permissionMode || !sameSelection(runSelection(run), runSelection(input))) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
       return { session: history.summary, accepted: submissionReceipt(run) }
@@ -82,12 +85,13 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
 
   private async acceptFirst(input: FirstMessage, submit: (session: T) => Promise<SubmissionAccepted>): Promise<StartedSession> {
     const resolveDirectory = await this.validateWorkspace(input.workspaceId)
+    const permissionMode = input.permissionMode ?? await this.options.getDefaultPermissionMode?.() ?? 'normal'
     this.ensureOpen()
     const summary = this.newSummary(input.clientMessageId, input.workspaceId)
     const store = this.options.store
     const session = this.options.createSession(resolveDirectory, store && {
       summary, store, first: () => Object.assign(summary, this.newSummary(summary.id, summary.workspaceId)),
-    })
+    }, permissionMode)
     let closing: Promise<void> | undefined
     const close = () => closing ??= Promise.resolve().then(() => session.close?.())
     this.provisional.add(close)

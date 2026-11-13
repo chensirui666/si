@@ -28,7 +28,7 @@ describe('AgentSession 初始订阅', () => {
       done: false,
       value: {
         type: 'snapshot',
-        snapshot: { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
+        snapshot: { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
       },
     })
 
@@ -56,7 +56,7 @@ describe('AgentSession 初始订阅', () => {
     const second = agent.subscribe(controller.signal)[Symbol.asyncIterator]()
     expect((await second.next()).value).toEqual({
       type: 'snapshot',
-      snapshot: { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
+      snapshot: { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
     })
     controller.abort()
   })
@@ -178,7 +178,7 @@ describe('AgentSession 提交与运行', () => {
   it.each([{ ...input, text: ' \n ' }, { ...input, modelId: 'unknown' }, { ...input, clientMessageId: '' }])('无效提交不改变正式状态', async value => {
     const agent = createSession({ stream: () => { throw new Error('must not call') } })
     await expect(agent.submit(value)).rejects.toMatchObject({ code: 'invalid' })
-    expect(await snapshot(agent)).toEqual({ seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null })
+    expect(await snapshot(agent)).toEqual({ seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null })
   })
 
   it('事件独立累积，不读取已领先的 shared partial；切点后更新连续且副本独立', async () => {

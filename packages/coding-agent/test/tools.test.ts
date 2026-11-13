@@ -4,7 +4,7 @@ import { Check } from 'typebox/value'
 it('提供八种具备用途说明的工具声明', async () => {
   const { defaultTools } = await import('../src/tools.js')
 
-  expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write', 'find', 'grep', 'web_search', 'web_fetch'])
+  expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write', 'find', 'grep', 'ls', 'web_search', 'web_fetch'])
   for (const tool of defaultTools) {
     expect(tool.description.trim()).not.toBe('')
     expect(tool.parameters).toHaveProperty('type', 'object')

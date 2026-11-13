@@ -3,14 +3,16 @@ import { closeSync, mkdirSync, openSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import type { SessionSummary } from './sessions.js'
+import { isPermissionMode, type PermissionMode } from './permissions.js'
 import type { CompactionRecord, ConversationMessage, RunRecord, SubmissionAccepted } from './types.js'
 
-export type StoredRun = Omit<RunRecord, 'restored'> & { text: string; acceptedSeq: number }
+export type StoredRun = Omit<RunRecord, 'restored'> & { text: string; acceptedSeq: number; firstPermissionMode?: PermissionMode }
 export type SessionHistory = {
   summary: SessionSummary
   runs: StoredRun[]
   messages: ConversationMessage[]
   compactions: CompactionRecord[]
+  permissionMode: PermissionMode
   modelSelection?: ModelSelection
 }
 export type SessionPersistence = {
@@ -26,6 +28,7 @@ type SessionWrite = {
   messages?: ConversationMessage[]
   compaction?: CompactionRecord
   modelSelection?: ModelSelection
+  permissionMode?: PermissionMode
   defaultSelection?: ModelSelection
 }
 type Row = Record<string, SQLOutputValue>
@@ -43,6 +46,9 @@ const schema = `
   CREATE TABLE IF NOT EXISTS model_selections (
     scope TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id), data TEXT NOT NULL CHECK(json_valid(data)),
     CHECK(scope = coalesce(session_id, ''))
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS session_permissions (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id), mode TEXT NOT NULL CHECK(mode IN ('normal', 'read-only'))
   ) STRICT;
   CREATE TABLE IF NOT EXISTS runs (
     seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -123,7 +129,7 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, run, runId = run?.id, messages, compaction, modelSelection, defaultSelection }: SessionWrite) {
+  save(sessionId: string, { summary, run, runId = run?.id, messages, compaction, modelSelection, defaultSelection, permissionMode }: SessionWrite) {
     if (this.uncertain) throw new SessionWriteError('unconfirmed')
     let committing = false
     try {
@@ -131,6 +137,10 @@ export class SessionStore {
       if (summary) {
         this.db.prepare('INSERT INTO sessions (id, workspaceId, name, createdAt) VALUES (?, ?, ?, ?)')
           .run(summary.id, summary.workspaceId, summary.name, summary.createdAt)
+      }
+      if (permissionMode !== undefined) {
+        this.db.prepare(`INSERT INTO session_permissions (session_id, mode) VALUES (?, ?)
+          ON CONFLICT(session_id) DO UPDATE SET mode = excluded.mode`).run(sessionId, permissionMode)
       }
       if (run) {
         this.db.prepare(`INSERT INTO runs (session_id, id, client_id, data) VALUES (?, ?, ?, ?)
@@ -213,6 +223,7 @@ export class SessionStore {
       .map(row => {
         const run = parse<StoredRun>(row)
         if (run.sessionId !== summary.id || run.clientMessageId !== row.client_id || typeof run.text !== 'string'
+          || (run.firstPermissionMode !== undefined && !isPermissionMode(run.firstPermissionMode))
           || typeof run.modelId !== 'string' || !['task', 'compaction'].includes(run.kind)
           || !['running', 'completed', 'failed', 'aborted'].includes(run.status)
           || !Number.isFinite(run.startedAt) || (run.status !== 'running' && !Number.isFinite(run.finishedAt))
@@ -283,6 +294,9 @@ export class SessionStore {
     const compactionIds = new Set(compactions.map(item => item.id))
     if (runs.some(run => run.kind === 'task' ? !seen.has(run.id) : !compactionIds.has(run.id))) throw new Error('Missing submitted record')
     const modelSelection = this.readSelection(summary.id)
-    return { summary, runs, messages, compactions, ...(modelSelection && { modelSelection }) }
+    const permission = this.db.prepare('SELECT mode FROM session_permissions WHERE session_id = ?').get(summary.id)
+    const permissionMode = permission ? permission.mode : 'normal'
+    if (!isPermissionMode(permissionMode)) throw new Error('Invalid session permission mode')
+    return { summary, runs, messages, compactions, permissionMode, ...(modelSelection && { modelSelection }) }
   }
 }

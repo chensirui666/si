@@ -49,7 +49,7 @@ describe('eight tool declarations through the real Model and SDK', () => {
     const { message } = await receive(run(model, input))
 
     expect(message.stopReason).toBe('stop')
-    expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write', 'find', 'grep', 'web_search', 'web_fetch'])
+    expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write', 'find', 'grep', 'ls', 'web_search', 'web_fetch'])
     expect(requestBody!.tools).toEqual(defaultTools.map(tool => ({
       type: 'function', function: {
         name: tool.name, description: tool.description, parameters: JSON.parse(JSON.stringify(tool.parameters)),

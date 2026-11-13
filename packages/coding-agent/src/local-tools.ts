@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { access, mkdir, open, readFile, stat, writeFile } from 'node:fs/promises'
+import { access, mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { addAbortListener } from 'node:events'
 import { homedir } from 'node:os'
 import { basename, dirname, relative, resolve } from 'node:path'
@@ -7,7 +7,7 @@ import { StringDecoder } from 'node:string_decoder'
 import type { ToolResultMessage } from '@agent-learning/model'
 import { imageMimeType, MAX_IMAGE_SOURCE_BYTES, prepareReadImage } from './read-image.js'
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type ToolRuntime } from './tool-runtime.js'
-import type { BashParams, EditParams, FindParams, GrepParams, ReadParams, WriteParams } from './tools.js'
+import type { BashParams, EditParams, FindParams, GrepParams, LsParams, ReadParams, WriteParams } from './tools.js'
 
 export type LocalToolContext = { cwd: string; signal: AbortSignal; recordFileOperation?: (path: string) => void }
 
@@ -403,9 +403,42 @@ async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: L
   ].filter(Boolean).join('\n')
 }
 
+async function ls({ path, limit = 500 }: LsParams, { cwd, signal }: LocalToolContext) {
+  const directory = pathFrom(cwd, path || '.')
+  const maxEntries = Math.max(1, Math.floor(limit))
+  return readWithAbort(signal, async () => {
+    const info = await stat(directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') throw new Error(`路径不存在：${directory}`, { cause: error })
+      throw new Error(`无法读取目录：${directory}`, { cause: error })
+    })
+    if (!info.isDirectory()) throw new Error(`不是目录：${directory}`)
+    signal.throwIfAborted()
+    const entries = await readdir(directory).catch(error => { throw new Error(`无法读取目录：${directory}`, { cause: error }) })
+    entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    const output = new OutputLines()
+    let count = 0
+    let bytesReached = false
+    const notices: string[] = []
+    for (const entry of entries) {
+      signal.throwIfAborted()
+      if (count >= maxEntries) {
+        notices.push(`已达到 ${maxEntries} 项上限，可用 limit=${maxEntries * 2} 查看更多`)
+        break
+      }
+      const child = await stat(resolve(directory, entry)).catch(() => undefined)
+      if (!child) continue
+      count++
+      if (!bytesReached) bytesReached = !output.append(entry + (child.isDirectory() ? '/' : ''))
+    }
+    if (bytesReached) notices.push('已达到 50 KiB 输出上限')
+    return (output.text() || '（空目录）') + (notices.length ? `\n\n[${notices.join('。')}]` : '')
+  })
+}
+
 export function createLocalTools(runtime: ToolRuntime) {
   return {
     read,
+    ls,
     write,
     edit,
     bash: (params: BashParams, context: LocalToolContext) => bash(runtime, params, context),

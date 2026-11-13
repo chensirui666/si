@@ -89,6 +89,7 @@ it('W1.1 启动前中止显示已停止及未启动原因，不伪造工具结�
 })
 
 it.each([
+  { code: 'permission_denied', isError: true, status: '未执行', text: '只读模式下未执行此工具。' },
   { code: 'file_locked', isError: true, status: '失败', text: '文件暂时不可用' },
   { code: undefined, isError: false, status: '成功', text: '输出已截断，最后一行：第2100行，完整输出：/tmp/full.txt' },
   { code: undefined, isError: true, status: '失败', text: '本批未执行：本轮回复截断' },

@@ -27,6 +27,7 @@ export function ChatPageHarness({ messages = [], modelConfigured = false, useWor
     let sessionId: string | null = null
     const snapshot: ConversationSnapshot = {
       seq: 0,
+      permissionMode: 'normal',
       messages: messages.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })),
       running: null,
       compactions: [], contextUsage: null, activeContent: [],

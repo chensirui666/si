@@ -1,11 +1,12 @@
 import type { ModelSelection } from '@agent-learning/model'
-import type { ConversationSnapshot, ConversationUpdate, SessionSummary, SubmissionAccepted } from '@agent-learning/coding-agent'
+import type { ConversationSnapshot, ConversationUpdate, PermissionMode, SessionSummary, SubmissionAccepted } from '@agent-learning/coding-agent'
 import type { WorkspaceRegistration } from '../workspaces.js'
 
 export type {
   ActiveContent, CompactionRecord, ContextUsage, ConversationMessage, ConversationSnapshot,
-  ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure, SessionSummary, SubmissionAccepted,
+  ConversationUpdate, ModelFrame, PermissionMode, RunRecord, RunningState, SaveFailure, SessionSummary, SubmissionAccepted,
 } from '@agent-learning/coding-agent'
+export { isPermissionMode } from '@agent-learning/coding-agent/permissions'
 export type { WorkspaceView } from '../workspaces.js'
 export type { WebSettingsView } from '../web-settings.js'
 
@@ -16,7 +17,9 @@ export type SubmitMessageRequest = Pick<ModelSelection, 'modelId'> & Partial<Mod
   & { clientMessageId: string; text: string; sessionId: string }
 export type SaveModelSelectionRequest = ModelSelection & { sessionId?: string }
 export type SubmitMessageAccepted = SubmissionAccepted & { sessionId: string }
-export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { workspaceId: string }
+export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { workspaceId: string; permissionMode?: PermissionMode }
+export type PermissionSettings = { defaultPermissionMode: PermissionMode }
+export type SessionPermission = { permissionMode: PermissionMode }
 export type StartSessionAccepted = { session: SessionSummary; accepted: SubmitMessageAccepted }
 export type AbortRequest = { sessionId: string; runId: string }
 export type AbortResult = AbortRequest & { handled: boolean }
@@ -33,7 +36,7 @@ export type ServerFrame =
   | ({ type: 'snapshot'; snapshot: ConversationSnapshot } & SubscriptionTarget)
   | ({ type: 'update'; update: ConversationUpdate } & SubscriptionTarget)
   | ({ type: 'subscription_error'; error: string } & SubscriptionTarget)
-  | { type: 'models_changed' | 'workspaces_changed' | 'sessions_changed' | 'web_settings_changed' }
+  | { type: 'models_changed' | 'workspaces_changed' | 'sessions_changed' | 'web_settings_changed' | 'permission_settings_changed' }
 
 export type BrowserCookiePayload = {
   version: 1

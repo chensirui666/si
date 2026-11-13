@@ -28,7 +28,7 @@ export class Agent {
     return this.run(input)
   }
 
-  private async loop({ model, reasoningEffort, context, tools = [], signal, prepareContext, saveToolCheckpoint }: AgentRunInput): Promise<AgentResult> {
+  private async loop({ model, reasoningEffort, context, tools = [], signal, prepareContext, finalizeContext, beforeToolCall, saveToolCheckpoint }: AgentRunInput): Promise<AgentResult> {
     if (tools.length) context = {
       ...context,
       tools: tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
@@ -46,6 +46,11 @@ export class Agent {
           signal.throwIfAborted()
           if ('error' in next) return failure(next.error)
           context = next
+        }
+        if (finalizeContext) {
+          const final = finalizeContext(context)
+          if ('error' in final) return failure(final.error)
+          context = final
         }
         const response = await this.generate(model, context, signal, reasoningEffort)
         const complete: AgentResult = { type: 'response', message: response }
@@ -72,7 +77,6 @@ export class Agent {
         const execute = async ({ call, contentIndex }: typeof calls[number]) => {
           signal.throwIfAborted()
           const truncated = response.stopReason === 'length'
-          if (!truncated) this.emit({ type: 'tool_start', contentIndex })
           let output: string | ToolResultMessage['content']
           let isError = false
           let errorCode: string | undefined
@@ -81,8 +85,11 @@ export class Agent {
           try {
             if (truncated) throw new Error('本批工具未执行：本轮回复截断，请重新提供完整的工具调用。')
             if (call.argumentsError) throw new Error(call.argumentsError)
+            const denial = beforeToolCall?.(call)
+            if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
             const tool = tools.find(({ name }) => name === call.name)
             if (!tool) throw new Error(`未知工具：${call.name}`)
+            this.emit({ type: 'tool_start', contentIndex })
             executed = true
             output = await tool.execute(call.arguments, { signal, recordDetails: detail => { details.push(detail) } })
           } catch (error) {

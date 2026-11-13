@@ -3,23 +3,25 @@ import { errorNotice, NoticeText, noticeSummary, type Notice } from '../i18n/mes
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, PlusIcon } from 'lucide-react'
 import type { ModelDiscovery, ModelSelection } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, PermissionMode, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
+import { PermissionPicker } from '../components/PermissionPicker'
 import { ModelPicker, effortLabel } from '../components/ModelPicker'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
-import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
+import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger } from '../components/ui/sidebar'
 import { initialState, mergeSubmissions, settleSubmission, type Subscribe, type Subscription } from '../chat/state'
 import type { LocalSubmission } from '../types'
-import { newSessionDraft, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend } from '../chat/drafts'
+import { newSessionDraft, readDraftPermission, writeDraftPermission, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend } from '../chat/drafts'
 
 type Props = {
   subscribe?: Subscribe
+  getDefaultPermission?: typeof queryDefaultPermission
   getModels?: () => Promise<ModelDiscovery>
   getSessions?: () => Promise<SessionSummary[]>
   startSession?: (input: StartSessionRequest) => Promise<StartSessionAccepted>
@@ -48,6 +50,7 @@ function useServerView<T>(load: () => Promise<T>, failure: Notice['key']) {
     try {
       const value = await load()
       if (request === version.current) apply(value)
+      return value
     } catch (error) {
       if (request !== version.current) return
       setError(errorNotice(failure, error))
@@ -56,7 +59,7 @@ function useServerView<T>(load: () => Promise<T>, failure: Notice['key']) {
   return { view, error, apply, refresh, invalidate, setView }
 }
 
-export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
+export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = queryDefaultPermission, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
   const { t } = useTranslation()
   const [state, setState] = useState(initialState)
   const { sessionId } = state
@@ -113,6 +116,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces, 'chat.workspaceReadFailed')
   const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings, 'chat.webSettingsReadFailed')
   const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions, 'chat.sessionReadFailed')
+  const { view: defaultPermission, error: permissionReadError, refresh: refreshPermission, invalidate: invalidatePermission, setView: setDefaultPermissionView } =
+    useServerView(getDefaultPermission, 'permission.readFailed')
+  const [draftPermission, setDraftPermission] = useState(readDraftPermission)
+  const [permissionError, setPermissionError] = useState<{ sessionId: string; notice: Notice }>()
+  const savingSessionPermission = useRef(false)
+  const [sessionPermissionBusy, setSessionPermissionBusy] = useState(false)
+  const savingDefaultPermission = useRef(false)
+  const [defaultPermissionBusy, setDefaultPermissionBusy] = useState(false)
+  const [defaultPermissionError, setDefaultPermissionError] = useState<Notice>()
   const selected = useRef<string | null>(null)
   const initialized = useRef(false)
   const navigation = useRef(0)
@@ -146,6 +158,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     initialized.current = true
     if (userAction) navigation.current++
     setSessionError(null)
+    setPermissionError(undefined)
     if (selected.current === id) {
       if (id && userAction && stateRef.current.error) subscription.current?.requestSnapshot?.()
       return
@@ -180,6 +193,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   }
 
   function openNewSession(workspaceId?: string) {
+    if (!draftPermission && !firstSend.current) {
+      setDefaultPermissionView(null)
+      void refreshPermission()
+    }
     openSession(null, true)
     if (workspaceId) chooseDraftWorkspace(workspaceId)
   }
@@ -189,11 +206,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     if (!pending || pending.input.clientMessageId !== session.id || pending.input.workspaceId !== session.workspaceId) return
     firstSend.current = null
     writeFirstSend(null)
+    writeDraftPermission(null)
+    setDraftPermission(null)
+    setDefaultPermissionView(null)
+    void refreshPermission()
     setFirstPhase(null)
     setFirstError(null)
     clearSentDraft(newSessionDraft, pending.input.text, pending.revision)
     if (selected.current === null) openSession(session.id)
-  }, [clearSentDraft, openSession])
+  }, [clearSentDraft, openSession, refreshPermission, setDefaultPermissionView])
 
   function attemptFirstSend(pending: FirstSend) {
     if (pending.sending || stateRef.current.connection !== 'ready') return
@@ -292,6 +313,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     void refreshWorkspaces()
     void refreshWebSettings()
     void refreshSessions()
+    void refreshPermission()
     let needsRefresh = true
     const stop = subscribe(next => {
       if (next.sessionId !== selected.current) return
@@ -302,6 +324,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         void refreshWorkspaces()
         void refreshWebSettings()
         void refreshSessions()
+        void refreshPermission()
       }
       if (next.connection === 'ready' && next.sessionId) {
         if (next.snapshot) {
@@ -319,7 +342,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       stateRef.current = next
       updateSubmissions(submissionsRef.current)
       setState(next)
-    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions)
+    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, refreshPermission)
     subscription.current = stop
     stop.setSession(selected.current)
     return () => {
@@ -328,12 +351,13 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       invalidateWorkspaces()
       invalidateWebSettings()
       invalidateSessions()
+      invalidatePermission()
       stop()
       subscription.current = null
       for (const timer of timers.current) clearTimeout(timer)
       timers.current.clear()
     }
-  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateSessions, updateSubmissions, updateAbort, writeStorage])
+  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage])
 
   useEffect(() => {
     if (!sessions) return
@@ -354,6 +378,54 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     const sent = sessions?.find(item => item.id === firstSend.current?.input.clientMessageId)
     if (sent) finishFirstSend(sent)
   }, [sessions, finishFirstSend])
+
+  useEffect(() => {
+    if (selected.current === null && sessions && draftPermission === null && !firstSend.current && defaultPermission && !permissionReadError) {
+      writeDraftPermission(defaultPermission)
+      setDraftPermission(defaultPermission)
+    }
+  }, [sessions, isNew, draftPermission, defaultPermission, permissionReadError])
+
+  function changeDraftPermission(mode: PermissionMode) {
+    if (firstSend.current || selected.current !== null) return
+    writeDraftPermission(mode)
+    setDraftPermission(mode)
+  }
+
+  async function changeSessionPermission(id: string, mode: PermissionMode) {
+    if (savingSessionPermission.current || selected.current !== id || stateRef.current.connection !== 'ready') return
+    savingSessionPermission.current = true
+    setSessionPermissionBusy(true)
+    setPermissionError(undefined)
+    try {
+      await saveSessionPermission(id, mode)
+    } catch (error) {
+      if (mounted.current && selected.current === id) {
+        setPermissionError({ sessionId: id, notice: errorNotice('permission.saveFailed', error) })
+        subscription.current?.requestSnapshot?.()
+      }
+    } finally {
+      savingSessionPermission.current = false
+      if (mounted.current) setSessionPermissionBusy(false)
+    }
+  }
+
+  async function changeDefaultPermission(mode: PermissionMode) {
+    if (savingDefaultPermission.current) return
+    savingDefaultPermission.current = true
+    setDefaultPermissionBusy(true)
+    setDefaultPermissionError(undefined)
+    try {
+      await saveDefaultPermission(mode)
+      await refreshPermission()
+    } catch (error) {
+      const confirmed = await refreshPermission()
+      if (mounted.current && confirmed !== mode) setDefaultPermissionError(errorNotice('permission.saveFailed', error))
+    } finally {
+      savingDefaultPermission.current = false
+      if (mounted.current) setDefaultPermissionBusy(false)
+    }
+  }
 
   const selection = state.snapshot?.modelSelection ?? discovery?.defaultSelection
   const selectedModel = discovery?.models.find(model => model.id === selection?.modelId && model.provider === selection.provider)
@@ -382,21 +454,21 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     }
   }
   const canStart = () => selected.current === null && draftWorkspace?.available && !workspaceError && !pickingRef.current
-    && stateRef.current.connection === 'ready' && hasModel() && !firstSend.current
+    && stateRef.current.connection === 'ready' && hasModel() && draftPermission !== null && !firstSend.current
   const canSubmit = () => !!sessionId && sessionId === selected.current && workspace?.available && !workspaceError && stateRef.current.sessionId === sessionId && stateRef.current.connection === 'ready' && stateRef.current.snapshot !== null && stateRef.current.snapshot.running === null
-    && hasModel()
+    && hasModel() && !savingSessionPermission.current
     && !submissionsRef.current.some(local => local.sessionId === sessionId && local.state !== 'failed')
 
   const send = (text: string) => {
     if (!text.trim() || !selection) return false
     if (sessionId === null) {
-      if (!canStart() || !draftWorkspace) return false
+      if (!canStart() || !draftWorkspace || !draftPermission) return false
       if (text.trim() === '/compact') {
         setFirstError({ key: 'chat.compactNeedsHistory' })
         return false
       }
       const pending = firstSend.current = {
-        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text },
+        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text, permissionMode: draftPermission },
         revision: draftRevision(newSessionDraft), sending: false,
       }
       writeFirstSend(pending.input)
@@ -540,6 +612,9 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         const trigger = settingsButton.current
         if (trigger && !trigger.closest('[hidden]')) trigger.focus()
         else sidebarButton.current?.focus()
+      }} permissionSettings={{ mode: defaultPermission, busy: defaultPermissionBusy,
+        readError: permissionReadError, saveError: defaultPermissionError,
+        onSelect: changeDefaultPermission, onRetry: () => { setDefaultPermissionError(undefined); void refreshPermission() },
       }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
         if (!mounted.current) return
         applyWebSettings(result)
@@ -593,7 +668,16 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">{activeAbort.error ? t('chat.abortUnconfirmedDetail', { detail: noticeSummary(t, activeAbort.error) }) : t('chat.abortUnconfirmed')}{activeAbort.error?.detail && <> · <span>{activeAbort.error.detail}</span></>}</p>}
           {storageUnavailable && <p className="configuration-error" role="alert">{t('chat.draftStorageUnavailable')}</p>}
           <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
-          <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={modelSelect} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
+          {isNew && !draftPermission && !pendingInput && permissionReadError && <p className="configuration-error" role="alert">
+            <NoticeText notice={permissionReadError} /> <Button variant="ghost" onClick={() => { void refreshPermission() }}>{t('common.retry')}</Button>
+          </p>}
+          {permissionError?.sessionId === sessionId && <p className="configuration-error" role="alert"><NoticeText notice={permissionError.notice} /></p>}
+          <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={<>
+            <PermissionPicker mode={isNew ? pendingInput?.permissionMode ?? draftPermission : state.snapshot?.permissionMode ?? null}
+              disabled={state.connection !== 'ready' || (isNew ? firstPhase !== null : sessionPermissionBusy)}
+              onSelect={mode => { if (sessionId) void changeSessionPermission(sessionId, mode); else changeDraftPermission(mode) }} />
+            {modelSelect}
+          </>} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
       </div>

@@ -36,6 +36,11 @@ const findParameters = Type.Object({
   limit: Type.Optional(Type.Number({ description: '结果条数上限，默认 1000' })),
 })
 
+const lsParameters = Type.Object({
+  path: Type.Optional(Type.String({ description: '要列出的目录，默认当前工作区目录' })),
+  limit: Type.Optional(Type.Number({ description: '条目上限，默认 500' })),
+})
+
 const grepParameters = Type.Object({
   pattern: Type.String({ description: '要查找的正则表达式或字面文本' }),
   path: Type.Optional(Type.String({ description: '搜索文件或目录，默认当前工作区目录' })),
@@ -63,6 +68,7 @@ const declarations = {
   write: { name: 'write', description: '创建或完整覆盖文本文件。', parameters: writeParameters },
   find: { name: 'find', description: '按通配规则查找文件或目录，返回相对于搜索目录的路径。', parameters: findParameters },
   grep: { name: 'grep', description: '在文件中搜索文本，返回文件路径、行号、命中文本及可选的上下文。', parameters: grepParameters },
+  ls: { name: 'ls', description: '列出目录的直接子项，包括隐藏项。目录名以 / 结尾。', parameters: lsParameters },
   web_search: { name: 'web_search', description: '搜索网页并返回标题、链接和相关片段。', parameters: webSearchParameters },
   web_fetch: { name: 'web_fetch', description: '获取指定网页的正文。', parameters: webFetchParameters },
 } satisfies Record<string, Tool>
@@ -84,6 +90,7 @@ export type BashParams = Static<typeof bashParameters>
 export type EditParams = Static<typeof editParameters>
 export type WriteParams = Static<typeof writeParameters>
 export type FindParams = Static<typeof findParameters>
+export type LsParams = Static<typeof lsParameters>
 export type GrepParams = Static<typeof grepParameters>
 export type WebSearchParams = Static<typeof webSearchParameters>
 export type WebFetchParams = Static<typeof webFetchParameters>
@@ -123,6 +130,7 @@ export function createTools(runtime: ToolRuntime, web: WebTools, cwd: string): C
     executable(declarations.write, local.write, cwd, 'modified'),
     executable(declarations.find, local.find, cwd),
     executable(declarations.grep, local.grep, cwd),
+    executable(declarations.ls, local.ls, cwd),
     executable(declarations.web_search, web.web_search, cwd),
     executable(declarations.web_fetch, web.web_fetch, cwd),
   ]

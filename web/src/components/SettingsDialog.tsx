@@ -2,13 +2,14 @@ import { useRef, useState, type ComponentProps, type FormEvent } from 'react'
 import { SettingsIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { WebSettingsView } from '@agent-learning/server/protocol'
+import type { PermissionMode, WebSettingsView } from '@agent-learning/server/protocol'
 import { deleteApiKey, saveApiKey, deleteWebApiKey, saveWebApiKey, saveWebSettings } from '../chat/client'
 import { loadLanguage, selectLanguage, useLanguage } from '../i18n'
 import type { CopyKey } from '../i18n/en'
 import { errorNotice, NoticeText, type Notice } from '../i18n/messages'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
+import { PermissionPicker } from './PermissionPicker'
 import { Input } from './ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select'
 
@@ -24,6 +25,14 @@ type Props = {
   onCloseAutoFocus: (event: Event) => void
   discovery: ModelDiscovery | null
   onChange: (discovery: ModelDiscovery) => void
+  permissionSettings?: {
+    mode: PermissionMode | null
+    busy: boolean
+    readError: Notice | null
+    saveError?: Notice
+    onSelect(mode: PermissionMode): void
+    onRetry(): void
+  }
   webSettings?: WebSettingsView | null
   webSettingsError?: Notice | null
   onWebSettingsChange?: (settings: WebSettingsView) => void
@@ -38,7 +47,7 @@ export function SettingsButton(props: ComponentProps<typeof Button>) {
   </Button>
 }
 
-export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, webSettings, webSettingsError, onWebSettingsChange }: Props) {
+export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, permissionSettings, webSettings, webSettingsError, onWebSettingsChange }: Props) {
   const { t } = useTranslation()
   const { language, status: languageStatus, detail: languageDetail } = useLanguage()
   const languageBusy = languageStatus === 'loading' || languageStatus === 'saving'
@@ -166,6 +175,22 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
             {(languageStatus === 'readFailed' || languageStatus === 'saveFailed' || languageStatus === 'unconfirmed') && <>
               <p className="configuration-error" role="alert"><NoticeText notice={{ key: `settings.language.${languageStatus}`, detail: languageDetail }} /></p>
               {languageStatus === 'readFailed' && <Button variant="ghost" onClick={() => { void loadLanguage() }}>{t('common.retry')}</Button>}
+            </>}
+            {permissionSettings && <>
+              <div className="language-setting">
+                <div>
+                  <label htmlFor="settings-permission">{t('permission.label')}</label>
+                  <p className="settings-help">{t('permission.defaultHelp')}</p>
+                </div>
+                <PermissionPicker id="settings-permission" mode={permissionSettings.mode}
+                  disabled={permissionSettings.busy || !!permissionSettings.readError} onSelect={permissionSettings.onSelect} />
+              </div>
+              {permissionSettings.busy && <p className="settings-help" role="status">{t('permission.saving')}</p>}
+              {permissionSettings.saveError && <p className="configuration-error" role="alert"><NoticeText notice={permissionSettings.saveError} /></p>}
+              {permissionSettings.readError && <>
+                <p className="configuration-error" role="alert"><NoticeText notice={permissionSettings.readError} /></p>
+                <Button variant="ghost" onClick={permissionSettings.onRetry}>{t('common.retry')}</Button>
+              </>}
             </>}
           </> : web ? <>
             <p className="settings-help">{t('settings.webHelp')}</p>

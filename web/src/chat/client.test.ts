@@ -16,7 +16,7 @@ class Socket extends EventTarget {
 }
 
 const sessionId = 'session-a'
-const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 
 it.each([true, false])('abort validates the target and handled=%s with same-origin credentials', async handled => {
   const fetcher = vi.fn(async () => Response.json({ sessionId, runId: 'user-1', handled }))

@@ -9,8 +9,9 @@ const desktop = { id: 'desktop', name: 'Desktop', path: '/tmp/Desktop', availabl
 const stardust = { id: 'stardust', name: 'Stardust', path: '/tmp/Stardust', available: true }
 const existing = { id: 'existing', workspaceId: desktop.id, name: '会话 1', createdAt: '2026-11-10T00:00:00Z' }
 const getModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'configured' as const } }], defaultSelection: { provider: 'deepseek', modelId: 'deepseek-flash' } })
+const getDefaultPermission = async () => 'normal' as const
 const getWorkspaces = async () => ({ workspaces: [desktop, stardust] })
-const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 const subscribe: Subscribe = onState => Object.assign(() => {}, { setSession: (sessionId: string | null) => {
   onState({ sessionId, connection: 'ready', slow: false, error: null, snapshot: sessionId ? empty : null })
 } })
@@ -42,7 +43,7 @@ it('首发等待时保留草稿，迟到的成功保留用户后来打开的历�
   const receipt = new Promise<ReturnType<typeof acceptance>>(done => { resolve = done })
   const startSession = vi.fn((_input: { clientMessageId: string; workspaceId: string; text: string }) => receipt)
   let sessions = [existing]
-  const view = render(<ChatPage subscribe={subscribe} getModels={getModels} getWorkspaces={getWorkspaces}
+  const view = render(<ChatPage getDefaultPermission={getDefaultPermission} subscribe={subscribe} getModels={getModels} getWorkspaces={getWorkspaces}
     getSessions={async () => sessions} startSession={startSession} />)
   await chooseAndType()
   expect(startSession).not.toHaveBeenCalled()
@@ -69,7 +70,7 @@ it('首发回执丢失或重试授权过期时仍使用同一编号和原请求'
     sessions = [response.session]
     return response
   })
-  const view = render(<ChatPage subscribe={subscribe} getModels={getModels} getWorkspaces={getWorkspaces}
+  const view = render(<ChatPage getDefaultPermission={getDefaultPermission} subscribe={subscribe} getModels={getModels} getWorkspaces={getWorkspaces}
     getSessions={async () => sessions} startSession={startSession} />)
   await chooseAndType()
   fireEvent.click(screen.getByRole('button', { name: '发送' }))
@@ -80,6 +81,7 @@ it('首发回执丢失或重试授权过期时仍使用同一编号和原请求'
   expect(localStorage.getItem(draftKey('new-session'))).toBe(firstText)
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: '重试首次发送' })) })
   expect(startSession).toHaveBeenCalledTimes(3)
+  expect(startSession.mock.calls[0]?.[0]).toMatchObject({ permissionMode: 'normal' })
   expect(startSession.mock.calls[1]).toEqual(startSession.mock.calls[0])
   expect(startSession.mock.calls[2]).toEqual(startSession.mock.calls[0])
   expect(view.container.querySelector('.chat-page')).toHaveAttribute('data-session-id', sessions[0]!.id)
@@ -92,7 +94,7 @@ it('刷新时仍能用同一个编号确认未收到回执的首发', async () =
     throw new Error('连接已断开')
   })
   const getSessions = async (): Promise<SessionSummary[]> => []
-  const app = <ChatPage subscribe={subscribe} getModels={getModels} getWorkspaces={getWorkspaces}
+  const app = <ChatPage getDefaultPermission={getDefaultPermission} subscribe={subscribe} getModels={getModels} getWorkspaces={getWorkspaces}
     getSessions={getSessions} startSession={startSession} />
   const original = render(app)
   await chooseAndType()
@@ -104,5 +106,6 @@ it('刷新时仍能用同一个编号确认未收到回执的首发', async () =
   expect(localStorage.getItem(draftKey('new-session'))).toBe(firstText)
   await act(async () => { fireEvent.click(retry) })
   expect(startSession).toHaveBeenCalledTimes(2)
+  expect(startSession.mock.calls[0]?.[0]).toMatchObject({ permissionMode: 'normal' })
   expect(startSession.mock.calls[1]).toEqual(startSession.mock.calls[0])
 })

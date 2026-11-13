@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { watch } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { join } from 'node:path'
@@ -364,4 +364,58 @@ it('处理工具输出抛错时仍杀死进程，不能让后续取消失效', a
     if (pid) { try { process.kill(pid, 'SIGKILL') } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error } }
     await outcome
   }
+})
+
+it.each([
+  [{ path: '', limit: 2 }, 'a.txt\nB.txt', 'limit=4'],
+  [{ limit: 2.9 }, 'a.txt\nB.txt', 'limit=4'],
+  [{ limit: 0 }, 'a.txt', 'limit=2'],
+  [{ limit: 3 }, 'a.txt\nB.txt\nc.txt', undefined],
+])('lists directory entries with limits %j', async (params, expected, notice) => {
+  await Promise.all(['c.txt', 'B.txt', 'a.txt'].map(name => writeFile(join(cwd, name), '')))
+  const result = await tool('ls')(params, context())
+  expect(typeof result).toBe('string')
+  const [body, details] = (result as string).split('\n\n')
+  expect(body).toBe(expected)
+  if (notice) expect(details).toContain(notice)
+  else expect(details).toBeUndefined()
+})
+
+it('lists only the first 500 entries by default', async () => {
+  for (let i = 0; i <= 500; i++) await writeFile(join(cwd, String(i).padStart(3, '0')), '')
+  const [body, notice] = String(await tool('ls')({}, context())).split('\n\n')
+  expect(body.split('\n')).toHaveLength(500)
+  expect(body.split('\n').at(-1)).toBe('499')
+  expect(notice).toContain('limit=1000')
+})
+
+it('limits a multibyte directory listing to complete lines within 50 KiB', async () => {
+  const names = Array.from({ length: 300 }, (_, i) => String(i).padStart(3, '0') + '青禾'.repeat(30))
+  for (const name of names) await writeFile(join(cwd, name), '')
+  const [body, notice] = String(await tool('ls')({}, context())).split('\n\n')
+  const lines = body.split('\n')
+  expect(lines.length).toBeLessThan(names.length)
+  expect(lines).toEqual(names.slice(0, lines.length))
+  expect(Buffer.byteLength(body)).toBeLessThanOrEqual(50 * 1024)
+  expect(Buffer.byteLength(body + '\n' + names[lines.length])).toBeGreaterThan(50 * 1024)
+  expect(notice).toContain('50 KiB')
+})
+
+it('lists hidden files, directory symlinks and empty directories', async () => {
+  await mkdir(join(cwd, 'src'))
+  await symlink('src', join(cwd, 'link'))
+  await symlink('missing', join(cwd, 'broken'))
+  await writeFile(join(cwd, '.gitignore'), '')
+  expect(await tool('ls')({}, context())).toBe('.gitignore\nlink/\nsrc/')
+  expect(await tool('ls')({ path: 'src' }, context())).toContain('空目录')
+})
+
+it('reports missing, unreadable and non-directory targets', async () => {
+  await expect(tool('ls')({ path: 'missing' }, context())).rejects.toThrow('路径不存在')
+  await writeFile(join(cwd, 'file.txt'), '')
+  await expect(tool('ls')({ path: 'file.txt' }, context())).rejects.toThrow('不是目录')
+  const locked = join(cwd, 'locked')
+  await mkdir(locked, { mode: 0o000 })
+  try { await expect(tool('ls')({ path: 'locked' }, context())).rejects.toThrow('无法读取目录') }
+  finally { await chmod(locked, 0o700) }
 })

@@ -251,6 +251,36 @@ describe('AgentSession compaction', () => {
     }
   })
 
+  it('refreshes tool declarations and system instructions if permission changes during compression', async () => {
+    const started = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const contexts: ModelContext[] = []
+    const agent = createSession({
+      tools: [tool, { ...tool, name: 'edit' }],
+      compaction: { triggerTokens: 1700, keepRecentTokens: 100 },
+      stream: (_model, context) => {
+        contexts.push(structuredClone(context))
+        if (context.tools) return output(reply())
+        return { result: async () => reply('旧事实青禾'), async *[Symbol.asyncIterator]() {
+          started.resolve()
+          await release.promise
+          yield { type: 'done', reason: 'stop', message: reply('旧事实青禾') } as const
+        } }
+      },
+    })
+    await seed(agent)
+    const count = contexts.length
+    await agent.submit({ ...input, text: '继续' })
+    try {
+      await started.promise
+      agent.selectPermissionMode('read-only')
+    } finally { release.resolve() }
+    await idle(agent)
+    expect(contexts.slice(count).map(context => context.tools?.map(tool => tool.name))).toEqual([undefined, ['read']])
+    expect(contexts.at(-1)?.systemPrompt).toContain('- read：')
+    expect(contexts.at(-1)?.systemPrompt).not.toContain('- edit：')
+  })
+
   it('abort waits for A’s summary cleanup and preserves A’s context while B keeps running', async () => {
     const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
     let compress = false

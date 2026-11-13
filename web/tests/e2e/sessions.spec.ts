@@ -79,7 +79,7 @@ test('未发送的新会话共用一份草稿，首次发送使用最后选中�
     const response = await receipt
     expect(response.status()).toBe(202)
     const request: StartSessionRequest = response.request().postDataJSON()
-    expect(request).toEqual({ workspaceId: workspaceB, clientMessageId: expect.any(String), provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high', text: draft })
+    expect(request).toEqual({ permissionMode: 'normal', workspaceId: workspaceB, clientMessageId: expect.any(String), provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high', text: draft })
     const { session }: StartSessionAccepted = await response.json()
     expect(session).toMatchObject({ id: request.clientMessageId, workspaceId: workspaceB, name: '会话 1' })
     expect(await listSessions()).toEqual([session])

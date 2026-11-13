@@ -17,7 +17,7 @@ type TestState = Omit<ChatState, 'sessionId'>
 
 beforeEach(() => localStorage.setItem(recentSessionKey, sessionId))
 afterEach(() => localStorage.clear())
-const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 
 function deferred<T>() {
   let resolve!: (value: T) => void

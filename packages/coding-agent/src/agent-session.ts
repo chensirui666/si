@@ -8,9 +8,12 @@ import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFil
 import { SessionWriteError, runSelection, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
 import { buildSystemPrompt } from './system-prompt.js'
 import type { CodingTool } from './tools.js'
+import { isPermissionMode, type PermissionMode } from './permissions.js'
 import type { CompactionRecord, SubmissionAccepted, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure } from './types.js'
 
-type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & { clientMessageId: string; text: string }
+type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & { clientMessageId: string; text: string; permissionMode?: PermissionMode }
+
+const readOnlyTools = new Set(['read', 'grep', 'find', 'ls'])
 
 const capacityError = '当前模型容量不足，无法继续这轮，请切换模型重新压缩。'
 const staleSelection = '模型设置已更新，请确认后再发送。'
@@ -27,7 +30,7 @@ function isFileOperation(detail: unknown): detail is NonNullable<ConversationMes
 export class AgentSession {
   private readonly agent: Agent
   private readonly omittedToolImageResults = new Set<string>()
-  private readonly state: ConversationSnapshot = { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
+  private readonly state: ConversationSnapshot = { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
   private readonly listeners = new Set<(update: ConversationUpdate) => void>()
   private controller?: AbortController
   private task?: Promise<void>
@@ -40,9 +43,11 @@ export class AgentSession {
   private readonly storedRuns = new Map<string, StoredRun>()
   private readonly savedMessages = new Set<string>()
   private failure?: SaveFailure
+  private permissionUnconfirmed = false
 
   constructor(private readonly options: {
     persistence?: SessionPersistence
+    permissionMode?: PermissionMode
     stream?: typeof stream
     tools?: (cwd: string) => CodingTool[]
     documentationRoot?: string
@@ -53,6 +58,7 @@ export class AgentSession {
   }) {
     this.agent = new Agent({ stream: options.stream })
     const history = options.persistence?.history
+    this.state.permissionMode = history?.permissionMode ?? options.permissionMode ?? 'normal'
     if (history) {
       const last = history.runs.at(-1)
       this.state.modelSelection = history.modelSelection ?? (last && runSelection(last))
@@ -79,6 +85,29 @@ export class AgentSession {
     storage?.store.saveModelSelection(selection, storage.summary.id)
     this.state.modelSelection = selection
     this.publish({ type: 'selection', selection })
+  }
+
+  selectPermissionMode(permissionMode: PermissionMode) {
+    if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+    if (!isPermissionMode(permissionMode)) throw new SessionSubmitError('invalid', '权限模式无效')
+    try {
+      if (this.permissionUnconfirmed) throw new SessionWriteError('unconfirmed')
+      this.save({ permissionMode })
+    } catch (error) {
+      if (error instanceof SessionWriteError && error.reason === 'unconfirmed') this.permissionUnconfirmed = true
+      throw error
+    }
+    this.state.permissionMode = permissionMode
+    this.publish({ type: 'permission', permissionMode })
+  }
+
+  private configure(cwd: string, tools: CodingTool[], files: ProjectContextFile[]) {
+    const available = this.state.permissionMode === 'normal' ? tools : tools.filter(tool => readOnlyTools.has(tool.name))
+    const declarations = available.map(({ name, description, parameters }) => ({ name, description, parameters }))
+    this.configuration = {
+      systemPrompt: buildSystemPrompt(cwd, available, this.options.documentationRoot, files),
+      ...(declarations.length ? { tools: declarations } : {}),
+    }
   }
 
   async submit(input: SubmissionInput): Promise<SubmissionAccepted> {
@@ -116,11 +145,7 @@ export class AgentSession {
     model.defaultReasoningEffort = selection.reasoningEffort
     this.model = model
     const tools = this.options.tools?.(cwd) ?? []
-    const declarations = tools.map(({ name, description, parameters }) => ({ name, description, parameters }))
-    this.configuration = {
-      systemPrompt: buildSystemPrompt(cwd, tools, this.options.documentationRoot, this.projectContext?.cwd === cwd ? this.projectContext.files : []),
-      ...(declarations.length ? { tools: declarations } : {}),
-    }
+    this.configure(cwd, tools, this.projectContext?.cwd === cwd ? this.projectContext.files : [])
     const controller = new AbortController()
     if (input.text.trim() === '/compact') {
       const record = this.newCompaction('manual', input.clientMessageId)
@@ -165,13 +190,13 @@ export class AgentSession {
   private replay(input: SubmissionInput, selection: ModelSelection) {
     const previous = this.storedRuns.get(input.clientMessageId)
     if (!previous) return
-    if (previous.text !== input.text || !sameSelection(runSelection(previous), selection)) {
+    if (previous.text !== input.text || previous.firstPermissionMode !== input.permissionMode || !sameSelection(runSelection(previous), selection)) {
       throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
     }
     return submissionReceipt(previous)
   }
 
-  private publicRun({ text: _text, acceptedSeq: _acceptedSeq, ...run }: StoredRun): RunRecord {
+  private publicRun({ text: _text, acceptedSeq: _acceptedSeq, firstPermissionMode: _firstPermissionMode, ...run }: StoredRun): RunRecord {
     return run
   }
 
@@ -179,10 +204,12 @@ export class AgentSession {
     data: { messages?: ConversationMessage[]; compaction?: CompactionRecord }) {
     const storage = this.options.persistence
     if (!storage) return
+    const { permissionMode, ...message } = input
+    const summary = this.storedRuns.size === 0 ? storage.first?.() : undefined
     const run: StoredRun = {
-      ...input, ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
+      ...message, ...(summary && permissionMode !== undefined && { firstPermissionMode: permissionMode }), ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
     }
-    this.save({ ...data, run, summary: this.storedRuns.size === 0 ? storage.first?.() : undefined,
+    this.save({ ...data, run, summary, ...(summary && { permissionMode: this.state.permissionMode }),
       modelSelection: this.state.modelSelection ? undefined : selection })
     return run
   }
@@ -415,35 +442,41 @@ export class AgentSession {
         throw error
       }
       signal.throwIfAborted()
-      const systemPrompt = buildSystemPrompt(cwd, tools, this.options.documentationRoot, files)
-      const configuration = { ...this.configuration, systemPrompt }
-      if (this.estimate({ ...configuration, messages: [] }) > inputBudget) {
+      this.projectContext = { cwd, files }
+      this.configure(cwd, tools, files)
+      if (this.estimate({ ...this.configuration, messages: [] }) > inputBudget) {
         return { error: files.length ? new ProjectContextOverflow().message : '系统提示和工具定义超出当前模型容量，请切换模型。' }
       }
-      this.projectContext = { cwd, files }
-      this.configuration = configuration
       const context = this.context()
-      const ready = (candidate: ModelContext) => {
-        if (this.pressure(candidate, model) + model.maxTokens > model.contextWindow) {
-          return { error: capacityError }
-        }
-        usedCompaction = this.latestCompaction()
-        for (const index of omittedToolImageIndexes(candidate)) {
-          const result = candidate.messages[index]
-          if (result.role === 'toolResult' && result.imageResultId !== undefined) this.omittedToolImageResults.add(result.imageResultId)
-        }
-        return candidate
-      }
       const fingerprint = JSON.stringify(context.messages)
       const margin = Math.min(16_384, Math.floor(inputBudget / 8))
       const trigger = Math.min(this.options.compaction?.triggerTokens ?? Infinity, inputBudget - margin)
-      if (this.pressure(context, model) < trigger || attemptedInput === fingerprint) return ready(context)
+      if (this.pressure(context, model) < trigger || attemptedInput === fingerprint) return context
       attemptedInput = fingerprint
       return this.compact(model, reasoningEffort, 'auto', { ...running, assistantMessageId: messageId }, signal).then(() => {
         signal.throwIfAborted()
         modelPhase()
-        return ready(this.context())
+        return this.context()
       })
+    }
+
+    const finalizeContext: AgentRunInput['finalizeContext'] = () => {
+      this.configure(cwd, tools, this.projectContext?.files ?? [])
+      const candidate = this.context()
+      if (this.pressure(candidate, model) + model.maxTokens > model.contextWindow) return { error: capacityError }
+      usedCompaction = this.latestCompaction()
+      for (const index of omittedToolImageIndexes(candidate)) {
+        const result = candidate.messages[index]
+        if (result.role === 'toolResult' && result.imageResultId !== undefined) this.omittedToolImageResults.add(result.imageResultId)
+      }
+      return candidate
+    }
+
+    const beforeToolCall: AgentRunInput['beforeToolCall'] = call => {
+      if (this.permissionUnconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
+      if (this.state.permissionMode === 'read-only' && !readOnlyTools.has(call.name)) {
+        return { code: 'permission_denied', message: '只读模式下未执行此工具。' }
+      }
     }
 
     const unsubscribe = this.agent.subscribe(event => {
@@ -507,7 +540,7 @@ export class AgentSession {
       }
     }
     try {
-      const options = { model, reasoningEffort, tools, signal, prepareContext, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined }
+      const options = { model, reasoningEffort, tools, signal, prepareContext, finalizeContext, beforeToolCall, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined }
       let result = await this.agent.run({ ...options, context: this.context() })
       while (result.type === 'response' && result.message.stopReason === 'error' && result.message.errorCode === 'context_overflow'
         && !recovered && !signal.aborted) {
@@ -548,7 +581,7 @@ export class AgentSession {
     const fileOperation = event.details.find(isFileOperation)
     return {
       id: randomUUID(), toolCall: { assistantMessageId: messageId, contentIndex: event.contentIndex }, message: event.result,
-      ...(event.errorCode === 'interrupted' && { toolErrorCode: event.errorCode }),
+      ...((event.errorCode === 'interrupted' || event.errorCode === 'permission_denied') && { toolErrorCode: event.errorCode }),
       ...(fileOperation && { fileOperation }),
     }
   }

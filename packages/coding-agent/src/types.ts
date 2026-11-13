@@ -1,5 +1,7 @@
 import type { AssistantMessage, ModelMessage, ModelUsage, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
 
+import type { PermissionMode } from './permissions.js'
+
 type ToolLocation = {
   assistantMessageId: string
   contentIndex: number
@@ -54,6 +56,7 @@ export type ContextUsage = {
 
 export type ConversationSnapshot = {
   seq: number
+  permissionMode: PermissionMode
   messages: ConversationMessage[]
   running: RunningState
   modelSelection?: ModelSelection
@@ -71,6 +74,7 @@ export type ConversationUpdate = {
   run?: RunRecord
   saveFailure?: SaveFailure
   change:
+    | { type: 'permission'; permissionMode: PermissionMode }
     | { type: 'selection'; selection: ModelSelection }
     | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }

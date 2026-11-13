@@ -1,16 +1,34 @@
 import { useCallback, useRef, useState } from 'react'
-import type { StartSessionRequest } from '@agent-learning/server/protocol'
+import { isPermissionMode, type PermissionMode, type StartSessionRequest } from '@agent-learning/server/protocol'
 
 export const recentSessionKey = 'agent-learning:recent-session'
 export const recentWorkspaceKey = 'agent-learning:recent-workspace'
 export const newSessionDraft = 'new-session'
+const draftPermissionKey = 'agent-learning:draft-permission'
+
+export function readDraftPermission(): PermissionMode | null {
+  try {
+    const value = sessionStorage.getItem(draftPermissionKey)
+    if (isPermissionMode(value)) return value
+  } catch { /* In-memory state remains usable. */ }
+  return null
+}
+
+export function writeDraftPermission(value: PermissionMode | null) {
+  try {
+    if (value) sessionStorage.setItem(draftPermissionKey, value)
+    else sessionStorage.removeItem(draftPermissionKey)
+  } catch { /* In-memory state remains usable. */ }
+}
+
 const firstSendKey = 'agent-learning:first-send'
 
 export function readFirstSend(): StartSessionRequest | undefined {
   try {
     const value = JSON.parse(sessionStorage.getItem(firstSendKey) ?? 'null')
     if (value && typeof value.workspaceId === 'string' && typeof value.clientMessageId === 'string'
-      && typeof value.modelId === 'string' && typeof value.text === 'string') return value
+      && typeof value.modelId === 'string' && typeof value.text === 'string'
+      && (value.permissionMode === undefined || isPermissionMode(value.permissionMode))) return value
   } catch { /* Drafts still work within the page when storage is unavailable. */ }
 }
 

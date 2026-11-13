@@ -1,10 +1,11 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import { isPermissionMode } from '@agent-learning/server/protocol'
+import type { PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
 import { applyFrame, initialState, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
-export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged) => {
+export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged) => {
   let state: ChatState = initialState
   let stopped = false
   let socket: WebSocket | null = null
@@ -79,6 +80,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
         if (frame.type === 'models_changed') { onModelsChanged?.(); return }
         if (frame.type === 'workspaces_changed') { onWorkspacesChanged?.(); return }
         if (frame.type === 'sessions_changed') { onSessionsChanged?.(); return }
+        if (frame.type === 'permission_settings_changed') { onPermissionSettingsChanged?.(); return }
         if (frame.type === 'web_settings_changed') { onWebSettingsChanged?.(); return }
       }
       const result = applyFrame(state, frame, subscriptionId)
@@ -210,6 +212,31 @@ async function requestView<T>(path: string, label: CopyKey, validate: (value: un
 }
 
 const putJson = (value: unknown): RequestInit => ({ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
+
+const permissionPath = '/api/settings/permission'
+const permissionSettings = (value: unknown): value is PermissionSettings =>
+  record(value) && isPermissionMode(value.defaultPermissionMode)
+const sessionPermission = (value: unknown): value is SessionPermission =>
+  record(value) && isPermissionMode(value.permissionMode)
+
+export async function getDefaultPermission() {
+  const view = await requestView(permissionPath, 'permission.label', permissionSettings, { signal: AbortSignal.timeout(5000) })
+  return view.defaultPermissionMode
+}
+
+export async function saveDefaultPermission(defaultPermissionMode: PermissionMode) {
+  const view = await requestView(permissionPath, 'permission.label', permissionSettings, {
+    ...putJson({ defaultPermissionMode }), signal: AbortSignal.timeout(5000),
+  })
+  if (view.defaultPermissionMode !== defaultPermissionMode) throw new Error('Unexpected default permission response')
+}
+
+export async function saveSessionPermission(sessionId: string, permissionMode: PermissionMode) {
+  const view = await requestView(`/api/sessions/${encodeURIComponent(sessionId)}/permission`, 'permission.label', sessionPermission, {
+    ...putJson({ permissionMode }), signal: AbortSignal.timeout(5000),
+  })
+  if (view.permissionMode !== permissionMode) throw new Error('Unexpected session permission response')
+}
 
 const languagePath = '/api/settings/language'
 

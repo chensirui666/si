@@ -6,6 +6,7 @@ import { draftKey, newSessionDraft, recentSessionKey } from '../chat/drafts'
 import { Button } from '../components/ui/button'
 
 test.beforeEach(async ({ page }) => {
+  await page.route('**/api/settings/permission', route => route.fulfill({ json: { defaultPermissionMode: 'normal' } }))
   await page.route('**/api/web/settings', route => route.fulfill({
     json: {
       searchProvider: 'tavily', fetchProvider: 'tavily',
@@ -645,7 +646,7 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   await editor.press('Enter')
   const history = groupB.getByRole('button', { name: '会话 1', exact: true })
   await expect(history).toHaveAttribute('aria-current', 'page')
-  expect(starts).toEqual([{ workspaceId: otherWorkspace.id, provider: 'deepseek', modelId: 'deepseek-flash', clientMessageId: expect.any(String), text: original }])
+  expect(starts).toEqual([{ permissionMode: 'normal', workspaceId: otherWorkspace.id, provider: 'deepseek', modelId: 'deepseek-flash', clientMessageId: expect.any(String), text: original }])
   await expect(draftRow).toHaveCount(0)
   await expect(heading).toHaveCount(0)
   await expect.poll(readDraft).toBeNull()
@@ -774,6 +775,9 @@ test('02 首发保存被拒绝时保留草稿，顶部提示三秒后消失', as
   await mount(<ChatPageHarness useWorkspaceApi modelConfigured />)
   await page.getByRole('combobox', { name: '工作区', exact: true }).click()
   await page.getByRole('option', { name: workspace.name, exact: true }).click()
+  const permission = page.locator('.composer-actions').getByRole('combobox', { name: '权限', exact: true })
+  await permission.click()
+  await page.getByRole('option', { name: '只读', exact: true }).click()
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   await editor.fill('读取 README.md')
   await page.getByRole('button', { name: '发送', exact: true }).click()
@@ -781,10 +785,12 @@ test('02 首发保存被拒绝时保留草稿，顶部提示三秒后消失', as
   await expect(notice).toHaveText('会话保存失败 · 磁盘空间不足，未保存')
   expect((await notice.boundingBox())?.y).toBeLessThan(24)
   await expect(editor).toHaveText('读取 README.md')
+  await expect(permission).toHaveText('只读')
   await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
   await page.clock.runFor(3000)
   await expect(notice).toHaveCount(0)
   await expect(editor).toHaveText('读取 README.md')
+  await expect(permission).toHaveText('只读')
 })
 
 test('28 历史读取失败时不能发送，收到完整快照后恢复', async ({ mount, page }) => {

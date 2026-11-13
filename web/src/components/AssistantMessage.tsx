@@ -9,7 +9,7 @@ import { RunStatus } from './RunStatus'
 export type AssistantEntry = { id: string; message: Message }
 export type ToolResults = ReadonlyMap<string, ReadonlyMap<number, ConversationMessage>>
 
-type ToolState = 'preparing' | 'running' | 'ok' | 'error' | 'stopped' | 'unknown'
+type ToolState = 'preparing' | 'running' | 'ok' | 'error' | 'stopped' | 'denied' | 'unknown'
 
 const toolTargets: Readonly<Record<string, string>> = {
   read: 'path',
@@ -18,6 +18,7 @@ const toolTargets: Readonly<Record<string, string>> = {
   write: 'path',
   find: 'pattern',
   grep: 'pattern',
+  ls: 'path',
   web_search: 'query',
   web_fetch: 'urls',
 }
@@ -54,7 +55,8 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
     <span className="tool-status" data-state="error" data-result="failure">{t('tool.status.error')}</span>
   </div>
   const outcome = result?.message.role === 'toolResult' ? result.message : undefined
-  const state: ToolState = outcome ? result?.toolErrorCode === 'interrupted' ? 'stopped' : outcome.isError ? 'error' : 'ok'
+  const state: ToolState = outcome ? result?.toolErrorCode === 'permission_denied' ? 'denied'
+    : result?.toolErrorCode === 'interrupted' ? 'stopped' : outcome.isError ? 'error' : 'ok'
     : executing ? 'running' : unknown ? 'unknown' : stopped ? 'stopped' : failure ? 'error' : running ? 'preparing' : 'error'
   const reason = outcome || state === 'preparing' || state === 'running' ? undefined
     : state === 'unknown' ? t('tool.noSavedResult')

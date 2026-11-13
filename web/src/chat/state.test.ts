@@ -3,7 +3,7 @@ import { applyFrame, initialState as disconnected } from './state'
 
 const sessionId = 'session-a'
 const initialState = { ...disconnected, sessionId }
-const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 const ready = () => applyFrame(initialState, { type: 'snapshot', sessionId, subscriptionId: 'current', snapshot: empty }, 'current').state
 
 describe('conversation state', () => {

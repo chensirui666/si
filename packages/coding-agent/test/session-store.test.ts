@@ -71,7 +71,7 @@ it('首发一起提交；任何一条写入失败就回滚会话登记', () => {
     expect(store.listSessions()).toEqual([])
     expect(store.loadSession(summary.id)).toBeUndefined()
     store.save(summary.id, { summary, run, messages: [user] })
-    expect(store.loadSession(summary.id)).toEqual({ summary, runs: [run], messages: [user], compactions: [] })
+    expect(store.loadSession(summary.id)).toEqual({ summary, runs: [run], messages: [user], compactions: [], permissionMode: 'normal' })
   } finally { store.close() }
 })
 
@@ -109,8 +109,8 @@ it('27 读取会话各表时维持同一事务，第二连接无法在中途改�
         return prepare.call(this, sql)
       })
       try {
-        expect(store.loadSession(summary.id)).toEqual({ summary, runs: [run], messages: [user], compactions: [] })
-        expect(readSteps).toHaveLength(5)
+        expect(store.loadSession(summary.id)).toEqual({ summary, runs: [run], messages: [user], compactions: [], permissionMode: 'normal' })
+        expect(readSteps).toHaveLength(6)
       } finally { observe.mockRestore() }
     } finally { other.close(); store.close() }
   } finally { await rm(directory, { recursive: true, force: true }) }

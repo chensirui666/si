@@ -1,4 +1,4 @@
-import type { AssistantMessage, JsonObject, ModelContext, ModelEvent, ModelInfo, ReasoningEffort, Tool, ToolResultMessage } from '@agent-learning/model'
+import type { AssistantMessage, JsonObject, ModelContext, ModelEvent, ModelInfo, ReasoningEffort, Tool, ToolCall, ToolResultMessage } from '@agent-learning/model'
 
 export type ExecutableTool = Tool & {
   executionMode?: 'parallel' | 'sequential'
@@ -15,6 +15,8 @@ export type AgentRunInput = {
     | { type: 'assistant'; message: AssistantMessage }
     | (Extract<AgentEvent, { type: 'tool_result' }> & { executed: boolean })
   ): void | Promise<void>
+  beforeToolCall?(call: ToolCall): { code: string; message: string } | undefined
+  finalizeContext?(context: ModelContext): ModelContext | { error: string }
   prepareContext?(context: ModelContext): ModelContext | { error: string } | Promise<ModelContext | { error: string }>
 }
 

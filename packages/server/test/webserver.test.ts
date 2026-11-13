@@ -4,13 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { request } from 'node:http'
+import { DatabaseSync } from 'node:sqlite'
 import { connect as connectTcp } from 'node:net'
 import { once } from 'node:events'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { Type } from 'typebox'
 import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
-import { AgentSession, SessionStore, SessionWriteError, SessionReadError, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
+import { AgentSession, SessionStore, SessionWriteError, SessionReadError, ToolRuntime, createTools, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
 import { createModelStream, type ModelContext, type AssistantMessage, type ModelEvent } from '@agent-learning/model'
 
 vi.mock('node:fs/promises', { spy: true })
@@ -71,7 +72,7 @@ async function rejectedHandshake(url: string, headers: Record<string, string>) {
     socket.on('error', () => {})
   })
 }
-const empty = { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
 
 describe('主动中止入口', () => {
   it('沿用来源、授权和 JSON 校验；无效请求不交付 Agent', async () => {
@@ -1004,8 +1005,8 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
     .replace('{{workspacePath}}', () => app.workspace)
   expect(requests[0].messages[0]).toEqual({ role: 'system', content: expectedPrompt })
   expect(requests[1].messages[0]).toEqual(requests[0].messages[0])
-  expect(requests[0].tools).toHaveLength(8)
-  expect(requests[1].tools).toHaveLength(8)
+  expect(requests[0].tools).toHaveLength(9)
+  expect(requests[1].tools).toHaveLength(9)
   expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })
   expect(await readFile(join(app.workspace, 'written.txt'), 'utf8')).toBe('working-directory')
   let history!: ConversationSnapshot
@@ -1490,31 +1491,31 @@ it('首发按绑定工作区选说明，真实 edit 后续轮刷新，同目录�
   expect(requests[5].filter(message => message.role === 'user').map(message => message.content)).toEqual(['会话 C 私有消息', '继续 C'])
 })
 
+type Content = AssistantMessage['content']
+
+function controlledStream(reply: (context: ModelContext) => readonly Content[number][]) {
+  const calls: ModelContext[] = []
+  const stream: NonNullable<ConstructorParameters<typeof AgentSession>[0]['stream']> = (model, context) => {
+    calls.push(structuredClone(context))
+    const content = [...reply(context)]
+    const stopReason = content.some(block => block.type === 'toolCall') ? 'toolUse' : 'stop'
+    const message: AssistantMessage = { role: 'assistant', model: model.id, provider: model.provider, api: model.api,
+      content, stopReason, timestamp: Date.now(), usage: { input: 120 } }
+    return {
+      result: async () => message,
+      async *[Symbol.asyncIterator](): AsyncGenerator<ModelEvent> {
+        yield { type: 'start', partial: { ...message, stopReason: 'pending', content: [] } }
+        yield { type: 'done', reason: stopReason, message }
+      },
+    }
+  }
+  return { stream, calls }
+}
+
 describe('Feature 10 会话库', () => {
   const answer = [{ type: 'text', text: '已完成本轮' }] as const
   const modelId = 'deepseek-flash'
   type Write = Parameters<SessionStore['save']>[1]
-  type Content = AssistantMessage['content']
-
-  function controlledStream(reply: (context: ModelContext) => readonly Content[number][]) {
-    const calls: ModelContext[] = []
-    const stream: NonNullable<ConstructorParameters<typeof AgentSession>[0]['stream']> = (model, context) => {
-      calls.push(structuredClone(context))
-      const content = [...reply(context)]
-      const stopReason = content.some(block => block.type === 'toolCall') ? 'toolUse' : 'stop'
-      const message: AssistantMessage = { role: 'assistant', model: model.id, provider: model.provider, api: model.api,
-        content, stopReason, timestamp: Date.now(), usage: { input: 120 } }
-      return {
-        result: async () => message,
-        async *[Symbol.asyncIterator](): AsyncGenerator<ModelEvent> {
-          yield { type: 'start', partial: { ...message, stopReason: 'pending', content: [] } }
-          yield { type: 'done', reason: stopReason, message }
-        },
-      }
-    }
-    return { stream, calls }
-  }
-
   function writes(shouldFail: (data: Write) => boolean = () => false) {
     const original = SessionStore.prototype.save
     const saved: Write[] = []
@@ -1815,4 +1816,232 @@ it('模型选择保存被回滚时，接口、默认值和会话快照保留上�
     expect(JSON.parse((await http(app.url + '/api/models', headers)).text).defaultSelection).toEqual(first)
     expect((await serverSnapshot(app.url, auth, sessionId)).modelSelection).toEqual(first)
   } finally { reject.mockRestore() }
+})
+
+it('permission settings persist and initialize only new sessions', async () => {
+  const app = await setup()
+  const auth = await cookie(app.authUrl)
+  const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const settings = app.url + '/api/settings/permission'
+  expect(JSON.parse((await http(settings, headers)).text)).toEqual({ defaultPermissionMode: 'normal' })
+  const old = await pickSession(app.url, auth)
+  const untouched = await pickSession(app.url, auth)
+  expect((await http(settings, headers, 'PUT', JSON.stringify({ defaultPermissionMode: 'other' }))).status).toBe(400)
+  expect((await http(settings, headers, 'PUT', JSON.stringify({ defaultPermissionMode: 'read-only' }))).status).toBe(200)
+  const fresh = await pickSession(app.url, auth)
+  expect((await serverSnapshot(app.url, auth, old)).permissionMode).toBe('normal')
+  expect((await serverSnapshot(app.url, auth, fresh)).permissionMode).toBe('read-only')
+  const change = await http(app.url + '/api/sessions/' + old + '/permission', headers, 'PUT', JSON.stringify({ permissionMode: 'read-only' }))
+  expect(change.status).toBe(200)
+  expect((await serverSnapshot(app.url, auth, untouched)).permissionMode).toBe('normal')
+  await app.server.close()
+  const restarted = new WebServer(app.config)
+  cleanups.push(() => restarted.close())
+  const start = await restarted.start()
+  const reopened = await cookie(start.authUrl)
+  expect(JSON.parse((await http(start.url + '/api/settings/permission', { Cookie: reopened })).text)).toEqual({ defaultPermissionMode: 'read-only' })
+  expect((await serverSnapshot(start.url, reopened, old)).permissionMode).toBe('read-only')
+})
+
+describe('权限管理', () => {
+  const readOnly = ['find', 'grep', 'ls', 'read']
+  const edit = { type: 'toolCall' as const, id: 'edit-1', name: 'edit',
+    arguments: { path: 'README.md', edits: [{ oldText: '青禾原文', newText: '改过' }] } }
+  const answer = [{ type: 'text' as const, text: '本轮完成' }]
+
+  async function fixture(reply: Parameters<typeof controlledStream>[0], sequential = false, sessionPath = ':memory:') {
+    const provider = controlledStream(reply)
+    const runtime = new ToolRuntime()
+    cleanups.push(() => runtime.close())
+    const app = await setup({ sessionPath,
+      createSession: (resolveDirectory, persistence, permissionMode) => new AgentSession({
+        resolveDirectory, persistence, permissionMode, stream: provider.stream,
+        tools: cwd => createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, cwd)
+          .map(tool => sequential && tool.name === 'bash' ? { ...tool, executionMode: 'sequential' } : tool),
+      }),
+    })
+    const auth = await cookie(app.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const workspaceId = await pickWorkspace(app.url, auth)
+    await mkdir(join(app.workspace, 'src'))
+    await writeFile(join(app.workspace, 'src/index.ts'), '青禾')
+    await writeFile(join(app.workspace, '.gitignore'), '')
+    const path = join(app.workspace, 'README.md')
+    await writeFile(path, '青禾原文')
+    const call = (route: string, body: object, method = 'POST') => http(app.url + route, headers, method, JSON.stringify(body))
+    const makeFirst = () => ({ workspaceId, clientMessageId: randomUUID(), modelId: 'deepseek-flash', text: '查看 README' })
+    const first = (input: ReturnType<typeof makeFirst> & { permissionMode?: string }) => call('/api/sessions/start', input)
+    const change = (id: string, permissionMode: string) => call('/api/sessions/' + id + '/permission', { permissionMode }, 'PUT')
+    const send = (id: string) => call('/api/messages', { ...makeFirst(), workspaceId: undefined, sessionId: id })
+    const snapshot = (id: string) => serverSnapshot(app.url, auth, id)
+    const idle = async (id: string) => {
+      await vi.waitFor(async () => expect((await snapshot(id)).running).toBeNull(), { timeout: 4000 })
+      return snapshot(id)
+    }
+    return { ...app, auth, provider, path, first, makeFirst, change, send, snapshot, idle, call }
+  }
+
+  it('01–03 declarations, real filesystem effects and matched denied results', async () => {
+    const calls = ['ls', 'find', 'grep', 'read'].map((name, index) => ({
+      type: 'toolCall' as const, id: name + '-1', name,
+      arguments: ([{}, { pattern: 'index.ts' }, { pattern: '青禾', path: 'src' }, { path: 'src/index.ts' }][index])!,
+    }))
+    const app = await fixture(context => context.messages.at(-1)?.role !== 'user' ? answer
+      : context.tools?.length === 4 ? [...calls, edit] : [edit, {
+        type: 'toolCall', id: 'bash-1', name: 'bash', arguments: { command: 'cat README.md' },
+      }], true)
+    const input = { ...app.makeFirst(), permissionMode: 'read-only' }
+    expect((await app.first(input)).status).toBe(202)
+    const first = await app.idle(input.clientMessageId)
+    expect(app.provider.calls[0]?.tools?.map(tool => tool.name).sort()).toEqual(readOnly)
+    expect(app.provider.calls[0]?.systemPrompt).toContain('- ls：')
+    expect(app.provider.calls[0]?.systemPrompt).not.toContain('- edit：')
+    const results = first.messages.filter(entry => entry.message.role === 'toolResult')
+    for (const [index, [id, text]] of [
+      ['ls-1', '.gitignore\nREADME.md\nsrc/'], ['find-1', 'src/index.ts'], ['grep-1', 'index.ts:1:'], ['read-1', '青禾'],
+    ].entries()) {
+      expect(results[index]?.message).toMatchObject({ toolCallId: id, isError: false,
+        content: [expect.objectContaining({ text: expect.stringContaining(text) })] })
+    }
+    expect(results[4]).toMatchObject({ toolErrorCode: 'permission_denied',
+      message: { toolCallId: 'edit-1', isError: true, content: [{ type: 'text', text: expect.stringContaining('只读') }] } })
+    expect(app.provider.calls[1]?.messages.slice(-2)).toMatchObject([
+      { role: 'toolResult', toolCallId: 'read-1' }, { role: 'toolResult', toolCallId: 'edit-1', isError: true },
+    ])
+    expect(await readFile(app.path, 'utf8')).toBe('青禾原文')
+    expect((await app.change(input.clientMessageId, 'normal')).status).toBe(200)
+    expect((await app.send(input.clientMessageId)).status).toBe(202)
+    const second = await app.idle(input.clientMessageId)
+    expect(app.provider.calls[2]?.tools?.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write', 'find', 'grep', 'ls', 'web_search', 'web_fetch'])
+    expect(await readFile(app.path, 'utf8')).toBe('改过')
+    expect(second.messages.find(entry => entry.message.role === 'toolResult' && entry.message.toolCallId === 'bash-1')?.message)
+      .toMatchObject({ isError: false, content: [{ text: expect.stringContaining('改过') }] })
+  })
+
+  it.each([false, true])('15/16 checks permission when a queued tool starts, stop=%s', async stop => {
+    const bash = { type: 'toolCall' as const, id: 'gate', name: 'bash',
+      arguments: { command: 'touch started; while [ ! -f release ]; do sleep 0.05; done; printf finished', timeout: 10 } }
+    const app = await fixture(context => context.messages.at(-1)?.role === 'user' ? [bash, edit] : answer, true)
+    const input = app.makeFirst()
+    expect((await app.first(input)).status).toBe(202)
+    const id = input.clientMessageId
+    await vi.waitFor(() => stat(join(app.workspace, 'started')))
+    const active = await app.snapshot(id)
+    expect(active.running).toMatchObject({ phase: 'tools', activeTools: [{ contentIndex: 0 }] })
+    const socket = await connect(app.url, app.auth)
+    const subscribed = nextConversationFrame(socket)
+    socket.send(JSON.stringify({ type: 'subscribe', sessionId: id, subscriptionId: 'permission' }))
+    expect(await subscribed).toMatchObject({ type: 'snapshot', snapshot: { permissionMode: 'normal' } })
+    const update = nextConversationFrame(socket)
+    expect((await app.change(id, 'read-only')).status).toBe(200)
+    expect(await update).toMatchObject({ update: { change: { type: 'permission', permissionMode: 'read-only' } } })
+    expect((await app.snapshot(id)).running).toMatchObject({ phase: 'tools', activeTools: [{ contentIndex: 0 }] })
+    if (stop) {
+      const result = await app.call('/api/abort', { sessionId: id, runId: active.running?.runId })
+      expect(JSON.parse(result.text).handled).toBe(true)
+    } else await writeFile(join(app.workspace, 'release'), '')
+    const completed = await app.idle(id)
+    const results = completed.messages.filter(entry => entry.message.role === 'toolResult')
+    expect(await readFile(app.path, 'utf8')).toBe('青禾原文')
+    if (stop) {
+      expect(results).toHaveLength(1)
+      expect(results[0]).toMatchObject({ toolErrorCode: 'interrupted', message: { toolCallId: 'gate', isError: true } })
+    } else {
+      expect(results).toMatchObject([
+        { message: { toolCallId: 'gate', isError: false, content: [{ text: expect.stringContaining('finished') }] } },
+        { toolErrorCode: 'permission_denied', message: { toolCallId: 'edit-1', isError: true } },
+      ])
+      expect(app.provider.calls[1]?.tools?.map(tool => tool.name).sort()).toEqual(readOnly)
+    }
+  })
+
+  it.each(['write-failed', 'unconfirmed'] as const)('19/20 gates new calls after permission write %s', async reason => {
+    const app = await fixture(context => context.messages.at(-1)?.role === 'user' ? [edit] : answer)
+    const id = await pickSession(app.url, app.auth)
+    const save = SessionStore.prototype.save
+    vi.spyOn(SessionStore.prototype, 'save').mockImplementation(function (this: SessionStore, sessionId, data) {
+      if (data.permissionMode === 'read-only') throw new SessionWriteError(reason)
+      return save.call(this, sessionId, data)
+    })
+    const failed = await app.change(id, 'read-only')
+    expect(failed.status).toBe(reason === 'unconfirmed' ? 500 : 507)
+    expect((await app.snapshot(id)).permissionMode).toBe('normal')
+    expect((await app.send(id)).status).toBe(202)
+    const completed = await app.idle(id)
+    const result = completed.messages.find(entry => entry.message.role === 'toolResult')
+    if (reason === 'unconfirmed') {
+      expect(result).toMatchObject({ toolErrorCode: 'permission_denied',
+        message: { isError: true, content: [{ text: expect.stringContaining('请重启') }] } })
+      expect(await readFile(app.path, 'utf8')).toBe('青禾原文')
+    } else {
+      expect(result?.message).toMatchObject({ isError: false })
+      expect(await readFile(app.path, 'utf8')).toBe('改过')
+    }
+  })
+
+  it('25/27 rejects a failed first transaction and a retry with changed permissions', async () => {
+    const app = await fixture(() => answer)
+    const input = { ...app.makeFirst(), permissionMode: 'read-only' }
+    const fail = vi.spyOn(SessionStore.prototype, 'save').mockImplementationOnce(() => { throw new SessionWriteError('storage-full') })
+    expect((await app.first(input)).status).toBe(507)
+    expect(app.provider.calls).toHaveLength(0)
+    expect(JSON.parse((await http(app.url + '/api/sessions', { Cookie: app.auth })).text).sessions).toEqual([])
+    fail.mockRestore()
+    expect((await app.first(input)).status).toBe(202)
+    await app.idle(input.clientMessageId)
+    expect((await app.first({ ...input, permissionMode: 'normal' })).status).toBe(409)
+    expect(app.provider.calls).toHaveLength(1)
+    expect((await app.snapshot(input.clientMessageId)).permissionMode).toBe('read-only')
+  })
+
+  it('26 replays the original first permission after restart and a default change', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-permission-replay-'))
+    cleanups.push(() => rm(dir, { recursive: true, force: true }))
+    const app = await fixture(() => answer, false, join(dir, 'sessions.sqlite'))
+    expect((await app.call('/api/settings/permission', { defaultPermissionMode: 'read-only' }, 'PUT')).status).toBe(200)
+    const input = { ...app.makeFirst(), permissionMode: 'read-only' }
+    const response = await app.first(input)
+    expect(response.status).toBe(202)
+    await app.idle(input.clientMessageId)
+    expect((await app.call('/api/settings/permission', { defaultPermissionMode: 'normal' }, 'PUT')).status).toBe(200)
+    await app.server.close()
+    const restarted = new WebServer(app.config)
+    cleanups.push(() => restarted.close())
+    const next = await restarted.start()
+    const auth = await cookie(next.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const replayed = await http(next.url + '/api/sessions/start', headers, 'POST', JSON.stringify(input))
+    expect(replayed.status).toBe(202)
+    expect(JSON.parse(replayed.text)).toEqual(JSON.parse(response.text))
+    const snapshot = await serverSnapshot(next.url, auth, input.clientMessageId)
+    expect(snapshot).toMatchObject({ permissionMode: 'read-only', runs: [{ restored: true, status: 'completed' }] })
+    expect(app.provider.calls).toHaveLength(1)
+  })
+
+  it('21/22/28 declares the saved permission after restart and defaults old records to normal', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'agent-permission-restore-'))
+    cleanups.push(() => rm(dir, { recursive: true, force: true }))
+    const sessionPath = join(dir, 'sessions.sqlite')
+    const app = await fixture(() => answer, false, sessionPath)
+    expect((await app.call('/api/settings/permission', { defaultPermissionMode: 'read-only' }, 'PUT')).status).toBe(200)
+    const modern = await pickSession(app.url, app.auth)
+    const legacy = await pickSession(app.url, app.auth)
+    await app.server.close()
+    const db = new DatabaseSync(sessionPath)
+    try { db.prepare('DELETE FROM session_permissions WHERE session_id = ?').run(legacy) }
+    finally { db.close() }
+    const restarted = new WebServer(app.config)
+    cleanups.push(() => restarted.close())
+    const next = await restarted.start()
+    const auth = await cookie(next.authUrl)
+    expect((await serverSnapshot(next.url, auth, legacy)).permissionMode).toBe('normal')
+    expect((await serverSnapshot(next.url, auth, modern)).permissionMode).toBe('read-only')
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const send = (sessionId: string) => http(next.url + '/api/messages', headers, 'POST', JSON.stringify({
+      sessionId, clientMessageId: randomUUID(), modelId: 'deepseek-flash', text: '继续',
+    }))
+    expect((await send(modern)).status).toBe(202)
+    await vi.waitFor(() => expect(app.provider.calls).toHaveLength(1))
+    expect(app.provider.calls[0]?.tools?.map(tool => tool.name).sort()).toEqual(readOnly)
+  })
 })

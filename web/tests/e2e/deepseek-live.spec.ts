@@ -289,9 +289,9 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
       const result = await complete(page, observed, '本条消息只调用一次 read 读取工作区当前的 note.txt。收到这次工具结果后，直接回答其中的项目名称。')
       expect(textOf(result.message)).toContain(name)
       expect(modelRequests).toHaveLength(before + 2)
-      expect(modelRequests[before]?.tools).toHaveLength(8)
+      expect(modelRequests[before]?.tools).toHaveLength(9)
       const followup = modelRequests[before + 1]!
-      expect(followup.tools).toHaveLength(8)
+      expect(followup.tools).toHaveLength(9)
       const call = followup.messages.at(-2)?.tool_calls?.[0]
       expect(call?.id).toBeTruthy()
       expect(followup.messages.at(-1)).toMatchObject({
@@ -311,7 +311,7 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
   }
 })
 
-for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${scenario}: 实际工具结果进入后续请求，每轮保留八种工具`, async ({ page, context }) => {
+for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${scenario}: 实际工具结果进入后续请求，每轮保留九种工具`, async ({ page, context }) => {
   test.setTimeout(450_000)
   const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
   test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE')
@@ -338,7 +338,7 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
     const result = await complete(page, observed, scenario === 'loop'
       ? '请根据 index.txt 的线索找到项目名称。请先用 read 读取 index.txt，再根据真实结果继续使用 read，最后只回答项目名称。'
       : '已确认这是新建的空测试工作区，note.txt 不存在。请直接用 write 把“项目名称：青禾”写入 note.txt。本次只允许一次 write 调用，不使用其他工具，不检查目录或读取验证，收到写入结果后直接回答“已保存”。')
-    expect(requests.every(request => request.tools?.length === 8)).toBe(true)
+    expect(requests.every(request => request.tools?.length === 9)).toBe(true)
     const actualResults = observed.updates.flatMap(({ update }) => update.change.type === 'task' && update.change.message?.message.role === 'toolResult' ? [update.change.message] : [])
     expect(actualResults.every(entry => entry.message.role === 'toolResult' && !entry.message.isError)).toBe(true)
     if (scenario === 'loop') {
@@ -363,6 +363,50 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
     }
   } finally {
     await Promise.allSettled([context.clearCookies(), server.close()])
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+test('里程碑 2 权限 14：真实 DeepSeek 从网页用只读工具列目录并读取文件', async ({ page }) => {
+  test.setTimeout(180_000)
+  const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
+  test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE')
+  const temporary = await mkdtemp(join(tmpdir(), 'agent-permission-live-'))
+  const cwd = join(temporary, 'workspace')
+  const server = new WebServer({
+    port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
+    globalContextDirectory: join(temporary, 'global-context'),
+    browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
+    workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
+  })
+  try {
+    const marker = 'permission-' + randomUUID().slice(0, 8)
+    await mkdir(cwd)
+    await writeFile(join(cwd, 'proof.txt'), marker)
+    const observed = observe(page)
+    await authorize(page, (await server.start()).authUrl)
+    await addWorkspace(page)
+    await saveKey(page, await readLiveKey(keyFile!))
+    const permission = page.locator('.composer-actions').getByRole('combobox', { name: '权限' })
+    await permission.click()
+    await page.getByRole('option', { name: '只读', exact: true }).click()
+    const editor = page.getByRole('textbox', { name: '消息', exact: true })
+    await editor.fill('先用 ls 列出当前工作目录，再用 read 读取列表中的 proof.txt。最后只回答文件中的完整标记。')
+    await page.getByRole('button', { name: '发送', exact: true }).click()
+    await expect.poll(() => observed.updates.some(({ update: { change } }) => change.type === 'task' && !change.running), { timeout: 120_000 }).toBe(true)
+    await expect(permission).toHaveText('只读')
+    const results = observed.updates.flatMap(({ update: { change } }) =>
+      change.type === 'task' && change.message?.message.role === 'toolResult' ? [change.message.message] : [])
+    expect(results.some(result => result.toolName === 'ls' && !result.isError && textOf(result).includes('proof.txt'))).toBe(true)
+    expect(results.some(result => result.toolName === 'read' && !result.isError && textOf(result).includes(marker))).toBe(true)
+    const terminal = [...observed.updates].reverse().find(({ update: { change } }) => change.type === 'model'
+      && (change.event.type === 'done' || change.event.type === 'error'))?.update.change
+    expect(terminal).toMatchObject({ type: 'model', event: { type: 'done', message: { model: 'deepseek-flash',
+      content: expect.arrayContaining([expect.objectContaining({ type: 'text', text: expect.stringContaining(marker) })]),
+    } } })
+    await expect(page.locator('.message-list')).toContainText(marker)
+  } finally {
+    await server.close()
     await rm(temporary, { recursive: true, force: true })
   }
 })

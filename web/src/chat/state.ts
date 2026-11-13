@@ -1,3 +1,4 @@
+import { isPermissionMode } from '@agent-learning/server/protocol'
 import type { CompactionRecord, ConversationMessage, ConversationSnapshot, RunRecord, SaveFailure, ServerFrame } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
@@ -13,7 +14,7 @@ export type ChatState = {
   connectionNotice?: CopyKey
 }
 export type Subscription = (() => void) & { requestSnapshot?: () => void; setSession: (sessionId: string | null) => void }
-export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void) => Subscription
+export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void, onPermissionSettingsChanged?: () => void) => Subscription
 export const initialState: ChatState = { sessionId: null, connection: 'connecting', snapshot: null, slow: false, error: null }
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -141,7 +142,7 @@ function saveFailure(value: unknown): value is SaveFailure {
 }
 
 function validSnapshot(value: unknown): value is ConversationSnapshot {
-  return record(value) && sequence(value.seq) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
+  return record(value) && sequence(value.seq) && isPermissionMode(value.permissionMode) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
     && (value.modelSelection === undefined || modelSelection(value.modelSelection))
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
     && value.activeContent.every(block => record(block) && typeof block.messageId === 'string' && sequence(block.contentIndex)
@@ -183,6 +184,12 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   const capacity = frame.update.contextUsage === undefined ? state.snapshot.contextUsage : frame.update.contextUsage as ConversationSnapshot['contextUsage']
   const change = frame.update.change
   if (!record(change)) return { state, resubscribe: true }
+  if (change.type === 'permission') {
+    if (!isPermissionMode(change.permissionMode)) return { state, resubscribe: true }
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, seq: frame.update.seq, permissionMode: change.permissionMode, contextUsage: capacity,
+    } }, resubscribe: false }
+  }
   if (change.type === 'selection') {
     if (!modelSelection(change.selection)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {

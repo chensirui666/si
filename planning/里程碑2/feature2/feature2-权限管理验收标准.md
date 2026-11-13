@@ -1,6 +1,6 @@
 # 里程碑 2 Feature 2 权限管理验收标准
 
-状态为待执行。共 32 个案例，分为 4 个主题。用临时工作区和独立设置文件验收，检查工具实际效果、跨页面状态和重启恢复。
+2026-11-14 完成验收。32 个案例分为 4 个主题。用临时工作区和独立设置文件验收，检查工具实际效果、跨页面状态和重启恢复。
 
 | 验收主题 | 验证什么 | 对应案例 |
 | --- | --- | --- |
@@ -273,8 +273,22 @@
 - **目的** 验证非法模式无法写入持久数据。
 - **怎么测** 对默认权限保存接口提交 `"other"`。检查服务返回输入错误，重读仍得到原默认值。
 
-## 执行说明
+## 执行结果
 
-- **既有覆盖已复跑。** 后端包构建通过。筛选相关后端用例共 45 项通过，450 项未选中。已复用的历史覆盖包括 [工具串并行、结果配对、截断与中止](../../../packages/coding-agent/test/agent-session.test.ts#L573)，以及 [设置保存](../../../packages/server/test/webserver.test.ts#L1043)、[首发保存和重试](../../../packages/server/test/webserver.test.ts#L1552)、[会话设置明确回滚](../../../packages/server/test/webserver.test.ts#L1800)。这些结果只证明已有能力。
-- **本期案例待实现和执行。** 复用现有测试文件、受控模型和临时目录。网页端到端仅用于验证实际页面、服务、存储及订阅协作。组件用例使用真实 Chromium，后端逻辑用实际接口或模块验证。
-- **真实模型待验收。** 按项目开发指南提供测试凭据后执行案例 14，记录模型、工具调用和可核对的结果。 [开发指南](../../../docs/development.md#校验)
+2026-11-14 在 `codex/milestone2-feature2` 的独立 worktree 使用临时工作区、设置文件和 SQLite 会话库完成验收。
+
+| 案例 | 结果 | 证据 |
+| --- | --- | --- |
+| 01–03、15–16、18–22、25–28、32 | 通过 | [服务端集成测试](../../../packages/server/test/webserver.test.ts)。核对首轮及下一轮工具声明、实际文件变更、调用编号、运行中切换、保存错误、首发重试和重启恢复。 |
+| 04–13 | 通过 | [目录工具测试](../../../packages/coding-agent/test/tool-execution.test.ts)。使用真实目录验证排序、隐藏项和链接、条数和字节上限及错误。 |
+| 14 | 通过 | [真实浏览器验收](../../../web/tests/e2e/deepseek-live.spec.ts)。DeepSeek Flash（`deepseek-flash`）用 `ls` 找到 `proof.txt`，用 `read` 读出该次测试的随机标记，最终回复包含同一标记。 |
+| 17、23–24、29 | 通过 | [浏览器端到端测试](../../../web/tests/e2e/permissions.spec.ts)。同一会话两页同步，已打开草稿保留权限，新草稿使用当时保存的默认值。 |
+| 25、30–31 | 通过 | [首发失败组件测试](../../../web/src/pages/ChatPage.browser.test.tsx)和[设置组件测试](../../../web/src/components/SettingsDialog.browser.test.tsx)。检查草稿保留、明确写入失败和回执丢失。 |
+
+另验证在自动压缩过程中切换权限，压缩完成后发给模型的工具声明与系统提示使用同一个最新模式。 [压缩测试](../../../packages/coding-agent/test/agent-compaction.test.ts)
+
+### 项目回归
+
+- 受控校验通过。后端 412 项、网页单元 151 项、Chromium 组件 60 项。使用测试凭据运行浏览器全量回归 39 项通过，含 10 项真实 DeepSeek 用例。
+- 真实工具回归 7 项通过，覆盖 Bash、编辑、写入、查找、内容搜索、Tavily 搜索和正文获取。
+- Feature 1 的逐型号真实回归首次通过 15/22。定向复跑后，Kimi K3 通过，累计 16/22 获得通过结果。Gemini 3.7 Flash 和 3.8 Flash 返回 HTTP 503，Gemini 4 Argon、Carbon、Hydrogen 遇到限流。DeepSeek 与 Gemini 3.7 Flash 的跨协议续做首次超时，复跑返回 HTTP 503。与 Gemini 4 Hydrogen 的跨协议续做首次通过，复跑遇到限流。

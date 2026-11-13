@@ -20,7 +20,7 @@ export async function freeVitePort() {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   return address.port
 }
-export const emptySnapshot = { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null } satisfies ConversationSnapshot
+export const emptySnapshot = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null } satisfies ConversationSnapshot
 
 type Started = { url: string; authUrl: string; devAuthUrl: string }
 
@@ -187,8 +187,10 @@ export async function expectBrowserStorage(page: Page, recent: string, workspace
   expected['agent-learning:recent-workspace'] = workspaceId
   await expect.poll(() => page.evaluate(expected => {
     const keys = Object.keys(localStorage)
+    const tabKeys = Object.keys(sessionStorage)
     return keys.length === Object.keys(expected).length
       && keys.every(key => localStorage.getItem(key) === expected[key])
-      && sessionStorage.length === 0
+      && tabKeys.every(key => key === 'agent-learning:draft-permission'
+        && ['normal', 'read-only'].includes(sessionStorage.getItem(key) ?? ''))
   }, expected), { message: '浏览器仅保存会话选择和草稿' }).toBe(true)
 }
