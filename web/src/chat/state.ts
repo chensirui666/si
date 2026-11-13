@@ -1,5 +1,5 @@
 import type { CompactionRecord, ConversationMessage, ConversationSnapshot, RunRecord, SaveFailure, ServerFrame } from '@agent-learning/server/protocol'
-import type { AssistantMessage, ModelMessage } from '@agent-learning/model'
+import type { AssistantMessage, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 
 export type ConnectionState = 'connecting' | 'awaitingSnapshot' | 'ready' | 'disconnected'
@@ -15,6 +15,15 @@ export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: 
 export const initialState: ChatState = { sessionId: null, connection: 'connecting', snapshot: null, slow: false, error: null }
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+export const reasoningEffort = (value: unknown): value is ReasoningEffort =>
+  typeof value === 'string' && ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value)
+
+export function modelSelection(value: unknown): value is ModelSelection {
+  return record(value) && typeof value.provider === 'string' && value.provider !== ''
+    && typeof value.modelId === 'string' && value.modelId !== ''
+    && (value.reasoningEffort === undefined || reasoningEffort(value.reasoningEffort))
+}
+
 const sequence = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const textContent = (value: unknown) => record(value) && value.type === 'text' && typeof value.text === 'string'
@@ -131,6 +140,7 @@ function saveFailure(value: unknown): value is SaveFailure {
 
 function validSnapshot(value: unknown): value is ConversationSnapshot {
   return record(value) && sequence(value.seq) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
+    && (value.modelSelection === undefined || modelSelection(value.modelSelection))
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
     && value.activeContent.every(block => record(block) && typeof block.messageId === 'string' && sequence(block.contentIndex)
       && (block.type === 'text' || block.type === 'thinking' || (block.type === 'toolCall' && typeof block.argumentsText === 'string')))
@@ -159,16 +169,24 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   if (frame.update.seq <= state.snapshot.seq) return unchanged
   if (frame.update.seq !== state.snapshot.seq + 1) return { state, resubscribe: true }
   if (frame.update.contextUsage !== undefined && !contextUsage(frame.update.contextUsage)) return { state, resubscribe: true }
-  const { run, saveFailure: failure } = frame.update
+  const { run, saveFailure: failure, modelSelection: selection } = frame.update
+  if (selection !== undefined && !modelSelection(selection)) return { state, resubscribe: true }
   if (run !== undefined && (!runRecord(run) || run.sessionId !== state.sessionId)
     || failure !== undefined && (!saveFailure(failure) || failure.runId !== state.snapshot.running?.runId)) return { state, resubscribe: true }
   const metadata = {
+    ...(selection && { modelSelection: selection }),
     ...(run && { runs: [...(state.snapshot.runs ?? []).filter(item => item.id !== run.id), run] }),
     ...(failure && { saveFailures: [...state.snapshot.saveFailures ?? [], failure] }),
   }
   const capacity = frame.update.contextUsage === undefined ? state.snapshot.contextUsage : frame.update.contextUsage as ConversationSnapshot['contextUsage']
   const change = frame.update.change
   if (!record(change)) return { state, resubscribe: true }
+  if (change.type === 'selection') {
+    if (!modelSelection(change.selection)) return { state, resubscribe: true }
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, seq: frame.update.seq, modelSelection: change.selection, contextUsage: capacity,
+    } }, resubscribe: false }
+  }
   if (change.type === 'model') {
     const snapshot = applyModel(state.snapshot, change.messageId, change.event)
     return snapshot ? { state: { ...state, snapshot: { ...snapshot, ...metadata, seq: frame.update.seq, contextUsage: capacity } }, resubscribe: false } : { state, resubscribe: true }

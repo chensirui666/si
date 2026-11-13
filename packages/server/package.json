@@ -17,7 +17,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "test": "vitest run --environment node test",
-    "test:tools:live": "vitest run --config vitest.tools-live.config.ts"
+    "test:tools:live": "vitest run --config vitest.tools-live.config.ts",
+    "test:models:live": "vitest run --config vitest.models-live.config.ts"
   },
   "dependencies": {
     "@agent-learning/coding-agent": "0.1.0",

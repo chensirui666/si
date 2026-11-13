@@ -1,6 +1,7 @@
 import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
+import { effortLabel } from './ModelPicker'
 import { SaveFailureNotice } from './SaveFailureNotice'
 
 type MessageRow =
@@ -49,6 +50,8 @@ export function MessageList({ messages, activeContent = [], running = null, runs
             const next = rows[index + 1]
             const endsTurn = row.type === 'assistant' || next?.type !== 'assistant' || next.userId !== runId
             return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.id} data-message-id={row.id} data-run-status={run?.status}>
+            {row.type === 'assistant' && run && <p className="message-model">{run.provider ?? 'deepseek'} / {run.modelId}{(run.reasoningEffort ?? (!run.provider ? 'high' : undefined)) &&
+              ` · ${effortLabel(run.reasoningEffort ?? 'high')}`}</p>}
             {row.type === 'assistant'
               ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure}
                 running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />

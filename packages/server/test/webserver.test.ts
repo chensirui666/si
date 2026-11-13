@@ -267,18 +267,19 @@ describe('阶段二模型配置', () => {
     const headers = { Cookie: await cookie(app.authUrl), Origin: app.url, 'Content-Type': 'application/json' }
     const missing = await http(app.url + '/api/models', headers)
     expect(missing.status).toBe(200)
-    expect(JSON.parse(missing.text)).toEqual({ models: [], deepseek: { state: 'missing' } })
+    expect(JSON.parse(missing.text)).toMatchObject({ models: [], providers: expect.arrayContaining([expect.objectContaining({ id: 'deepseek', status: { state: 'missing' } })]) })
     for (const apiKey of ['stage2-first-fake-key', 'stage2-replacement-fake-key']) {
       const response = await http(app.url + '/api/providers/deepseek', headers, 'PUT', JSON.stringify({ apiKey }))
       expect(response.status).toBe(200)
-      expect(JSON.parse(response.text)).toMatchObject({ models: [{ id: 'deepseek-flash', provider: 'deepseek' }], deepseek: { state: 'configured' } })
+      expect(JSON.parse(response.text)).toMatchObject({ models: expect.arrayContaining([expect.objectContaining({ id: 'deepseek-flash', provider: 'deepseek' })]),
+        defaultSelection: { modelId: 'deepseek-flash', provider: 'deepseek', reasoningEffort: 'high' } })
       expect(response.text).not.toContain(apiKey)
       expect(response.headers['cache-control']).toBe('no-store')
       expect(JSON.parse(await readFile(app.config.modelAuthPath, 'utf8')).deepseek.key).toBe(apiKey)
     }
     const removed = await http(app.url + '/api/providers/deepseek', headers, 'DELETE')
     expect(removed.status).toBe(200)
-    expect(JSON.parse(removed.text)).toEqual({ models: [], deepseek: { state: 'missing' } })
+    expect(JSON.parse(removed.text)).toMatchObject({ models: [], providers: expect.arrayContaining([expect.objectContaining({ id: 'deepseek', status: { state: 'missing' } })]) })
     expect(JSON.parse(await readFile(app.config.modelAuthPath, 'utf8'))).toEqual({})
   })
   it('未授权、跨站和非法输入均拒绝，不能写文件或泄露正文', async () => {
@@ -307,7 +308,7 @@ describe('阶段二模型配置', () => {
     const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
     expect((await http(app.url, headers)).status).toBe(200)
     const models = await http(app.url + '/api/models', headers)
-    expect(JSON.parse(models.text)).toMatchObject({ models: [], deepseek: { state: 'error' } })
+    expect(JSON.parse(models.text)).toMatchObject({ models: [], providers: expect.arrayContaining([expect.objectContaining({ id: 'deepseek', status: expect.objectContaining({ state: 'error' }) })]) })
     for (const method of ['PUT', 'DELETE']) {
       const response = await http(app.url + '/api/providers/deepseek', headers, method, method === 'PUT' ? '{"apiKey":"new-fake-key"}' : undefined)
       expect(response.status).toBeGreaterThanOrEqual(400)
@@ -332,10 +333,15 @@ describe('阶段二模型配置', () => {
     const headers = { Cookie: credentials, 'Content-Type': 'application/json' }
     expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"notification-fake-key"}')).status).toBe(200)
     await vi.waitFor(() => expect(frames.every((list, index) => list.filter(frame => frame.type === 'models_changed').length > counts[index]!)).toBe(true))
+    const afterFirst = frames.map(list => list.filter(frame => frame.type === 'models_changed').length)
+    expect((await http(app.url + '/api/providers/moonshotai-cn', headers, 'PUT', '{"apiKey":"second-provider-fake-key"}')).status).toBe(200)
+    await vi.waitFor(() => expect(frames.every((list, index) => list.filter(frame => frame.type === 'models_changed').length > afterFirst[index]!)).toBe(true))
+    const view = JSON.parse((await http(app.url + '/api/models', headers)).text)
+    expect(new Set(view.models.map((model: { provider: string }) => model.provider))).toEqual(new Set(['deepseek', 'moonshotai-cn']))
     const before = frames.map(list => list.filter(frame => frame.type === 'models_changed').length)
     await writeFile(app.config.modelAuthPath, '{invalid external data', { mode: 0o600 })
     await vi.waitFor(() => expect(frames.every((list, index) => list.filter(frame => frame.type === 'models_changed').length > before[index]!)).toBe(true), { timeout: 5000 })
-    expect(JSON.parse((await http(app.url + '/api/models', headers)).text).deepseek.state).toBe('error')
+    expect(JSON.parse((await http(app.url + '/api/models', headers)).text).providers.find((provider: { id: string }) => provider.id === 'deepseek').status.state).toBe('error')
     for (const list of frames) {
       expect(list.filter(frame => frame.type === 'snapshot').map(frame => frame.snapshot.seq)).toEqual([0])
       expect(list.some(frame => frame.type === 'update')).toBe(false)
@@ -345,7 +351,7 @@ describe('阶段二模型配置', () => {
     const restarted = new WebServer({ ...app.config, port: Number(new URL(app.url).port) })
     cleanups.push(() => restarted.close())
     await restarted.start()
-    expect(JSON.parse((await http(app.url + '/api/models', headers)).text).deepseek.state).toBe('error')
+    expect(JSON.parse((await http(app.url + '/api/models', headers)).text).providers.find((provider: { id: string }) => provider.id === 'deepseek').status.state).toBe('error')
   })
 })
 
@@ -1728,4 +1734,37 @@ describe('Feature 10 会话库', () => {
     socket.send(JSON.stringify({ type: 'subscribe', sessionId: id, subscriptionId: 'retry-read' }))
     expect(await second).toMatchObject({ type: 'snapshot', subscriptionId: 'retry-read', snapshot: { messages: [], running: null } })
   })
+})
+
+it('旧格式的首次发送仍须与已配置的默认模型一致', async () => {
+  const app = await setup()
+  const auth = await cookie(app.authUrl)
+  const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const workspaceId = await pickWorkspace(app.url, auth)
+  expect((await http(app.url + '/api/providers/moonshotai-cn', headers, 'PUT', '{"apiKey":"configured-for-moonshot"}')).status).toBe(200)
+  const input = { clientMessageId: randomUUID(), workspaceId, modelId: 'deepseek-flash', text: '第一次发送' }
+  const result = await http(app.url + '/api/sessions/start', headers, 'POST', JSON.stringify(input))
+  expect(result.status).toBe(409)
+  expect(JSON.parse(result.text)).toMatchObject({ code: 'model_selection_changed' })
+  expect(JSON.parse((await http(app.url + '/api/sessions', headers)).text)).toEqual({ sessions: [] })
+})
+
+it('模型选择保存被回滚时，接口、默认值和会话快照保留上次确认的选择', async () => {
+  const app = await setup()
+  const auth = await cookie(app.authUrl)
+  const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const sessionId = await pickSession(app.url, auth)
+  expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"configured-for-test"}')).status).toBe(200)
+  const first = { provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high' }
+  const save = (selection: typeof first) =>
+    http(app.url + '/api/model-selection', headers, 'PUT', JSON.stringify({ ...selection, sessionId }))
+  expect((await save(first)).status).toBe(200)
+  const reject = vi.spyOn(SessionStore.prototype, 'saveModelSelection').mockImplementationOnce(() => { throw new SessionWriteError('write-failed') })
+  try {
+    const failed = await save({ ...first, reasoningEffort: 'low' })
+    expect(failed.status).toBe(507)
+    expect(JSON.parse(failed.text)).toMatchObject({ code: 'save_rejected' })
+    expect(JSON.parse((await http(app.url + '/api/models', headers)).text).defaultSelection).toEqual(first)
+    expect((await serverSnapshot(app.url, auth, sessionId)).modelSelection).toEqual(first)
+  } finally { reject.mockRestore() }
 })

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Type } from 'typebox'
+import { piModels } from '../src/catalog.js'
+import { toPiContext } from '../src/context.js'
 import * as modelApi from '../src/index.js'
 import type { AssistantMessage, ModelContext } from '../src/index.js'
 
@@ -63,4 +65,32 @@ describe('model-visible context estimates', () => {
     expect(missing).toEqual(explicit)
     expect(turn).toEqual(original)
   })
+})
+
+
+it('replays foreign Gemini 4 tool history as text and preserves native call and result pairs', () => {
+  const gemini = piModels.getModel('google', 'gemini-4-hydrogen')!
+  const foreignCall: AssistantMessage = {
+    ...assistant, stopReason: 'toolUse',
+    content: [{ type: 'toolCall', id: 'foreign', name: 'read', arguments: { path: 'index.txt' } }],
+  }
+  const nativeCall: AssistantMessage = {
+    ...assistant, provider: 'google', model: gemini.id, api: gemini.api, stopReason: 'toolUse',
+    content: [{ type: 'toolCall', id: 'native', name: 'read', arguments: { path: 'note.txt' }, thoughtSignature: 'aGVsbG8=' }],
+  }
+  const context: ModelContext = { messages: [
+    foreignCall,
+    { role: 'toolResult', toolCallId: 'foreign', toolName: 'read', isError: true, timestamp: 2,
+      content: [{ type: 'text', text: 'index.txt was missing' }] },
+    nativeCall,
+    { role: 'toolResult', toolCallId: 'native', toolName: 'read', isError: false, timestamp: 3,
+      content: [{ type: 'text', text: 'note contents' }] },
+  ] }
+  const snapshot = structuredClone(context)
+  const messages = toPiContext(context, gemini).messages
+  expect(messages[0]).toMatchObject({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: expect.stringContaining('index.txt') }] })
+  expect(messages[1]).toMatchObject({ role: 'user', content: expect.stringContaining('index.txt was missing') })
+  expect(messages[2]).toMatchObject(nativeCall)
+  expect(messages[3]).toEqual(context.messages[3])
+  expect(context).toEqual(snapshot)
 })

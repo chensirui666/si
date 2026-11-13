@@ -1,3 +1,4 @@
+import type { ModelSelection } from '@agent-learning/model'
 import { closeSync, mkdirSync, openSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
@@ -10,6 +11,7 @@ export type SessionHistory = {
   runs: StoredRun[]
   messages: ConversationMessage[]
   compactions: CompactionRecord[]
+  modelSelection?: ModelSelection
 }
 export type SessionPersistence = {
   store: SessionStore
@@ -23,12 +25,18 @@ type SessionWrite = {
   runId?: string
   messages?: ConversationMessage[]
   compaction?: CompactionRecord
+  modelSelection?: ModelSelection
+  defaultSelection?: ModelSelection
 }
 type Row = Record<string, SQLOutputValue>
 
 const schema = `
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY, workspaceId TEXT NOT NULL, name TEXT NOT NULL, createdAt TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS model_selections (
+    scope TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id), data TEXT NOT NULL CHECK(json_valid(data)),
+    CHECK(scope = coalesce(session_id, ''))
   ) STRICT;
   CREATE TABLE IF NOT EXISTS runs (
     seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -58,6 +66,11 @@ export class SessionWriteError extends Error {
 }
 
 export class SessionReadError extends Error {}
+
+export function runSelection(run: Pick<RunRecord, 'provider' | 'modelId' | 'reasoningEffort'>): ModelSelection {
+  return run.provider ? { provider: run.provider, modelId: run.modelId, reasoningEffort: run.reasoningEffort }
+    : { provider: 'deepseek', modelId: run.modelId, reasoningEffort: 'high' }
+}
 
 export function submissionReceipt(run: StoredRun): SubmissionAccepted {
   const common = { clientMessageId: run.clientMessageId, acceptedSeq: run.acceptedSeq }
@@ -104,7 +117,7 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, run, runId = run?.id, messages, compaction }: SessionWrite) {
+  save(sessionId: string, { summary, run, runId = run?.id, messages, compaction, modelSelection, defaultSelection }: SessionWrite) {
     if (this.uncertain) throw new SessionWriteError('unconfirmed')
     let committing = false
     try {
@@ -127,6 +140,12 @@ export class SessionStore {
           ON CONFLICT(session_id, id) DO UPDATE SET data = excluded.data`)
           .run(sessionId, runId!, compaction.id, JSON.stringify(compaction))
       }
+      if (modelSelection || defaultSelection) {
+        const upsert = this.db.prepare(`INSERT INTO model_selections (scope, session_id, data) VALUES (?, ?, ?)
+          ON CONFLICT(scope) DO UPDATE SET data = excluded.data`)
+        if (modelSelection) upsert.run(sessionId, sessionId, JSON.stringify(modelSelection))
+        if (defaultSelection) upsert.run('', null, JSON.stringify(defaultSelection))
+      }
       committing = true
       this.db.exec('COMMIT')
     } catch (error) {
@@ -136,6 +155,28 @@ export class SessionStore {
       } else if (committing) this.uncertain = true
       throw new SessionWriteError(this.uncertain ? 'unconfirmed' : sqliteCode(error) === 13 ? 'storage-full' : 'write-failed', error)
     }
+  }
+
+  saveModelSelection(selection: ModelSelection, sessionId?: string) {
+    this.save(sessionId ?? '', { modelSelection: sessionId ? selection : undefined, defaultSelection: selection })
+  }
+
+  getDefaultSelection(): ModelSelection | undefined {
+    try {
+      if (this.uncertain) throw new Error('Commit state unknown')
+      return this.readSelection('')
+    } catch (error) { throw new SessionReadError('无法读取默认模型选择，请重试', { cause: error }) }
+  }
+
+  private readSelection(scope: string): ModelSelection | undefined {
+    const row = this.db.prepare('SELECT data FROM model_selections WHERE scope = ?').get(scope)
+    if (!row) return
+    const selection = JSON.parse(String(row.data)) as ModelSelection
+    if (!selection || typeof selection.provider !== 'string' || !selection.provider || typeof selection.modelId !== 'string'
+      || !selection.modelId || (selection.reasoningEffort !== undefined && typeof selection.reasoningEffort !== 'string')) {
+      throw new Error('Invalid model selection')
+    }
+    return selection
   }
 
   listSessions(): SessionSummary[] {
@@ -231,6 +272,7 @@ export class SessionStore {
       })
     const compactionIds = new Set(compactions.map(item => item.id))
     if (runs.some(run => run.kind === 'task' ? !seen.has(run.id) : !compactionIds.has(run.id))) throw new Error('Missing submitted record')
-    return { summary, runs, messages, compactions }
+    const modelSelection = this.readSelection(summary.id)
+    return { summary, runs, messages, compactions, ...(modelSelection && { modelSelection }) }
   }
 }

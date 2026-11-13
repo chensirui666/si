@@ -1,33 +1,13 @@
-import { Credentials } from '@agent-learning/credentials'
+import type { Credentials } from '@agent-learning/credentials'
 import OpenAI from 'openai'
+import { findModel } from './catalog.js'
 import { AssistantEventStream } from './event-stream.js'
 import { parseToolArguments } from './tool-arguments.js'
 import { convertMessages, convertTools } from './context.js'
 import type {
-  AssistantMessage, ModelContext, ModelDiscovery, ModelEventStream, ModelInfo,
+  AssistantMessage, ModelContext, ModelEventStream, ModelInfo, ModelStreamOptions,
   ModelStopReason, TextContent, ThinkingContent, ToolCall,
 } from './types.js'
-
-const deepseek: ModelInfo = {
-  id: 'deepseek-flash',
-  name: 'DeepSeek Flash',
-  provider: 'deepseek',
-  api: 'openai-completions',
-  contextWindow: 1_048_576,
-  maxTokens: 65_536,
-}
-
-export function findModel(modelId: string): ModelInfo | undefined {
-  return modelId === deepseek.id ? { ...deepseek } : undefined
-}
-
-export async function discoverModels(
-  credentials: Pick<Credentials, 'readStatus'> = new Credentials(),
-): Promise<ModelDiscovery> {
-  const status = await credentials.readStatus('deepseek')
-  return { models: status.state === 'configured' ? [{ ...deepseek }] : [], deepseek: status }
-}
-
 
 class ModelFailure extends Error {}
 
@@ -53,10 +33,10 @@ function isContextOverflow(error: unknown): boolean {
 
 type ToolState = { block: ToolCall; contentIndex: number; argumentsText: string; index?: number }
 
-export function createModelStream(
+export function createDeepSeekStream(
   credentials: Pick<Credentials, 'readApiKey'>,
   configuration: { fetch?: typeof fetch; baseURL?: string } = {},
-): typeof stream {
+): (model: ModelInfo, context: ModelContext, options?: ModelStreamOptions) => ModelEventStream {
   return (model, context, options) => {
     const events = new AssistantEventStream()
     const started = performance.now()
@@ -106,7 +86,7 @@ export function createModelStream(
         options?.signal?.addEventListener('abort', cancel, { once: true })
         if (options?.signal?.aborted) cancel()
         if (interruption) throw new ModelFailure('本次模型调用已取消。')
-        const supported = findModel(model.id)
+        const supported = findModel(model.id, model.provider)
         if (!supported || supported.provider !== model.provider || supported.api !== model.api) {
           throw new ModelFailure('不支持所选模型。')
         }
@@ -119,12 +99,14 @@ export function createModelStream(
           // The rolling timer owns inactivity; 0 means immediate timeout in the SDK.
           timeout: 2_147_483_647,
         })
+        const effort = options?.reasoningEffort ?? 'high'
         const upstream = await Promise.race([
           client.chat.completions.create({
-            model: model.id, messages: convertMessages(context), max_tokens: model.maxTokens, stream: true,
-            stream_options: { include_usage: true }, reasoning_effort: 'high',
+            model: model.id, messages: convertMessages(context, effort !== 'off' && Boolean(context.tools?.length), true, model), max_tokens: model.maxTokens, stream: true,
+            stream_options: { include_usage: true },
+            ...(effort !== 'off' && { reasoning_effort: effort }),
             ...(context.tools?.length ? { tools: convertTools(context.tools) } : {}),
-            ...{ thinking: { type: 'enabled' } },
+            ...{ thinking: { type: effort === 'off' ? 'disabled' : 'enabled' } },
           }, { signal: controller.signal, maxRetries: 0 }),
           interrupted,
         ])
@@ -251,9 +233,3 @@ export function createModelStream(
     return events
   }
 }
-
-export function stream(model: ModelInfo, context: ModelContext, options?: { signal?: AbortSignal }): ModelEventStream {
-  return defaultStream(model, context, options)
-}
-
-const defaultStream = createModelStream(new Credentials())

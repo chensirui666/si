@@ -4,7 +4,7 @@ import * as modelApi from '../src/index.js'
 import type { ModelInfo } from '../src/index.js'
 
 const selected: ModelInfo = {
-  id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536,
+  id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_000_000, maxTokens: 65_536,
 }
 const context = { messages: [{ role: 'user' as const, content: '  你好\n第二行  ', timestamp: 1 }] }
 const credentials = { readApiKey: async () => 'test-private-key' }
@@ -117,7 +117,7 @@ describe('Model single SDK stream', () => {
     expect(modelApi.stream).toBeTypeOf('function')
     expect(modelApi.findModel('other')).toBeUndefined()
     const found = modelApi.findModel(selected.id)!
-    expect(found).toEqual(selected)
+    expect(found).toMatchObject(selected)
     found.name = 'changed'
     expect(modelApi.findModel(selected.id)!.name).toBe('DeepSeek Flash')
   })
@@ -616,4 +616,107 @@ describe('Model single SDK stream', () => {
     expect(events.at(-1)?.type).toBe('error')
     expect(vi.getTimerCount()).toBe(0)
   })
+})
+
+it('streams a configured Moonshot model, sends its own Key and omits unknown usage', async () => {
+  const model = modelApi.findModel('kimi-k3', 'moonshotai-cn')!
+  const received: string[] = []
+  const output = await consume(modelApi.createModelStream({ readApiKey: async provider => {
+    expect(provider).toBe('moonshotai-cn')
+    return 'moonshot-test-key'
+  } }, { fetch: async (url, init) => {
+    received.push(String(url), new Headers(init?.headers).get('authorization') ?? '', JSON.parse(String(init?.body)).model)
+    return response([chunk({ content: 'moonshot' }), chunk({}, 'stop')])
+  } })(model, context))
+  expect(received).toEqual(['https://api.moonshot.cn/v1/chat/completions', 'Bearer moonshot-test-key', model.id])
+  expect(output.result).toMatchObject({ provider: 'moonshotai-cn', stopReason: 'stop', content: [{ type: 'text', text: 'moonshot' }] })
+  expect(output.result.usage).toBeUndefined()
+})
+
+it('replays foreign tool calls into DeepSeek with paired normalized IDs and no foreign reasoning', async () => {
+  const calls = [{ type: 'toolCall' as const, id: 'call_id|fc_' + '+/'.repeat(100), name: 'read', arguments: { path: 'note.txt' } }]
+  const history: modelApi.ModelContext = {
+    messages: [
+      { role: 'assistant', api: 'openai-responses', provider: 'openai', model: 'gpt-5', timestamp: 1,
+        stopReason: 'toolUse', content: [{ type: 'thinking', thinking: 'foreign-reasoning' }, ...calls] },
+      { role: 'toolResult', toolCallId: calls[0].id, toolName: 'read', isError: false, timestamp: 2, content: [{ type: 'text', text: 'note contents' }] },
+    ],
+    tools: [{ name: 'read', description: '', parameters: Type.Object({ path: Type.String() }) }],
+  }
+  let sent: { role: string; content: string; reasoning_content?: string; tool_calls?: { id: string }[]; tool_call_id?: string }[] = []
+  await consume(modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    sent = JSON.parse(String(init?.body)).messages
+    return response([chunk({ content: 'seen' }), chunk({}, 'stop')])
+  } })(selected, history))
+  expect(sent[0].reasoning_content).toBe('')
+  expect(sent[0].tool_calls?.[0].id).toMatch(/^[a-zA-Z0-9_-]{1,40}$/)
+  expect(sent[1]).toMatchObject({ tool_call_id: sent[0].tool_calls?.[0].id, content: 'note contents' })
+  expect(history.messages[1]).toMatchObject({ toolCallId: calls[0].id })
+})
+
+it('keeps the advertised reply cap after an Anthropic-compatible adapter adds reasoning', async () => {
+  const model = modelApi.findModel('MiniMax-M3', 'minimax-cn')!
+  let outputBudget: number | undefined
+  await consume(modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    outputBudget = JSON.parse(String(init?.body)).max_tokens
+    return Response.json({ type: 'error', error: { type: 'authentication_error', message: 'controlled error' } }, { status: 401 })
+  } })(model, context, { reasoningEffort: 'high' }))
+  expect(outputBudget).toBeDefined()
+  expect(outputBudget).toBeLessThanOrEqual(model.maxTokens)
+})
+
+it('keeps a native effort boundary in same-model history without changing tool IDs', async () => {
+  const model = modelApi.findModel('claude-sonnet-5-5', 'anthropic')!
+  const content = [{ type: 'toolCall' as const, id: 'toolu_test', name: 'read', arguments: { path: 'note.txt' } }]
+  const responses = [{
+    type: 'message_start',
+    message: { id: 'msg_1', type: 'message', role: 'assistant', model: model.id, content: [], usage: { input_tokens: 25, output_tokens: 0 } },
+  }, {
+    type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: content[0].id, name: 'read', input: content[0].arguments },
+  }, { type: 'content_block_stop', index: 0 },
+  { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 20 } },
+  { type: 'message_stop' }]
+  const requests: { messages: unknown[]; output_config?: { effort: string } }[] = []
+  const stream = modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    requests.push(JSON.parse(String(init?.body)))
+    return new Response(responses.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''), {
+      headers: { 'content-type': 'text/event-stream' },
+    })
+  } })
+  const first = await stream(model, context, { reasoningEffort: 'low' }).result()
+  expect(first).toMatchObject({ stopReason: 'toolUse', providerThinkingLevel: 'low' })
+  await stream(model, { messages: [...context.messages, first, {
+    role: 'toolResult', toolCallId: content[0].id, toolName: 'read', content: [{ type: 'text', text: 'read note' }],
+    isError: false, timestamp: 2,
+  }] }, { reasoningEffort: 'high' }).result()
+  expect(requests[0].messages.at(-1)).toMatchObject({ role: 'system', output_config: { effort: 'low' } })
+  expect(requests[1].messages.at(-1)).toMatchObject({ role: 'system', output_config: { effort: 'high' } })
+  expect(requests[1].messages).toEqual(expect.arrayContaining([
+    expect.objectContaining({ role: 'system', output_config: { effort: 'low' } }),
+    expect.objectContaining({ role: 'assistant', content: expect.arrayContaining([expect.objectContaining({ type: 'tool_use', id: content[0].id })]) }),
+    expect.objectContaining({ role: 'user', content: expect.arrayContaining([expect.objectContaining({ type: 'tool_result', tool_use_id: content[0].id })]) }),
+  ]))
+})
+
+it('sends the selected thinking level to Gemini 4 Hydrogen and records the response model', async () => {
+  const model = modelApi.findModel('gemini-4-hydrogen', 'google')!
+  const sent: unknown[] = []
+  vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
+    sent.push(JSON.parse(String(init.body)).generationConfig.thinkingConfig)
+    return response([{
+      modelVersion: 'gemini-4-hydrogen',
+      candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+    }], false)
+  })
+  try {
+    const run = modelApi.createModelStream(credentials)
+    const low = await run(model, context, { reasoningEffort: 'low' }).result()
+    const high = await run(model, context, { reasoningEffort: 'high' }).result()
+    expect(sent).toEqual([
+      { includeThoughts: true, thinkingLevel: 'LOW' },
+      { includeThoughts: true, thinkingLevel: 'HIGH' },
+    ])
+    expect(low).toMatchObject({ model: 'gemini-4-hydrogen', responseModel: 'gemini-4-hydrogen', stopReason: 'stop' })
+    expect(high.responseModel).toBe(low.responseModel)
+  } finally { vi.unstubAllGlobals() }
 })

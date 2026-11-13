@@ -6,8 +6,8 @@ import { deleteApiKey, saveApiKey } from '../chat/client'
 import { SettingsButton, SettingsDialog } from './SettingsDialog'
 
 vi.mock('../chat/client', () => ({ saveApiKey: vi.fn(), deleteApiKey: vi.fn() }))
-const missing: ModelDiscovery = { models: [], deepseek: { state: 'missing' } }
-const configured: ModelDiscovery = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], deepseek: { state: 'configured' } }
+const missing: ModelDiscovery = { models: [], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'missing' } }] }
+const configured: ModelDiscovery = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'configured' } }], defaultSelection: { provider: 'deepseek', modelId: 'deepseek-flash' } }
 function Harness({ initial = missing }: { initial?: ModelDiscovery }) {
   const [discovery, setDiscovery] = useState(initial)
   const [open, setOpen] = useState(false)
@@ -39,7 +39,7 @@ describe('SettingsDialog', () => {
     expect(input).toHaveAttribute('type', 'password')
     fireEvent.change(input, { target: { value: 'fake-private-key' } })
     fireEvent.click(screen.getByRole('button', { name: '保存' }))
-    await waitFor(() => expect(saveApiKey).toHaveBeenCalledExactlyOnceWith('fake-private-key'))
+    await waitFor(() => expect(saveApiKey).toHaveBeenCalledExactlyOnceWith('deepseek', 'fake-private-key'))
     expect(await screen.findByText(/已保存在本机/)).toBeVisible()
     expect(input).toHaveValue('')
     expect(screen.queryByDisplayValue('fake-private-key')).not.toBeInTheDocument()
@@ -74,7 +74,7 @@ describe('SettingsDialog', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
   it('配置错误仍可进入设置且不能宣称未配置或已验证', async () => {
-    render(<Harness initial={{ models: [], deepseek: { state: 'error', message: '模型凭据 JSON 格式错误' } }} />)
+    render(<Harness initial={{ models: [], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'error', message: '模型凭据 JSON 格式错误' } }] }} />)
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('模型凭据 JSON 格式错误')
     expect(screen.getByRole('button', { name: '添加提供方' })).toBeVisible()

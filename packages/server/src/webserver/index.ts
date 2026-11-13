@@ -11,7 +11,7 @@ import {
   type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
-import { createModelStream, discoverModels } from '@agent-learning/model'
+import { createModelStream, defaultSelection, discoverModels, isModelProvider, type AssistantMessage, type ModelSelection, type ToolCall } from '@agent-learning/model'
 import { pickDirectory, type DirectoryPicker } from '../directory-picker.js'
 import { Workspaces, WorkspaceBindingError } from '../workspaces.js'
 import { WebSettings } from '../web-settings.js'
@@ -21,9 +21,35 @@ import type { ClientFrame, ServerFrame, StartSessionAccepted, StartSessionReques
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
-} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close'>>
+} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'selectModel'>>
 
 type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
+
+function visibleToolCall({ thoughtSignature: _signature, namespace: _namespace, ...call }: ToolCall): ToolCall {
+  return call
+}
+
+function visibleAssistant({ providerThinkingLevel: _effort, ...message }: AssistantMessage): AssistantMessage {
+  return { ...message, content: message.content.map(block => {
+    if (block.type === 'toolCall') return visibleToolCall(block)
+    if (block.type === 'thinking') return { type: 'thinking', thinking: block.redacted ? '' : block.thinking }
+    return { type: 'text', text: block.text }
+  }) }
+}
+
+function browserEvent(event: SessionSubscriptionEvent): SessionSubscriptionEvent {
+  if (event.type === 'snapshot') {
+    return { ...event, snapshot: { ...event.snapshot, messages: event.snapshot.messages.map(entry =>
+      entry.message.role === 'assistant' ? { ...entry, message: visibleAssistant(entry.message) } : entry) } }
+  }
+  const { change } = event.update
+  if (change.type !== 'model') return event
+  const frame = change.event
+  const visible = frame.type === 'done' ? { ...frame, message: visibleAssistant(frame.message) }
+    : frame.type === 'error' ? { ...frame, error: visibleAssistant(frame.error) }
+    : frame.type === 'toolcall_end' ? { ...frame, toolCall: visibleToolCall(frame.toolCall) } : frame
+  return { ...event, update: { ...event.update, change: { ...change, event: visible } } }
+}
 
 const siRoot = fileURLToPath(new URL('../../../../', import.meta.url))
 
@@ -77,14 +103,18 @@ async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspa
   const value = await readJson(req)
   const targetLabel = target === 'sessionId' ? '会话' : '工作区'
   const targetId = value && typeof value === 'object' ? (value as Record<string, unknown>)[target] : undefined
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 4
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => ![target, 'text', 'modelId', 'provider', 'reasoningEffort', 'clientMessageId'].includes(key))
     || !validId(targetId)
     || !('text' in value) || typeof value.text !== 'string' || !value.text.trim()
-    || !('modelId' in value) || typeof value.modelId !== 'string'
+    || !('modelId' in value) || !validId(value.modelId)
+    || ('provider' in value && !validId(value.provider))
+    || ('reasoningEffort' in value && (!('provider' in value) || !validId(value.reasoningEffort)))
     || !('clientMessageId' in value) || !validId(value.clientMessageId)) {
     throw new InputError(400, `请提交原文、模型、有效临时编号和${targetLabel}编号`)
   }
-  return { targetId, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text } }
+  return { targetId, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text,
+    ...('provider' in value && { provider: value.provider as string }),
+    ...('reasoningEffort' in value && { reasoningEffort: value.reasoningEffort as ModelSelection['reasoningEffort'] }), } }
 }
 function validFrame(value: unknown): value is ClientFrame {
   if (!value || typeof value !== 'object') return false
@@ -121,7 +151,7 @@ export class WebServer {
       resolveDirectory: id => this.workspaces.resolveDirectory(id),
       store: this.store,
       createSession: this.options.createSession ?? ((resolveDirectory, persistence) => new AgentSession({
-        resolveDirectory, persistence, stream, tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+        resolveDirectory, persistence, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
       })),
@@ -206,7 +236,33 @@ export class WebServer {
     if (this.admit(req) !== 200) { this.respond(res, 401, '需要网页授权，请重新打开终端中的启动链接。'); return }
     if (this.closing) { this.json(res, 503, { error: '服务正在关闭' }); return }
     if (url.pathname === '/api/models' && req.method === 'GET') {
-      this.respond(res, 200, JSON.stringify(await discoverModels(this.credentials)), { 'content-type': 'application/json; charset=utf-8' })
+      try { this.json(res, 200, await this.modelDiscovery()) }
+      catch (error) { this.sessionError(res, error, '无法读取模型选择') }
+      return
+    }
+    if (url.pathname === '/api/model-selection' && req.method === 'PUT') {
+      try {
+        const value = await readJson(req)
+        if (!value || typeof value !== 'object' || Array.isArray(value)
+          || Object.keys(value).some(key => !['provider', 'modelId', 'reasoningEffort', 'sessionId'].includes(key))
+          || !('provider' in value) || !validId(value.provider) || !('modelId' in value) || !validId(value.modelId)
+          || ('sessionId' in value && !validId(value.sessionId))) {
+          throw new InputError(400, '请提交有效的模型选择')
+        }
+        const { models } = await discoverModels(this.credentials)
+        const model = models.find(item => item.id === value.modelId && item.provider === value.provider)
+        if (!model) throw new InputError(400, '当前模型不可用，请重新选择')
+        const effort = 'reasoningEffort' in value ? value.reasoningEffort : undefined
+        if (model.reasoningEfforts ? !model.reasoningEfforts.some(level => level === effort) : effort !== undefined) {
+          throw new InputError(400, '所选模型不支持此推理强度')
+        }
+        const selection: ModelSelection = { provider: model.provider, modelId: model.id,
+          ...(effort !== undefined && { reasoningEffort: effort as ModelSelection['reasoningEffort'] }) }
+        const id = 'sessionId' in value ? value.sessionId as string : undefined
+        if (!this.sessions.selectModel(selection, id)) throw new InputError(404, '会话已不可用')
+        this.json(res, 200, selection)
+        this.notify('models_changed')
+      } catch (error) { this.sessionError(res, error, '无法保存模型选择') }
       return
     }
     if (url.pathname === '/api/workspaces' && req.method === 'GET') {
@@ -284,13 +340,13 @@ export class WebServer {
       }
       return
     }
-    if (url.pathname === '/api/providers/deepseek' && (req.method === 'PUT' || req.method === 'DELETE')) {
+    const provider = /^\/api\/providers\/([a-z][a-z0-9-]*)$/.exec(url.pathname)?.[1]
+    if (provider && isModelProvider(provider) && (req.method === 'PUT' || req.method === 'DELETE')) {
       try {
         if (req.method === 'PUT') {
-          await this.credentials.saveApiKey('deepseek', await this.readKey(req))
-        } else await this.credentials.deleteApiKey('deepseek')
-        const discovery = await discoverModels(this.credentials)
-        this.respond(res, 200, JSON.stringify(discovery), { 'content-type': 'application/json; charset=utf-8' })
+          await this.credentials.saveApiKey(provider, await this.readKey(req))
+        } else await this.credentials.deleteApiKey(provider)
+        this.json(res, 200, await this.modelDiscovery())
         this.notify('models_changed')
       } catch (error) {
         const status = error instanceof InputError ? error.status : 500
@@ -310,6 +366,12 @@ export class WebServer {
       res.end(req.method === 'HEAD' ? undefined : content)
     } catch { this.respond(res, 404, '未找到页面或资源，请先运行 npm run build。') }
   }
+  private async modelDiscovery() {
+    const discovery = await discoverModels(this.credentials)
+    const first = discovery.models.find(model => model.provider === 'deepseek' && model.id === 'deepseek-flash') ?? discovery.models[0]
+    const selection = this.store?.getDefaultSelection() ?? (first && defaultSelection(first))
+    return { ...discovery, ...(selection && { defaultSelection: selection }) }
+  }
   private target(id: string): SessionTarget {
     if (this.closing) throw new InputError(503, '服务正在关闭')
     const session = this.sessions.get(id)
@@ -325,7 +387,9 @@ export class WebServer {
       this.notify('workspaces_changed')
       this.json(res, 409, { error: error.message })
     } else if (error instanceof SessionSubmitError) {
-      this.json(res, { invalid: 400, busy: 409, closed: 503 }[error.code], { error: error.message })
+      this.json(res, { invalid: 400, busy: 409, closed: 503, model_selection_changed: 409 }[error.code], {
+        error: error.message, ...(error.code === 'model_selection_changed' && { code: error.code }),
+      })
     } else if (error instanceof SessionWriteError) {
       this.json(res, error.reason === 'unconfirmed' ? 500 : 507, {
         error: error.message, code: error.reason === 'unconfirmed' ? 'save_unconfirmed' : 'save_rejected',
@@ -460,7 +524,7 @@ export class WebServer {
           if (!session) { await send({ type: 'subscription_error', error: '会话已不可用' }); return }
           for await (const event of session.subscribe(signal)) {
             if (signal.aborted) break
-            await send(event)
+            await send(browserEvent(event))
           }
         } catch (error) {
           if (!signal.aborted && error instanceof SessionReadError) await send({ type: 'subscription_error', error: error.message })

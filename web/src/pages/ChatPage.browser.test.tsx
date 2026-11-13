@@ -588,7 +588,7 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   await editor.press('Enter')
   const history = groupB.getByRole('button', { name: '会话 1', exact: true })
   await expect(history).toHaveAttribute('aria-current', 'page')
-  expect(starts).toEqual([{ workspaceId: otherWorkspace.id, modelId: 'deepseek-flash', clientMessageId: expect.any(String), text: original }])
+  expect(starts).toEqual([{ workspaceId: otherWorkspace.id, provider: 'deepseek', modelId: 'deepseek-flash', clientMessageId: expect.any(String), text: original }])
   await expect(draftRow).toHaveCount(0)
   await expect(heading).toHaveCount(0)
   await expect.poll(readDraft).toBeNull()

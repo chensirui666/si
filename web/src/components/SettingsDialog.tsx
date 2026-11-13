@@ -35,21 +35,24 @@ export function SettingsButton(props: ComponentProps<typeof Button>) {
 
 export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, webSettings, webSettingsError, onWebSettingsChange }: Props) {
   const [screen, setScreen] = useState<Screen>('models')
-  const [webProviderId, setWebProviderId] = useState('')
+  const [providerId, setProviderId] = useState('')
   const [form, setForm] = useState<ProviderFormState>({ apiKey: '', status: 'idle' })
   const [notice, setNotice] = useState('')
   const generation = useRef(0)
   const pending = useRef(false)
-  const configured = discovery?.deepseek.state === 'configured'
+  const configured = discovery?.providers.filter(provider => provider.status.state === 'configured') ?? []
+  const addable = discovery?.providers.filter(provider => provider.status.state !== 'configured') ?? []
+  const modelProvider = discovery?.providers.find(provider => provider.id === providerId)
+  const providerError = discovery?.providers.find(provider => provider.status.state === 'error')?.status
   const web = screen === 'web'
-  const webProvider = webSettings?.providers.find(provider => provider.id === webProviderId)
+  const webProvider = webSettings?.providers.find(provider => provider.id === providerId)
   const busy = form.status !== 'idle'
 
   function navigate(next: Screen, providerId = '') {
     generation.current++
     pending.current = false
     setScreen(next)
-    setWebProviderId(providerId)
+    setProviderId(providerId)
     setForm({ apiKey: '', status: 'idle' })
     setNotice('')
   }
@@ -84,13 +87,13 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
       if (web && webProvider) {
         const settings = await (deleting ? deleteWebApiKey(webProvider.id) : saveWebApiKey(webProvider.id, form.apiKey))
         onWebSettingsChange?.(settings)
-      } else {
-        onChange(await (deleting ? deleteApiKey() : saveApiKey(form.apiKey)))
+      } else if (modelProvider) {
+        onChange(await (deleting ? deleteApiKey(modelProvider.id) : saveApiKey(modelProvider.id, form.apiKey)))
       }
     }, deleting ? '已删除本机配置' : '已保存在本机，尚未验证远端有效性', () => {
       setForm({ apiKey: '', status: 'idle' })
       if (!deleting) return
-      if (web) setWebProviderId('')
+      if (web) setProviderId('')
       else setScreen('models')
     })
   }
@@ -162,13 +165,18 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
               {webProvider && keyForm(webProvider.name, webProvider.status.state === 'configured')}
             </>}
           </> : <>
-            <p className="settings-help">添加 DeepSeek API Key 后，模型会出现在聊天页面。</p>
-            {discovery?.deepseek.state === 'error' && <p className="configuration-error" role="alert">{discovery.deepseek.message}</p>}
-            {screen === 'models' && (configured
-              ? <div className="provider-row"><span>DeepSeek <small>已配置</small></span><Button variant="outline" onClick={() => navigate('edit')}>编辑</Button></div>
-              : <Button variant="outline" onClick={() => navigate('providers')}>添加提供方</Button>)}
-            {screen === 'providers' && <Button className="provider-choice" variant="outline" onClick={() => navigate('edit')}>DeepSeek</Button>}
-            {screen === 'edit' && keyForm('DeepSeek', configured)}
+            <p className="settings-help">添加提供方的 API Key 后，可以在聊天中选择它的模型。</p>
+            {providerError?.state === 'error' && <p className="configuration-error" role="alert">{providerError.message}</p>}
+            {screen === 'models' && <>
+              {configured.map(provider => <div className="provider-row" key={provider.id}>
+                <span>{provider.name} <small>已配置</small></span>
+                <Button variant="outline" onClick={() => navigate('edit', provider.id)}>编辑</Button>
+              </div>)}
+              <Button variant="outline" disabled={!addable.length} onClick={() => navigate('providers')}>添加提供方</Button>
+            </>}
+            {screen === 'providers' && <div className="provider-choices">{addable.map(provider =>
+              <Button key={provider.id} className="provider-choice" variant="outline" onClick={() => navigate('edit', provider.id)}>{provider.name}</Button>)}</div>}
+            {screen === 'edit' && modelProvider && keyForm(modelProvider.name, modelProvider.status.state === 'configured')}
           </>}
           {form.errorMessage && <p className="configuration-error" role="alert">{form.errorMessage}</p>}
           {notice && <p className="configuration-success" aria-live="polite">{notice}</p>}

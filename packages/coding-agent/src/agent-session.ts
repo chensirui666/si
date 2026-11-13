@@ -1,17 +1,22 @@
 import { randomUUID } from 'node:crypto'
 import { Agent } from '@agent-learning/agent'
 import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
-import { estimateContextTokens, findModel, stream } from '@agent-learning/model'
-import type { AssistantMessage, ModelContext, ModelEvent, ModelInfo } from '@agent-learning/model'
+import { estimateContextTokens, findModel, sameSelection, stream } from '@agent-learning/model'
+import type { AssistantMessage, ModelContext, ModelEvent, ModelInfo, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
-import { SessionWriteError, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
+import { SessionWriteError, runSelection, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
 import { buildSystemPrompt } from './system-prompt.js'
 import type { CodingTool } from './tools.js'
 import type { CompactionRecord, SubmissionAccepted, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure } from './types.js'
 
+type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & { clientMessageId: string; text: string }
+
+const capacityError = '当前模型容量不足，无法继续这轮，请切换模型重新压缩。'
+const staleSelection = '模型设置已更新，请确认后再发送。'
+
 export class SessionSubmitError extends Error {
-  constructor(readonly code: 'invalid' | 'busy' | 'closed', message: string) { super(message) }
+  constructor(readonly code: 'invalid' | 'busy' | 'closed' | 'model_selection_changed', message: string) { super(message) }
 }
 
 function isFileOperation(detail: unknown): detail is NonNullable<ConversationMessage['fileOperation']> {
@@ -29,7 +34,7 @@ export class AgentSession {
   private model?: ModelInfo
   private configuration: Omit<ModelContext, 'messages'> = {}
   private projectContext?: { cwd: string; files: ProjectContextFile[] }
-  private sample?: { modelId: string; config: string; messages: string[]; input: number; estimate: number }
+  private sample?: { key: string; config: string; messages: string[]; input: number; estimate: number }
   private gateSample?: typeof this.sample
   private readonly storedRuns = new Map<string, StoredRun>()
   private readonly savedMessages = new Set<string>()
@@ -42,11 +47,14 @@ export class AgentSession {
     documentationRoot?: string
     globalContextDirectory?: string
     resolveDirectory: () => Promise<string>
+    discoverModels?: typeof import('@agent-learning/model').discoverModels
     compaction?: { triggerTokens: number; keepRecentTokens: number }
   }) {
     this.agent = new Agent({ stream: options.stream })
     const history = options.persistence?.history
     if (history) {
+      const last = history.runs.at(-1)
+      this.state.modelSelection = history.modelSelection ?? (last && runSelection(last))
       this.state.messages = history.messages
       this.state.compactions = history.compactions.map(record => record.status === 'running'
         ? { ...record, status: 'interrupted', finishedAt: Date.now(), reason: '服务中断，压缩未完成。' } : record)
@@ -64,20 +72,47 @@ export class AgentSession {
     }
   }
 
-  async submit(input: { clientMessageId: string; modelId: string; text: string }): Promise<SubmissionAccepted> {
+  selectModel(selection: ModelSelection) {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
-    const model = typeof input?.modelId === 'string' ? findModel(input.modelId) : undefined
-    if (!model || typeof input.text !== 'string' || !input.text.trim()
+    const storage = this.options.persistence
+    storage?.store.saveModelSelection(selection, storage.summary.id)
+    this.state.modelSelection = selection
+    this.publish({ type: 'selection', selection })
+  }
+
+  async submit(input: SubmissionInput): Promise<SubmissionAccepted> {
+    if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+    if (typeof input?.modelId !== 'string' || !input.provider && input.modelId !== 'deepseek-flash'
+      || typeof input.text !== 'string' || !input.text.trim()
       || typeof input.clientMessageId !== 'string' || !input.clientMessageId.trim() || input.clientMessageId.length > 128) {
       throw new SessionSubmitError('invalid', '请提交有效原文、支持的模型和临时编号')
     }
-    const previous = this.replay(input)
+    const selection = runSelection(input)
+    const previous = this.replay(input, selection)
     if (previous) return previous
+    const model = findModel(selection.modelId, selection.provider)
+    if (!model) throw new SessionSubmitError('invalid', '当前模型不可用，请重新选择')
+    if (model.reasoningEfforts
+      ? !selection.reasoningEffort || !model.reasoningEfforts.includes(selection.reasoningEffort) : selection.reasoningEffort !== undefined) {
+      throw new SessionSubmitError('invalid', '所选模型不支持此推理强度')
+    }
     const cwd = await this.options.resolveDirectory()
+    const directory = await this.options.discoverModels?.()
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
-    const concurrent = this.replay(input)
+    const concurrent = this.replay(input, selection)
     if (concurrent) return concurrent
     if (this.state.running) throw new SessionSubmitError('busy', '正在生成，请等待本次回答结束')
+    const storedDefault = this.options.persistence?.store.getDefaultSelection()
+    const fallback = directory?.defaultSelection
+    const current = this.state.modelSelection ?? storedDefault ?? fallback
+    const legacyUnconfigured = !input.provider && !current && !directory?.models.length
+    if (!legacyUnconfigured && (directory || current) && !sameSelection(selection, current)) {
+      throw new SessionSubmitError('model_selection_changed', staleSelection)
+    }
+    if (!legacyUnconfigured && directory && !directory.models.some(item => item.provider === selection.provider && item.id === selection.modelId)) {
+      throw new SessionSubmitError('invalid', '当前模型不可用，请重新选择')
+    }
+    model.defaultReasoningEffort = selection.reasoningEffort
     this.model = model
     const tools = this.options.tools?.(cwd) ?? []
     const declarations = tools.map(({ name, description, parameters }) => ({ name, description, parameters }))
@@ -89,16 +124,17 @@ export class AgentSession {
     if (input.text.trim() === '/compact') {
       const record = this.newCompaction('manual', input.clientMessageId)
       const running = { kind: 'compaction' as const, runId: record.id, phase: 'compaction' as const }
-      const run = this.saveStart(input, record.id, 'compaction', { compaction: record })
+      const run = this.saveStart(input, selection, record.id, 'compaction', { compaction: record })
+      const initialSelection = this.confirmInitialSelection(selection)
       this.controller = controller
       this.state.compactions.push(record)
       this.state.running = running
-      this.publish({ type: 'compaction', record, running }, run && this.publicRun(run))
+      this.publish({ type: 'compaction', record, running }, run && this.publicRun(run), undefined, initialSelection)
       const acceptedSeq = this.state.seq
       this.task = Promise.resolve().then(async () => {
         let status: RunRecord['status'] = 'failed'
         try {
-          await this.compact(model, 'manual', running, controller.signal, record)
+          await this.compact(model, selection.reasoningEffort, 'manual', running, controller.signal, record)
           status = this.storedRuns.get(input.clientMessageId)?.status ?? 'completed'
         } catch (error) {
           if (!(error instanceof SessionWriteError)) throw error
@@ -108,20 +144,27 @@ export class AgentSession {
     }
     const user = { id: randomUUID(), clientMessageId: input.clientMessageId, message: { role: 'user' as const, content: input.text, timestamp: Date.now() } }
     const running = { kind: 'task' as const, runId: user.id, assistantMessageId: randomUUID(), phase: 'model' as const, activeTools: [] }
-    const run = this.saveStart(input, user.id, 'task', { messages: [user] })
+    const run = this.saveStart(input, selection, user.id, 'task', { messages: [user] })
+    const initialSelection = this.confirmInitialSelection(selection)
     this.controller = controller
     this.state.messages.push(user)
     this.state.running = running
-    this.publish({ type: 'accepted', user, running }, run && this.publicRun(run))
+    this.publish({ type: 'accepted', user, running }, run && this.publicRun(run), undefined, initialSelection)
     const acceptedSeq = this.state.seq
-    this.task = Promise.resolve().then(() => this.runTask(model, running, cwd, tools, controller.signal))
+    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, controller.signal))
     return { kind: 'message', clientMessageId: input.clientMessageId, userMessageId: user.id, acceptedSeq }
   }
 
-  private replay(input: { clientMessageId: string; text: string; modelId: string }) {
+  private confirmInitialSelection(selection: ModelSelection) {
+    if (this.state.modelSelection) return
+    this.state.modelSelection = selection
+    return selection
+  }
+
+  private replay(input: SubmissionInput, selection: ModelSelection) {
     const previous = this.storedRuns.get(input.clientMessageId)
     if (!previous) return
-    if (previous.text !== input.text || previous.modelId !== input.modelId) {
+    if (previous.text !== input.text || !sameSelection(runSelection(previous), selection)) {
       throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
     }
     return submissionReceipt(previous)
@@ -131,14 +174,15 @@ export class AgentSession {
     return run
   }
 
-  private saveStart(input: { clientMessageId: string; text: string; modelId: string }, id: string, kind: RunRecord['kind'],
+  private saveStart(input: SubmissionInput, selection: ModelSelection, id: string, kind: RunRecord['kind'],
     data: { messages?: ConversationMessage[]; compaction?: CompactionRecord }) {
     const storage = this.options.persistence
     if (!storage) return
     const run: StoredRun = {
-      ...input, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
+      ...input, ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
     }
-    this.save({ ...data, run, summary: this.storedRuns.size === 0 ? storage.first?.() : undefined })
+    this.save({ ...data, run, summary: this.storedRuns.size === 0 ? storage.first?.() : undefined,
+      modelSelection: this.state.modelSelection ? undefined : selection })
     return run
   }
 
@@ -169,16 +213,17 @@ export class AgentSession {
     return { ...this.configuration, messages: buildModelHistory(this.historyMessages(), this.latestCompaction(), !!this.options.persistence) }
   }
 
-  private estimate(context: ModelContext) {
-    const estimate = estimateContextTokens(context)
+  private estimate(context: ModelContext, model = this.model) {
+    const estimate = estimateContextTokens(context, model)
     return estimate.systemTokens + estimate.toolsTokens + estimate.messageTokens
   }
 
   private configKey() { return JSON.stringify(this.configuration) }
+  private modelKey(model: ModelInfo) { return JSON.stringify([model.provider, model.id, model.defaultReasoningEffort]) }
 
   private pressure(context: ModelContext, model: ModelInfo) {
     const estimate = this.estimate(context), sample = this.gateSample
-    if (sample && sample.modelId === model.id && sample.config === this.configKey()
+    if (sample && sample.key === this.modelKey(model) && sample.config === this.configKey()
       && sample.messages.length <= context.messages.length
       && sample.messages.every((message, index) => message === JSON.stringify(context.messages[index]))) {
       return Math.max(0, sample.input + estimate - sample.estimate)
@@ -190,9 +235,9 @@ export class AgentSession {
     if (!this.model) return
     const context = this.context(), estimate = this.estimate(context), sample = this.sample
     this.state.contextUsage = {
-      tokens: sample?.modelId === this.model.id && sample.config === this.configKey()
+      tokens: sample?.key === this.modelKey(this.model) && sample.config === this.configKey()
         ? Math.max(0, sample.input + estimate - sample.estimate) : estimate,
-      contextWindow: this.model.contextWindow, breakdown: estimateContextTokens(context),
+      contextWindow: this.model.contextWindow, breakdown: estimateContextTokens(context, this.model),
     }
   }
 
@@ -201,7 +246,7 @@ export class AgentSession {
     return record
   }
 
-  private async compact(model: ModelInfo, trigger: CompactionRecord['trigger'], running: NonNullable<RunningState>, signal: AbortSignal, initial?: CompactionRecord) {
+  private async compact(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, trigger: CompactionRecord['trigger'], running: NonNullable<RunningState>, signal: AbortSignal, initial?: CompactionRecord) {
     const record = initial ?? this.newCompaction(trigger)
     const working: NonNullable<RunningState> = { ...running, phase: 'compaction' }
     this.state.running = working
@@ -215,7 +260,7 @@ export class AgentSession {
     let summaryUsage: AssistantMessage['usage']
     try {
       signal.throwIfAborted()
-      const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000, Boolean(this.configuration.tools?.length), !!this.options.persistence)
+      const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000, Boolean(this.configuration.tools?.length), !!this.options.persistence, model)
       if (preparation.status === 'skipped') {
         final = { ...record, status: 'skipped', finishedAt: Date.now(), reason: preparation.reason === 'already_compacted' ? '刚压缩完成，尚无新内容。' : '没有可压缩的较早内容。' }
       } else {
@@ -223,12 +268,13 @@ export class AgentSession {
         if (this.estimate(context) + model.maxTokens > model.contextWindow) throw new Error('摘要请求预计超出模型容量。')
         let terminal: AssistantMessage | undefined
         try {
-          for await (const event of (this.options.stream ?? stream)(model, context, { signal })) {
+          for await (const event of (this.options.stream ?? stream)(model, context, { signal, reasoningEffort })) {
             if (event.type === 'done' || event.type === 'error') { terminal = structuredClone(event.type === 'done' ? event.message : event.error); break }
           }
         } catch (error) { if (!terminal) throw error }
         summaryUsage = terminal?.usage
         signal.throwIfAborted()
+        if (terminal?.errorCode === 'context_overflow') throw new Error('模型服务报告摘要请求超出容量。')
         if (!terminal || terminal.stopReason !== 'stop' || terminal.content.some(block => block.type === 'toolCall')) throw new Error('摘要生成未完整完成，保留原上下文。')
         const summary = terminal.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n').trim()
         if (!summary) throw new Error('摘要为空，保留原上下文。')
@@ -248,7 +294,7 @@ export class AgentSession {
       }
     } catch (error) {
       final = { ...record, status: signal.aborted ? 'aborted' : 'failed', finishedAt: Date.now(),
-        reason: signal.aborted ? '本次压缩已停止。' : error instanceof Error && ['摘要请求预计超出模型容量。', '摘要生成未完整完成，保留原上下文。', '摘要为空，保留原上下文。', '摘要未有效缩短输入，保留原上下文。', '压缩后仍预计超出模型容量，保留原上下文。'].includes(error.message) ? error.message : '摘要生成失败，保留原上下文。',
+        reason: signal.aborted ? '本次压缩已停止。' : error instanceof Error && ['摘要请求预计超出模型容量。', '模型服务报告摘要请求超出容量。', '摘要生成未完整完成，保留原上下文。', '摘要为空，保留原上下文。', '摘要未有效缩短输入，保留原上下文。', '压缩后仍预计超出模型容量，保留原上下文。'].includes(error.message) ? error.message : '摘要生成失败，保留原上下文。',
         ...(summaryUsage && { summaryUsage }),
       }
     }
@@ -317,12 +363,12 @@ export class AgentSession {
     this.publish({ type: 'compaction', record: compaction, running: this.state.running })
   }
 
-  private publish(change: ConversationUpdate['change'], run?: RunRecord, saveFailure?: SaveFailure) {
+  private publish(change: ConversationUpdate['change'], run?: RunRecord, saveFailure?: SaveFailure, modelSelection?: ModelSelection) {
     if (run) this.state.runs = [...(this.state.runs ?? []).filter(item => item.id !== run.id), run]
     if (saveFailure) this.state.saveFailures = [...this.state.saveFailures ?? [], saveFailure]
     const refresh = change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error'
     if (refresh) this.refreshUsage()
-    const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(run && { run }), ...(saveFailure && { saveFailure }), ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
+    const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(modelSelection && { modelSelection }), ...(run && { run }), ...(saveFailure && { saveFailure }), ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
     for (const listener of this.listeners) listener(structuredClone(update))
   }
 
@@ -332,7 +378,7 @@ export class AgentSession {
     this.publish(message ? { type: 'task', running, message, messageIndex } : { type: 'task', running })
   }
 
-  private async runTask(model: ModelInfo, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], signal: AbortSignal) {
+  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], signal: AbortSignal) {
     let messageId = running.assistantMessageId
     let advanceRound = false
     let recovered = false
@@ -367,24 +413,25 @@ export class AgentSession {
       signal.throwIfAborted()
       const systemPrompt = buildSystemPrompt(cwd, tools, this.options.documentationRoot, files)
       const configuration = { ...this.configuration, systemPrompt }
-      if (files.length && this.estimate({ ...configuration, messages: [] }) > inputBudget) {
-        return { error: new ProjectContextOverflow().message }
+      if (this.estimate({ ...configuration, messages: [] }) > inputBudget) {
+        return { error: files.length ? new ProjectContextOverflow().message : '系统提示和工具定义超出当前模型容量，请切换模型。' }
       }
       this.projectContext = { cwd, files }
       this.configuration = configuration
       const context = this.context()
       const ready = (candidate: ModelContext) => {
         if (this.pressure(candidate, model) + model.maxTokens > model.contextWindow) {
-          return { error: '当前输入与回复预留预计超出模型容量，请缩短输入或压缩对话。' }
+          return { error: capacityError }
         }
         usedCompaction = this.latestCompaction()
         return candidate
       }
       const fingerprint = JSON.stringify(context.messages)
-      const trigger = this.options.compaction?.triggerTokens ?? model.contextWindow - model.maxTokens - 16_384
+      const margin = Math.min(16_384, Math.floor(inputBudget / 8))
+      const trigger = Math.min(this.options.compaction?.triggerTokens ?? Infinity, inputBudget - margin)
       if (this.pressure(context, model) < trigger || attemptedInput === fingerprint) return ready(context)
       attemptedInput = fingerprint
-      return this.compact(model, 'auto', { ...running, assistantMessageId: messageId }, signal).then(() => {
+      return this.compact(model, reasoningEffort, 'auto', { ...running, assistantMessageId: messageId }, signal).then(() => {
         signal.throwIfAborted()
         modelPhase()
         return ready(this.context())
@@ -394,12 +441,13 @@ export class AgentSession {
     const unsubscribe = this.agent.subscribe(event => {
       if (event.type === 'model') {
         const frame = this.frame(event.event)
+        if (frame.type === 'error' && frame.error.errorCode === 'context_overflow' && recovered) frame.error.errorMessage = capacityError
         this.apply(messageId, frame)
         const terminal = frame.type === 'done' ? frame.message : frame.type === 'error' ? frame.error : undefined
         if (terminal?.usage?.input !== undefined) {
           const context = event.context
           this.sample = this.gateSample = {
-            modelId: model.id, config: this.configKey(),
+            key: this.modelKey(model), config: this.configKey(),
             messages: context.messages.map(message => JSON.stringify(message)),
             input: terminal.usage.input, estimate: this.estimate(context),
           }
@@ -451,7 +499,7 @@ export class AgentSession {
       }
     }
     try {
-      const options = { model, tools, signal, prepareContext, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined }
+      const options = { model, reasoningEffort, tools, signal, prepareContext, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined }
       let result = await this.agent.run({ ...options, context: this.context() })
       while (result.type === 'response' && result.message.stopReason === 'error' && result.message.errorCode === 'context_overflow'
         && !recovered && !signal.aborted) {
@@ -460,8 +508,9 @@ export class AgentSession {
           try { saveReply(terminalEntry) }
           catch (error) { this.noteFailure(error, 'finish'); throw error }
         }
-        if (!await this.compact(model, 'overflow', { ...running, assistantMessageId: messageId }, signal)) {
+        if (!await this.compact(model, reasoningEffort, 'overflow', { ...running, assistantMessageId: messageId }, signal)) {
           if (signal.aborted) status = 'aborted'
+          else terminalEntry = this.fail(model, randomUUID(), capacityError)
           return
         }
         signal.throwIfAborted()

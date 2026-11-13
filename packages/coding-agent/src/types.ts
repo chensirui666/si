@@ -1,4 +1,4 @@
-import type { AssistantMessage, ModelMessage, ModelUsage, ContextEstimate, ToolCall } from '@agent-learning/model'
+import type { AssistantMessage, ModelMessage, ModelUsage, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
 
 type ToolLocation = {
   assistantMessageId: string
@@ -55,6 +55,7 @@ export type ConversationSnapshot = {
   seq: number
   messages: ConversationMessage[]
   running: RunningState
+  modelSelection?: ModelSelection
   activeContent: ActiveContent[]
   compactions: CompactionRecord[]
   contextUsage: ContextUsage | null
@@ -65,9 +66,11 @@ export type ConversationSnapshot = {
 export type ConversationUpdate = {
   seq: number
   contextUsage?: ContextUsage | null
+  modelSelection?: ModelSelection
   run?: RunRecord
   saveFailure?: SaveFailure
   change:
+    | { type: 'selection'; selection: ModelSelection }
     | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }
     | { type: 'compaction'; record: CompactionRecord; running: RunningState }
@@ -100,6 +103,8 @@ export type RunRecord = {
   sessionId: string
   clientMessageId: string
   modelId: string
+  provider?: string
+  reasoningEffort?: ModelSelection['reasoningEffort']
   kind: 'task' | 'compaction'
   status: 'running' | 'completed' | 'failed' | 'aborted' | 'interrupted'
   startedAt: number

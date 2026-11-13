@@ -1,5 +1,5 @@
 import { estimateMessageTokens } from '@agent-learning/model'
-import type { ModelContext, ModelMessage } from '@agent-learning/model'
+import type { ModelContext, ModelInfo, ModelMessage } from '@agent-learning/model'
 import type { CompactionRecord, ConversationMessage } from './types.js'
 
 type LatestCompaction = Extract<CompactionRecord, { status: 'success' }>
@@ -62,7 +62,7 @@ export function buildModelHistory(entries: ConversationMessage[], latest?: Lates
 
 export function prepareCompaction(
   entries: ConversationMessage[], latest: LatestCompaction | undefined,
-  keepRecentTokens: number, includeThinking: boolean, recoverTools = false,
+  keepRecentTokens: number, includeThinking: boolean, recoverTools = false, model?: ModelInfo,
 ): CompactionPreparation {
   const effective = effectiveEntries(entries, latest)
   const last = effective.at(-1)
@@ -70,7 +70,7 @@ export function prepareCompaction(
   let tokens = 0
   let firstKept = 0
   for (let index = effective.length - 1; index >= 0; index--) {
-    tokens += estimateMessageTokens(effective[index].message, includeThinking)
+    tokens += estimateMessageTokens(effective[index].message, includeThinking, model)
     if (tokens >= keepRecentTokens) {
       firstKept = index
       // A tool result cannot survive without the assistant's entire call batch.

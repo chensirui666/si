@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { expect, it, vi } from 'vitest'
+import { AgentSession } from '../src/agent-session.js'
 import { SessionStore } from '../src/session-store.js'
 
 const summary = { id: 'session', workspaceId: 'workspace', name: '会话 1', createdAt: new Date().toISOString() }
@@ -38,7 +39,7 @@ it('同一 SQLite 库只由一个连接接管，关闭后可恢复原会话', as
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-it('27 读取四表时维持同一事务，第二连接无法在中途改写任务或消息', async () => {
+it('27 读取会话各表时维持同一事务，第二连接无法在中途改写任务或消息', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-store-snapshot-'))
   const path = join(directory, 'sessions.sqlite')
   try {
@@ -58,7 +59,7 @@ it('27 读取四表时维持同一事务，第二连接无法在中途改写任�
       })
       try {
         expect(store.loadSession(summary.id)).toEqual({ summary, runs: [run], messages: [user], compactions: [] })
-        expect(readSteps).toHaveLength(4)
+        expect(readSteps).toHaveLength(5)
       } finally { observe.mockRestore() }
     } finally { other.close(); store.close() }
   } finally { await rm(directory, { recursive: true, force: true }) }
@@ -101,4 +102,44 @@ it('提交状态不明时保留待核对状态，重启后读取实际已提交�
     try { expect(reopened.loadSession(summary.id)?.messages).toEqual([user]) }
     finally { reopened.close() }
   } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+it('Feature 1 旧库只含任务时，从原任务恢复 DeepSeek High', async () => {
+  const store = SessionStore.open(':memory:')
+  try {
+    store.save(summary.id, { summary, run, messages: [user] })
+    const history = store.loadSession(summary.id)!
+    expect(history.modelSelection).toBeUndefined()
+    const agent = new AgentSession({ resolveDirectory: async () => '/tmp', persistence: { summary, store, history } })
+    const controller = new AbortController()
+    try {
+      expect((await agent.subscribe(controller.signal).next()).value).toMatchObject({
+        snapshot: { messages: [user], modelSelection: { provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high' } },
+      })
+    } finally { controller.abort(); await agent.close() }
+  } finally { store.close() }
+})
+
+it('Feature 1 保存会话选择与默认值，失败时同时回滚', () => {
+  const store = SessionStore.open(':memory:')
+  const first = { provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high' } as const
+  const next = { provider: 'moonshotai-cn', modelId: 'kimi-k2.6', reasoningEffort: 'off' } as const
+  try {
+    store.save(summary.id, { summary })
+    store.saveModelSelection(first, summary.id)
+    expect(store.getDefaultSelection()).toEqual(first)
+    expect(store.loadSession(summary.id)?.modelSelection).toEqual(first)
+    const exec = DatabaseSync.prototype.exec
+    const reject = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql) {
+      if (sql === 'COMMIT') throw new Error('注入事务失败')
+      exec.call(this, sql)
+    })
+    try { expect(() => store.saveModelSelection(next, summary.id)).toThrow(/未保存/) }
+    finally { reject.mockRestore() }
+    expect(store.getDefaultSelection()).toEqual(first)
+    expect(store.loadSession(summary.id)?.modelSelection).toEqual(first)
+    store.saveModelSelection(next, summary.id)
+    expect(store.getDefaultSelection()).toEqual(next)
+    expect(store.loadSession(summary.id)?.modelSelection).toEqual(next)
+  } finally { store.close() }
 })

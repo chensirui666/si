@@ -28,7 +28,7 @@ export class Agent {
     return this.run(input)
   }
 
-  private async loop({ model, context, tools = [], signal, prepareContext, saveToolCheckpoint }: AgentRunInput): Promise<AgentResult> {
+  private async loop({ model, reasoningEffort, context, tools = [], signal, prepareContext, saveToolCheckpoint }: AgentRunInput): Promise<AgentResult> {
     if (tools.length) context = {
       ...context,
       tools: tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
@@ -47,7 +47,7 @@ export class Agent {
           if ('error' in next) return failure(next.error)
           context = next
         }
-        const response = await this.generate(model, context, signal)
+        const response = await this.generate(model, context, signal, reasoningEffort)
         const complete: AgentResult = { type: 'response', message: response }
         if (response.stopReason === 'error' || response.stopReason === 'aborted') return complete
         const calls = response.content.flatMap((call, contentIndex) => call.type === 'toolCall' ? [{ call, contentIndex }] : [])
@@ -122,10 +122,10 @@ export class Agent {
     }
   }
 
-  private async generate(model: ModelInfo, context: ModelContext, signal: AbortSignal) {
+  private async generate(model: ModelInfo, context: ModelContext, signal: AbortSignal, reasoningEffort?: AgentRunInput['reasoningEffort']) {
     let terminal: AssistantMessage | undefined
     try {
-      for await (const event of (this.options.stream ?? stream)(model, context, { signal })) {
+      for await (const event of (this.options.stream ?? stream)(model, context, { signal, reasoningEffort })) {
         this.emit({ type: 'model', event, context })
         if (event.type === 'done' || event.type === 'error') {
           terminal = event.type === 'done' ? event.message : event.error

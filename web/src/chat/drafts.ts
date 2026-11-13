@@ -22,7 +22,13 @@ export function writeFirstSend(input: StartSessionRequest | null) {
 }
 export const draftKey = (sessionId: string) => `agent-learning:draft:${sessionId}`
 
-type Draft = { text: string; revision: number; lastStored?: string | null; unsaved?: boolean }
+const tabDraftKey = (sessionId: string) => `agent-learning:tab-draft:${sessionId}`
+type Draft = { text: string; revision: number; lastStored?: string | null; unsaved?: boolean; tabLocal?: boolean }
+
+function readTabDraft(sessionId: string): string | null {
+  try { return sessionStorage.getItem(tabDraftKey(sessionId)) }
+  catch { return null }
+}
 
 export function useDrafts() {
   const entries = useRef(new Map<string, Draft>())
@@ -45,13 +51,14 @@ export function useDrafts() {
   const load = useCallback((sessionId: string | null) => {
     if (!sessionId) { setDraft({ text: '' }); return }
     const entry = entries.current.get(sessionId)
-    const persisted = entry?.unsaved ? undefined : read(draftKey(sessionId))
-    const text = (persisted === undefined ? entry?.text : persisted) ?? ''
+    const tabDraft = entry?.tabLocal ? entry.text : readTabDraft(sessionId)
+    const persisted = tabDraft !== null || entry?.unsaved ? undefined : read(draftKey(sessionId))
+    const text = tabDraft ?? (persisted === undefined ? entry?.text : persisted) ?? ''
     entries.current.set(sessionId, {
       text,
       revision: (entry?.revision ?? 0) + Number(!!entry && text !== entry.text),
       lastStored: persisted === undefined ? entry?.lastStored : persisted,
-      unsaved: entry?.unsaved,
+      unsaved: entry?.unsaved, tabLocal: tabDraft !== null,
     })
     setDraft({ text })
   }, [read])
@@ -60,6 +67,12 @@ export function useDrafts() {
     const previous = entries.current.get(sessionId)
     if (previous?.text === text) return
     const value = text || null
+    if (previous?.tabLocal) {
+      try { sessionStorage.setItem(tabDraftKey(sessionId), text) }
+      catch { setStorageUnavailable(true) }
+      entries.current.set(sessionId, { ...previous, text, revision: previous.revision + 1 })
+      return
+    }
     const unsaved = !write(draftKey(sessionId), value)
     entries.current.set(sessionId, {
       text, revision: (previous?.revision ?? 0) + 1,
@@ -67,20 +80,24 @@ export function useDrafts() {
     })
   }, [write])
 
-  const restore = useCallback((sessionId: string, text: string, clearedRevision: number, visible: boolean) => {
+  const restore = useCallback((sessionId: string, text: string, clearedRevision: number, visible: boolean, keepInTab = false) => {
     const entry = entries.current.get(sessionId)
-    if (entry?.revision !== clearedRevision || entry.text) return
+    if (entry?.revision !== clearedRevision || entry.text) return false
     const persisted = read(draftKey(sessionId))
-    if (persisted && persisted !== entry.lastStored) return
+    if (!entry.tabLocal && persisted && persisted !== entry.lastStored) {
+      if (!keepInTab) return false
+      entries.current.set(sessionId, { ...entry, tabLocal: true })
+    }
     save(sessionId, text)
     if (visible) setDraft({ text })
+    return true
   }, [read, save])
 
   const clearSent = useCallback((sessionId: string, text: string, revision: number) => {
     const entry = entries.current.get(sessionId)
     if (entry?.revision !== revision || entry.text !== text) return false
     const persisted = read(draftKey(sessionId))
-    if (persisted && persisted !== entry.lastStored) return false
+    if (!entry.tabLocal && persisted && persisted !== entry.lastStored) return false
     save(sessionId, '')
     return true
   }, [read, save])

@@ -554,13 +554,16 @@ describe('项目说明与压缩', () => {
   it('超限压缩期间改写说明，恢复请求刷新一次且不重跑已完成工具', async () => {
     await projectFixture(async (cwd, path) => {
       const contexts: ModelContext[] = []
+      const next = { provider: 'moonshotai-cn', modelId: 'kimi-k3', reasoningEffort: 'low' } as const
       let running = false, calls = 0
       const execute = vi.fn(async () => '已完成的工具结果')
       const agent = new AgentSession({
         resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }],
         compaction: { triggerTokens: 10_000, keepRecentTokens: 100 },
-        stream: (_m, context) => {
+        stream: (model, context, options) => {
           if (!running) return output(reply())
+          expect(model.provider).toBe(next.provider)
+          expect(options?.reasoningEffort).toBe(next.reasoningEffort)
           contexts.push(context)
           if (!context.tools) return {
             result: async () => reply('恢复摘要'),
@@ -577,7 +580,8 @@ describe('项目说明与压缩', () => {
       })
       await seed(agent)
       running = true
-      await agent.submit({ ...input, text: '继续任务' }); await idle(agent)
+      agent.selectModel(next)
+      await agent.submit({ ...next, clientMessageId: 'switch-overflow', text: '继续任务' }); await idle(agent)
       expect(contexts).toHaveLength(4)
       expect(contexts[1].systemPrompt).toContain('project-rule-original')
       expect(JSON.stringify(contexts[2])).not.toContain('project-rule-')
@@ -611,4 +615,113 @@ describe('项目说明与压缩', () => {
       ])
     })
   })
+})
+
+describe('里程碑 2 Feature 1 模型切换与容量', () => {
+  const next = { provider: 'moonshotai-cn', modelId: 'kimi-k3', reasoningEffort: 'low' } as const
+  const unavailable = '当前模型容量不足，无法继续这轮，请切换模型重新压缩。'
+  const modelRequest = (clientMessageId: string, text: string) => ({ ...next, clientMessageId, text })
+
+  it.each([
+    { contextWindow: 1500, summary: '简短摘要', reason: '摘要请求预计超出模型容量。', calls: 0 },
+    { contextWindow: 2100, summary: 's'.repeat(5900), reason: '压缩后仍预计超出模型容量，保留原上下文。', calls: 1 },
+  ])('小容量模型失败后原历史仍可压缩和接续（$reason）', async ({ contextWindow, summary, reason, calls }) => {
+    const models = await import('@agent-learning/model')
+    const original = models.findModel
+    const lookup = vi.spyOn(models, 'findModel').mockImplementation((id, provider) => {
+      const model = original(id, provider)
+      return model && provider === next.provider ? { ...model, contextWindow, maxTokens: 128 } : model
+    })
+    const requests: { provider: string; effort?: string; summary: boolean }[] = []
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 2600, keepRecentTokens: 100 },
+      stream: (model, context, options) => {
+        requests.push({ provider: model.provider, effort: options?.reasoningEffort, summary: !context.tools })
+        if (!context.tools) return output(reply(model.provider === next.provider ? summary : 'A 整理过的旧事实'))
+        return output(reply())
+      },
+    })
+    try {
+      await seed(agent)
+      agent.selectModel(next)
+      await agent.submit(modelRequest('small', '新的请求：' + 'u'.repeat(4200))); await idle(agent)
+      const failed = await state(agent)
+      expect(failed.messages.at(-1)?.message).toMatchObject({ stopReason: 'error', errorMessage: unavailable })
+      expect(failed.compactions.at(-1)).toMatchObject({ status: 'failed', reason })
+      expect(requests.filter(entry => entry.provider === next.provider)).toEqual(
+        Array.from({ length: calls }, () => ({ provider: next.provider, effort: 'low', summary: true })),
+      )
+      agent.selectModel({ provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high' })
+      await agent.submit({ ...input, clientMessageId: 'manual', text: '/compact' }); await idle(agent)
+      expect((await state(agent)).compactions.at(-1)).toMatchObject({ status: 'success', summary: 'A 整理过的旧事实' })
+      agent.selectModel(next)
+      await agent.submit(modelRequest('retry', '请继续')); await idle(agent)
+      expect((await state(agent)).messages.at(-1)?.message).toMatchObject({ stopReason: 'stop' })
+      expect(requests.at(-1)).toEqual({ provider: next.provider, effort: 'low', summary: false })
+    } finally { await agent.close(); lookup.mockRestore() }
+  })
+
+  it('切换后由新模型按自己的档位自动压缩并续做', async () => {
+    const requests: { provider: string; effort?: string; messages: ModelContext['messages']; compact: boolean }[] = []
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 2400, keepRecentTokens: 100 },
+      stream: (model, context, options) => {
+        requests.push({ provider: model.provider, effort: options?.reasoningEffort, messages: context.messages, compact: !context.tools })
+        return output(context.tools ? reply() : reply('新模型的摘要'))
+      },
+    })
+    try {
+      await seed(agent)
+      agent.selectModel(next)
+      await agent.submit(modelRequest('cross-model', 'b'.repeat(5000))); await idle(agent)
+      const switched = requests.filter(entry => entry.provider === next.provider)
+      expect(switched.map(item => [item.effort, item.compact])).toEqual([['low', true], ['low', false]])
+      expect(JSON.stringify(switched.at(-1)?.messages)).toContain('新模型的摘要')
+      expect((await state(agent)).messages[0]?.message.content).toBe(input.text)
+    } finally { await agent.close() }
+  })
+})
+
+it('运行中改选模型后，当前工具回填和自动摘要继续用原模型与档位', async () => {
+  const first = { provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'low' } as const
+  const next = { provider: 'moonshotai-cn', modelId: 'kimi-k3', reasoningEffort: 'low' } as const
+  const started = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const execute = vi.fn(async () => '本轮真实工具结果')
+  const requests: { provider: string; effort?: string; compact: boolean; context: ModelContext }[] = []
+  const agent = createSession({ tools: [{ ...tool, execute }], compaction: { triggerTokens: 4000, keepRecentTokens: 100 },
+    stream: (model, context, options) => {
+      requests.push({ provider: model.provider, effort: options?.reasoningEffort, compact: !context.tools, context })
+      if (context.messages.at(-1)?.content === '现在调用工具') {
+        const call = reply('', { stopReason: 'toolUse', usage: { input: 5500 }, content: [
+          { type: 'toolCall', id: 'once', name: 'read', arguments: {} },
+        ] })
+        return {
+          result: async () => call,
+          async *[Symbol.asyncIterator]() {
+            started.resolve()
+            await release.promise
+            yield { type: 'done', reason: 'toolUse', message: call }
+          },
+        }
+      }
+      return output(context.tools ? reply() : reply('原模型完成自动压缩'))
+    },
+  })
+  try {
+    await seed(agent)
+    agent.selectModel(first)
+    const count = requests.length
+    await agent.submit({ ...first, clientMessageId: 'pinned', text: '现在调用工具' })
+    await started.promise
+    agent.selectModel(next)
+    await expect(agent.submit({ ...next, clientMessageId: 'early', text: '过早发送' })).rejects.toMatchObject({ code: 'busy' })
+    release.resolve()
+    await idle(agent)
+    expect(execute).toHaveBeenCalledOnce()
+    expect(requests.slice(count).map(item => [item.provider, item.effort, item.compact])).toEqual([
+      ['deepseek', 'low', false], ['deepseek', 'low', true], ['deepseek', 'low', false],
+    ])
+    expect(JSON.stringify(requests.at(-1)?.context.messages)).toContain('本轮真实工具结果')
+    await agent.submit({ ...next, clientMessageId: 'next', text: '现在用下一家' }); await idle(agent)
+    expect(requests.at(-1)).toMatchObject({ provider: next.provider, effort: 'low' })
+  } finally { release.resolve(); await agent.close() }
 })

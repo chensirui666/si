@@ -1,5 +1,8 @@
 export type {
   ModelInfo,
+  ModelSelection,
+  ModelStreamOptions,
+  ReasoningEffort,
   ModelDiscovery,
   ModelMessage,
   SystemMessage,
@@ -19,5 +22,6 @@ export type {
   ModelEvent,
   ModelEventStream,
 } from './types.js'
-export { discoverModels, findModel, stream, createModelStream } from './deepseek.js'
+export { defaultSelection, discoverModels, findModel, isModelProvider, sameSelection } from './catalog.js'
+export { stream, createModelStream } from './pi-stream.js'
 export { estimateMessageTokens, estimateContextTokens } from './context.js'

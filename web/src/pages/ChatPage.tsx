@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FolderOpenIcon, FolderPlusIcon, PlusIcon } from 'lucide-react'
-import type { ModelDiscovery } from '@agent-learning/model'
+import type { ModelDiscovery, ModelSelection } from '@agent-learning/model'
 import type { AbortRequest, AbortResult, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
+import { ModelPicker, effortLabel } from '../components/ModelPicker'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
-import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
+import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger } from '../components/ui/sidebar'
@@ -73,8 +74,9 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const mounted = useRef(false)
   const [discovery, setDiscovery] = useState<ModelDiscovery | null>(null)
   const discoveryRef = useRef(discovery)
-  const [modelId, setModelId] = useState('')
-  const modelIdRef = useRef(modelId)
+  const [selectionBusy, setSelectionBusy] = useState(false)
+  const savingSelection = useRef(false)
+  const [selectionError, setSelectionError] = useState<{ sessionId: string | null; message: string }>()
   const [modelError, setModelError] = useState<string | null>(null)
   const requestVersion = useRef(0)
   const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces)
@@ -188,6 +190,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         const text = error instanceof Error ? error.message : '首条消息被拒绝，请重试。'
         if (saveRejected) setSaveNotice({ sessionId: null, text })
         else setFirstError(text)
+        if (error?.code === 'model_selection_changed') {
+          receiveModels(null)
+          void refreshModels()
+        }
         void refreshWorkspaces()
       } else {
         setFirstPhase('unconfirmed')
@@ -229,9 +235,6 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const receiveModels = useCallback((result: ModelDiscovery | null) => {
     discoveryRef.current = result
     setDiscovery(result)
-    const selected = result?.models.some(model => model.id === modelIdRef.current) ? modelIdRef.current : result?.models[0]?.id ?? ''
-    modelIdRef.current = selected
-    setModelId(selected)
   }, [])
   const refreshModels = useCallback(async () => {
     const version = ++requestVersion.current
@@ -321,8 +324,32 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     if (sent) finishFirstSend(sent)
   }, [sessions, finishFirstSend])
 
-  const hasModel = () => discoveryRef.current?.deepseek.state === 'configured'
-    && discoveryRef.current.models.some(model => model.id === modelIdRef.current)
+  const selection = state.snapshot?.modelSelection ?? discovery?.defaultSelection
+  const selectedModel = discovery?.models.find(model => model.id === selection?.modelId && model.provider === selection.provider)
+  const hasModel = () => !savingSelection.current && !!selection && discoveryRef.current?.models.some(model =>
+    model.id === selection.modelId && model.provider === selection.provider
+    && (model.reasoningEfforts ? model.reasoningEfforts.some(level => level === selection.reasoningEffort) : selection.reasoningEffort === undefined))
+
+  async function selectModel(next: ModelSelection) {
+    if (savingSelection.current || stateRef.current.connection !== 'ready' || selected.current !== sessionId
+      || (sessionId ? !stateRef.current.snapshot : !!firstSend.current)) return
+    if (next.provider === selection?.provider && next.modelId === selection.modelId && next.reasoningEffort === selection.reasoningEffort) return
+    savingSelection.current = true
+    setSelectionBusy(true)
+    setSelectionError(undefined)
+    try {
+      await saveModelSelection({ ...next, ...(sessionId && { sessionId }) })
+    } catch (error) {
+      if (mounted.current) setSelectionError({ sessionId, message: error instanceof Error ? error.message : '模型选择未确认，请重试。' })
+    } finally {
+      if (mounted.current) {
+        if (sessionId && selected.current === sessionId) subscription.current?.requestSnapshot?.()
+        await refreshModels()
+      }
+      savingSelection.current = false
+      if (mounted.current) setSelectionBusy(false)
+    }
+  }
   const canStart = () => selected.current === null && draftWorkspace?.available && !workspaceError && !pickingRef.current
     && stateRef.current.connection === 'ready' && hasModel() && !firstSend.current
   const canSubmit = () => !!sessionId && sessionId === selected.current && workspace?.available && !workspaceError && stateRef.current.sessionId === sessionId && stateRef.current.connection === 'ready' && stateRef.current.snapshot !== null && stateRef.current.snapshot.running === null
@@ -330,7 +357,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     && !submissionsRef.current.some(local => local.sessionId === sessionId && local.state !== 'failed')
 
   const send = (text: string) => {
-    if (!text.trim()) return false
+    if (!text.trim() || !selection) return false
     if (sessionId === null) {
       if (!canStart() || !draftWorkspace) return false
       if (text.trim() === '/compact') {
@@ -338,7 +365,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         return false
       }
       const pending = firstSend.current = {
-        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, text },
+        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text },
         revision: draftRevision(newSessionDraft), sending: false,
       }
       writeFirstSend(pending.input)
@@ -347,7 +374,8 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       return false
     }
     if (!canSubmit()) return false
-    const input: SubmitMessageRequest = { clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, sessionId, text }
+    setSelectionError(undefined)
+    const input: SubmitMessageRequest = { clientMessageId: crypto.randomUUID(), ...selection, sessionId, text }
     const clearedRevision = draftRevision(sessionId) + 1
     const syncTarget = () => {
       if (selected.current === sessionId) subscription.current?.requestSnapshot?.()
@@ -373,16 +401,20 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     }, error => {
       if (!mounted.current) return
       const saveRejected = error?.code === 'save_rejected'
-      const rejected = saveRejected || typeof error?.status === 'number' && error.status >= 400 && error.status < 500
+      const selectionChanged = error?.code === 'model_selection_changed'
+      const rejected = saveRejected || selectionChanged || typeof error?.status === 'number' && error.status >= 400 && error.status < 500
       const message = error instanceof Error ? error.message : '提交异常，未确认接收'
       const local = submissionsRef.current.find(item => item.clientMessageId === input.clientMessageId)
       if (!local || local.accepted) return
-      if (saveRejected) {
+      const restored = rejected && restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId, selectionChanged)
+      if (saveRejected || selectionChanged && restored) {
         updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== input.clientMessageId))
-        setSaveNotice({ sessionId, text: message })
-      } else updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: message }))
+      } else updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: selectionChanged ? undefined : message }))
+      if (selectionChanged) {
+        setSelectionError({ sessionId, message })
+        syncTarget()
+      } else if (saveRejected) setSaveNotice({ sessionId, text: message })
       if (rejected) {
-        restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId)
         void refreshWorkspaces()
         if (error.status === 404) void refreshSessions()
       } else syncTarget()
@@ -416,15 +448,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     disconnected: '连接已断开，正在重试…',
   }[state.connection])
 
-  const selectedModel = isNew ? pendingInput?.modelId ?? modelId : modelId
-  const modelSelect = <Select value={discovery?.models.length ? selectedModel : ''}
-    onValueChange={value => { modelIdRef.current = value; setModelId(value) }}
-    disabled={!discovery?.models.length || (isNew && firstPhase !== null)}>
-    <SelectTrigger aria-label="模型" className="composer-model">
-      <SelectValue placeholder={modelError ? '模型查询失败' : discovery ? '无可用模型' : '正在查询模型…'} />
-    </SelectTrigger>
-    <SelectContent align="end">{discovery?.models.map(model => <SelectItem key={model.id} value={model.id}>{model.name}</SelectItem>)}</SelectContent>
-  </Select>
+  const modelSelect = <ModelPicker discovery={discovery} selection={selection} model={selectedModel}
+    disabled={!discovery?.models.length || selectionBusy || state.connection !== 'ready' || (isNew ? firstPhase !== null : !state.snapshot)}
+    placeholder={modelError ? '模型查询失败' : selection ? '重新选择模型' : discovery ? '无可用模型' : '正在查询模型…'}
+    onSelect={next => { void selectModel(next) }} />
+  const providerError = discovery?.providers.find(item => item.status.state === 'error')?.status
+  const runningRun = state.snapshot?.runs?.find(run => run.id === target)
+  const currentModel = runningRun && (discovery?.models.find(model => model.id === runningRun.modelId
+    && model.provider === (runningRun.provider ?? 'deepseek'))?.name ?? runningRun.modelId)
+
 
   return (
     <SidebarProvider>
@@ -513,7 +545,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
             <Button variant="outline" disabled={state.connection !== 'ready'} onClick={() => { if (firstSend.current) attemptFirstSend(firstSend.current) }}>重试首次发送</Button>
           </div>}
           {(isNew ? draftWorkspace && !draftWorkspace.available : workspace && !workspace.available) && <p className="model-error configuration-error" role="alert">工作区目录不可用</p>}
-          {(modelError || discovery?.deepseek.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (discovery?.deepseek.state === 'error' ? discovery.deepseek.message : '')}</p>}
+          {(modelError || providerError?.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (providerError?.state === 'error' ? providerError.message : '')}</p>}
+          {selection && discovery && !hasModel() && !selectionBusy && <p className="model-error configuration-error" role="alert">当前模型不可用，请重新选择。</p>}
+          {selectionError?.sessionId === sessionId && <p className="model-error configuration-error" role="alert">{selectionError.message}</p>}
+          {runningRun && <p className="connection-status">本次任务使用 {currentModel}{runningRun.reasoningEffort && ` · ${effortLabel(runningRun.reasoningEffort)}`}</p>}
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
           {storageUnavailable && <p className="configuration-error" role="alert">浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。</p>}
           <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />

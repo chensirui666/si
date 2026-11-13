@@ -1,3 +1,4 @@
+import type { ModelSelection } from '@agent-learning/model'
 import type { ConversationSnapshot, ConversationUpdate, SessionSummary, SubmissionAccepted } from '@agent-learning/coding-agent'
 import type { WorkspaceRegistration } from '../workspaces.js'
 
@@ -11,7 +12,9 @@ export type { WebSettingsView } from '../web-settings.js'
 export type WorkspacePick = { cancelled: true } | ({ cancelled: false } & WorkspaceRegistration)
 export type CreateSessionRequest = { workspaceId: string }
 export type SessionList = { sessions: SessionSummary[] }
-export type SubmitMessageRequest = { clientMessageId: string; modelId: string; text: string; sessionId: string }
+export type SubmitMessageRequest = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection>
+  & { clientMessageId: string; text: string; sessionId: string }
+export type SaveModelSelectionRequest = ModelSelection & { sessionId?: string }
 export type SubmitMessageAccepted = SubmissionAccepted & { sessionId: string }
 export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { workspaceId: string }
 export type StartSessionAccepted = { session: SessionSummary; accepted: SubmitMessageAccepted }

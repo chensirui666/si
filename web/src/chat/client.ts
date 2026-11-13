@@ -1,6 +1,6 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, ClientFrame, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
-import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
+import type { SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import { applyFrame, initialState, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
 export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged) => {
   let state: ChatState = initialState
@@ -153,10 +153,13 @@ const credentialStatus = (value: unknown) => record(value) && (value.state === '
   || (value.state === 'error' && typeof value.message === 'string'))
 
 function modelDiscovery(value: unknown): value is ModelDiscovery {
-  if (!record(value) || !Array.isArray(value.models) || !record(value.deepseek)) return false
+  if (!record(value) || !Array.isArray(value.models) || !Array.isArray(value.providers)) return false
   return value.models.every(model => record(model) && ['id', 'name', 'provider', 'api'].every(key => typeof model[key] === 'string')
-    && ['contextWindow', 'maxTokens'].every(key => typeof model[key] === 'number' && Number.isSafeInteger(model[key]) && (model[key] as number) > 0))
-    && credentialStatus(value.deepseek)
+    && ['contextWindow', 'maxTokens'].every(key => typeof model[key] === 'number' && Number.isSafeInteger(model[key]) && (model[key] as number) > 0)
+    && (model.reasoningEfforts === undefined ? model.defaultReasoningEffort === undefined
+      : Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.every(reasoningEffort) && model.reasoningEfforts.some(level => level === model.defaultReasoningEffort)))
+    && value.providers.every(provider => record(provider) && typeof provider.id === 'string' && typeof provider.name === 'string' && credentialStatus(provider.status))
+    && (value.defaultSelection === undefined || modelSelection(value.defaultSelection))
 }
 
 function workspaceView(value: unknown): value is WorkspaceView {
@@ -207,8 +210,11 @@ async function requestView<T>(path: string, label: string, validate: (value: unk
 const putJson = (value: unknown): RequestInit => ({ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
 
 export const getModels = () => requestView('/api/models', '模型配置', modelDiscovery)
-export const saveApiKey = (apiKey: string) => requestView('/api/providers/deepseek', '模型配置', modelDiscovery, putJson({ apiKey }), apiKey)
-export const deleteApiKey = () => requestView('/api/providers/deepseek', '模型配置', modelDiscovery, { method: 'DELETE' })
+export const saveApiKey = (provider: string, apiKey: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, '模型配置', modelDiscovery, putJson({ apiKey }), apiKey)
+export const deleteApiKey = (provider: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, '模型配置', modelDiscovery, { method: 'DELETE' })
+
+export const saveModelSelection = (input: SaveModelSelectionRequest) =>
+  requestView('/api/model-selection', '模型选择', modelSelection, { ...putJson(input), signal: AbortSignal.timeout(10_000) })
 
 export const getWorkspaces = () => requestView('/api/workspaces', '工作区', workspaceView)
 export const pickWorkspace = () => requestView('/api/workspaces/pick', '工作区选择', workspacePick, { method: 'POST' })
@@ -245,7 +251,7 @@ async function postSubmission(path: string, input: SubmitMessageRequest | StartS
   let value: unknown
   try { value = await response.json() } catch { value = null }
   const code = record(value) ? value.code : undefined
-  if (code === 'save_rejected' || code === 'save_unconfirmed') {
+  if (code === 'save_rejected' || code === 'save_unconfirmed' || code === 'model_selection_changed') {
     const message = record(value) && typeof value.error === 'string' ? value.error : '会话保存失败'
     throw Object.assign(new Error(message), { status: response.status, code })
   }

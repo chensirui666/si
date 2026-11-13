@@ -1,6 +1,7 @@
+import { sameSelection, type ModelSelection } from '@agent-learning/model'
 import { randomUUID } from 'node:crypto'
 import { SessionSubmitError, type AgentSession } from './agent-session.js'
-import { submissionReceipt, type SessionPersistence, type SessionStore } from './session-store.js'
+import { runSelection, submissionReceipt, type SessionPersistence, type SessionStore } from './session-store.js'
 import type { SubmissionAccepted } from './types.js'
 
 export type SessionSummary = {
@@ -13,7 +14,7 @@ export type SessionSummary = {
 type FirstMessage = Parameters<AgentSession['submit']>[0] & { workspaceId: string }
 type StartedSession = { session: SessionSummary; accepted: SubmissionAccepted }
 
-export class Sessions<T extends { close?: () => Promise<void> }> {
+export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (selection: ModelSelection) => void }> {
   private readonly sessions = new Map<string, { summary: SessionSummary; session: T }>()
   private readonly starts = new Map<string, { input: FirstMessage; result: Promise<StartedSession> }>()
   private readonly provisional = new Set<() => Promise<void>>()
@@ -26,6 +27,17 @@ export class Sessions<T extends { close?: () => Promise<void> }> {
     closeTools?(): Promise<void>
     onStarted?(): void
   }) {}
+
+  selectModel(selection: ModelSelection, sessionId?: string) {
+    this.ensureOpen()
+    if (sessionId) {
+      const session = this.get(sessionId)
+      if (!session) return false
+      if (!session.selectModel) throw new SessionSubmitError('invalid', '当前会话不支持模型选择')
+      session.selectModel(selection)
+    } else this.options.store?.saveModelSelection(selection)
+    return true
+  }
 
   async create(workspaceId: string): Promise<SessionSummary> {
     const resolveDirectory = await this.validateWorkspace(workspaceId)
@@ -45,7 +57,7 @@ export class Sessions<T extends { close?: () => Promise<void> }> {
     const id = input.clientMessageId
     const previous = this.starts.get(id)
     if (previous) {
-      if (previous.input.workspaceId !== input.workspaceId || previous.input.modelId !== input.modelId || previous.input.text !== input.text) {
+      if (previous.input.workspaceId !== input.workspaceId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
       return previous.result
@@ -54,7 +66,7 @@ export class Sessions<T extends { close?: () => Promise<void> }> {
     if (history) {
       const run = history.runs[0]
       if (run?.kind !== 'task' || run.clientMessageId !== id || history.summary.workspaceId !== input.workspaceId
-        || run.text !== input.text || run.modelId !== input.modelId) {
+        || run.text !== input.text || !sameSelection(runSelection(run), runSelection(input))) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
       return { session: history.summary, accepted: submissionReceipt(run) }

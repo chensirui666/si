@@ -16,15 +16,25 @@ export async function startModelServer() {
   const exchanges: {
     path: string | undefined
     authorized: boolean
+    authorization?: string
     body: RequestBody
     delta: (delta: Record<string, unknown>) => void
     finish: (reason?: 'stop' | 'tool_calls' | 'length') => void
     closed: boolean
   }[] = []
   const responses = new Set<ServerResponse>()
+  let rejected = 0
+  let rejectNext = false
   const server = createServer(async (request, response) => {
     let body = ''
     for await (const chunk of request) body += String(chunk)
+    if (rejectNext) {
+      rejectNext = false
+      rejected++
+      response.writeHead(400, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify({ error: { message: 'Invalid message format for this conversation history' } }))
+      return
+    }
     response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
     response.flushHeaders()
     responses.add(response)
@@ -39,6 +49,7 @@ export async function startModelServer() {
     const exchange = {
       path: request.url,
       authorized: request.headers.authorization === 'Bearer controlled-stage3-key',
+      authorization: request.headers.authorization,
       body: JSON.parse(body) as RequestBody,
       delta: (delta: Record<string, unknown>) => chunk(delta),
       finish: (reason: 'stop' | 'tool_calls' | 'length' = 'stop') => {
@@ -60,6 +71,8 @@ export async function startModelServer() {
   if (!address || typeof address === 'string') throw new Error('受控模型服务未能取得端口')
   return {
     exchanges,
+    get rejected() { return rejected },
+    rejectHistory() { rejectNext = true },
     baseURL: `http://127.0.0.1:${address.port}/v1`,
     close: async () => {
       for (const response of responses) response.destroy()

@@ -1,3 +1,4 @@
+import type { ModelThinkingLevel } from '@earendil-works/pi-ai'
 import type { CredentialStatus } from '@agent-learning/credentials'
 import type { TSchema } from 'typebox'
 
@@ -23,6 +24,7 @@ export type AssistantMessage = {
   model: string
   responseId?: string
   responseModel?: string
+  providerThinkingLevel?: string
   stopReason: 'pending' | ModelStopReason
   errorMessage?: string
   errorCode?: 'context_overflow'
@@ -43,12 +45,14 @@ export type ToolResultMessage = {
 export type TextContent = {
   type: 'text'
   text: string
+  textSignature?: string
 }
 
 export type ThinkingContent = {
   type: 'thinking'
   thinking: string
   thinkingSignature?: string
+  redacted?: boolean
 }
 
 export type ToolCall = {
@@ -57,6 +61,8 @@ export type ToolCall = {
   name: string
   arguments: JsonObject
   argumentsError?: string
+  thoughtSignature?: string
+  namespace?: string
 }
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject
@@ -81,11 +87,24 @@ export type ModelInfo = {
   api: string
   contextWindow: number
   maxTokens: number
+  reasoningEfforts?: ReasoningEffort[]
+  defaultReasoningEffort?: ReasoningEffort
 }
+
+export type ReasoningEffort = ModelThinkingLevel
+
+export type ModelSelection = {
+  provider: string
+  modelId: string
+  reasoningEffort?: ReasoningEffort
+}
+
+export type ModelStreamOptions = { signal?: AbortSignal; reasoningEffort?: ReasoningEffort }
 
 export type ModelDiscovery = {
   models: ModelInfo[]
-  deepseek: CredentialStatus
+  providers: { id: string; name: string; status: CredentialStatus }[]
+  defaultSelection?: ModelSelection
 }
 
 export type ContextEstimate = {

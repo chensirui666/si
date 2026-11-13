@@ -1,4 +1,4 @@
-import type { AssistantMessage, JsonObject, ModelContext, ModelEvent, ModelInfo, Tool, ToolResultMessage } from '@agent-learning/model'
+import type { AssistantMessage, JsonObject, ModelContext, ModelEvent, ModelInfo, ReasoningEffort, Tool, ToolResultMessage } from '@agent-learning/model'
 
 export type ExecutableTool = Tool & {
   executionMode?: 'parallel' | 'sequential'
@@ -7,6 +7,7 @@ export type ExecutableTool = Tool & {
 
 export type AgentRunInput = {
   model: ModelInfo
+  reasoningEffort?: ReasoningEffort
   context: ModelContext
   tools?: ExecutableTool[]
   signal: AbortSignal

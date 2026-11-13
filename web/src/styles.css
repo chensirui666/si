@@ -331,3 +331,17 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 
 .save-notice { position: fixed; inset: 16px auto auto 50%; z-index: 5; transform: translateX(-50%); width: max-content; max-width: calc(100vw - 32px); margin: 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--background); color: #b42318; font-size: 13px; box-shadow: 0 2px 12px rgb(0 0 0 / 8%); }
 .tool-block-locked { display: flex; align-items: center; gap: 8px; min-height: 28px; font-size: 13px; }
+
+.composer-model-controls { display: flex; gap: 2px; align-items: center; min-width: 0; }
+.composer-model-controls > button { min-width: 0; }
+.composer-model-controls > button:first-child { anchor-name: --composer-model-trigger; }
+.composer-model-controls > button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-picker { position: fixed; position-anchor: --composer-model-trigger; inset: auto; bottom: 80px; right: 12px; bottom: anchor(top, 80px); right: anchor(right, 12px); position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline; margin: 0 0 6px; width: min(290px, calc(100vw - 24px)); max-height: min(340px, 48vh); overflow: auto; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--background); color: inherit; box-shadow: 0 4px 12px rgb(0 0 0 / 12%); }
+.model-picker-list { margin-top: 4px; }
+.model-picker-list button { width: 100%; justify-content: flex-start; text-align: left; height: auto; min-height: 32px; white-space: normal; }
+.model-picker-list small { color: var(--secondary-text); font-size: 11px; overflow-wrap: anywhere; }
+.model-picker-list button[aria-pressed="true"] { background: var(--muted); }
+.model-picker-label { font-size: 12px; padding: 5px 8px; color: var(--secondary-text); }
+.provider-row + .provider-row { margin-top: 8px; }
+.provider-choices { display: grid; gap: 6px; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); }
+.message-model { margin: 0 0 4px; font-size: 12px; color: var(--secondary-text); }

@@ -8,7 +8,7 @@ import { draftKey } from '../chat/drafts'
 const desktop = { id: 'desktop', name: 'Desktop', path: '/tmp/Desktop', available: true }
 const stardust = { id: 'stardust', name: 'Stardust', path: '/tmp/Stardust', available: true }
 const existing = { id: 'existing', workspaceId: desktop.id, name: '会话 1', createdAt: '2026-11-10T00:00:00Z' }
-const getModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], deepseek: { state: 'configured' as const } })
+const getModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'configured' as const } }], defaultSelection: { provider: 'deepseek', modelId: 'deepseek-flash' } })
 const getWorkspaces = async () => ({ workspaces: [desktop, stardust] })
 const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 const subscribe: Subscribe = onState => Object.assign(() => {}, { setSession: (sessionId: string | null) => {
