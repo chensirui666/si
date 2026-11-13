@@ -1,10 +1,12 @@
 import { execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { watch } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import sharp from 'sharp'
 import { createTools } from '../src/tools.js'
 import { ToolRuntime } from '../src/tool-runtime.js'
 
@@ -39,6 +41,55 @@ it('reads UTF-8 lines from task cwd and from an absolute path', async () => {
   expect(await read({ path: join(cwd, 'note.txt'), offset: 4 }, context())).toContain('丁')
   await expect(read({ path: 'note.txt', offset: 1.5 }, context())).rejects.toThrow('offset')
   await expect(read({ path: 'note.txt', offset: 5 }, context())).rejects.toThrow('offset')
+})
+
+it.each(['png', 'jpeg', 'webp'] as const)('returns original %s bytes even when the file has no extension', async format => {
+  const path = join(cwd, 'capture')
+  const source = await sharp({ create: { width: 16, height: 16, channels: 3, background: 'red' } }).toFormat(format).toBuffer()
+  await writeFile(path, source)
+  await expect(tool('read')({ path: 'capture' }, context())).resolves.toEqual([
+    { type: 'text', text: expect.stringContaining(path) },
+    { type: 'image', mimeType: `image/${format}`, data: source.toString('base64') },
+  ])
+})
+
+it.each(['dimensions', 'encoded size'] as const)('resizes an image that exceeds the %s budget', async condition => {
+  const path = join(cwd, 'large.png')
+  const source = condition === 'dimensions'
+    ? await sharp({ create: { width: 2400, height: 1200, channels: 3, background: 'white' } }).png().toBuffer()
+    : await sharp(randomBytes(1400 * 1400 * 3), { raw: { width: 1400, height: 1400, channels: 3 } }).png().toBuffer()
+  if (condition === 'encoded size') expect(source.length).toBeGreaterThan(4 * 1024 * 1024)
+  await writeFile(path, source)
+  const output = await tool('read')({ path }, context())
+  const image = typeof output === 'string' ? undefined : output.find(block => block.type === 'image')
+  expect(image?.type).toBe('image')
+  if (image?.type !== 'image') throw new Error('missing Read image')
+  expect(image.data.length).toBeLessThanOrEqual(512 * 1024)
+  const resized = sharp(Buffer.from(image.data, 'base64'))
+  const { width, height, format } = await resized.metadata()
+  expect(image.mimeType).toBe(`image/${format}`)
+  expect(Math.max(width!, height!)).toBeLessThanOrEqual(2000)
+  expect(width).toBe(condition === 'dimensions' ? 2 * height! : height)
+  await resized.stats()
+  expect((await readFile(path)).equals(source)).toBe(true)
+})
+
+it('returns a decoding error and records no successful read for a truncated image', async () => {
+  const path = join(cwd, 'broken.png')
+  const source = await sharp({ create: { width: 16, height: 16, channels: 3, background: 'red' } }).png().toBuffer()
+  await writeFile(path, source.subarray(0, 40))
+  const recordDetails = vi.fn()
+  await expect(tool('read')({ path }, { ...context(), recordDetails })).rejects.toThrow(/图片.*解码.*broken\.png/)
+  expect(recordDetails).not.toHaveBeenCalled()
+})
+
+it('bounds the source file read for an oversized image', async () => {
+  const path = join(cwd, 'huge.png')
+  await writeFile(path, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  await truncate(path, 50 * 1024 * 1024 + 1)
+  const recordDetails = vi.fn()
+  await expect(tool('read')({ path }, { ...context(), recordDetails })).rejects.toThrow(/图片.*50 MiB/)
+  expect(recordDetails).not.toHaveBeenCalled()
 })
 
 it('records the resolved path of an empty read and omits a failed read', async () => {

@@ -3,7 +3,8 @@ import { Type } from 'typebox'
 import { piModels } from '../src/catalog.js'
 import { toPiContext } from '../src/context.js'
 import * as modelApi from '../src/index.js'
-import type { AssistantMessage, ModelContext } from '../src/index.js'
+import type { AssistantMessage, ModelContext, ToolResultMessage } from '../src/index.js'
+import { convertMessages } from '../src/context.js'
 
 const assistant: AssistantMessage = {
   role: 'assistant', content: [{ type: 'text', text: 'answer' }, { type: 'thinking', thinking: 'x'.repeat(400) }],
@@ -36,7 +37,7 @@ describe('model-visible context estimates', () => {
     expect(estimate.toolsTokens).toBeGreaterThan(0)
     const shorter = structuredClone(context)
     const result = shorter.messages[2]
-    if (result.role === 'toolResult') result.content[0].text = ''
+    if (result.role === 'toolResult' && result.content[0].type === 'text') result.content[0].text = ''
     const shortEstimate = modelApi.estimateContextTokens(shorter)
     expect(estimate.messageTokens).toBe(shortEstimate.messageTokens + 100)
     expect(estimate.toolsTokens).toBe(shortEstimate.toolsTokens)
@@ -65,6 +66,63 @@ describe('model-visible context estimates', () => {
     expect(missing).toEqual(explicit)
     expect(turn).toEqual(original)
   })
+
+  it('counts image inputs independently of their encoded byte length', () => {
+    const text: ToolResultMessage = {
+      role: 'toolResult', toolCallId: 'r1', toolName: 'read', isError: false, timestamp: 1,
+      content: [{ type: 'text', text: 'Read screenshot.png' }],
+    }
+    const estimate = (data: string) => modelApi.estimateMessageTokens({ ...text, content: [
+      ...text.content, { type: 'image', mimeType: 'image/png', data },
+    ] }, true)
+    expect(estimate('AAAA')).toBeGreaterThan(modelApi.estimateMessageTokens(text, true))
+    expect(estimate('AAAA'.repeat(1024 * 1024))).toBe(estimate('AAAA'))
+  })
+
+  it.each([
+    { count: 48, last: 500_000, omitted: 0 },
+    { count: 48, last: 500_004, omitted: 8 },
+    { count: 49, last: 500_000, omitted: 8 },
+    { count: 56, last: 500_000, omitted: 8 },
+    { count: 57, last: 500_000, omitted: 16 },
+  ])('omits $omitted oldest tool images with $count images and $last final bytes', ({ count, last, omitted }) => {
+    const data = 'A'.repeat(500_000)
+    const calls = Array.from({ length: count }, (_, index) => ({
+      type: 'toolCall' as const, id: `read-${index}`, name: 'read', arguments: { path: `${index}.png` },
+    }))
+    const results: ToolResultMessage[] = calls.map(call => ({
+      role: 'toolResult', toolCallId: call.id, toolName: call.name, isError: false, timestamp: 1,
+      content: [{ type: 'text', text: call.arguments.path }, { type: 'image', mimeType: 'image/png',
+        data: call === calls.at(-1) ? 'A'.repeat(last) : data }],
+    }))
+    const messages = convertMessages({ messages: [{ ...assistant, content: calls }, ...results] })
+    expect(messages.filter(message => message.role === 'tool').map(message => message.tool_call_id)).toEqual(calls.map(call => call.id))
+    const outcomes = messages.filter(message => message.role === 'tool')
+    for (const [index, outcome] of outcomes.entries()) {
+      expect(outcome.content).toContain(`${index}.png`)
+      expect(outcome.content.includes('已省略')).toBe(index < omitted)
+    }
+    const attachment = messages.at(-1)
+    expect(attachment?.role === 'user' && Array.isArray(attachment.content)
+      && attachment.content.filter(block => block.type === 'image_url')).toHaveLength(count - omitted)
+  })
+
+  it('keeps previously omitted images out without confusing repeated call ids', () => {
+    const turn: AssistantMessage = { ...assistant, content: [{ type: 'toolCall', id: 'same', name: 'read', arguments: {} }] }
+    const result = (id: string): ToolResultMessage => ({
+      role: 'toolResult', toolCallId: 'same', toolName: 'read', imageResultId: id, isError: false, timestamp: 1,
+      content: [{ type: 'text', text: `${id}.png` }, { type: 'image', mimeType: 'image/png', data: 'AAAA' }],
+    })
+    const omittedToolImageResults = new Set(['previous'])
+    const context: ModelContext = { messages: [turn, result('previous'), turn, result('current')], omittedToolImageResults }
+    modelApi.estimateContextTokens(context)
+    expect(omittedToolImageResults).toEqual(new Set(['previous']))
+    const sent = convertMessages(context)
+    expect(sent.filter(message => message.role === 'tool').map(message => message.content)).toEqual([
+      expect.stringMatching(/previous\.png.*\n.*已省略/), 'current.png',
+    ])
+    expect(sent.filter(message => message.role === 'user')).toHaveLength(1)
+  })
 })
 
 
@@ -89,7 +147,10 @@ it('replays foreign Gemini 4 tool history as text and preserves native call and 
   const snapshot = structuredClone(context)
   const messages = toPiContext(context, gemini).messages
   expect(messages[0]).toMatchObject({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: expect.stringContaining('index.txt') }] })
-  expect(messages[1]).toMatchObject({ role: 'user', content: expect.stringContaining('index.txt was missing') })
+  expect(messages[1]).toMatchObject({ role: 'user', content: [
+    { type: 'text', text: 'Previous tool read (foreign) failed:' },
+    { type: 'text', text: 'index.txt was missing' },
+  ] })
   expect(messages[2]).toMatchObject(nativeCall)
   expect(messages[3]).toEqual(context.messages[3])
   expect(context).toEqual(snapshot)

@@ -23,7 +23,7 @@ describe('回复内容', () => {
   })
   it.each([['length', '达到长度限制，回答可能不完整'], ['aborted', '回答已中止'], ['error', '网络中断']] as const)('明确展示 %s 终止原因并保留部分正文', (stopReason, text) => {
     render(<AssistantMessage messages={[{ id: 'answer', message: { ...message, stopReason, errorMessage: stopReason === 'error' ? '网络中断' : undefined } }]} />)
-    expect(screen.getByText(text, { selector: '.message-ending' })).toBeVisible()
+    expect(screen.getByText(text)).toBeVisible()
     expect(screen.getByText('答案')).toBeVisible()
   })
   it('空内容块不伪造回答或思考折叠区域', () => {

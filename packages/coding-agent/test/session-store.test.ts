@@ -5,6 +5,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { expect, it, vi } from 'vitest'
 import { AgentSession } from '../src/agent-session.js'
 import { SessionStore } from '../src/session-store.js'
+import { buildModelHistory } from '../src/compaction.js'
+import type { ConversationMessage } from '../src/types.js'
 
 const summary = { id: 'session', workspaceId: 'workspace', name: '会话 1', createdAt: new Date().toISOString() }
 const run = {
@@ -12,6 +14,55 @@ const run = {
   text: '原文', kind: 'task', status: 'running', startedAt: 1, acceptedSeq: 1,
 } as const
 const user = { id: run.id, clientMessageId: run.clientMessageId, message: { role: 'user', content: run.text, timestamp: 1 } } as const
+
+it('stores image reads as text and restores legacy image rows without replaying their bytes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-store-image-'))
+  const path = join(directory, 'sessions.sqlite')
+  let store: SessionStore | undefined = SessionStore.open(path)
+  const assistant: ConversationMessage = {
+    id: 'call', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+      timestamp: 2, stopReason: 'toolUse', content: [
+        { type: 'toolCall', name: 'read', id: 'read-1', arguments: { path: 'shot.png' } },
+        { type: 'toolCall', name: 'read', id: 'read-2', arguments: { path: 'note.txt' } },
+      ] },
+  }
+  const note = { type: 'text', text: '已读取图片：/work/shot.png' } as const
+  const image = { type: 'image', mimeType: 'image/png', data: 'AABBCCDD' } as const
+  const result: ConversationMessage = {
+    id: 'result', toolCall: { assistantMessageId: 'call', contentIndex: 0 }, fileOperation: { kind: 'read', path: '/work/shot.png' },
+    message: { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', content: [note, image], isError: false, timestamp: 3 },
+  }
+  const textResult: ConversationMessage = {
+    id: 'text-result', toolCall: { assistantMessageId: 'call', contentIndex: 1 },
+    message: { role: 'toolResult', toolCallId: 'read-2', toolName: 'read', content: [{ type: 'text', text: '普通文本' }], isError: false, timestamp: 4 },
+  }
+  try {
+    store.save(summary.id, { summary, run, messages: [user, assistant, result, textResult] })
+    store.close()
+    store = undefined
+    const expected = { ...result, imageOmitted: true, message: { ...result.message, content: [note] } }
+    const database = new DatabaseSync(path)
+    try {
+      const stored = String(database.prepare('SELECT data FROM messages WHERE id = ?').get(result.id)?.data)
+      expect(JSON.parse(stored)).toEqual(expected)
+      expect(stored).not.toContain(image.data)
+      expect(result.message.content).toEqual([note, image])
+      database.prepare('UPDATE messages SET data = ? WHERE id = ?').run(JSON.stringify(result), result.id)
+    } finally { database.close() }
+    store = SessionStore.open(path)
+    const restored = store.loadSession(summary.id)!.messages
+    expect(restored).toEqual([user, assistant, expected, textResult])
+    const history = buildModelHistory(restored, undefined, true)
+    expect(history.at(-2)).toMatchObject({ role: 'toolResult', toolCallId: 'read-1', content: [
+      note, { type: 'text', text: expect.stringMatching(/图片.*重新.*read/) },
+    ] })
+    expect(history.at(-1)).toEqual(textResult.message)
+    expect(JSON.stringify(history)).not.toContain(image.data)
+  } finally {
+    store?.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
 it('首发一起提交；任何一条写入失败就回滚会话登记', () => {
   const store = SessionStore.open(':memory:')

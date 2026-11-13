@@ -37,7 +37,8 @@ export type ToolResultMessage = {
   role: 'toolResult'
   toolCallId: string
   toolName: string
-  content: TextContent[]
+  imageResultId?: string
+  content: (TextContent | ImageContent)[]
   isError: boolean
   timestamp: number
 }
@@ -46,6 +47,12 @@ export type TextContent = {
   type: 'text'
   text: string
   textSignature?: string
+}
+
+export type ImageContent = {
+  type: 'image'
+  mimeType: 'image/png' | 'image/jpeg' | 'image/webp'
+  data: string
 }
 
 export type ThinkingContent = {
@@ -117,6 +124,7 @@ export type ModelContext = {
   systemPrompt?: string
   messages: ModelMessage[]
   tools?: Tool[]
+  omittedToolImageResults?: ReadonlySet<string>
 }
 
 export type Tool<TParameters extends TSchema = TSchema> = {

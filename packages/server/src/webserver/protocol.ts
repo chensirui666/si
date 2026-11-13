@@ -20,6 +20,8 @@ export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { wo
 export type StartSessionAccepted = { session: SessionSummary; accepted: SubmitMessageAccepted }
 export type AbortRequest = { sessionId: string; runId: string }
 export type AbortResult = AbortRequest & { handled: boolean }
+export type InterfaceLanguage = 'en' | 'zh-CN'
+export type LanguageSettings = { language: InterfaceLanguage }
 
 type SubscriptionTarget = { sessionId: string; subscriptionId: string }
 

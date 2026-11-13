@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/experimental-ct-react';
+import type { RunRecord } from '@agent-learning/server/protocol';
 import type { ConversationMessage } from '../types';
 import { MessageList } from './MessageList';
 
@@ -72,6 +73,44 @@ test('原文展示、长内容换行与复制', async ({ mount, page, context })
   );
   await expect(region.getByRole('listitem')).toHaveCount(0);
   await expect(region).toHaveText('');
+});
+
+test('整轮计时从服务端开始，经过工具和回复，结束后固定为记录的用时', async ({ mount, page }) => {
+  const start = new Date('2026-11-13T00:00:00Z');
+  await page.clock.install({ time: start });
+  await page.clock.pauseAt(new Date(start.getTime() + 500));
+  const user: ConversationMessage = { id: 'u', message: { role: 'user', content: '查一下', timestamp: start.getTime() } };
+  const run: RunRecord = { id: 'u', sessionId: 'session-a', clientMessageId: 'client-u', modelId: 'deepseek-flash', kind: 'task', status: 'running', startedAt: start.getTime() + 500 };
+  const running = { kind: 'task', runId: 'u', assistantMessageId: 'a', phase: 'model', activeTools: [] } as const;
+  const assistant = { id: 'a', message: {
+    role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: run.startedAt,
+    stopReason: 'pending', content: [{ type: 'thinking', thinking: '检查文件' }, { type: 'text', text: '第一段回复' }, { type: 'thinking', thinking: '继续检查' }],
+  } } satisfies ConversationMessage;
+  const component = await mount(<MessageList messages={[user]} runs={[run]} running={{ ...running, activeTools: [] }} />);
+  const status = component.locator('.run-status');
+  await expect(status).toHaveText('正在执行');
+  await page.clock.runFor(1000);
+  await expect(status).toHaveText('正在执行 · 1 秒');
+  await component.update(<MessageList messages={[user, assistant]} runs={[run]} running={{ ...running, phase: 'tools', activeTools: [] }} />);
+  await expect(status).toHaveCount(1);
+  await expect(component.getByText('第一段回复')).toBeVisible();
+  await page.clock.runFor(1000);
+  await expect(status).toHaveText('正在执行 · 2 秒');
+
+  const completed: RunRecord = { ...run, status: 'completed', finishedAt: run.startedAt + 68_000 };
+  await component.update(<MessageList messages={[user, assistant]} runs={[completed]} />);
+  await expect(status).toHaveText('用时 1 分 08 秒');
+  await page.clock.runFor(1000);
+  await expect(status).toHaveText('用时 1 分 08 秒');
+  await component.locator('.process-group > summary').filter({ has: page.locator('.run-status') }).press('Enter');
+  await expect(component.getByText(/思考 · 检查文件/)).toBeVisible();
+
+  await component.update(<MessageList messages={[user]} runs={[{ ...completed, status: 'aborted' }]} />);
+  await expect(status).toHaveText('已中止 · 1 分 08 秒');
+  await component.update(<MessageList messages={[user]} runs={[{ ...completed, status: 'failed' }]} />);
+  await expect(status).toHaveText('执行失败 · 1 分 08 秒');
+  await component.update(<MessageList messages={[user]} runs={[{ ...run, status: 'interrupted', restored: true }]} />);
+  await expect(status).toHaveText('已中断');
 });
 
 test('执行过程逐步展示并独立展开，正文分段，结果按来源关联并随任务结束收起', async ({ mount }) => {
@@ -175,7 +214,7 @@ test('结果保存失败的工具卡不可展开，并在本轮说明磁盘原�
   await component.locator('.process-group > summary').click()
   const tool = component.locator('.tool-block')
   await expect(tool).toContainText('工具已执行，结果未保存')
-  await expect(tool.locator('[data-state="error"]')).toHaveText('Error')
+  await expect(tool.locator('[data-state="error"]')).toHaveText('失败')
   await expect(tool.locator('summary')).toHaveCount(0)
   await expect(component.getByRole('alert')).toContainText('磁盘空间不足')
 })

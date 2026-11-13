@@ -2,7 +2,7 @@ import type { AssistantMessage, JsonObject, ModelContext, ModelEvent, ModelInfo,
 
 export type ExecutableTool = Tool & {
   executionMode?: 'parallel' | 'sequential'
-  execute(arguments_: JsonObject, context: { signal: AbortSignal; recordDetails(details: unknown): void }): Promise<string>
+  execute(arguments_: JsonObject, context: { signal: AbortSignal; recordDetails(details: unknown): void }): Promise<string | ToolResultMessage['content']>
 }
 
 export type AgentRunInput = {

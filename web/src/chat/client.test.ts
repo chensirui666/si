@@ -189,8 +189,8 @@ describe('browser subscription', () => {
 
   it('不把无法区分原因的 WS 异常报告为授权 401', () => {
     start(); socket().error()
-    expect(current().error).toContain('连接异常')
-    expect(current().error).not.toMatch(/401|授权失效|模型/)
+    expect(current().connectionNotice).toBe('chat.connectionFailed')
+    expect(current().error).toBeNull()
   })
 
   it('初始离线不创建连接，畸形 JSON 不中断后续有效快照', () => {

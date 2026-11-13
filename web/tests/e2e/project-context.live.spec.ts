@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebServer } from '@agent-learning/server'
-import { expect, test } from '@playwright/test'
+import { expect, test } from './chinese-fixture'
 import { readLiveKey } from './live-key'
 import { addWorkspace, authorize, saveKey } from './test-utils'
 

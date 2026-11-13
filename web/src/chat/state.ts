@@ -1,6 +1,7 @@
 import type { CompactionRecord, ConversationMessage, ConversationSnapshot, RunRecord, SaveFailure, ServerFrame } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
+import type { CopyKey } from '../i18n/en'
 
 export type ConnectionState = 'connecting' | 'awaitingSnapshot' | 'ready' | 'disconnected'
 export type ChatState = {
@@ -9,6 +10,7 @@ export type ChatState = {
   snapshot: ConversationSnapshot | null
   slow: boolean
   error: string | null
+  connectionNotice?: CopyKey
 }
 export type Subscription = (() => void) & { requestSnapshot?: () => void; setSession: (sessionId: string | null) => void }
 export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void) => Subscription

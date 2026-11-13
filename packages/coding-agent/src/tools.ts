@@ -1,15 +1,15 @@
 import { Type, type Static, type TSchema } from 'typebox'
 import { Check } from 'typebox/value'
 import type { ExecutableTool } from '@agent-learning/agent'
-import type { Tool } from '@agent-learning/model'
+import type { Tool, ToolResultMessage } from '@agent-learning/model'
 import { createLocalTools, type LocalToolContext } from './local-tools.js'
 import type { WebTools } from './web-tools.js'
 import type { ToolRuntime } from './tool-runtime.js'
 
 const readParameters = Type.Object({
-  path: Type.String({ description: '要读取的文本文件路径' }),
-  offset: Type.Optional(Type.Number({ description: '起始行号，从 1 开始' })),
-  limit: Type.Optional(Type.Number({ description: '最多读取的行数' })),
+  path: Type.String({ description: '要读取的本地文件路径' }),
+  offset: Type.Optional(Type.Number({ description: '读取文本时的起始行号，从 1 开始' })),
+  limit: Type.Optional(Type.Number({ description: '读取文本时的最大行数' })),
 })
 
 const bashParameters = Type.Object({
@@ -57,7 +57,7 @@ const webFetchParameters = Type.Object({
 })
 
 const declarations = {
-  read: { name: 'read', description: '读取 UTF-8 文本文件，可指定起始行和最多读取行数。', parameters: readParameters },
+  read: { name: 'read', description: '读取本地 UTF-8 文本或 PNG、JPEG、WebP 图片。文本可按行读取，图片超出发送大小时尝试等比缩小。', parameters: readParameters },
   bash: { name: 'bash', description: '在工作目录运行 Bash 命令，可指定超时秒数。', parameters: bashParameters },
   edit: { name: 'edit', description: '对同一原文件进行一处或多处文本替换，先精确匹配，未命中时忽略行尾普通空格。', parameters: editParameters },
   write: { name: 'write', description: '创建或完整覆盖文本文件。', parameters: writeParameters },
@@ -90,7 +90,7 @@ export type WebFetchParams = Static<typeof webFetchParameters>
 
 function executable<Schema extends TSchema>(
   declaration: Tool<Schema>,
-  execute: (params: Static<Schema>, context: LocalToolContext) => Promise<string>,
+  execute: (params: Static<Schema>, context: LocalToolContext) => Promise<string | ToolResultMessage['content']>,
   cwd: string,
   fileKind?: 'read' | 'modified',
 ): CodingTool {

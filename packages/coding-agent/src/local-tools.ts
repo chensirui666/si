@@ -1,8 +1,11 @@
-import { access, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, mkdir, open, readFile, stat, writeFile } from 'node:fs/promises'
 import { addAbortListener } from 'node:events'
 import { homedir } from 'node:os'
 import { basename, dirname, relative, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import type { ToolResultMessage } from '@agent-learning/model'
+import { imageMimeType, MAX_IMAGE_SOURCE_BYTES, prepareReadImage } from './read-image.js'
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type ToolRuntime } from './tool-runtime.js'
 import type { BashParams, EditParams, FindParams, GrepParams, ReadParams, WriteParams } from './tools.js'
 
@@ -26,12 +29,41 @@ function pathFrom(cwd: string, value: string): string {
   return resolve(cwd, value)
 }
 
-async function readText(path: string, signal: AbortSignal, keepBom = false): Promise<string> {
+async function readBytes(path: string, signal: AbortSignal, allowImages = false): Promise<Buffer> {
   signal.throwIfAborted()
-  if (!(await stat(path)).isFile()) throw new Error(`不是文件：${path}`)
+  const info = await stat(path)
+  if (!info.isFile()) throw new Error(`不是文件：${path}`)
+  signal.throwIfAborted()
+  if (allowImages && info.size >= 3) {
+    const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK)
+    try {
+      const opened = await file.stat()
+      if (!opened.isFile()) throw new Error(`不是文件：${path}`)
+      signal.throwIfAborted()
+      const prefix = Buffer.alloc(12)
+      const { bytesRead } = await file.read(prefix, 0, prefix.length, 0)
+      if (imageMimeType(prefix.subarray(0, bytesRead))) {
+        if (opened.size > MAX_IMAGE_SOURCE_BYTES) throw new Error(`原始图片超过 50 MiB：${path}`)
+        const bytes = Buffer.allocUnsafe(opened.size + 1)
+        let offset = 0
+        while (offset < bytes.length) {
+          signal.throwIfAborted()
+          const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset)
+          if (!bytesRead) break
+          offset += bytesRead
+        }
+        if (offset !== opened.size) throw new Error(`图片大小在读取期间发生变化：${path}`)
+        return bytes.subarray(0, offset)
+      }
+    } finally { await file.close() }
+  }
   signal.throwIfAborted()
   const bytes = await readFile(path, { signal })
   signal.throwIfAborted()
+  return bytes
+}
+
+function decodeText(path: string, bytes: Buffer, keepBom = false): string {
   try {
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: keepBom }).decode(bytes)
     if (text.includes('\0')) throw new Error('binary')
@@ -41,12 +73,16 @@ async function readText(path: string, signal: AbortSignal, keepBom = false): Pro
   }
 }
 
-async function readWithAbort(path: string, signal: AbortSignal) {
+async function readText(path: string, signal: AbortSignal, keepBom = false): Promise<string> {
+  return decodeText(path, await readBytes(path, signal), keepBom)
+}
+
+async function readWithAbort<T>(signal: AbortSignal, read: () => Promise<T>): Promise<T> {
   signal.throwIfAborted()
   let subscription: ReturnType<typeof addAbortListener> | undefined
   try {
     return await Promise.race([
-      readText(path, signal),
+      read(),
       new Promise<never>((_, reject) => { subscription = addAbortListener(signal, () => reject(signal.reason)) }),
     ])
   } finally { subscription?.[Symbol.dispose]() }
@@ -75,11 +111,20 @@ class OutputLines {
   }
 }
 
-async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: LocalToolContext) {
+async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: LocalToolContext): Promise<string | ToolResultMessage['content']> {
   const start = integer(offset, 'offset') - 1
   const count = limit === undefined ? Infinity : integer(limit, 'limit')
   const target = pathFrom(cwd, path)
-  const text = await readWithAbort(target, signal)
+  const bytes = await readWithAbort(signal, () => readBytes(target, signal, true))
+  signal.throwIfAborted()
+  const mimeType = imageMimeType(bytes)
+  if (mimeType) {
+    const image = await readWithAbort(signal, () => prepareReadImage(target, bytes, mimeType, signal))
+    signal.throwIfAborted()
+    recordFileOperation?.(target)
+    return [{ type: 'text', text: `已读取图片：${target}` }, image]
+  }
+  const text = decodeText(target, bytes)
   const lines = linesOf(text)
   if (start >= lines.length && (lines.length || start > 0)) throw new Error(`offset 超出文件范围（共 ${lines.length} 行）`)
   recordFileOperation?.(target)
@@ -327,7 +372,7 @@ async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: L
     const label = stats.isDirectory() ? relative(search, match.path) : basename(match.path)
     if (context > 0 && contextPath !== match.path) {
       try {
-        lines = linesOf(await readWithAbort(match.path, signal))
+        lines = linesOf(await readWithAbort(signal, () => readText(match.path, signal)))
       } catch {
         signal.throwIfAborted()
         lines = []

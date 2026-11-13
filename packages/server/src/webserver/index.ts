@@ -8,16 +8,17 @@ import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
   AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools,
-  type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
+  type ConversationMessage, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, defaultSelection, discoverModels, isModelProvider, type AssistantMessage, type ModelSelection, type ToolCall } from '@agent-learning/model'
 import { pickDirectory, type DirectoryPicker } from '../directory-picker.js'
 import { Workspaces, WorkspaceBindingError } from '../workspaces.js'
 import { WebSettings } from '../web-settings.js'
+import { isSettingsObject, readSettingsFile, updateSettingsFile } from '../settings-file.js'
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
-import type { ClientFrame, ServerFrame, StartSessionAccepted, StartSessionRequest } from './protocol.js'
+import type { ClientFrame, LanguageSettings, ServerFrame, StartSessionAccepted, StartSessionRequest } from './protocol.js'
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
@@ -37,12 +38,21 @@ function visibleAssistant({ providerThinkingLevel: _effort, ...message }: Assist
   }) }
 }
 
+function browserMessage(entry: ConversationMessage): ConversationMessage {
+  const { message } = entry
+  if (message.role === 'assistant') return { ...entry, message: visibleAssistant(message) }
+  if (message.role !== 'toolResult' || !message.content.some(block => block.type === 'image')) return entry
+  return { ...entry, message: { ...message, content: message.content.filter(block => block.type === 'text') } }
+}
+
 function browserEvent(event: SessionSubscriptionEvent): SessionSubscriptionEvent {
   if (event.type === 'snapshot') {
-    return { ...event, snapshot: { ...event.snapshot, messages: event.snapshot.messages.map(entry =>
-      entry.message.role === 'assistant' ? { ...entry, message: visibleAssistant(entry.message) } : entry) } }
+    return { ...event, snapshot: { ...event.snapshot, messages: event.snapshot.messages.map(browserMessage) } }
   }
   const { change } = event.update
+  if (change.type === 'task' && change.message) {
+    return { ...event, update: { ...event.update, change: { ...change, message: browserMessage(change.message) } } }
+  }
   if (change.type !== 'model') return event
   const frame = change.event
   const visible = frame.type === 'done' ? { ...frame, message: visibleAssistant(frame.message) }
@@ -307,6 +317,10 @@ export class WebServer {
       }
       return
     }
+    if (url.pathname === '/api/settings/language' && (req.method === 'GET' || req.method === 'PUT')) {
+      await this.handleLanguageSettings(req, res)
+      return
+    }
     const webProvider = /^\/api\/web\/providers\/([a-z][a-z0-9-]*)$/.exec(url.pathname)?.[1]
     if ((url.pathname === '/api/web/settings' && (req.method === 'GET' || req.method === 'PUT'))
       || (webProvider && (req.method === 'PUT' || req.method === 'DELETE'))) {
@@ -440,6 +454,30 @@ export class WebServer {
     } finally {
       res.off('close', disconnect)
       this.selection = undefined
+    }
+  }
+
+  private async handleLanguageSettings(req: IncomingMessage, res: ServerResponse) {
+    try {
+      if (req.method === 'GET') {
+        const { locale } = await readSettingsFile(this.options.webSettingsPath)
+        const language = isSettingsObject(locale) && locale.preference === 'zh-CN' ? 'zh-CN' : 'en'
+        this.json(res, 200, { language } satisfies LanguageSettings)
+        return
+      }
+      const value = await readJson(req)
+      if (!isSettingsObject(value) || Object.keys(value).length !== 1 || (value.language !== 'en' && value.language !== 'zh-CN')) {
+        throw new InputError(400, '请选择英文或简体中文。')
+      }
+      const { language } = value
+      await updateSettingsFile(this.options.webSettingsPath, file => {
+        file.locale = { ...(isSettingsObject(file.locale) ? file.locale : {}), preference: language }
+      })
+      this.json(res, 200, { language } satisfies LanguageSettings)
+    } catch (error) {
+      this.json(res, error instanceof InputError ? error.status : 500, {
+        error: error instanceof InputError ? error.message : '无法读取或保存语言设置，请检查本机设置文件及权限。',
+      })
     }
   }
 

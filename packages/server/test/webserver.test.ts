@@ -1040,6 +1040,54 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
   expect(requests).toHaveLength(2)
 })
 
+it('language settings validate, share the settings file safely and survive a restart', async () => {
+  const app = await setup({ webProviders: [
+    { id: 'tavily', name: 'Tavily', search: async () => [], fetch: async () => '' },
+    { id: 'alternate', name: 'Alternate', search: async () => [] },
+  ] })
+  const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+  const endpoint = app.url + '/api/settings/language'
+  const filename = app.config.webSettingsPath
+  expect((await http(endpoint)).status).toBe(401)
+  expect((await http(endpoint, { ...headers, Origin: 'https://untrusted.invalid' }, 'PUT', '{"language":"zh-CN"}')).status).toBe(403)
+  expect(JSON.parse((await http(endpoint, headers)).text)).toEqual({ language: 'en' })
+  await expect(stat(filename)).rejects.toMatchObject({ code: 'ENOENT' })
+  const web = { searchProvider: 'tavily', fetchProvider: 'tavily' }
+  const original = JSON.stringify({ web, locale: { preference: 'ja', other: true }, custom: 42 })
+  await writeFile(filename, original, { mode: 0o600 })
+  expect(JSON.parse((await http(endpoint, headers)).text)).toEqual({ language: 'en' })
+  for (const body of ['{"language":"ja"}', '{"language":"en","extra":true}', 'null']) {
+    expect((await http(endpoint, headers, 'PUT', body)).status).toBe(400)
+  }
+  expect(await readFile(filename, 'utf8')).toBe(original)
+
+  const [language, tools] = await Promise.all([
+    http(endpoint, headers, 'PUT', '{"language":"zh-CN"}'),
+    http(app.url + '/api/web/settings', headers, 'PUT', JSON.stringify({ ...web, searchProvider: 'alternate' })),
+  ])
+  expect(language.status).toBe(200)
+  expect(JSON.parse(language.text)).toEqual({ language: 'zh-CN' })
+  expect(tools.status).toBe(200)
+  expect(JSON.parse(await readFile(filename, 'utf8'))).toEqual({
+    web: { ...web, searchProvider: 'alternate' }, locale: { preference: 'zh-CN', other: true }, custom: 42,
+  })
+  await app.server.close()
+  const next = new WebServer(app.config)
+  const restarted = await next.start()
+  cleanups.push(() => next.close())
+  expect(JSON.parse((await http(restarted.url + '/api/settings/language', { Cookie: await cookie(restarted.authUrl) })).text)).toEqual({ language: 'zh-CN' })
+})
+
+it('language settings preserve a damaged settings file', async () => {
+  const app = await setup()
+  const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+  const endpoint = app.url + '/api/settings/language'
+  await writeFile(app.config.webSettingsPath, '{"locale":', { mode: 0o600 })
+  expect((await http(endpoint, headers)).status).toBe(500)
+  expect((await http(endpoint, headers, 'PUT', '{"language":"zh-CN"}')).status).toBe(500)
+  expect(await readFile(app.config.webSettingsPath, 'utf8')).toBe('{"locale":')
+})
+
 it('P1: saves capability choices independently of the shared Tavily credential and notifies without secrets', async () => {
   const app = await setup()
   const auth = await cookie(app.authUrl)

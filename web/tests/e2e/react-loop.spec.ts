@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test, expect } from '@playwright/test'
+import { test, expect } from './chinese-fixture'
 import { addWorkspace, authorize, freeVitePort, observe, saveKey, seedSession, startBackend, startVite, stop } from './test-utils'
 import { startModelServer } from './model-server'
 
@@ -54,7 +54,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(editor).toHaveText('停止后保留的草稿')
       await expect(page.locator('.tool-status')).toHaveText(['成功', '成功', '成功', '已停止'])
       expect(provider.exchanges).toHaveLength(3)
-      await page.getByText('执行过程', { exact: true }).click()
+      await page.locator('.process-group > summary').click()
       await page.locator('.tool-block').last().locator('summary').click()
       await expect(page.locator('.tool-result').last()).toContainText('等待中')
       await page.screenshot({ path: testInfo.outputPath(`${mode}-feature6-stopped.png`), fullPage: true })

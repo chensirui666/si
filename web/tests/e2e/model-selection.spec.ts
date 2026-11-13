@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './chinese-fixture'
 import { startModelServer } from './model-server'
 import { addWorkspace, authorize, observe, openSession, ready, saveKey, startBackend, stop } from './test-utils'
 
@@ -33,6 +33,7 @@ test('Feature 1 配置两家提供方、运行中预选、跨页同步、过期�
     await saveKey(page, 'controlled-stage3-key')
     await page.getByRole('button', { name: '设置', exact: true }).click()
     const settings = page.getByRole('dialog', { name: '设置', exact: true })
+    await settings.getByRole('button', { name: '模型', exact: true }).click()
     await settings.getByRole('button', { name: '添加提供方' }).click()
     await expect(settings.getByRole('button', { name: 'DeepSeek', exact: true })).toHaveCount(0)
     await settings.getByRole('button', { name: 'Moonshot AI CN' }).click()
@@ -51,6 +52,7 @@ test('Feature 1 配置两家提供方、运行中预选、跨页同步、过期�
     await expect(settings).toContainText('已保存在本机')
     await page.keyboard.press('Escape')
     await page.getByRole('button', { name: '设置', exact: true }).click()
+    await settings.getByRole('button', { name: '模型', exact: true }).click()
     const moonshot = settings.locator('.provider-row').filter({ hasText: 'Moonshot AI CN' })
     await moonshot.getByRole('button', { name: '编辑', exact: true }).click()
     await key.fill('controlled-moonshot-replacement')

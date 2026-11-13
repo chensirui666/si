@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Agent } from '@agent-learning/agent'
 import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
-import { estimateContextTokens, findModel, sameSelection, stream } from '@agent-learning/model'
+import { estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelEvent, ModelInfo, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
@@ -26,6 +26,7 @@ function isFileOperation(detail: unknown): detail is NonNullable<ConversationMes
 
 export class AgentSession {
   private readonly agent: Agent
+  private readonly omittedToolImageResults = new Set<string>()
   private readonly state: ConversationSnapshot = { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
   private readonly listeners = new Set<(update: ConversationUpdate) => void>()
   private controller?: AbortController
@@ -209,8 +210,11 @@ export class AgentSession {
     return [...this.state.compactions].reverse().find((record): record is Extract<CompactionRecord, { status: 'success' }> => record.status === 'success')
   }
 
-  private context(): ModelContext {
-    return { ...this.configuration, messages: buildModelHistory(this.historyMessages(), this.latestCompaction(), !!this.options.persistence) }
+  private context(compaction = this.latestCompaction()): ModelContext {
+    return {
+      ...this.configuration, messages: buildModelHistory(this.historyMessages(), compaction, !!this.options.persistence),
+      omittedToolImageResults: this.omittedToolImageResults,
+    }
   }
 
   private estimate(context: ModelContext, model = this.model) {
@@ -285,7 +289,7 @@ export class AgentSession {
           ...(summaryUsage && { summaryUsage }),
           ...(preparation.fileOperations && { fileOperations: preparation.fileOperations }),
         }
-        const next = { ...this.configuration, messages: buildModelHistory(this.historyMessages(), candidate, !!this.options.persistence) }
+        const next = this.context(candidate)
         candidate.estimatedAfter = this.estimate(next)
         if (candidate.estimatedAfter >= candidate.estimatedBefore) throw new Error('摘要未有效缩短输入，保留原上下文。')
         if (candidate.estimatedAfter + model.maxTokens > model.contextWindow) throw new Error('压缩后仍预计超出模型容量，保留原上下文。')
@@ -424,6 +428,10 @@ export class AgentSession {
           return { error: capacityError }
         }
         usedCompaction = this.latestCompaction()
+        for (const index of omittedToolImageIndexes(candidate)) {
+          const result = candidate.messages[index]
+          if (result.role === 'toolResult' && result.imageResultId !== undefined) this.omittedToolImageResults.add(result.imageResultId)
+        }
         return candidate
       }
       const fingerprint = JSON.stringify(context.messages)

@@ -133,6 +133,7 @@ export async function ready(page: Page, observed: ReturnType<typeof observe>, af
 export async function saveKey(page: Page, key: string) {
   await page.getByRole('button', { name: '设置', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: '设置', exact: true })
+  await dialog.getByRole('button', { name: '模型', exact: true }).click()
   if (await dialog.getByRole('button', { name: '编辑', exact: true }).count()) {
     await dialog.getByRole('button', { name: '编辑', exact: true }).click()
   } else {

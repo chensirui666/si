@@ -10,6 +10,7 @@ export type ConversationMessage = {
   clientMessageId?: string
   toolCall?: ToolLocation
   toolErrorCode?: string
+  imageOmitted?: true
   fileOperation?: { kind: 'read' | 'modified'; path: string }
   message: ModelMessage
 }

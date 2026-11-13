@@ -30,6 +30,12 @@ type SessionWrite = {
 }
 type Row = Record<string, SQLOutputValue>
 
+function storedMessage(entry: ConversationMessage): ConversationMessage {
+  const { message } = entry
+  if (message.role !== 'toolResult' || !message.content.some(block => block.type === 'image')) return entry
+  return { ...entry, imageOmitted: true, message: { ...message, content: message.content.filter(block => block.type === 'text') } }
+}
+
 const schema = `
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY, workspaceId TEXT NOT NULL, name TEXT NOT NULL, createdAt TEXT NOT NULL
@@ -133,7 +139,7 @@ export class SessionStore {
       }
       if (messages?.length) {
         const insert = this.db.prepare('INSERT INTO messages (session_id, run_id, id, data) VALUES (?, ?, ?, ?)')
-        for (const message of messages) insert.run(sessionId, runId!, message.id, JSON.stringify(message))
+        for (const message of messages) insert.run(sessionId, runId!, message.id, JSON.stringify(storedMessage(message)))
       }
       if (compaction) {
         this.db.prepare(`INSERT INTO compactions (session_id, run_id, id, data) VALUES (?, ?, ?, ?)
@@ -223,6 +229,7 @@ export class SessionStore {
         const run = byRun.get(String(row.run_id))
         const message = entry.message
         if (!run || run.kind !== 'task' || !message || !Number.isFinite(message.timestamp)) throw new Error('Invalid message owner')
+        if (entry.imageOmitted !== undefined && (entry.imageOmitted !== true || message.role !== 'toolResult')) throw new Error('Invalid image marker')
         if (message.role === 'user') {
           if (entry.id !== run.id || entry.clientMessageId !== run.clientMessageId || message.content !== run.text) throw new Error('Invalid submitted message')
           currentRunId = run.id
@@ -243,13 +250,16 @@ export class SessionStore {
             || call.name !== message.toolName || !Number.isSafeInteger(contentIndex) || contentIndex <= (resultPositions.get(assistantMessageId) ?? -1)
             || (index !== assistant.index + 1 && seen.get(lastId)?.entry.toolCall?.assistantMessageId !== assistantMessageId)
             || typeof message.isError !== 'boolean' || !Array.isArray(message.content)
-            || !message.content.every(block => block?.type === 'text' && typeof block.text === 'string')) throw new Error('Invalid tool result')
+            || !message.content.every(block => block && (block.type === 'text' && typeof block.text === 'string'
+              || block.type === 'image' && ['image/png', 'image/jpeg', 'image/webp'].includes(block.mimeType)
+                && typeof block.data === 'string' && block.data.length > 0))) throw new Error('Invalid tool result')
           resultPositions.set(assistantMessageId, contentIndex)
         } else throw new Error('Invalid message')
         if (message.role !== 'toolResult' && entry.toolCall !== undefined) throw new Error('Invalid tool result reference')
-        seen.set(entry.id, { entry, runId: run.id, index })
+        const restored = storedMessage(entry)
+        seen.set(entry.id, { entry: restored, runId: run.id, index })
         lastId = entry.id
-        return entry
+        return restored
       })
     const compactions = this.db.prepare('SELECT id, run_id, data FROM compactions WHERE session_id = ? ORDER BY seq').all(summary.id)
       .map(row => {

@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test, expect } from '@playwright/test'
+import { test, expect } from './chinese-fixture'
 import { addWorkspace, authorize, freeVitePort, observe, saveKey, seedSession, startBackend, startVite, stop } from './test-utils'
 import { startModelServer } from './model-server'
 

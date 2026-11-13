@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebServer } from '@agent-learning/server'
 import type { SessionList, StartSessionAccepted, StartSessionRequest, WorkspacePick } from '@agent-learning/server/protocol'
-import { expect, test } from '@playwright/test'
+import { expect, test } from './chinese-fixture'
 import { startModelServer } from './model-server'
 import { addWorkspace, authorize, expectBrowserStorage, observe, openSession, ready, saveKey, startBackend, stop } from './test-utils'
 

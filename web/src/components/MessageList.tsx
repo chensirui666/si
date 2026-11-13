@@ -1,3 +1,5 @@
+import { NoticeText } from '../i18n/messages'
+import { useTranslation } from 'react-i18next'
 import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
@@ -15,8 +17,10 @@ export function MessageList({ messages, activeContent = [], running = null, runs
   runs?: readonly RunRecord[]
   saveFailures?: readonly SaveFailure[]
 }) {
+  const { t } = useTranslation()
   const rows: MessageRow[] = []
   const toolResults = new Map<string, Map<number, ConversationMessage>>()
+  const taskRuns = new Map(runs.filter(run => run.kind === 'task').map(run => [run.id, run]))
   let userId = ''
   for (const item of messages) {
     if ('state' in item) {
@@ -38,35 +42,38 @@ export function MessageList({ messages, activeContent = [], running = null, runs
       toolResults.set(toolCall.assistantMessageId, results)
     }
   }
+  const answered = new Set(rows.flatMap(row => row.type === 'assistant' ? [row.userId] : []))
+  const shown = new Set<string>()
 
   return (
-    <div className="message-list-frame">
-      <section className="message-list" role="region" aria-label="消息列表" tabIndex={0}>
+    <section className="message-list" role="region" aria-label={t('chat.messages')} tabIndex={0}>
         <ol className="message-items">
-          {rows.map((row, index) => {
+          {rows.flatMap(row => row.type === 'user' && taskRuns.has(row.id) && !answered.has(row.id)
+            ? [row, { type: 'assistant' as const, id: `pending:${row.id}`, userId: row.id, messages: [] }]
+            : [row]).map((row, index, displayedRows) => {
             const runId = row.type === 'assistant' ? row.userId : row.id
             const run = runs.find(item => item.id === runId)
             const failure = saveFailures.find(item => item.runId === runId)
-            const next = rows[index + 1]
+            const next = displayedRows[index + 1]
             const endsTurn = row.type === 'assistant' || next?.type !== 'assistant' || next.userId !== runId
+            const activity = row.type === 'assistant' && !shown.has(runId) ? taskRuns.get(runId) : undefined
+            if (activity) shown.add(runId)
             return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.id} data-message-id={row.id} data-run-status={run?.status}>
             {row.type === 'assistant' && run && <p className="message-model">{run.provider ?? 'deepseek'} / {run.modelId}{(run.reasoningEffort ?? (!run.provider ? 'high' : undefined)) &&
-              ` · ${effortLabel(run.reasoningEffort ?? 'high')}`}</p>}
+              ` · ${effortLabel(t, run.reasoningEffort ?? 'high')}`}</p>}
             {row.type === 'assistant'
-              ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure}
+              ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure} run={activity}
                 running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
               : <>
                 <div className="message-text">{row.text}<br /></div>
                 {row.local && <div className="submission-status" data-state={row.local.state}>
-                  <span>{row.local.accepted ? '已接收，正在同步' : row.local.state === 'pending' ? '正在发送…' : row.local.state === 'failed' ? '发送失败' : '未确认接收'}</span>
-                  {row.local.errorMessage && <p>{row.local.errorMessage}</p>}
+                  <span>{t(row.local.accepted ? 'chat.accepted' : row.local.state === 'pending' ? 'chat.sending' : row.local.state === 'failed' ? 'chat.sendFailed' : 'chat.notConfirmed')}</span>
+                  {row.local.errorMessage && <p><NoticeText notice={row.local.errorMessage} /></p>}
                 </div>}
               </>}
-            {endsTurn && run?.status === 'interrupted' && <p className="message-ending" role="status">已中断</p>}
             {endsTurn && failure && <SaveFailureNotice failure={failure} />}
           </li>})}
         </ol>
-      </section>
-    </div>
+    </section>
   )
 }

@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ModelDiscovery } from '@agent-learning/model'
 import { deleteApiKey, saveApiKey } from '../chat/client'
@@ -22,7 +22,8 @@ function Harness({ initial = missing }: { initial?: ModelDiscovery }) {
 }
 async function openEditor(configured = false) {
   fireEvent.click(screen.getByRole('button', { name: '设置' }))
-  await screen.findByRole('dialog', { name: '设置' })
+  const dialog = await screen.findByRole('dialog', { name: '设置' })
+  fireEvent.click(within(dialog).getByRole('button', { name: '模型' }))
   if (configured) fireEvent.click(screen.getByRole('button', { name: '编辑' }))
   else {
     fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
@@ -76,6 +77,7 @@ describe('SettingsDialog', () => {
   it('配置错误仍可进入设置且不能宣称未配置或已验证', async () => {
     render(<Harness initial={{ models: [], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'error', message: '模型凭据 JSON 格式错误' } }] }} />)
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: '模型' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('模型凭据 JSON 格式错误')
     expect(screen.getByRole('button', { name: '添加提供方' })).toBeVisible()
   })

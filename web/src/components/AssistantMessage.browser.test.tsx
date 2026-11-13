@@ -12,6 +12,9 @@ test('工具开始即显示，展开后可读流式参数和最终参数错误',
   await component.getByText('工具调用', { exact: true }).click()
   await expect(component.locator('pre')).toBeVisible()
   await expect(component.locator('pre')).toHaveText('{"city":')
+  await expect(component.locator('pre')).toHaveCSS('font-family', /^ui-monospace,.*Noto Sans Mono CJK SC/)
+  await expect(component.locator('pre')).toHaveCSS('font-size', '14px')
+  await expect(component.locator('pre')).toHaveCSS('line-height', '22px')
   await component.update(<AssistantMessage messages={[{ id: 'a', message: { ...message, content: [{ type: 'toolCall', id: 'call', name: 'weather', arguments: {}, argumentsError: '参数 JSON 无效，原文：{"city":' }], stopReason: 'toolUse' } }]} running={running} />)
   await expect(component.getByText('weather')).toBeVisible()
   await expect(component.getByText('参数 JSON 无效，原文：{"city":')).toBeVisible()
@@ -47,4 +50,15 @@ test('终止状态保留正文，正常的工具阶段没有报错提示', async
     if (status) await expect(component.getByText(status)).toBeVisible()
     else await expect(component.locator('.message-ending')).toHaveCount(0)
   }
+})
+
+test('代码块显示语言并原样复制长代码', async ({ mount, page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const code = `  const value = '${'x'.repeat(100)}'\n  console.log(value)`
+  const component = await mount(<div style={{ width: 280 }}><MarkdownText text={'```ts\n' + code + '\n```'} /></div>)
+  await expect(component.getByText('ts', { exact: true })).toBeVisible()
+  await component.getByRole('button', { name: '复制', exact: true }).click()
+  await expect(component.getByRole('button', { name: '已复制' })).toBeVisible()
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(code)
+  expect(await component.locator('pre').evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true)
 })

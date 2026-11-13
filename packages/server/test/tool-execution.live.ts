@@ -103,8 +103,8 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
     expect(calls.map(call => call.name), assistants[0]?.errorMessage).toEqual([scenario.name])
     const result = results[0]
     expect(results.map(item => item.toolName)).toEqual([scenario.name])
-    expect(result?.isError, result?.content.map(item => item.text).join('\n')).toBe(false)
-    const toolText = result!.content.map(item => item.text).join('\n')
+    const toolText = result?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n') ?? ''
+    expect(result?.isError, toolText).toBe(false)
     expect(toolText).toMatch(scenario.result)
     expect(requests).toHaveLength(2)
     expect(requests[0]?.tools).toHaveLength(8)

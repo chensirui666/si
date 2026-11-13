@@ -1,5 +1,7 @@
 # Local font assets
 
+The interface prefers system sans-serif and monospace fonts. The Noto faces provide local fallbacks, and EB Garamond is used for the SI wordmark.
+
 All three fonts are distributed under SIL Open Font License 1.1. Keep the accompanying license files and copyright notices when redistributing these assets.
 
 | Asset | Internal family | Supplied weights | Official source |

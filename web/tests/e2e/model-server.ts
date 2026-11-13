@@ -1,10 +1,12 @@
 import { createServer, type ServerResponse } from 'node:http'
 import { once } from 'node:events'
 
+type ContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
+
 type RequestBody = {
   model: string
   stream: boolean
-  messages: { role: string; content: string; reasoning_content?: string }[]
+  messages: { role: string; content: string | null | ContentPart[]; reasoning_content?: string }[]
   thinking: { type: string }
   reasoning_effort: string
   max_tokens: number

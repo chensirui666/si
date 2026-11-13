@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { FolderOpenIcon, FolderPlusIcon, PlusIcon } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { errorNotice, NoticeText, noticeSummary, type Notice } from '../i18n/messages'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, PlusIcon } from 'lucide-react'
 import type { ModelDiscovery, ModelSelection } from '@agent-learning/model'
 import type { AbortRequest, AbortResult, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
@@ -29,11 +31,11 @@ type Props = {
 
 type FirstSend = { input: StartSessionRequest; revision: number; sending: boolean }
 
-type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: string }
+type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: Notice }
 
-function useServerView<T>(load: () => Promise<T>) {
+function useServerView<T>(load: () => Promise<T>, failure: Notice['key']) {
   const [view, setView] = useState<T | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<Notice | null>(null)
   const version = useRef(0)
   const invalidate = useCallback(() => { version.current++ }, [])
   const apply = useCallback((value: T) => {
@@ -48,15 +50,44 @@ function useServerView<T>(load: () => Promise<T>) {
       if (request === version.current) apply(value)
     } catch (error) {
       if (request !== version.current) return
-      setError(error instanceof Error ? error.message : '读取配置失败，请重试')
+      setError(errorNotice(failure, error))
     }
-  }, [apply, load])
+  }, [apply, failure, load])
   return { view, error, apply, refresh, invalidate, setView }
 }
 
 export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
+  const { t } = useTranslation()
   const [state, setState] = useState(initialState)
   const { sessionId } = state
+  const chatScroll = useRef<HTMLElement>(null)
+  const [showToBottom, setShowToBottom] = useState(false)
+  const updateToBottom = useCallback(() => {
+    const scroll = chatScroll.current
+    setShowToBottom(Boolean(scroll && scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop > 2))
+  }, [])
+  useLayoutEffect(() => {
+    if (chatScroll.current) chatScroll.current.scrollTop = 0
+    setShowToBottom(false)
+  }, [sessionId])
+  useEffect(() => {
+    const scroll = chatScroll.current
+    if (!scroll || sessionId === null) return
+    updateToBottom()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(updateToBottom)
+    observer.observe(scroll)
+    for (const child of scroll.children) observer.observe(child)
+    return () => observer.disconnect()
+  }, [sessionId, updateToBottom])
+
+  function scrollToBottom() {
+    const scroll = chatScroll.current
+    if (!scroll) return
+    scroll.querySelector<HTMLElement>('.message-list')?.focus({ preventScroll: true })
+    scroll.scrollTop = scroll.scrollHeight
+    updateToBottom()
+  }
   const stateRef = useRef(state)
   const [allSubmissions, setSubmissions] = useState<LocalSubmission[]>([])
   const submissionsRef = useRef(allSubmissions)
@@ -76,30 +107,30 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const discoveryRef = useRef(discovery)
   const [selectionBusy, setSelectionBusy] = useState(false)
   const savingSelection = useRef(false)
-  const [selectionError, setSelectionError] = useState<{ sessionId: string | null; message: string }>()
-  const [modelError, setModelError] = useState<string | null>(null)
+  const [selectionError, setSelectionError] = useState<{ sessionId: string | null; message: Notice }>()
+  const [modelError, setModelError] = useState<Notice | null>(null)
   const requestVersion = useRef(0)
-  const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces)
-  const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings)
-  const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions)
+  const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces, 'chat.workspaceReadFailed')
+  const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings, 'chat.webSettingsReadFailed')
+  const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions, 'chat.sessionReadFailed')
   const selected = useRef<string | null>(null)
   const initialized = useRef(false)
   const navigation = useRef(0)
   const opening = useRef(false)
-  const [sessionError, setSessionError] = useState<string | null>(null)
+  const [sessionError, setSessionError] = useState<Notice | null>(null)
   const [picking, setPicking] = useState(false)
   const pickingRef = useRef(false)
   const [draftWorkspaceId, setDraftWorkspaceId] = useState<string | null>(null)
   const firstSend = useRef<FirstSend | null>(null)
   const [firstPhase, setFirstPhase] = useState<'sending' | 'unconfirmed' | null>(null)
-  const [firstError, setFirstError] = useState<string | null>(null)
-  const [saveNotice, setSaveNotice] = useState<{ sessionId: string | null; text: string } | null>(null)
+  const [firstError, setFirstError] = useState<Notice | null>(null)
+  const [saveNotice, setSaveNotice] = useState<{ sessionId: string | null; text: Notice } | null>(null)
   useEffect(() => {
     if (!saveNotice) return
     const timer = setTimeout(() => setSaveNotice(null), 3000)
     return () => clearTimeout(timer)
   }, [saveNotice])
-  const [pickError, setPickError] = useState<string | null>(null)
+  const [pickError, setPickError] = useState<Notice | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const settingsButton = useRef<HTMLButtonElement>(null)
   const sidebarButton = useRef<HTMLButtonElement>(null)
@@ -187,7 +218,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         firstSend.current = null
         writeFirstSend(null)
         setFirstPhase(null)
-        const text = error instanceof Error ? error.message : '首条消息被拒绝，请重试。'
+        const text = errorNotice(saveRejected ? 'request.saveFailed' : 'chat.firstRejected', error)
         if (saveRejected) setSaveNotice({ sessionId: null, text })
         else setFirstError(text)
         if (error?.code === 'model_selection_changed') {
@@ -197,7 +228,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         void refreshWorkspaces()
       } else {
         setFirstPhase('unconfirmed')
-        if (authorizationRejected && error instanceof Error) setFirstError(error.message)
+        if (authorizationRejected && error instanceof Error) setFirstError(errorNotice('chat.firstRejected', error))
         void refreshSessions()
       }
     })
@@ -216,7 +247,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       void refreshWorkspaces()
       if (selected.current === null && !firstSend.current && request === navigation.current) chooseDraftWorkspace(result.workspaceId)
     } catch (error) {
-      if (mounted.current) setPickError(error instanceof Error ? error.message : '选择工作区失败，请重试')
+      if (mounted.current) setPickError(errorNotice('chat.workspacePickFailed', error))
     } finally {
       pickingRef.current = false
       if (mounted.current) setPicking(false)
@@ -246,7 +277,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     } catch (error) {
       if (version !== requestVersion.current) return
       receiveModels(null)
-      setModelError(error instanceof Error ? error.message : '模型查询失败，请重试')
+      setModelError(errorNotice('model.loadFailed', error))
     }
   }, [getModels, receiveModels])
   const applyModels = useCallback((result: ModelDiscovery) => {
@@ -281,7 +312,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
             writeStorage(recentSessionKey, next.sessionId)
           }
         } else if (next.error) {
-          setSessionError(next.error)
+          setSessionError({ key: 'chat.sessionReadFailed', detail: next.error })
           void refreshSessions()
         }
       }
@@ -316,7 +347,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       }
     } else if (!selected.current || sessions.some(item => item.id === selected.current)) return
     openSession(null)
-    setSessionError('之前打开的会话已不可用，请选择或新建会话。')
+    setSessionError({ key: 'chat.sessionUnavailable' })
   }, [sessions, openSession, readStorage])
 
   useEffect(() => {
@@ -340,7 +371,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     try {
       await saveModelSelection({ ...next, ...(sessionId && { sessionId }) })
     } catch (error) {
-      if (mounted.current) setSelectionError({ sessionId, message: error instanceof Error ? error.message : '模型选择未确认，请重试。' })
+      if (mounted.current) setSelectionError({ sessionId, message: errorNotice('model.selectionUnconfirmed', error) })
     } finally {
       if (mounted.current) {
         if (sessionId && selected.current === sessionId) subscription.current?.requestSnapshot?.()
@@ -361,7 +392,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     if (sessionId === null) {
       if (!canStart() || !draftWorkspace) return false
       if (text.trim() === '/compact') {
-        setFirstError('请先发送消息，有聊天记录后再压缩。')
+        setFirstError({ key: 'chat.compactNeedsHistory' })
         return false
       }
       const pending = firstSend.current = {
@@ -391,7 +422,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     const timer = setTimeout(() => {
       timers.current.delete(timer)
       if (!mounted.current || !submissionsRef.current.some(item => item.clientMessageId === input.clientMessageId && item.state !== 'failed')) return
-      updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: 'unconfirmed', errorMessage: '十秒内未确认接收，正在重新同步' }))
+      updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: 'unconfirmed', errorMessage: { key: 'chat.receiptTimeout' } }))
       syncTarget()
     }, 10_000)
     timers.current.add(timer)
@@ -403,7 +434,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       const saveRejected = error?.code === 'save_rejected'
       const selectionChanged = error?.code === 'model_selection_changed'
       const rejected = saveRejected || selectionChanged || typeof error?.status === 'number' && error.status >= 400 && error.status < 500
-      const message = error instanceof Error ? error.message : '提交异常，未确认接收'
+      const message = errorNotice(saveRejected ? 'request.saveFailed' : selectionChanged ? 'model.selectionChanged' : rejected ? 'chat.sendFailed' : 'chat.notConfirmed', error)
       const local = submissionsRef.current.find(item => item.clientMessageId === input.clientMessageId)
       if (!local || local.accepted) return
       const restored = rejected && restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId, selectionChanged)
@@ -438,24 +469,29 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       await abortMessage({ sessionId, runId })
     } catch (error) {
       if (!mounted.current || abortRef.current.get(sessionId)?.runId !== runId) return
-      updateAbort(sessionId, { runId, status: 'unconfirmed', error: error instanceof Error ? error.message : '中止请求失败' })
+      updateAbort(sessionId, { runId, status: 'unconfirmed', error: errorNotice('request.abortFailed', error) })
     }
     if (mounted.current && selected.current === sessionId && abortRef.current.get(sessionId)?.runId === runId) subscription.current?.requestSnapshot?.()
   }
-  const status = state.error ?? (state.slow ? '连接较慢，正在等待对话恢复…' : {
-    connecting: '正在连接…', awaitingSnapshot: '正在恢复对话…',
-    ready: !sessionId ? firstPhase === 'sending' ? '正在发送第一条消息…' : '新会话' : state.snapshot?.running?.phase === 'compaction' ? '正在压缩对话…' : state.snapshot?.running?.phase === 'tools' ? '正在执行工具…' : state.snapshot?.running ? '正在生成回答…' : waiting ? '正在确认消息接收…' : '对话已同步',
-    disconnected: '连接已断开，正在重试…',
-  }[state.connection])
+  const statusKey = state.connectionNotice ?? (state.slow ? 'chat.connectionSlow' : ({
+    connecting: 'chat.connecting', awaitingSnapshot: 'chat.restoring', disconnected: 'chat.disconnected',
+    ready: !sessionId ? firstPhase === 'sending' ? 'chat.firstSending' : 'chat.new'
+      : state.snapshot?.running?.phase === 'compaction' ? 'chat.compacting'
+      : state.snapshot?.running?.phase === 'tools' ? 'chat.runningTools'
+      : state.snapshot?.running ? 'chat.generating' : waiting ? 'chat.waitingReceipt' : 'chat.connected',
+  } as const)[state.connection])
+  const status = state.error ? t('chat.sessionReadFailed') : t(statusKey)
 
   const modelSelect = <ModelPicker discovery={discovery} selection={selection} model={selectedModel}
     disabled={!discovery?.models.length || selectionBusy || state.connection !== 'ready' || (isNew ? firstPhase !== null : !state.snapshot)}
-    placeholder={modelError ? '模型查询失败' : selection ? '重新选择模型' : discovery ? '无可用模型' : '正在查询模型…'}
+    placeholder={t(modelError ? 'model.loadFailed' : selection ? 'model.reselect' : discovery ? 'model.none' : 'model.loading')}
     onSelect={next => { void selectModel(next) }} />
   const providerError = discovery?.providers.find(item => item.status.state === 'error')?.status
   const runningRun = state.snapshot?.runs?.find(run => run.id === target)
   const currentModel = runningRun && (discovery?.models.find(model => model.id === runningRun.modelId
     && model.provider === (runningRun.provider ?? 'deepseek'))?.name ?? runningRun.modelId)
+  const workspaceNotice = workspaceError ?? pickError
+  const sessionNotice = sessionError ?? listError
 
 
   return (
@@ -464,15 +500,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       <Sidebar>
         <div className="sidebar-title">SI</div>
         <SidebarDismiss>
-          <Button className="sidebar-new-session" variant="outline" aria-label="新会话" onClick={() => openNewSession()}>
+          <Button className="sidebar-new-session" variant="outline" aria-label={t('chat.new')} onClick={() => openNewSession()}>
             <PlusIcon aria-hidden="true" />
-            <span>新会话</span>
+            <span>{t('chat.new')}</span>
           </Button>
         </SidebarDismiss>
-        <nav className="sidebar-workspaces" aria-label="工作区">
+        <nav className="sidebar-workspaces" aria-label={t('chat.workspaces')}>
           <div className="sidebar-workspaces-heading">
-            <span>工作区</span>
-            <Button variant="ghost" size="icon-sm" aria-label="添加工作区" title="添加工作区" disabled={picking || !workspaces} onClick={() => { void pickWorkspace() }}>
+            <span>{t('chat.workspace')}</span>
+            <Button variant="ghost" size="icon-sm" aria-label={t('chat.addWorkspace')} title={t('chat.addWorkspace')} disabled={picking || !workspaces} onClick={() => { void pickWorkspace() }}>
               <FolderPlusIcon aria-hidden="true" />
             </Button>
           </div>
@@ -480,13 +516,13 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
             <div className="workspace-row" data-bound={group.id === workspace?.id}>
               <FolderOpenIcon aria-hidden="true" /><span title={group.path}>{group.name}</span>
               <SidebarDismiss>
-                <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label="新建会话" title={group.available ? '新建会话' : '工作区目录不可用'} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
+                <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label={t('chat.create')} title={t(group.available ? 'chat.create' : 'chat.workspaceUnavailable')} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
                   <PlusIcon aria-hidden="true" />
                 </Button>
               </SidebarDismiss>
             </div>
             {isNew && group.id === draftWorkspace?.id && <SidebarDismiss>
-              <Button className="workspace-conversation" variant="secondary" aria-label="未发送的新会话" aria-current="page" onClick={() => openNewSession()}>新会话</Button>
+              <Button className="workspace-conversation" variant="secondary" aria-label={t('chat.unsent')} aria-current="page" onClick={() => openNewSession()}>{t('chat.new')}</Button>
             </SidebarDismiss>}
             {sessions?.filter(item => item.workspaceId === group.id).map(item => <SidebarDismiss key={item.id}>
               <Button className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>
@@ -511,14 +547,19 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       }} />
       <div className="chat-workspace">
       <div className="chat-page" data-new-session={isNew || undefined} data-connection={state.connection} data-session-id={sessionId ?? undefined}>
-      {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert">{saveNotice.text}</p>}
+      {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert"><NoticeText notice={saveNotice.text} /></p>}
       {!isNew && <header className="chat-header">
-        <h1>聊天</h1>
+        <h1 title={session?.name}>{session?.name || t('chat.title')}</h1>
         <p className="connection-status" role="status">{status}</p>
       </header>}
-      <main className="chat-main">
+      <div className="chat-main-frame">
+      <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
         {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures} />}
         <div className="composer-stack">
+          {!isNew && showToBottom && <Button type="button" className="chat-to-bottom" variant="outline" size="icon"
+            aria-label={t('chat.toBottom')} title={t('chat.toBottom')} onClick={scrollToBottom}>
+            <ChevronDownIcon aria-hidden="true" />
+          </Button>}
           {isNew && <>
             <h1 className="new-session-title">SI</h1>
             <div className="new-session-workspace">
@@ -527,34 +568,35 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
                 if (value === 'add-workspace') void pickWorkspace()
                 else chooseDraftWorkspace(value)
               }}>
-                <SelectTrigger aria-label="工作区"><SelectValue placeholder="选择工作区" /></SelectTrigger>
+                <SelectTrigger aria-label={t('chat.workspace')}><SelectValue placeholder={t('chat.chooseWorkspace')} /></SelectTrigger>
                 <SelectContent>
                   {workspaces?.workspaces.map(item => <SelectItem key={item.id} value={item.id} disabled={!item.available}>{item.name}</SelectItem>)}
-                  <SelectItem value="add-workspace">添加工作区…</SelectItem>
+                  <SelectItem value="add-workspace">{t('chat.addWorkspaceOption')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
           </>}
           {isNew && <p className={state.connection === 'ready' && firstPhase !== 'sending' ? 'sr-only' : 'connection-status new-session-status'} role="status">{status}</p>}
-          {(workspaceError || pickError) && <p className="configuration-error" role="alert">{workspaceError ?? pickError}</p>}
-          {(sessionError || listError) && <p className="configuration-error" role="alert">{sessionError ?? listError}</p>}
-          {listError && <Button variant="ghost" className="self-start" onClick={() => { void refreshSessions() }}>重新读取会话</Button>}
-          {isNew && firstError && <p className="configuration-error" role="alert">{firstError}</p>}
+          {workspaceNotice && <p className="configuration-error" role="alert"><NoticeText notice={workspaceNotice} /></p>}
+          {sessionNotice && <p className="configuration-error" role="alert"><NoticeText notice={sessionNotice} /></p>}
+          {listError && <Button variant="ghost" className="self-start" onClick={() => { void refreshSessions() }}>{t('chat.reloadSessions')}</Button>}
+          {isNew && firstError && <p className="configuration-error" role="alert"><NoticeText notice={firstError} /></p>}
           {isNew && firstPhase === 'unconfirmed' && <div className="new-session-retry">
-            <p className="configuration-error" role="alert">首条消息未确认接收，草稿已保留。</p>
-            <Button variant="outline" disabled={state.connection !== 'ready'} onClick={() => { if (firstSend.current) attemptFirstSend(firstSend.current) }}>重试首次发送</Button>
+            <p className="configuration-error" role="alert">{t('chat.firstUnconfirmed')}</p>
+            <Button variant="outline" disabled={state.connection !== 'ready'} onClick={() => { if (firstSend.current) attemptFirstSend(firstSend.current) }}>{t('chat.retryFirst')}</Button>
           </div>}
-          {(isNew ? draftWorkspace && !draftWorkspace.available : workspace && !workspace.available) && <p className="model-error configuration-error" role="alert">工作区目录不可用</p>}
-          {(modelError || providerError?.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (providerError?.state === 'error' ? providerError.message : '')}</p>}
-          {selection && discovery && !hasModel() && !selectionBusy && <p className="model-error configuration-error" role="alert">当前模型不可用，请重新选择。</p>}
-          {selectionError?.sessionId === sessionId && <p className="model-error configuration-error" role="alert">{selectionError.message}</p>}
-          {runningRun && <p className="connection-status">本次任务使用 {currentModel}{runningRun.reasoningEffort && ` · ${effortLabel(runningRun.reasoningEffort)}`}</p>}
-          {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
-          {storageUnavailable && <p className="configuration-error" role="alert">浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。</p>}
+          {(isNew ? draftWorkspace && !draftWorkspace.available : workspace && !workspace.available) && <p className="model-error configuration-error" role="alert">{t('chat.workspaceUnavailable')}</p>}
+          {(modelError || providerError?.state === 'error') && <p className="model-error configuration-error" role="alert"><NoticeText notice={modelError ?? { key: 'settings.error', detail: providerError?.state === 'error' ? providerError.message : undefined }} /></p>}
+          {selection && discovery && !hasModel() && !selectionBusy && <p className="model-error configuration-error" role="alert">{t('model.unavailable')}</p>}
+          {selectionError?.sessionId === sessionId && <p className="model-error configuration-error" role="alert"><NoticeText notice={selectionError.message} /></p>}
+          {runningRun && <p className="connection-status">{t('chat.runningModel', { model: currentModel })}{runningRun.reasoningEffort && ` · ${effortLabel(t, runningRun.reasoningEffort)}`}</p>}
+          {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">{activeAbort.error ? t('chat.abortUnconfirmedDetail', { detail: noticeSummary(t, activeAbort.error) }) : t('chat.abortUnconfirmed')}{activeAbort.error?.detail && <> · <span>{activeAbort.error.detail}</span></>}</p>}
+          {storageUnavailable && <p className="configuration-error" role="alert">{t('chat.draftStorageUnavailable')}</p>}
           <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
           <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={modelSelect} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
+      </div>
       </div>
       </div>
     </SidebarProvider>

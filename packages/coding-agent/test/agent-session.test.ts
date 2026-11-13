@@ -7,6 +7,7 @@ import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
 import { buildSystemPrompt } from '../src/system-prompt.js'
 import type { ExecutableTool } from '@agent-learning/agent'
+import { omittedToolImageIndexes } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelEvent, ModelEventStream, ToolCall } from '@agent-learning/model'
 
 vi.mock('node:fs/promises', { spy: true })
@@ -732,6 +733,46 @@ describe('Feature6 连续决策与同批调度', () => {
     if (mode === 'abort') { await agent.submit(input); done(1); await until(async () => (await snapshot(agent)).running === null) }
     else await expect(agent.submit(input)).rejects.toMatchObject({ code: 'closed' })
   })
+})
+
+it('续聊只在用完图片预算余量时推进已省略的消息', async () => {
+  const data = 'A'.repeat(500_000)
+  const requests: { paths: string[]; omitted: number[]; recorded: number }[] = []
+  let total = 0
+  const agent = createSession({
+    tools: [{ name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }),
+      execute: async ({ path }) => [{ type: 'text', text: String(path) }, { type: 'image', mimeType: 'image/png', data }] }],
+    stream: (_model, context) => {
+      const queue = controlled()
+      if (context.messages.at(-1)?.role === 'user') {
+        const content = Array.from({ length: total === 0 ? 49 : 1 }, (_, index) =>
+          toolCall(`read-${index}`, { arguments: { path: `${++total}.png` } }))
+        queue.push({ type: 'done', reason: 'toolUse', message: { ...assistant(), content, stopReason: 'toolUse' } })
+      } else {
+        const omitted = omittedToolImageIndexes(context)
+        requests.push({
+          paths: context.messages.flatMap(message => message.role === 'toolResult'
+            ? message.content.flatMap(block => block.type === 'text' ? [block.text] : []) : []),
+          omitted: [...omitted],
+          recorded: context.omittedToolImageResults?.size ?? 0,
+        })
+        queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+      }
+      return queue.output
+    },
+  })
+  try {
+    for (let count = 49; count <= 57; count++) {
+      await agent.submit({ ...input, clientMessageId: `read-${count}` })
+      await until(async () => (await snapshot(agent)).running === null)
+      const omitted = count === 57 ? 16 : 8
+      expect(requests.at(-1)).toEqual({
+        paths: Array.from({ length: count }, (_, index) => `${index + 1}.png`),
+        omitted: Array.from({ length: omitted }, (_, index) => index + 2),
+        recorded: omitted,
+      })
+    }
+  } finally { await agent.close() }
 })
 
 describe('每轮项目说明', () => {

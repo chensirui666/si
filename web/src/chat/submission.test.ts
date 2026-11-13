@@ -14,8 +14,8 @@ describe('提交接收证据', () => {
   })
   it('WS 先到移除临时气泡，随后错误不能重新产生失败气泡', () => {
     const pending = settleSubmission([local], 'local', { accepted })
-    expect(settleSubmission([], 'local', { state: 'failed', errorMessage: '迟到错误' })).toEqual([])
-    expect(settleSubmission(pending, 'local', { state: 'failed', errorMessage: '迟到错误' })).toEqual(pending)
+    expect(settleSubmission([], 'local', { state: 'failed', errorMessage: { key: 'chat.sendFailed', detail: '迟到错误' } })).toEqual([])
+    expect(settleSubmission(pending, 'local', { state: 'failed', errorMessage: { key: 'chat.sendFailed', detail: '迟到错误' } })).toEqual(pending)
   })
   it('未确认条目不会因空快照消失，也不按相同文字去重', () => {
     const unresolved = { ...local, state: 'unconfirmed' as const }

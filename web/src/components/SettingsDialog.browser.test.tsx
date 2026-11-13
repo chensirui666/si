@@ -19,6 +19,11 @@ test('设置弹窗约束键盘焦点，Escape 关闭后返回入口并清空 Key
   await trigger.click()
   const dialog = page.getByRole('dialog', { name: '设置', exact: true })
   await expect(dialog).toBeVisible()
+  const heading = dialog.getByRole('heading', { name: '设置', exact: true })
+  await expect(heading).toHaveCSS('font-family', /^system-ui,.*Noto Sans CJK SC/)
+  await expect(heading).toHaveCSS('font-size', '20px')
+  await expect(heading).toHaveCSS('line-height', '28px')
+  await dialog.getByRole('button', { name: '模型', exact: true }).click()
   await page.getByRole('button', { name: '添加提供方', exact: true }).click()
   await page.getByRole('button', { name: 'DeepSeek', exact: true }).click()
   const key = page.getByLabel('API Key', { exact: true })
@@ -37,6 +42,7 @@ test('设置弹窗约束键盘焦点，Escape 关闭后返回入口并清空 Key
   await expect(trigger).toBeFocused()
   await expect(editor).toHaveText('设置期间保留的草稿')
   await trigger.click()
+  await dialog.getByRole('button', { name: '模型', exact: true }).click()
   await page.getByRole('button', { name: '添加提供方', exact: true }).click()
   await page.getByRole('button', { name: 'DeepSeek', exact: true }).click()
   await expect(key).toHaveValue('')
@@ -85,4 +91,24 @@ test('网页工具分别选择能力服务商，保存共用 Key 后再编辑没
   await expect(key).toHaveValue('')
   expect(await page.evaluate(() => Object.fromEntries(Object.entries(localStorage)))).toEqual({ [recentSessionKey]: 'session-a' })
   expect(await page.evaluate(() => sessionStorage.length)).toBe(0)
+})
+
+test('切换英文后，已有错误摘要更新并保留诊断原文', async ({ mount, page }) => {
+  await page.route('**/api/settings/language', route => route.fulfill({
+    json: { language: route.request().method() === 'GET' ? 'zh-CN' : 'en' },
+  }))
+  await mount(<ChatPageHarness />, { hooksConfig: { loadSavedLanguage: true } })
+  await expect(page.locator('[data-session-id]')).toHaveAttribute('data-session-id', 'session-a')
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: 'Provider quota exceeded', snapshot: null,
+    } }))
+  })
+  await expect(page.getByRole('alert')).toHaveText('无法读取会话 · Provider quota exceeded')
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('combobox', { name: '语言' }).click()
+  await page.getByRole('option', { name: 'English' }).click()
+  await expect(page.getByRole('combobox', { name: 'Language' })).toBeEnabled()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('alert')).toHaveText('Could not load the chat · Provider quota exceeded')
 })

@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowUpIcon, SquareIcon } from 'lucide-react'
 import { LexicalComposer } from '@lexical/react/LexicalComposer'
@@ -71,6 +72,7 @@ export function MessageInput(props: MessageInputProps) {
 }
 
 function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, footerControl, commandsEnabled = true, draft, onDraftChange }: MessageInputProps) {
+  const { t } = useTranslation()
   const [editor] = useLexicalComposerContext()
   const [canSend, setCanSend] = useState(Boolean(draft?.text.trim()))
   const draftRevision = useRef(0)
@@ -104,7 +106,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       closeMenu()
     }, { discrete: true, tag: HISTORY_PUSH_TAG })
   }, [closeMenu, editor])
-  const label = action === 'send' ? '发送' : action === 'abort' ? '中止' : '正在中止'
+  const label = t(action === 'send' ? 'chat.send' : action === 'abort' ? 'chat.abort' : 'chat.aborting')
 
   const submit = useCallback((text: string) => {
     let clearedRevision: number | undefined
@@ -226,10 +228,10 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
 
   return (
     <div className="message-input">
-      {menuOpen && <div className="command-menu" role="listbox" aria-label="命令" id="compact-menu">
-        <div className="command-menu-label">命令</div>
+      {menuOpen && <div className="command-menu" role="listbox" aria-label={t('chat.commands')} id="compact-menu">
+        <div className="command-menu-label">{t('chat.commands')}</div>
         <Button variant="ghost" type="button" role="option" aria-selected="true" id="compact-option" onMouseDown={event => event.preventDefault()} onClick={complete}>
-          <span>/compact</span><span>压缩较早的对话内容</span>
+          <span>/compact</span><span>{t('chat.compactCommand')}</span>
         </Button>
       </div>}
       <PlainTextPlugin
@@ -237,13 +239,13 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
           <ContentEditable
             className="message-editor"
             role="textbox"
-            aria-label="消息"
+            aria-label={t('chat.message')}
             aria-multiline="true"
             aria-controls={menuOpen ? 'compact-menu' : undefined}
             aria-activedescendant={menuOpen ? 'compact-option' : undefined}
             aria-autocomplete={commandsEnabled ? 'list' : undefined}
-            aria-placeholder="输入消息…"
-            placeholder={<div className="message-placeholder">输入消息…</div>}
+            aria-placeholder={t('chat.placeholder')}
+            placeholder={<div className="message-placeholder">{t('chat.placeholder')}</div>}
           />
         }
         ErrorBoundary={LexicalErrorBoundary}

@@ -1,8 +1,12 @@
 import { useRef, useState, type ComponentProps, type FormEvent } from 'react'
 import { SettingsIcon } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import type { ModelDiscovery } from '@agent-learning/model'
 import type { WebSettingsView } from '@agent-learning/server/protocol'
 import { deleteApiKey, saveApiKey, deleteWebApiKey, saveWebApiKey, saveWebSettings } from '../chat/client'
+import { loadLanguage, selectLanguage, useLanguage } from '../i18n'
+import type { CopyKey } from '../i18n/en'
+import { errorNotice, NoticeText, type Notice } from '../i18n/messages'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
 import { Input } from './ui/input'
@@ -11,7 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 type ProviderFormState = {
   apiKey: string
   status: 'idle' | 'saving' | 'deleting'
-  errorMessage?: string
+  errorMessage?: Notice
 }
 
 type Props = {
@@ -21,23 +25,28 @@ type Props = {
   discovery: ModelDiscovery | null
   onChange: (discovery: ModelDiscovery) => void
   webSettings?: WebSettingsView | null
-  webSettingsError?: string | null
+  webSettingsError?: Notice | null
   onWebSettingsChange?: (settings: WebSettingsView) => void
 }
 
-type Screen = 'models' | 'providers' | 'edit' | 'web'
+type Screen = 'general' | 'models' | 'providers' | 'edit' | 'web'
 
 export function SettingsButton(props: ComponentProps<typeof Button>) {
+  const { t } = useTranslation()
   return <Button className="settings-trigger" type="button" variant="ghost" aria-haspopup="dialog" {...props}>
-    <SettingsIcon aria-hidden="true" />设置
+    <SettingsIcon aria-hidden="true" />{t('settings.title')}
   </Button>
 }
 
 export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, webSettings, webSettingsError, onWebSettingsChange }: Props) {
-  const [screen, setScreen] = useState<Screen>('models')
+  const { t } = useTranslation()
+  const { language, status: languageStatus, detail: languageDetail } = useLanguage()
+  const languageBusy = languageStatus === 'loading' || languageStatus === 'saving'
+  const [languageMenuOpen, setLanguageMenuOpen] = useState(false)
+  const [screen, setScreen] = useState<Screen>('general')
   const [providerId, setProviderId] = useState('')
   const [form, setForm] = useState<ProviderFormState>({ apiKey: '', status: 'idle' })
-  const [notice, setNotice] = useState('')
+  const [notice, setNotice] = useState<CopyKey>()
   const generation = useRef(0)
   const pending = useRef(false)
   const configured = discovery?.providers.filter(provider => provider.status.state === 'configured') ?? []
@@ -45,6 +54,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
   const modelProvider = discovery?.providers.find(provider => provider.id === providerId)
   const providerError = discovery?.providers.find(provider => provider.status.state === 'error')?.status
   const web = screen === 'web'
+  const section = screen === 'general' || web ? screen : 'models'
   const webProvider = webSettings?.providers.find(provider => provider.id === providerId)
   const busy = form.status !== 'idle'
 
@@ -52,22 +62,23 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
     generation.current++
     pending.current = false
     setScreen(next)
+    setLanguageMenuOpen(false)
     setProviderId(providerId)
     setForm({ apiKey: '', status: 'idle' })
-    setNotice('')
+    setNotice(undefined)
   }
 
   function changeOpen(next: boolean) {
     onOpenChange(next)
-    navigate('models')
+    navigate('general')
   }
 
-  async function runUpdate(status: 'saving' | 'deleting', update: () => Promise<void>, message: string, done?: () => void) {
+  async function runUpdate(status: 'saving' | 'deleting', update: () => Promise<void>, message: CopyKey, done?: () => void) {
     if (pending.current) return
     pending.current = true
     const current = generation.current
     setForm(previous => ({ ...previous, status, errorMessage: undefined }))
-    setNotice('')
+    setNotice(undefined)
     try {
       await update()
       if (current !== generation.current) return
@@ -76,7 +87,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
       setNotice(message)
     } catch (error) {
       if (current !== generation.current) return
-      setForm(previous => ({ ...previous, status: 'idle', errorMessage: error instanceof Error ? error.message : '配置更新失败，请重试' }))
+      setForm(previous => ({ ...previous, status: 'idle', errorMessage: errorNotice('settings.updateFailed', error) }))
     } finally {
       if (current === generation.current) pending.current = false
     }
@@ -90,7 +101,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
       } else if (modelProvider) {
         onChange(await (deleting ? deleteApiKey(modelProvider.id) : saveApiKey(modelProvider.id, form.apiKey)))
       }
-    }, deleting ? '已删除本机配置' : '已保存在本机，尚未验证远端有效性', () => {
+    }, deleting ? 'settings.deleted' : 'settings.saved', () => {
       setForm({ apiKey: '', status: 'idle' })
       if (!deleting) return
       if (web) setProviderId('')
@@ -104,7 +115,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
     void runUpdate('saving', async () => {
       const settings = await saveWebSettings({ searchProvider, fetchProvider, [field]: value })
       onWebSettingsChange?.(settings)
-    }, '网页服务商选择已保存在本机')
+    }, 'settings.savedWeb')
   }
 
   function save(event: FormEvent) {
@@ -116,37 +127,57 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
     return <form className="provider-form" onSubmit={save}>
       <h3>{name}</h3>
       <label htmlFor="provider-key">API Key</label>
-      <div className="provider-key-field"><Input id="provider-key" type="password" value={form.apiKey} autoComplete="off" spellCheck={false} disabled={busy} placeholder={hasKey ? '输入新的 API Key 以替换' : '输入 API Key'} onChange={event => setForm(previous => ({ ...previous, apiKey: event.target.value, errorMessage: undefined }))} /></div>
-      <p className="settings-help">已有 Key 不会回填。保存成功或关闭编辑后会清空输入。</p>
+      <div className="provider-key-field"><Input id="provider-key" type="password" value={form.apiKey} autoComplete="off" spellCheck={false} disabled={busy} placeholder={t(hasKey ? 'settings.replaceKey' : 'settings.enterKey')} onChange={event => setForm(previous => ({ ...previous, apiKey: event.target.value, errorMessage: undefined }))} /></div>
+      <p className="settings-help">{t('settings.keyHelp')}</p>
       <div className="provider-actions">
-        <Button type="submit" disabled={busy || !form.apiKey.trim()}>{form.status === 'saving' ? '保存中…' : '保存'}</Button>
-        {hasKey && <Button type="button" variant="ghost" className="delete-provider" disabled={busy} onClick={() => updateKey(true)}>{form.status === 'deleting' ? '删除中…' : '删除 API Key'}</Button>}
+        <Button type="submit" disabled={busy || !form.apiKey.trim()}>{t(form.status === 'saving' ? 'common.saving' : 'common.save')}</Button>
+        {hasKey && <Button type="button" variant="ghost" className="delete-provider" disabled={busy} onClick={() => updateKey(true)}>{t(form.status === 'deleting' ? 'common.deleting' : 'settings.deleteKey')}</Button>}
       </div>
     </form>
   }
 
   return <Dialog open={open} onOpenChange={changeOpen}>
     <DialogContent onCloseAutoFocus={onCloseAutoFocus}>
-      <DialogTitle className="settings-title">设置</DialogTitle>
-      <DialogDescription className="settings-description">管理本机模型和网页工具。保存只检查本地配置，远端有效性需在使用时验证。</DialogDescription>
+      <DialogTitle className="settings-title">{t('settings.title')}</DialogTitle>
+      <DialogDescription className="sr-only">{t('settings.description')}</DialogDescription>
       <div className="settings-layout">
-        <nav className="settings-nav" aria-label="设置分类">
-          <Button variant={web ? 'ghost' : 'secondary'} aria-current={web ? undefined : 'page'} onClick={() => navigate('models')}>模型</Button>
-          <Button variant={web ? 'secondary' : 'ghost'} aria-current={web ? 'page' : undefined} onClick={() => navigate('web')}>网页工具</Button>
+        <nav className="settings-nav" aria-label={t('settings.sections')}>
+          {(['general', 'models', 'web'] as const).map(item => <Button key={item} variant={section === item ? 'secondary' : 'ghost'}
+            aria-current={section === item ? 'page' : undefined} onClick={() => navigate(item)}>{t(`settings.${item}`)}</Button>)}
         </nav>
         <section className="settings-models" aria-labelledby="settings-heading">
-          <h2 id="settings-heading">{web ? '网页工具' : '模型'}</h2>
-          {web ? <>
-            <p className="settings-help">选择网页搜索和网页获取的服务商。同一服务商的两种能力共用一个 API Key。</p>
-            {webSettingsError && <p className="configuration-error" role="alert">{webSettingsError}</p>}
-            {!webSettings && !webSettingsError && <p className="settings-help">正在读取网页工具设置…</p>}
+          <h2 id="settings-heading">{t(`settings.${section}`)}</h2>
+          {section === 'general' ? <>
+            <div className="language-setting">
+              <label htmlFor="settings-language">{t('settings.language')}</label>
+              <Select value={language} open={languageMenuOpen && !languageBusy} onOpenChange={next => {
+                if (!next || !languageBusy) setLanguageMenuOpen(next)
+              }} onValueChange={value => {
+                if (!languageBusy && (value === 'en' || value === 'zh-CN')) void selectLanguage(value)
+              }}>
+                <SelectTrigger id="settings-language" aria-disabled={languageBusy || undefined}><SelectValue /></SelectTrigger>
+                <SelectContent align="end">
+                  <SelectItem value="en" lang="en">English</SelectItem>
+                  <SelectItem value="zh-CN" lang="zh-CN">简体中文</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {languageStatus === 'saving' && <p className="settings-help" role="status">{t('settings.language.saving')}</p>}
+            {(languageStatus === 'readFailed' || languageStatus === 'saveFailed' || languageStatus === 'unconfirmed') && <>
+              <p className="configuration-error" role="alert"><NoticeText notice={{ key: `settings.language.${languageStatus}`, detail: languageDetail }} /></p>
+              {languageStatus === 'readFailed' && <Button variant="ghost" onClick={() => { void loadLanguage() }}>{t('common.retry')}</Button>}
+            </>}
+          </> : web ? <>
+            <p className="settings-help">{t('settings.webHelp')}</p>
+            {webSettingsError && <p className="configuration-error" role="alert"><NoticeText notice={webSettingsError} /></p>}
+            {!webSettings && !webSettingsError && <p className="settings-help">{t('settings.webLoading')}</p>}
             {webSettings && <>
               <div className="web-provider-selections">
                 {([
-                  { field: 'searchProvider', capability: 'search', label: '网页搜索' },
-                  { field: 'fetchProvider', capability: 'fetch', label: '网页获取' },
+                  { field: 'searchProvider', capability: 'search', label: 'settings.search' },
+                  { field: 'fetchProvider', capability: 'fetch', label: 'settings.fetch' },
                 ] as const).map(({ field, capability, label }) => <div key={field}>
-                  <label htmlFor={field}>{label}</label>
+                  <label htmlFor={field}>{t(label)}</label>
                   <Select value={webSettings[field]} disabled={busy} onValueChange={value => updateSelection(field, value)}>
                     <SelectTrigger id={field}><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -157,29 +188,29 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
               </div>
               {webSettings.providers.map(provider => <div className="provider-row" key={provider.id}>
                 <div>
-                  <span>{provider.name} <small data-status={provider.status.state}>{provider.status.state === 'configured' ? '已配置' : provider.status.state === 'missing' ? '未配置' : '配置异常'}</small></span>
+                  <span>{provider.name} <small data-status={provider.status.state}>{t(`settings.${provider.status.state}`)}</small></span>
                   {provider.status.state === 'error' && <p className="configuration-error" role="alert">{provider.status.message}</p>}
                 </div>
-                <Button variant="outline" disabled={busy} aria-label={`编辑 ${provider.name}`} onClick={() => navigate('web', provider.id)}>编辑</Button>
+                <Button variant="outline" disabled={busy} aria-label={t('settings.editProvider', { name: provider.name })} onClick={() => navigate('web', provider.id)}>{t('common.edit')}</Button>
               </div>)}
               {webProvider && keyForm(webProvider.name, webProvider.status.state === 'configured')}
             </>}
           </> : <>
-            <p className="settings-help">添加提供方的 API Key 后，可以在聊天中选择它的模型。</p>
-            {providerError?.state === 'error' && <p className="configuration-error" role="alert">{providerError.message}</p>}
+            <p className="settings-help">{t('settings.modelHelp')}</p>
+            {providerError?.state === 'error' && <p className="configuration-error" role="alert"><NoticeText notice={{ key: 'settings.error', detail: providerError.message }} /></p>}
             {screen === 'models' && <>
               {configured.map(provider => <div className="provider-row" key={provider.id}>
-                <span>{provider.name} <small>已配置</small></span>
-                <Button variant="outline" onClick={() => navigate('edit', provider.id)}>编辑</Button>
+                <span>{provider.name} <small>{t('settings.configured')}</small></span>
+                <Button variant="outline" onClick={() => navigate('edit', provider.id)}>{t('common.edit')}</Button>
               </div>)}
-              <Button variant="outline" disabled={!addable.length} onClick={() => navigate('providers')}>添加提供方</Button>
+              <Button variant="outline" disabled={!addable.length} onClick={() => navigate('providers')}>{t('settings.addProvider')}</Button>
             </>}
             {screen === 'providers' && <div className="provider-choices">{addable.map(provider =>
               <Button key={provider.id} className="provider-choice" variant="outline" onClick={() => navigate('edit', provider.id)}>{provider.name}</Button>)}</div>}
             {screen === 'edit' && modelProvider && keyForm(modelProvider.name, modelProvider.status.state === 'configured')}
           </>}
-          {form.errorMessage && <p className="configuration-error" role="alert">{form.errorMessage}</p>}
-          {notice && <p className="configuration-success" aria-live="polite">{notice}</p>}
+          {form.errorMessage && <p className="configuration-error" role="alert"><NoticeText notice={form.errorMessage} /></p>}
+          {notice && <p className="configuration-success" aria-live="polite">{t(notice)}</p>}
         </section>
       </div>
     </DialogContent>

@@ -1,5 +1,7 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import type { SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import { RequestError } from '../i18n/messages'
+import type { CopyKey } from '../i18n/en'
 import { applyFrame, initialState, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
 export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged) => {
@@ -27,10 +29,10 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     subscriptionId = ''
     previous.close()
   }
-  function fail(error = '连接异常，请重新打开启动链接后重试') {
+  function fail(key: CopyKey = 'chat.connectionFailed') {
     releaseSocket()
     if (stopped) return
-    publish({ ...state, connection: 'disconnected', slow: false, error })
+    publish({ ...state, connection: 'disconnected', slow: false, error: null, connectionNotice: key })
     if (!navigator.onLine) return
     const upper = Math.min(500 * 2 ** retryCount, 10_000)
     retryCount = Math.min(retryCount + 1, 5)
@@ -41,7 +43,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     slowTimer = setTimeout(() => {
       if (!stopped && socket) publish({ ...state, slow: true })
     }, 3000)
-    deadline = setTimeout(() => fail('连接超时，正在重试；如持续异常，请重新打开启动链接'), 15_000)
+    deadline = setTimeout(() => fail('chat.connectionTimeout'), 15_000)
   }
   function requestSnapshot() {
     const sessionId = state.sessionId
@@ -53,7 +55,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
   function connect() {
     clearTimeout(retryTimer)
     if (stopped || !navigator.onLine || socket) return
-    publish({ ...state, connection: 'connecting', slow: false, error: null })
+    publish({ ...state, connection: 'connecting', slow: false, error: null, connectionNotice: undefined })
     try {
       const url = new URL('/api/events', window.location.href)
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -66,7 +68,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
       else {
         clearPreparation()
         retryCount = 0
-        publish({ ...state, connection: 'ready', slow: false, error: null })
+        publish({ ...state, connection: 'ready', slow: false, error: null, connectionNotice: undefined })
       }
     }
     const message = (event: MessageEvent) => {
@@ -101,7 +103,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
   const offline = () => {
     clearTimeout(retryTimer)
     releaseSocket()
-    if (!stopped) publish({ ...state, connection: 'disconnected', slow: false, error: '网络已离线，联网后自动恢复' })
+    if (!stopped) publish({ ...state, connection: 'disconnected', slow: false, error: null, connectionNotice: 'chat.offline' })
   }
   const online = () => { if (!stopped) connect() }
   window.addEventListener('offline', offline)
@@ -124,7 +126,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     },
     setSession: (sessionId: string | null) => {
       if (stopped || state.sessionId === sessionId) return
-      state = { ...state, sessionId, snapshot: null, slow: false, error: null }
+      state = { ...state, sessionId, snapshot: null, slow: false, error: null, connectionNotice: undefined }
       if (socket?.readyState !== 1) {
         publish(state)
         return
@@ -191,55 +193,77 @@ function webSettings(value: unknown): value is WebSettingsView {
       && credentialStatus(provider.status))
 }
 
-async function requestView<T>(path: string, label: string, validate: (value: unknown) => value is T, options: RequestInit = {}, apiKey = ''): Promise<T> {
+async function requestView<T>(path: string, label: CopyKey, validate: (value: unknown) => value is T, options: RequestInit = {}, apiKey = ''): Promise<T> {
   let response: Response
   try { response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options }) }
-  catch { throw new Error('网络请求失败，请检查连接后重试') }
-  if (response.status === 401) throw new Error('授权已失效，请重新打开启动链接')
-  if (response.status === 403) throw new Error('访问来源不可信，请从启动链接进入')
+  catch { throw new RequestError({ key: 'request.network' }) }
+  if (response.status === 401) throw new RequestError({ key: 'request.unauthorized' })
+  if (response.status === 403) throw new RequestError({ key: 'request.forbidden' })
   let value: unknown
-  try { value = await response.json() } catch { throw new Error(`${label}响应无效，请重试`) }
+  try { value = await response.json() } catch { throw new RequestError({ key: 'request.invalid', label }) }
   if (!response.ok) {
-    const message = record(value) && typeof value.error === 'string' ? value.error : `${label}请求失败，请重试`
-    throw new Error(apiKey ? message.split(apiKey).join('•••') : message)
+    const detail = record(value) && typeof value.error === 'string' ? value.error : undefined
+    throw new RequestError({ key: 'request.failed', label, detail: apiKey ? detail?.split(apiKey).join('•••') : detail })
   }
-  if (!validate(value)) throw new Error(`${label}响应无效，请重试`)
+  if (!validate(value)) throw new RequestError({ key: 'request.invalid', label })
   return value
 }
 
 const putJson = (value: unknown): RequestInit => ({ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
 
-export const getModels = () => requestView('/api/models', '模型配置', modelDiscovery)
-export const saveApiKey = (provider: string, apiKey: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, '模型配置', modelDiscovery, putJson({ apiKey }), apiKey)
-export const deleteApiKey = (provider: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, '模型配置', modelDiscovery, { method: 'DELETE' })
+const languagePath = '/api/settings/language'
+
+async function languageFrom(response: Response): Promise<InterfaceLanguage> {
+  if (response.status !== 200) {
+    const error: unknown = await response.json().catch(() => undefined)
+    throw new RequestError({ key: 'settings.language.readFailed', status: response.status,
+      detail: record(error) && typeof error.error === 'string' ? error.error : undefined })
+  }
+  const value: unknown = await response.json()
+  if (!record(value) || (value.language !== 'en' && value.language !== 'zh-CN')) throw new Error('Invalid language settings response')
+  return value.language
+}
+
+export async function getLanguage() {
+  return languageFrom(await fetch(languagePath, { credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(2500) }))
+}
+
+export async function saveLanguage(language: InterfaceLanguage) {
+  const response = await fetch(languagePath, { ...putJson({ language }), credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(5000) })
+  if (await languageFrom(response) !== language) throw new Error('Unexpected language settings response')
+}
+
+export const getModels = () => requestView('/api/models', 'request.models', modelDiscovery)
+export const saveApiKey = (provider: string, apiKey: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, 'request.models', modelDiscovery, putJson({ apiKey }), apiKey)
+export const deleteApiKey = (provider: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, 'request.models', modelDiscovery, { method: 'DELETE' })
 
 export const saveModelSelection = (input: SaveModelSelectionRequest) =>
-  requestView('/api/model-selection', '模型选择', modelSelection, { ...putJson(input), signal: AbortSignal.timeout(10_000) })
+  requestView('/api/model-selection', 'request.selection', modelSelection, { ...putJson(input), signal: AbortSignal.timeout(10_000) })
 
-export const getWorkspaces = () => requestView('/api/workspaces', '工作区', workspaceView)
-export const pickWorkspace = () => requestView('/api/workspaces/pick', '工作区选择', workspacePick, { method: 'POST' })
+export const getWorkspaces = () => requestView('/api/workspaces', 'request.workspaces', workspaceView)
+export const pickWorkspace = () => requestView('/api/workspaces/pick', 'request.workspacePicker', workspacePick, { method: 'POST' })
 
-export const getSessions = async () => (await requestView('/api/sessions', '会话列表', sessionList)).sessions
+export const getSessions = async () => (await requestView('/api/sessions', 'request.sessions', sessionList)).sessions
 
-export const getWebSettings = () => requestView('/api/web/settings', '网页工具设置', webSettings)
+export const getWebSettings = () => requestView('/api/web/settings', 'request.web', webSettings)
 export const saveWebSettings = (selection: Pick<WebSettingsView, 'searchProvider' | 'fetchProvider'>) =>
-  requestView('/api/web/settings', '网页工具设置', webSettings, putJson(selection))
+  requestView('/api/web/settings', 'request.web', webSettings, putJson(selection))
 export const saveWebApiKey = (providerId: string, apiKey: string) =>
-  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, putJson({ apiKey }), apiKey)
+  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, 'request.web', webSettings, putJson({ apiKey }), apiKey)
 export const deleteWebApiKey = (providerId: string) =>
-  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, { method: 'DELETE' })
+  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, 'request.web', webSettings, { method: 'DELETE' })
 
 export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
   let response: Response
   try { response = await fetch('/api/abort', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) }
-  catch { throw new Error('网络请求失败，未确认中止') }
-  if (response.status === 401) throw new Error('授权已失效，请重新打开启动链接')
-  if (response.status === 403) throw new Error('访问来源不可信，请从启动链接进入')
+  catch { throw new RequestError({ key: 'request.abortNetwork' }) }
+  if (response.status === 401) throw new RequestError({ key: 'request.unauthorized' })
+  if (response.status === 403) throw new RequestError({ key: 'request.forbidden' })
   let value: unknown
   try { value = await response.json() } catch { value = null }
-  if (!response.ok) throw new Error(record(value) && typeof value.error === 'string' ? value.error : '中止请求失败，请重新同步后重试')
+  if (!response.ok) throw new RequestError({ key: 'request.abortFailed', detail: record(value) && typeof value.error === 'string' ? value.error : undefined })
   if (response.status !== 200 || !record(value) || value.sessionId !== input.sessionId || value.runId !== input.runId || typeof value.handled !== 'boolean') {
-    throw new Error('中止回执无效，未确认中止')
+    throw new RequestError({ key: 'request.abortInvalid' })
   }
   return value as AbortResult
 }
@@ -247,20 +271,22 @@ export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
 async function postSubmission(path: string, input: SubmitMessageRequest | StartSessionRequest, signal?: AbortSignal) {
   let response: Response
   try { response = await fetch(path, { ...putJson(input), method: 'POST', credentials: 'same-origin', cache: 'no-store', ...(signal && { signal }) }) }
-  catch { throw new Error('网络请求失败，未确认接收') }
+  catch { throw new RequestError({ key: 'request.sendNetwork' }) }
   let value: unknown
   try { value = await response.json() } catch { value = null }
   const code = record(value) ? value.code : undefined
   if (code === 'save_rejected' || code === 'save_unconfirmed' || code === 'model_selection_changed') {
-    const message = record(value) && typeof value.error === 'string' ? value.error : '会话保存失败'
-    throw Object.assign(new Error(message), { status: response.status, code })
+    const key = code === 'model_selection_changed' ? 'model.selectionChanged' : code === 'save_unconfirmed' ? 'save.unconfirmed' : 'request.saveFailed'
+    const detail = record(value) && typeof value.error === 'string' ? value.error : undefined
+    throw Object.assign(new RequestError({ key, detail }), { status: response.status, code })
   }
   if (response.status >= 400 && response.status < 500) {
-    const message = response.status === 401 ? '授权已失效，请重新打开启动链接' : response.status === 403 ? '访问来源不可信，请从启动链接进入'
-      : record(value) && typeof value.error === 'string' ? value.error : response.status === 409 ? '正在生成，请等待回答结束' : `消息提交被拒绝（HTTP ${response.status}）`
-    throw Object.assign(new Error(message), { status: response.status })
+    const { status } = response
+    const key = status === 401 ? 'request.unauthorized' : status === 403 ? 'request.forbidden' : status === 409 ? 'request.busy' : 'request.sendRejected'
+    const detail = status !== 401 && status !== 403 && record(value) && typeof value.error === 'string' ? value.error : undefined
+    throw Object.assign(new RequestError({ key, detail, status }), { status })
   }
-  if (response.status !== 202) throw new Error('提交回执无效，未确认接收')
+  if (response.status !== 202) throw new RequestError({ key: 'request.sendInvalid' })
   return value
 }
 
@@ -274,7 +300,7 @@ function acceptedSubmission(value: unknown, sessionId: string, clientMessageId: 
 export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
   const value = await postSubmission('/api/messages', input)
   if (!acceptedSubmission(value, input.sessionId, input.clientMessageId, input.text.trim() === '/compact' ? 'compaction' : 'message')) {
-    throw new Error('提交回执无效，未确认接收')
+    throw new RequestError({ key: 'request.sendInvalid' })
   }
   return value
 }
@@ -283,7 +309,7 @@ export async function startSession(input: StartSessionRequest): Promise<StartSes
   const value = await postSubmission('/api/sessions/start', input, AbortSignal.timeout(10_000))
   if (!record(value) || !sessionSummary(value.session) || value.session.id !== input.clientMessageId || value.session.workspaceId !== input.workspaceId
     || !acceptedSubmission(value.accepted, value.session.id, input.clientMessageId, 'message')) {
-    throw new Error('首条消息回执无效，未确认接收')
+    throw new RequestError({ key: 'request.firstInvalid' })
   }
   return { session: value.session, accepted: value.accepted }
 }

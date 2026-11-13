@@ -22,13 +22,22 @@ function effectiveEntries(entries: ConversationMessage[], latest?: LatestCompact
     && !(entry.toolCall && invalid.has(entry.toolCall.assistantMessageId)))
 }
 
+function messageForModel({ id, message, imageOmitted }: ConversationMessage): ModelMessage {
+  if (message.role !== 'toolResult') return message
+  if (imageOmitted) return { ...message, content: [
+    ...message.content, { type: 'text', text: '\n[历史图片未随会话保存。需要看图时可按原路径重新调用 read。]' },
+  ] }
+  return message.content.some(block => block.type === 'image') ? { ...message, imageResultId: id } : message
+}
+
 function modelMessages(entries: ConversationMessage[], recoverTools: boolean): ModelMessage[] {
-  if (!recoverTools) return entries.map(entry => entry.message)
+  if (!recoverTools) return entries.map(messageForModel)
   const results = new Map<string, Map<number, ModelMessage>>()
-  for (const { toolCall, message } of entries) {
+  for (const entry of entries) {
+    const { toolCall } = entry
     if (!toolCall) continue
     const batch = results.get(toolCall.assistantMessageId) ?? new Map()
-    batch.set(toolCall.contentIndex, message)
+    batch.set(toolCall.contentIndex, messageForModel(entry))
     results.set(toolCall.assistantMessageId, batch)
   }
   return entries.flatMap(({ id, message }): ModelMessage[] => {
@@ -111,7 +120,7 @@ function serializeConversation(messages: ModelMessage[]): string {
       return message.content.flatMap(block => block.type === 'text' ? [`[Assistant]: ${block.text}`]
         : block.type === 'toolCall' ? [`[Assistant tool call ${block.id}]: ${block.name}(${JSON.stringify(block.arguments)})`] : []).join('\n')
     }
-    const text = typeof message.content === 'string' ? message.content : message.content.map(block => block.text).join('')
+    const text = typeof message.content === 'string' ? message.content : message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
     if (message.role === 'toolResult') return `[Tool result ${message.toolCallId} ${message.toolName} ${message.isError ? 'error' : 'success'}]: ${resultForSummary(text)}`
     return `[${message.role === 'user' ? 'User' : 'System message'}]: ${text}`
   }).filter(Boolean).join('\n\n')

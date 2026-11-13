@@ -10,6 +10,7 @@ export type {
   AssistantMessage,
   ToolResultMessage,
   TextContent,
+  ImageContent,
   ThinkingContent,
   ToolCall,
   Tool,
@@ -25,3 +26,4 @@ export type {
 export { defaultSelection, discoverModels, findModel, isModelProvider, sameSelection } from './catalog.js'
 export { stream, createModelStream } from './pi-stream.js'
 export { estimateMessageTokens, estimateContextTokens } from './context.js'
+export { omittedToolImageIndexes } from './request-images.js'

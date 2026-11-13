@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test, expect } from '@playwright/test'
+import { test, expect } from './chinese-fixture'
 import { addWorkspace, authorize, expectBrowserStorage, freeVitePort, emptySnapshot, httpStatus, observe, ready, saveKey, seedSession, startBackend, startVite, stop, wsStatus } from './test-utils'
 import { startModelServer } from './model-server'
 
@@ -29,6 +29,7 @@ for (const mode of ['node', 'vite'] as const) {
       const editor = page.getByRole('textbox', { name: '消息', exact: true })
       const send = page.getByRole('button', { name: '发送', exact: true })
       const messages = page.getByRole('region', { name: '消息列表' })
+      const firstRunStatus = messages.locator('.run-status').first()
       const original = '  第一轮原文\n保留空格与换行  '
       await editor.fill(original)
       await expect(send).toBeEnabled()
@@ -38,6 +39,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(editor).toHaveText('')
       await expect(editor).toBeFocused()
       await expect.poll(() => provider.exchanges.length).toBe(1)
+      await expect(firstRunStatus).toHaveText(/^正在执行/)
       const first = provider.exchanges[0]!
       expect(first.path).toBe('/v1/chat/completions')
       expect(first.authorized).toBe(true)
@@ -76,6 +78,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(editor).toHaveText('另一个页面的草稿')
       await expect(messages).toContainText('第一段已经到达。')
       expect(observed.snapshots.at(-1)!.snapshot.running).toEqual(running)
+      await expect(firstRunStatus).toHaveText(/^正在执行 · .+秒$/)
       await editor.fill('断线期间保留的新草稿')
       await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
       await context.setOffline(true)
@@ -95,6 +98,7 @@ for (const mode of ['node', 'vite'] as const) {
 
       first.finish()
       await expect(send).toBeEnabled()
+      await expect(firstRunStatus).toHaveText(/^用时 .+秒$/)
       await expect.poll(() => otherObserved.updates.some(({ update }) => update.change.type === 'model' && update.change.event.type === 'done')).toBe(true)
       await expect(messages.getByRole('listitem')).toHaveCount(2)
       await editor.fill('第二轮请沿用前面的内容')
@@ -194,6 +198,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(model).toHaveText('DeepSeek Flash')
       await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
       await settings.click()
+      await dialog.getByRole('button', { name: '模型', exact: true }).click()
       await dialog.getByRole('button', { name: '编辑', exact: true }).click()
       await expect(keyInput).toHaveValue('')
       await page.screenshot({ path: testInfo.outputPath(`${mode}-settings.png`), fullPage: true })
@@ -211,6 +216,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(model).toHaveText('DeepSeek Flash')
       await expect(otherModel).toHaveText('DeepSeek Flash')
       await settings.click()
+      await dialog.getByRole('button', { name: '模型', exact: true }).click()
       await dialog.getByRole('button', { name: '编辑', exact: true }).click()
       await dialog.getByRole('button', { name: '删除 API Key', exact: true }).click()
       await expect(dialog).toContainText('已删除本机配置')
@@ -223,7 +229,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(page.getByRole('alert')).toContainText(/配置|JSON|credential/i)
       await expect(second.getByRole('alert')).toContainText(/配置|JSON|credential/i)
       await settings.click()
-      await expect(dialog).toBeVisible()
+      await dialog.getByRole('button', { name: '模型', exact: true }).click()
       await dialog.getByRole('button', { name: '添加提供方', exact: true }).click()
       await dialog.getByRole('button', { name: 'DeepSeek', exact: true }).click()
       await keyInput.fill('stage2-e2e-cannot-overwrite-bad-file')

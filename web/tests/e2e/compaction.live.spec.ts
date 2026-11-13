@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { CompactionRecord, ConversationSnapshot } from '@agent-learning/server/protocol'
 import { createModelStream, findModel, type AssistantMessage, type ModelContext, type Tool } from '@agent-learning/model'
 import { WebServer } from '@agent-learning/server'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './chinese-fixture'
 import { buildModelHistory } from '../../../packages/coding-agent/src/compaction'
 import { readLiveKey } from './live-key'
 import { addWorkspace, authorize, observe, openSession, ready, saveKey, seedSession } from './test-utils'
@@ -249,7 +249,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     const reads = toolResults.filter(result => result.toolName === 'read')
     expect(reads.length).toBeGreaterThanOrEqual(3)
     for (const fact of ['下一条线索在 note.txt', '项目名称：青禾', batchId]) {
-      expect(reads.some(result => result.content.some(block => block.text.includes(fact)))).toBe(true)
+      expect(reads.some(result => result.content.some(block => block.type === 'text' && block.text.includes(fact)))).toBe(true)
     }
     expect(toolResults.filter(result => result.toolName === 'write')).toHaveLength(1)
     expect(finalSnapshot.messages).toContainEqual(expect.objectContaining({

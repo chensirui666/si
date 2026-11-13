@@ -1,5 +1,5 @@
 import { StrictMode, type ComponentProps } from 'react'
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatState, Subscribe } from '../chat/state'
 import { ChatPage as Page } from './ChatPage'
@@ -197,6 +197,7 @@ it('晚到的配置保存结果后重新查询当前文件，避免恢复旧模�
     render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
     await screen.findByText('无可用模型')
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: '模型' }))
     fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
     fireEvent.click(screen.getByRole('button', { name: 'DeepSeek' }))
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'delayed-save-key' } })
@@ -215,6 +216,7 @@ it('初始模型查询尚未完成时等待提供方目录，读取完成后可�
   render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
   expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('正在查询模型…')
   fireEvent.click(screen.getByRole('button', { name: '设置' }))
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: '模型' }))
   expect(screen.getByRole('button', { name: '添加提供方' })).toBeDisabled()
   await act(async () => { resolveInitial(configured) })
   expect(screen.getByRole('button', { name: '编辑' })).toBeEnabled()

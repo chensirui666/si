@@ -19,18 +19,19 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
   await mount(<ChatPageHarness messages={history} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const list = page.getByRole('region', { name: '消息列表' })
+  const scroll = page.locator('.chat-main')
   const items = list.getByRole('listitem')
   await expect(items).toHaveCount(26)
-  expect(await list.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true)
-  await list.evaluate(el => { el.scrollTop = 350 })
+  expect(await scroll.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true)
+  await scroll.evaluate(el => { el.scrollTop = 350 })
   const oldItem = items.nth(5)
   const oldTop = (await oldItem.boundingBox())!.y
-  const readingPosition = await list.evaluate(el => el.scrollTop)
+  const readingPosition = await scroll.evaluate(el => el.scrollTop)
   const multiline = '多行草稿\n第二行\n\n第四行\n第五行\n最后一行'
   const before = await editor.boundingBox()
   await editor.fill(multiline)
   expect((await editor.boundingBox())!.height).toBeGreaterThan(before!.height + 90)
-  expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
+  expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
   expect((await oldItem.boundingBox())!.y).toBeCloseTo(oldTop, 0)
   for (const connection of ['disconnected', 'connecting', 'awaitingSnapshot', 'ready'] as const) {
     await page.evaluate(({ connection, history }) => {
@@ -44,7 +45,7 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
     await editor.press('Enter')
     expect(await editor.textContent()).toBe(multiline)
     await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled()
-    expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
+    expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
     expect((await oldItem.boundingBox())!.y).toBeCloseTo(oldTop, 0)
   }
   // fill('') 直接设置 DOM 选区后立刻 Delete，可能早于 Lexical 的选区同步。
@@ -52,14 +53,14 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
   await editor.press('Backspace')
   await expect(editor).toHaveText('')
   await expect.poll(async () => (await editor.boundingBox())!.height).toBeCloseTo(before!.height, 0)
-  expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
+  expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
   await list.focus()
-  const keyboardBefore = await list.evaluate(el => el.scrollTop)
+  const keyboardBefore = await scroll.evaluate(el => el.scrollTop)
   await list.press('PageDown')
-  await expect.poll(() => list.evaluate(el => el.scrollTop)).toBeGreaterThan(keyboardBefore)
-  await list.evaluate(el => { el.scrollTop = el.scrollHeight })
+  await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBeGreaterThan(keyboardBefore)
+  await scroll.evaluate(el => { el.scrollTop = el.scrollHeight })
   await expect(items.last()).toBeInViewport()
-  const bottom = await list.evaluate(el => el.scrollTop)
+  const bottom = await scroll.evaluate(el => el.scrollTop)
   await page.evaluate(history => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
@@ -67,9 +68,51 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
     } }))
   }, history)
   await expect(items).toHaveCount(27)
-  expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(bottom, 0)
-  expect(await list.evaluate(el => el.scrollTop + el.clientHeight < el.scrollHeight)).toBe(true)
+  expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(bottom, 0)
+  expect(await scroll.evaluate(el => el.scrollTop + el.clientHeight < el.scrollHeight)).toBe(true)
   expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(true)
+})
+
+test('正文外的留白能滚动，消息到输入框上沿才被遮住', async ({ mount, page }) => {
+  const messages = Array.from({ length: 30 }, (_, i) => `消息 ${i}\n第二行\n第三行`)
+  await mount(<ChatPageHarness messages={messages} />)
+  const workspace = (await page.locator('.chat-workspace').boundingBox())!
+  const scroll = page.locator('.chat-main')
+  const header = page.getByRole('heading', { name: '会话 1' })
+  const headerBefore = await header.boundingBox()
+  const composer = page.locator('.message-input')
+  const input = (await composer.boundingBox())!
+  const list = page.getByRole('region', { name: '消息列表' })
+  const rows = list.getByRole('listitem')
+  await expect(rows).toHaveCount(messages.length)
+  const scrollBox = (await scroll.boundingBox())!
+  expect(scrollBox.x).toBeCloseTo(workspace.x, 0)
+  expect(scrollBox.x + scrollBox.width).toBeCloseTo(workspace.x + workspace.width, 0)
+  const gutterX = (input.x + workspace.x) / 2
+  await page.mouse.move(gutterX, input.y - 60)
+  await page.mouse.wheel(0, 310)
+  await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBeGreaterThan(100)
+  expect(await header.boundingBox()).toEqual(headerBefore)
+  expect(await composer.boundingBox()).toEqual(input)
+
+  const row = rows.nth(10)
+  const box = (await row.boundingBox())!
+  await scroll.evaluate((el, delta) => { el.scrollTop += delta }, box.y + box.height / 2 - input.y)
+  const edge = await row.evaluate((el, { x, y }) => ({
+    above: el.contains(document.elementFromPoint(x, y - 2)),
+    below: Boolean(document.elementFromPoint(x, y + 2)?.closest('.message-input')),
+  }), { x: box.x + box.width / 2, y: input.y })
+  expect(edge).toEqual({ above: true, below: true })
+  const toBottom = page.getByRole('button', { name: '回到底部' })
+  await expect(toBottom).toBeVisible()
+  const jump = (await toBottom.boundingBox())!
+  expect(jump.y + jump.height).toBeLessThan(input.y)
+  expect(jump.x).toBeGreaterThan(input.x + input.width / 2)
+  await toBottom.click()
+  await expect(toBottom).toBeHidden()
+  const last = (await rows.last().boundingBox())!
+  expect(last.y + last.height).toBeLessThanOrEqual(input.y)
+  expect(last.y).toBeGreaterThanOrEqual(scrollBox.y)
 })
 
 test('输入组件发送按钮随空白和有效草稿切换颜色，发送后恢复空白状态', async ({ mount, page }) => {
@@ -98,15 +141,15 @@ test('输入组件发送按钮随空白和有效草稿切换颜色，发送后�
   await expectEmptyButton()
 })
 
-test('白色页面与消息输入区同轴，正文和标题遵守已确认尺寸', async ({ mount, page }) => {
+test('白色页面的正文与输入框同轴，输入框两侧各宽出 16px', async ({ mount, page }) => {
   await mount(<ChatPageHarness messages={['正文消息']} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const list = page.getByRole('region', { name: '消息列表' })
   const composer = page.locator('.message-input')
   await expect(page.locator('html')).toHaveCSS('background-color', 'rgb(255, 255, 255)')
-  await expect(page.getByRole('heading', { name: '聊天' })).toHaveCSS('font-size', '20px')
-  await expect(page.getByRole('heading', { name: '聊天' })).toHaveCSS('line-height', '28px')
-  await expect(page.getByRole('heading', { name: '聊天' })).toHaveCSS('font-weight', '600')
+  await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('font-size', '20px')
+  await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('line-height', '28px')
+  await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('font-weight', '600')
   await expect(editor).toHaveCSS('font-size', '14px')
   await expect(editor).toHaveCSS('line-height', '24px')
   await expect(editor).toHaveCSS('font-weight', '400')
@@ -116,9 +159,13 @@ test('白色页面与消息输入区同轴，正文和标题遵守已确认尺�
   expect(composerBox.width).toBeLessThanOrEqual(760)
   const workspaceBox = (await page.locator('.chat-workspace').boundingBox())!
   expect(composerBox.x + composerBox.width / 2).toBeCloseTo(workspaceBox.x + workspaceBox.width / 2, 0)
-  expect(listBox.x).toBeCloseTo(composerBox.x, 0)
-  expect(listBox.width).toBeCloseTo(composerBox.width, 0)
+  expect(listBox.x - composerBox.x).toBeCloseTo(16, 0)
+  expect(composerBox.x + composerBox.width - (listBox.x + listBox.width)).toBeCloseTo(16, 0)
   await expect(list.getByRole('listitem')).toHaveCSS('background-color', 'rgb(247, 247, 245)')
+  await expect(list.getByRole('listitem')).toHaveCSS('max-width', '72%')
+  await expect(list.getByRole('listitem')).toHaveCSS('padding', '10px 16px')
+  await page.setViewportSize({ width: 390, height: 700 })
+  await expect(list.getByRole('listitem')).toHaveCSS('max-width', '88%')
   const text = list.locator('.message-text')
   await expect(text).toHaveCSS('font-size', '14px')
   await expect(text).toHaveCSS('line-height', '24px')
@@ -142,6 +189,9 @@ test('窄屏长草稿到上限后内部滚动，输入和发送操作始终可�
   const composerBox = (await page.locator('.message-input').boundingBox())!
   expect(composerBox.x).toBeGreaterThanOrEqual(16)
   expect(composerBox.x + composerBox.width).toBeLessThanOrEqual(374)
+  const listBox = (await page.getByRole('region', { name: '消息列表' }).boundingBox())!
+  expect(listBox.x - composerBox.x).toBeCloseTo(16, 0)
+  expect(composerBox.x + composerBox.width - (listBox.x + listBox.width)).toBeCloseTo(16, 0)
   await expect(send).toBeDisabled()
   await editor.press('Enter')
   await expect(editor).not.toHaveText('')
@@ -190,17 +240,13 @@ test.describe('触屏操作', () => {
   })
 })
 
-test('正文使用随应用加载的 Noto Sans CJK SC 字体', async ({ mount, page, context }) => {
+test('中英混排正文和输入框优先使用系统字体', async ({ mount, page, context }) => {
   await mount(<ChatPageHarness messages={['中文正文 English']} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   await editor.fill('中文正文 English')
-  await editor.press('Enter')
-  const faces = await page.evaluate(async () => {
-    const loaded = await document.fonts.load('400 14px "Noto Sans CJK SC"', '中文正文 English')
-    return loaded.map(face => ({ family: face.family, status: face.status }))
-  })
-  expect(faces).toContainEqual({ family: 'Noto Sans CJK SC', status: 'loaded' })
-  await expect(page.locator('.message-text')).toHaveCSS('font-family', /Noto Sans CJK SC/)
+  await expect(editor).toHaveCSS('font-family', /^system-ui,.*Noto Sans CJK SC/)
+  await expect(page.locator('.message-text')).toHaveCSS('font-family', /^system-ui,.*Noto Sans CJK SC/)
+  await page.evaluate(() => document.fonts.ready.then(() => undefined))
 
   const session = await context.newCDPSession(page)
   await session.send('DOM.enable')
@@ -208,7 +254,10 @@ test('正文使用随应用加载的 Noto Sans CJK SC 字体', async ({ mount, p
   const { root } = await session.send('DOM.getDocument')
   const { nodeId } = await session.send('DOM.querySelector', { nodeId: root.nodeId, selector: '.message-text' })
   const { fonts } = await session.send('CSS.getPlatformFontsForNode', { nodeId })
-  expect(fonts.some(font => font.familyName === 'Noto Sans CJK SC' && font.isCustomFont && font.glyphCount > 0)).toBe(true)
+  expect(fonts.some(font => !font.isCustomFont && font.glyphCount >= 'English'.length)).toBe(true)
+  if (process.platform === 'darwin') {
+    expect(fonts.some(font => font.familyName === 'PingFang SC' && font.glyphCount > 0)).toBe(true)
+  }
   await session.detach()
 })
 
@@ -267,8 +316,9 @@ test('输入区聚焦、切换和发送后保持弱边界，按钮焦点使用�
 test('消息区键盘焦点使用固定局部标记，滚动和高对比度下仍可辨认', async ({ mount, page }) => {
   await mount(<ChatPageHarness messages={Array.from({ length: 12 }, (_, i) => `消息 ${i}：${'用于验证滚动。'.repeat(24)}`)} />)
   const list = page.getByRole('region', { name: '消息列表' })
-  const frame = page.locator('.message-list-frame')
-  await page.getByRole('heading', { name: '聊天' }).click()
+  const frame = page.locator('.chat-main-frame')
+  const scroll = page.locator('.chat-main')
+  await page.getByRole('heading', { name: '会话 1' }).click()
   await expect(frame).toHaveCount(1)
   expect(await frame.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
   await page.keyboard.press('Tab')
@@ -282,9 +332,9 @@ test('消息区键盘焦点使用固定局部标记，滚动和高对比度下�
   })
   expect(markerBefore).toMatchObject({ opacity: '1', width: '6px', height: '6px' })
   const frameBefore = await frame.boundingBox()
-  const scrollBefore = await list.evaluate(el => el.scrollTop)
+  const scrollBefore = await scroll.evaluate(el => el.scrollTop)
   await page.keyboard.press('PageDown')
-  await expect.poll(() => list.evaluate(el => el.scrollTop)).toBeGreaterThan(scrollBefore)
+  await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBeGreaterThan(scrollBefore)
   expect(await frame.boundingBox()).toEqual(frameBefore)
   expect(await frame.evaluate(el => {
     const marker = getComputedStyle(el, '::after')
@@ -402,10 +452,11 @@ test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动�
   const history = Array.from({ length: 26 }, (_, i) => `历史 ${i}：${'独立阅读位置。'.repeat(20)}`)
   await mount(<ChatPageHarness messages={history} modelConfigured />)
   const list = page.getByRole('region', { name: '消息列表' })
+  const scroll = page.locator('.chat-main')
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
-  await list.evaluate(el => { el.scrollTop = 350 })
+  await scroll.evaluate(el => { el.scrollTop = 350 })
   const oldTop = (await list.getByRole('listitem').nth(5).boundingBox())!.y
-  const scrollTop = await list.evaluate(el => el.scrollTop)
+  const scrollTop = await scroll.evaluate(el => el.scrollTop)
   await editor.fill('生成时继续编辑')
   for (const seq of [1, 2, 3]) {
     await page.evaluate(({ history, seq }) => {
@@ -415,7 +466,7 @@ test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动�
       } }))
     }, { history, seq })
     await expect(list.getByRole('listitem')).toHaveCount(27)
-    expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(scrollTop, 0)
+    expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(scrollTop, 0)
     expect((await list.getByRole('listitem').nth(5).boundingBox())!.y).toBeCloseTo(oldTop, 0)
     await expect(editor).toBeFocused()
     await expect(editor).toHaveText('生成时继续编辑')
@@ -497,6 +548,7 @@ test('侧栏不横滚，收起后保留草稿和容量，展开后可以继续�
   await reopen.press('Enter')
   await expect(sidebar.getByRole('button', { name: longName })).toHaveAttribute('aria-current', 'page')
   await sidebar.getByRole('button', { name: '会话 2' }).click()
+  await expect(page.getByRole('heading', { name: '会话 2' })).toBeVisible()
   await expect(editor).toHaveText('')
 })
 
@@ -541,6 +593,11 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   const groupB = page.getByRole('group', { name: '白榆', exact: true })
   const model = page.getByRole('combobox', { name: '模型', exact: true })
   await expect(heading).toBeVisible()
+  await expect(heading).toHaveCSS('font-family', /^"?EB Garamond/)
+  await expect(heading).toHaveCSS('font-size', '32px')
+  await expect(heading).toHaveCSS('line-height', '40px')
+  await expect(heading).toHaveCSS('font-weight', '400')
+  await expect(workspaceSelect).toHaveCSS('font-size', '14px')
   const headingBox = (await heading.boundingBox())!
   const editorBox = (await editor.boundingBox())!
   const workspaceBox = (await workspaceSelect.boundingBox())!
@@ -638,6 +695,7 @@ test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', as
   await expect(sidebarToggle).toBeFocused()
   await sidebarToggle.click()
   await settings.click()
+  await settingsDialog.getByRole('button', { name: '模型', exact: true }).click()
   await settingsDialog.getByRole('button', { name: '编辑', exact: true }).click()
   const key = settingsDialog.getByLabel('API Key')
   await key.fill('unsaved-test-key')
@@ -662,9 +720,11 @@ test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', as
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && document.documentElement.scrollHeight <= innerHeight)).toBe(true)
 })
 
-test('切换两段会话后恢复草稿的空格和换行', async ({ mount, page }) => {
-  await mount(<ChatPageHarness modelConfigured sessions={[sessionA, sessionB]} />)
+test('切换会话时从顶部阅读，并恢复草稿的空格和换行', async ({ mount, page }) => {
+  const messages = Array.from({ length: 20 }, (_, i) => `历史消息 ${i}`)
+  await mount(<ChatPageHarness messages={messages} modelConfigured sessions={[sessionA, sessionB]} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const scroll = page.locator('.chat-main')
   const a = page.getByRole('button', { name: '会话 1', exact: true })
   const b = page.getByRole('button', { name: '会话 2', exact: true })
   const text = '  先跑测试\n再整理结果  '
@@ -672,8 +732,10 @@ test('切换两段会话后恢复草稿的空格和换行', async ({ mount, page
   await a.click()
   await editor.fill(text)
   await expect.poll(() => page.evaluate(key => localStorage.getItem(key), draftKey(sessionA.id))).toBe(text)
+  expect(await scroll.evaluate(el => (el.scrollTop = 350, el.scrollTop))).toBeGreaterThan(0)
   await b.click()
   await expect(editor).toHaveText('')
+  expect(await scroll.evaluate(el => el.scrollTop)).toBe(0)
   await editor.fill('检查 README')
   await a.click()
   await expect.poll(readDraft).toBe(text)
@@ -716,7 +778,7 @@ test('02 首发保存被拒绝时保留草稿，顶部提示三秒后消失', as
   await editor.fill('读取 README.md')
   await page.getByRole('button', { name: '发送', exact: true }).click()
   const notice = page.locator('.save-notice')
-  await expect(notice).toHaveText('磁盘空间不足，未保存')
+  await expect(notice).toHaveText('会话保存失败 · 磁盘空间不足，未保存')
   expect((await notice.boundingBox())?.y).toBeLessThan(24)
   await expect(editor).toHaveText('读取 README.md')
   await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)

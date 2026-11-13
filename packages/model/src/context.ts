@@ -4,6 +4,7 @@ import { transformMessages } from '@earendil-works/pi-ai/api/transform-messages'
 import { piModels } from './catalog.js'
 import type { Api, AssistantMessage as PiMessage, Context, Model } from '@earendil-works/pi-ai'
 import type { ContextEstimate, ModelContext, ModelMessage, ModelInfo, ToolCall } from './types.js'
+import { omittedToolImageIndexes } from './request-images.js'
 
 const emptyUsage: PiMessage['usage'] = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -14,14 +15,25 @@ export function toPiContext(context: ModelContext, target?: Model<Api>): Context
   // Gemini 4 rejects foreign tool records without a native thought signature.
   const gemini4 = target?.api === 'google-generative-ai' && target.id.startsWith('gemini-4-')
   const foreignToolIds = new Set<string>()
+  const omittedImages = omittedToolImageIndexes(context)
   return {
     ...context,
-    messages: context.messages.map(message => {
-      if (gemini4 && message.role === 'toolResult' && foreignToolIds.delete(message.toolCallId)) {
-        return {
-          role: 'user', timestamp: message.timestamp,
-          content: `Previous tool ${message.toolName} (${message.toolCallId}) ${message.isError ? 'failed' : 'returned'}:\n${message.content.map(block => block.text).join('\n')}`,
+    messages: context.messages.map((message, index) => {
+      if (message.role === 'toolResult') {
+        const content = omittedImages.has(index) ? [
+          ...message.content.filter(block => block.type === 'text'),
+          { type: 'text' as const, text: '[图片因请求预算已省略。]' },
+        ] : message.content
+        if (gemini4 && foreignToolIds.delete(message.toolCallId)) {
+          return {
+            role: 'user', timestamp: message.timestamp,
+            content: [
+              { type: 'text', text: `Previous tool ${message.toolName} (${message.toolCallId}) ${message.isError ? 'failed' : 'returned'}:` },
+              ...content,
+            ],
+          }
         }
+        return { ...message, content }
       }
       if (message.role !== 'assistant') return message
       const { usage, ...history } = message
@@ -55,6 +67,8 @@ export function convertMessages(context: ModelContext, includeThinking = Boolean
   const received = new Set<string>()
   const wireIds = new Map<string, string>()
   const heldSystems: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = []
+  const omittedImages = omittedToolImageIndexes(context)
+  let attachments: OpenAI.Chat.Completions.ChatCompletionContentPart[] = []
   const closeTools = () => {
     for (const call of pending) {
       if (repairTools && !received.has(call.id)) messages.push({ role: 'tool', tool_call_id: wireIds.get(call.id) ?? call.id, content: 'No result provided' })
@@ -62,10 +76,13 @@ export function convertMessages(context: ModelContext, includeThinking = Boolean
     pending = []
     received.clear()
     wireIds.clear()
+    // Attach images after every tool call in the batch has its paired result.
+    if (attachments.length) messages.push({ role: 'user', content: attachments })
+    attachments = []
     messages.push(...heldSystems)
     heldSystems.length = 0
   }
-  for (const message of context.messages) {
+  for (const [index, message] of context.messages.entries()) {
     if (message.role === 'assistant' || message.role === 'user') closeTools()
     if (message.role === 'system' || message.role === 'user') {
       const content = typeof message.content === 'string' ? message.content : message.content.map((block) => block.text).join('')
@@ -73,7 +90,17 @@ export function convertMessages(context: ModelContext, includeThinking = Boolean
       else messages.push({ role: message.role, content })
     } else if (message.role === 'toolResult') {
       received.add(message.toolCallId)
-      messages.push({ role: 'tool', tool_call_id: wireIds.get(message.toolCallId) ?? message.toolCallId, content: message.content.map((block) => block.text).join('') })
+      const text = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
+      const omitted = omittedImages.has(index)
+      const attached = omitted ? [] : message.content.filter(block => block.type === 'image')
+      const content = omitted ? `${text}\n[图片因请求预算已省略。]`.trimStart() : text
+      messages.push({ role: 'tool', tool_call_id: wireIds.get(message.toolCallId) ?? message.toolCallId, content })
+      if (attached.length) {
+        attachments.push({ type: 'text', text: `工具 ${message.toolName}（${message.toolCallId}）返回的图片。${text}` })
+        for (const block of attached) {
+          attachments.push({ type: 'image_url', image_url: { url: `data:${block.mimeType};base64,${block.data}` } })
+        }
+      }
     } else {
       const text = message.content.filter((block) => block.type === 'text').map((block) => block.text).join('')
       const tools = message.content.filter((block) => block.type === 'toolCall')
@@ -115,12 +142,26 @@ function estimateSerialized(value: unknown): number {
   return 4 + Math.ceil(JSON.stringify(value).length / 4)
 }
 
+function estimateVisibleMessage(message: OpenAI.Chat.Completions.ChatCompletionMessageParam): number {
+  if (message.role !== 'user' || !Array.isArray(message.content)) return estimateSerialized(message)
+  const text = message.content.filter(block => block.type === 'text')
+  // DeepSeek Flash uses at most 1024 tokens per image based on its dimensions.
+  return estimateSerialized({ ...message, content: text }) + (message.content.length - text.length) * 1024
+}
+
 function targetModel(model?: ModelInfo) {
   return model && !(model.provider === 'deepseek' && model.id === 'deepseek-flash')
     ? piModels.getModel(model.provider, model.id) : undefined
 }
 
 function estimatePiMessage(message: ReturnType<typeof toPiContext>['messages'][number]): number {
+  if (message.role === 'toolResult' || message.role === 'user' && Array.isArray(message.content)) {
+    const content = message.content
+    if (typeof content !== 'string') {
+      const text = content.filter(block => block.type !== 'image')
+      return estimateSerialized({ ...message, content: text }) + (content.length - text.length) * 1024
+    }
+  }
   if (message.role !== 'assistant') return estimateSerialized(message)
   return estimateSerialized({ role: message.role, content: message.content })
 }
@@ -129,7 +170,7 @@ export function estimateMessageTokens(message: ModelMessage, includeThinking: bo
   const target = targetModel(model)
   if (target) return transformMessages(toPiContext({ messages: [message] }, target).messages, target).reduce((sum, entry) => sum + estimatePiMessage(entry), 0)
   return convertMessages({ messages: [message] }, includeThinking && model?.defaultReasoningEffort !== 'off', false, model)
-    .reduce((tokens, visible) => tokens + estimateSerialized(visible), 0)
+    .reduce((tokens, visible) => tokens + estimateVisibleMessage(visible), 0)
 }
 
 export function estimateContextTokens(context: ModelContext, model?: ModelInfo): ContextEstimate {
@@ -150,7 +191,7 @@ export function estimateContextTokens(context: ModelContext, model?: ModelInfo):
   let messageTokens = 0
   for (const [index, message] of messages.entries()) {
     if (index === lastSystem) systemTokens += estimateSerialized(message)
-    else messageTokens += estimateSerialized(message)
+    else messageTokens += estimateVisibleMessage(message)
   }
   const tools = convertTools(context.tools)
   return { systemTokens, toolsTokens: tools.length ? estimateSerialized(tools) : 0, messageTokens }

@@ -73,7 +73,7 @@ export class Agent {
           signal.throwIfAborted()
           const truncated = response.stopReason === 'length'
           if (!truncated) this.emit({ type: 'tool_start', contentIndex })
-          let text: string
+          let output: string | ToolResultMessage['content']
           let isError = false
           let errorCode: string | undefined
           const details: unknown[] = []
@@ -84,15 +84,15 @@ export class Agent {
             const tool = tools.find(({ name }) => name === call.name)
             if (!tool) throw new Error(`未知工具：${call.name}`)
             executed = true
-            text = await tool.execute(call.arguments, { signal, recordDetails: detail => { details.push(detail) } })
+            output = await tool.execute(call.arguments, { signal, recordDetails: detail => { details.push(detail) } })
           } catch (error) {
             isError = true
-            text = error instanceof Error ? error.message : '工具执行失败。'
+            output = error instanceof Error ? error.message : '工具执行失败。'
             if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string') errorCode = error.code
           }
           const result: ToolResultMessage = {
             role: 'toolResult', toolCallId: call.id, toolName: call.name,
-            content: [{ type: 'text', text }], isError, timestamp: Date.now(),
+            content: typeof output === 'string' ? [{ type: 'text', text: output }] : output, isError, timestamp: Date.now(),
           }
           return { type: 'tool_result' as const, contentIndex, result, details, executed, ...(errorCode && { errorCode }) }
         }
