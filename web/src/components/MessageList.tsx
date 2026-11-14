@@ -1,23 +1,27 @@
 import { NoticeText } from '../i18n/messages'
 import { useTranslation } from 'react-i18next'
+import { useRef } from 'react'
 import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
 import { effortLabel } from './ModelPicker'
 import { SaveFailureNotice } from './SaveFailureNotice'
+import { QuoteSelection } from './QuoteSelection'
 
 type MessageRow =
   | { type: 'user'; id: string; text: string; local?: LocalSubmission }
   | { type: 'assistant'; id: string; userId: string; messages: AssistantEntry[] }
 
-export function MessageList({ messages, activeContent = [], running = null, runs = [], saveFailures = [] }: {
+export function MessageList({ messages, activeContent = [], running = null, runs = [], saveFailures = [], onQuote }: {
   messages: readonly (ConversationMessage | LocalSubmission)[]
   activeContent?: readonly ActiveContent[]
   running?: RunningState
   runs?: readonly RunRecord[]
   saveFailures?: readonly SaveFailure[]
+  onQuote?: (text: string) => void
 }) {
   const { t } = useTranslation()
+  const list = useRef<HTMLElement>(null)
   const rows: MessageRow[] = []
   const toolResults = new Map<string, Map<number, ConversationMessage>>()
   const taskRuns = new Map(runs.filter(run => run.kind === 'task').map(run => [run.id, run]))
@@ -46,7 +50,7 @@ export function MessageList({ messages, activeContent = [], running = null, runs
   const shown = new Set<string>()
 
   return (
-    <section className="message-list" role="region" aria-label={t('chat.messages')} tabIndex={0}>
+    <section ref={list} className="message-list" role="region" aria-label={t('chat.messages')} tabIndex={0}>
         <ol className="message-items">
           {rows.flatMap(row => row.type === 'user' && taskRuns.has(row.id) && !answered.has(row.id)
             ? [row, { type: 'assistant' as const, id: `pending:${row.id}`, userId: row.id, messages: [] }]
@@ -74,6 +78,7 @@ export function MessageList({ messages, activeContent = [], running = null, runs
             {endsTurn && failure && <SaveFailureNotice failure={failure} />}
           </li>})}
         </ol>
+        {onQuote && <QuoteSelection list={list} onQuote={onQuote} />}
     </section>
   )
 }

@@ -1,9 +1,10 @@
 import { useTranslation } from 'react-i18next'
 import { NoticeText } from '../i18n/messages'
-import { useState, type ReactNode } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
 import type { AssistantMessage as Message, ToolCall } from '@agent-learning/model'
 import { MarkdownText } from './markdown/MarkdownText'
+import { CopyMarkdownButton } from './markdown/CopyMarkdownButton'
 import { RunStatus } from './RunStatus'
 
 export type AssistantEntry = { id: string; message: Message }
@@ -90,8 +91,10 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
   saveFailure?: SaveFailure
 }) {
   const { t } = useTranslation()
+  const response = useRef<HTMLDivElement>(null)
   const terminal = [...messages].reverse().find(entry => entry.message.stopReason === 'aborted' || entry.message.stopReason === 'error')?.message
   const rows: ReactNode[] = []
+  const reply: string[] = []
   let process: ReactNode[] = []
   let processKey = ''
   let activityRun = run
@@ -108,8 +111,9 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
       const active = activeContent.find(item => item.messageId === id && item.contentIndex === index)
       if (block.type === 'text') {
         if (!block.text) return
+        reply.push(block.text)
         flushProcess()
-        rows.push(<MarkdownText key={key} text={block.text} streaming={active?.type === 'text'} />)
+        rows.push(<MarkdownText key={key} text={block.text} streaming={active?.type === 'text'} response />)
         return
       }
       if (block.type === 'thinking' && !block.thinking) return
@@ -141,8 +145,13 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
     }
   }
   flushProcess()
-  return <div className="assistant-message">
+  const markdown = reply.join('\n\n')
+  return <div className="assistant-message" ref={response}>
     {activityRun && <p className="run-status-line"><RunStatus run={activityRun} /></p>}
     {rows}
+    {!running && markdown.trim() && <div className="response-actions">
+      <CopyMarkdownButton label={t('markdown.copyResponse')} markdown={markdown}
+        getElements={() => response.current?.querySelectorAll(':scope > [data-response-text]') ?? []} />
+    </div>}
   </div>
 }

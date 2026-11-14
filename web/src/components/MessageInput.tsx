@@ -1,6 +1,6 @@
 import { useTranslation } from 'react-i18next'
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowUpIcon, SquareIcon } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type ReactNode, type Ref } from 'react'
+import { ArrowUpIcon, QuoteIcon, SquareIcon, XIcon } from 'lucide-react'
 import { LexicalComposer } from '@lexical/react/LexicalComposer'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
 import { ContentEditable } from '@lexical/react/LexicalContentEditable'
@@ -39,6 +39,9 @@ type MessageInputProps = {
   commandsEnabled?: boolean
   draft?: { text: string }
   onDraftChange?: (text: string) => void
+  editorRef?: Ref<HTMLDivElement>
+  quote?: string
+  onRemoveQuote?: () => void
 }
 
 const initialConfig = {
@@ -71,7 +74,7 @@ export function MessageInput(props: MessageInputProps) {
   )
 }
 
-function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, footerControl, commandsEnabled = true, draft, onDraftChange }: MessageInputProps) {
+function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, footerControl, commandsEnabled = true, draft, onDraftChange, editorRef, quote, onRemoveQuote }: MessageInputProps) {
   const { t } = useTranslation()
   const [editor] = useLexicalComposerContext()
   const [canSend, setCanSend] = useState(Boolean(draft?.text.trim()))
@@ -228,6 +231,14 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
 
   return (
     <div className="message-input">
+      {quote && <div className="composer-quote" role="group" aria-label={t('chat.quotedText')}>
+        <QuoteIcon aria-hidden="true" />
+        <div className="composer-quote-text">{quote}</div>
+        <Button type="button" variant="ghost" size="icon-sm" aria-label={t('chat.removeQuote')} title={t('chat.removeQuote')} onClick={() => {
+          onRemoveQuote?.()
+          editor.getRootElement()?.focus({ preventScroll: true })
+        }}><XIcon aria-hidden="true" /></Button>
+      </div>}
       {menuOpen && <div className="command-menu" role="listbox" aria-label={t('chat.commands')} id="compact-menu">
         <div className="command-menu-label">{t('chat.commands')}</div>
         <Button variant="ghost" type="button" role="option" aria-selected="true" id="compact-option" onMouseDown={event => event.preventDefault()} onClick={complete}>
@@ -237,6 +248,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       <PlainTextPlugin
         contentEditable={
           <ContentEditable
+            ref={editorRef}
             className="message-editor"
             role="textbox"
             aria-label={t('chat.message')}
