@@ -33,7 +33,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(page.locator('html')).toHaveAttribute('lang', 'en')
       expect(await readFile(filename, 'utf8')).toBe(JSON.stringify(old))
       await page.getByRole('button', { name: 'Settings', exact: true }).click()
-      await expect(page.getByRole('button', { name: 'General', exact: true })).toHaveAttribute('aria-current', 'page')
+      await expect(page.getByRole('button', { name: 'General', exact: true })).toHaveAttribute('aria-current', 'true')
       const select = page.getByRole('combobox', { name: 'Language' })
       await expect(select).toHaveText('English')
       await select.press('Enter')

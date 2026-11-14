@@ -17,14 +17,14 @@ export function CodeBlock({ code, language }: { code: string; language?: string 
   }
 
   return <div className="markdown-code">
-    <div className="markdown-code-header">
+    <div className="markdown-code-header" data-copy-exclude>
       <span>{language}</span>
       <Button type="button" variant="ghost" size="sm" onClick={() => { void copy() }}>
         {t(result === true ? 'markdown.copied' : 'markdown.copy')}
       </Button>
       <span className="sr-only" role="status">{result === true ? t('markdown.copied') : ''}</span>
     </div>
-    {result === false && <div className="markdown-copy-error configuration-error" role="alert">{t('markdown.copyFailed')}</div>}
+    {result === false && <div className="markdown-copy-error configuration-error" role="alert" data-copy-exclude>{t('markdown.copyFailed')}</div>}
     <pre><code>{code}</code></pre>
   </div>
 }

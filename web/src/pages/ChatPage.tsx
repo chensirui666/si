@@ -134,6 +134,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const [settingsOpen, setSettingsOpen] = useState(false)
   const settingsButton = useRef<HTMLButtonElement>(null)
   const sidebarButton = useRef<HTMLButtonElement>(null)
+  const editor = useRef<HTMLDivElement>(null)
+  const [quotes, setQuotes] = useState<Record<string, string | symbol | undefined>>({})
+  const pendingQuote = sessionId === null ? undefined : quotes[sessionId]
+  const quote = typeof pendingQuote === 'string' ? pendingQuote : undefined
   const { draft, storageUnavailable, load: loadDraft, save: saveDraft, restore: restoreDraft, read: readStorage, write: writeStorage, revision: draftRevision, clearSent: clearSentDraft } = useDrafts()
   const session = sessions?.find(item => item.id === sessionId)
   const workspace = workspaces?.workspaces.find(item => item.id === session?.workspaceId)
@@ -406,18 +410,24 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     }
     if (!canSubmit()) return false
     setSelectionError(undefined)
-    const input: SubmitMessageRequest = { clientMessageId: crypto.randomUUID(), ...selection, sessionId, text }
+    const quotedText = quote && quote.split(/\r\n|\n|\r/).map(line => `> ${line}`).join('\n')
+    const input: SubmitMessageRequest = {
+      clientMessageId: crypto.randomUUID(), ...selection, sessionId,
+      text: quotedText ? `${quotedText}\n\n${text}` : text,
+    }
     const clearedRevision = draftRevision(sessionId) + 1
     const syncTarget = () => {
       if (selected.current === sessionId) subscription.current?.requestSnapshot?.()
     }
-    const local: LocalSubmission = { ...input, kind: text.trim() === '/compact' ? 'compaction' : 'message', state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
+    const local: LocalSubmission = { ...input, kind: input.text.trim() === '/compact' ? 'compaction' : 'message', state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
     // 同步写门禁，React 渲染前的第二次发送手势也会被拦住。
     const previous = submissionsRef.current
     submissionsRef.current = [...previous, local]
     let request: Promise<SubmitMessageAccepted>
     try { request = submitMessage(input) }
     catch { submissionsRef.current = previous; return false }
+    const quoteSent = quote ? Symbol() : undefined
+    if (quoteSent) setQuotes(current => ({ ...current, [sessionId]: quoteSent }))
     updateSubmissions(submissionsRef.current)
     const timer = setTimeout(() => {
       timers.current.delete(timer)
@@ -438,6 +448,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       const local = submissionsRef.current.find(item => item.clientMessageId === input.clientMessageId)
       if (!local || local.accepted) return
       const restored = rejected && restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId, selectionChanged)
+      if (restored && quoteSent) setQuotes(current => current[sessionId] === quoteSent ? { ...current, [sessionId]: quote } : current)
       if (saveRejected || selectionChanged && restored) {
         updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== input.clientMessageId))
       } else updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: selectionChanged ? undefined : message }))
@@ -449,7 +460,16 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         void refreshWorkspaces()
         if (error.status === 404) void refreshSessions()
       } else syncTarget()
-    }).finally(() => { clearTimeout(timer); timers.current.delete(timer) })
+    }).finally(() => {
+      clearTimeout(timer)
+      timers.current.delete(timer)
+      if (quoteSent && mounted.current) setQuotes(current => {
+        if (current[sessionId] !== quoteSent) return current
+        const next = { ...current }
+        delete next[sessionId]
+        return next
+      })
+    })
     return true
   }
 
@@ -554,7 +574,11 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       </header>}
       <div className="chat-main-frame">
       <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
-        {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures} />}
+        {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
+          onQuote={text => {
+            setQuotes(current => ({ ...current, [sessionId]: text }))
+            editor.current?.focus({ preventScroll: true })
+          }} />}
         <div className="composer-stack">
           {!isNew && showToBottom && <Button type="button" className="chat-to-bottom" variant="outline" size="icon"
             aria-label={t('chat.toBottom')} title={t('chat.toBottom')} onClick={scrollToBottom}>
@@ -593,7 +617,13 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">{activeAbort.error ? t('chat.abortUnconfirmedDetail', { detail: noticeSummary(t, activeAbort.error) }) : t('chat.abortUnconfirmed')}{activeAbort.error?.detail && <> · <span>{activeAbort.error.detail}</span></>}</p>}
           {storageUnavailable && <p className="configuration-error" role="alert">{t('chat.draftStorageUnavailable')}</p>}
           <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
-          <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={modelSelect} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
+          <MessageInput key={sessionId ?? newSessionDraft} editorRef={editor} draft={draft} onDraftChange={saveCurrentDraft}
+            quote={quote} onRemoveQuote={sessionId === null ? undefined : () => setQuotes(current => {
+              const next = { ...current }
+              delete next[sessionId]
+              return next
+            })}
+            contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={modelSelect} commandsEnabled={!isNew && !quote} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
       </div>

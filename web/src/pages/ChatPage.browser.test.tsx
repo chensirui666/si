@@ -372,6 +372,53 @@ test('浅色按钮以背景反馈悬停和按下，键盘焦点不叠加外圈',
   }
 })
 
+test('选中回复可引用追问，保留草稿并通过现有消息接口发送', async ({ mount, page }) => {
+  let sentText: string | undefined
+  await page.route('**/api/messages', async route => {
+    const input = route.request().postDataJSON()
+    sentText = input.text
+    await route.fulfill({ status: 409, json: { code: 'save_rejected', error: '磁盘错误' } })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  await expect(page.getByRole('heading', { name: '会话 1' })).toBeVisible()
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null,
+      snapshot: { seq: 1, messages: [
+        { id: 'user', message: { role: 'user', content: '说明方案', timestamp: 1 } },
+        { id: 'answer', message: { role: 'assistant', content: [{ type: 'text', text: '从 **服务端确认开始** 后记录耗时。' }], api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 2, stopReason: 'stop' } },
+      ], running: null, compactions: [], contextUsage: null, activeContent: [] },
+    } }))
+  })
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.fill('  为什么？  ')
+  const quote = page.getByRole('button', { name: '引用追问' })
+  const select = async () => {
+    await page.locator('.assistant-message strong').evaluate(element => {
+      const range = document.createRange()
+      range.selectNodeContents(element)
+      const selection = window.getSelection()!
+      selection.removeAllRanges()
+      selection.addRange(range)
+    })
+    await quote.click()
+  }
+  await select()
+  const remove = page.getByRole('button', { name: '移除引用' })
+  await expect(remove).toBeVisible()
+  await expect(editor).toBeFocused()
+  expect(await editor.textContent()).toBe('  为什么？  ')
+  expect(sentText).toBeUndefined()
+  await remove.click()
+  await expect(remove).toHaveCount(0)
+  expect(await editor.textContent()).toBe('  为什么？  ')
+  await select()
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  await expect.poll(() => sentText).toBe('> 服务端确认开始\n\n  为什么？  ')
+  await expect(editor).toHaveText('为什么？')
+  await expect(remove).toBeVisible()
+})
+
 test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到与迟到拒绝不覆盖新草稿', async ({ mount, page }) => {
   let request: { clientMessageId: string; modelId: string; text: string } | undefined
   let release: () => Promise<void> = async () => {}

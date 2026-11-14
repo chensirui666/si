@@ -138,13 +138,14 @@ export async function saveKey(page: Page, key: string) {
     await dialog.getByRole('button', { name: '编辑', exact: true }).click()
   } else {
     await dialog.getByRole('button', { name: '添加提供方', exact: true }).click()
-    await dialog.getByRole('button', { name: 'DeepSeek', exact: true }).click()
+    await dialog.getByRole('combobox', { name: '提供方', exact: true }).click()
+    await page.getByRole('option', { name: 'DeepSeek', exact: true }).click()
   }
   try { await dialog.getByLabel('API Key', { exact: true }).fill(key) }
   catch { throw new Error('API Key 输入失败，内容已省略') }
   await dialog.getByRole('button', { name: '保存', exact: true }).click()
   await expect(dialog).toContainText('已保存在本机')
-  await expect(dialog.getByLabel('API Key', { exact: true })).toHaveValue('')
+  await expect(dialog.getByLabel('API Key', { exact: true })).toHaveCount(0)
   await page.keyboard.press('Escape')
   await expect(dialog).not.toBeVisible()
   await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('DeepSeek Flash')
