@@ -112,7 +112,7 @@ test('真实 DeepSeek 从原图读取并准确抄出缩图中的三段小字', a
   const modelRequests: { model: string; messages: Message[] }[] = []
   const server = new WebServer({
     port: 0, sessionPath, directoryPicker: async () => cwd,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
@@ -268,7 +268,7 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
   const modelRequests: { messages: { role: string; tool_calls?: { id: string }[]; tool_call_id?: string; content?: string }[]; tools?: unknown[] }[] = []
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
@@ -320,7 +320,7 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
   const requests: { messages: { role: string; content?: string; tool_calls?: { id: string; function: { name: string; arguments: string } }[]; tool_call_id?: string }[]; tools?: unknown[] }[] = []
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => { requests.push(JSON.parse(String(init?.body))); return globalThis.fetch(url, init) } },
@@ -375,7 +375,7 @@ test('里程碑 2 权限 14：真实 DeepSeek 从网页用只读工具列目录�
   const cwd = join(temporary, 'workspace')
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
   })

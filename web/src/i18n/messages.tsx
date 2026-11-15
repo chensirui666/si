@@ -1,7 +1,16 @@
+import type { SkillSource } from '@agent-learning/server/protocol'
 import type { TFunction } from 'i18next'
 import { useTranslation } from 'react-i18next'
 import { i18n } from './copy'
 import type { CopyKey } from './en'
+
+export const skillSourceKey = {
+  'project-si': 'chat.skillProject',
+  'project-agents': 'chat.skillProject',
+  'user-si': 'chat.skillPersonal',
+  'user-agents': 'chat.skillPersonal',
+  bundled: 'chat.skillBundled',
+} as const satisfies Record<SkillSource, CopyKey>
 
 export type Notice = { key: CopyKey; detail?: string; label?: CopyKey; status?: number }
 

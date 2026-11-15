@@ -1,9 +1,9 @@
 import type { ModelDiscovery } from '@agent-learning/model'
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import type { WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
-import { applyFrame, initialState, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
+import { applyFrame, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
 export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged) => {
   let state: ChatState = initialState
@@ -209,6 +209,15 @@ async function requestView<T>(path: string, label: CopyKey, validate: (value: un
   }
   if (!validate(value)) throw new RequestError({ key: 'request.invalid', label })
   return value
+}
+
+export function getWorkspaceSkills(workspaceId: string, signal: AbortSignal) {
+  return requestView(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills`, 'chat.skills',
+    (value): value is WorkspaceSkills => record(value) && typeof value.complete === 'boolean'
+      && Array.isArray(value.skills) && value.skills.every(skill => record(skill)
+        && typeof skill.name === 'string' && typeof skill.description === 'string'
+        && isSkillSource(skill.source) && typeof skill.disableModelInvocation === 'boolean'),
+    { signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) })
 }
 
 const putJson = (value: unknown): RequestInit => ({ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })

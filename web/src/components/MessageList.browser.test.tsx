@@ -229,3 +229,31 @@ test('12 流式回答仍可读，轮末提示未保存', async ({ mount }) => {
   await expect(component.getByText('启动命令已核对', { exact: true })).toBeVisible()
   await expect(component.getByRole('alert')).toContainText('回答已生成，但未保存')
 })
+
+test('Skill 读取失败时显示原因，并保留提交原文', async ({ mount }) => {
+  const text = '/skill:review 请复核修改';
+  const component = await mount(<MessageList messages={[{
+    id: 'failed-skill',
+    message: { role: 'user', content: text, timestamp: 1 },
+    skillInvocation: { source: 'project-si', name: 'review', status: 'failed', reason: '说明文件已移走或删除。' },
+  }]} />);
+  await expect(component.locator('.message-text')).toHaveText(text);
+  await expect(component.locator('[data-skill-status="failed"]')).toHaveText('读取 review 失败：说明文件已移走或删除。 · 项目');
+});
+
+test('加载记录分别标明预置版和个人版', async ({ mount }) => {
+  const component = await mount(<MessageList messages={[
+    {
+      id: 'bundled-version',
+      message: { role: 'user', content: '/skill:grill-me', timestamp: 1 },
+      skillInvocation: { source: 'bundled', name: 'grill-me', status: 'loaded' },
+    },
+    {
+      id: 'personal-version',
+      message: { role: 'user', content: '/skill:grill-me', timestamp: 2 },
+      skillInvocation: { source: 'user-si', name: 'grill-me', status: 'loaded' },
+    },
+  ]} />);
+  await expect(component.locator('[data-skill-status="loaded"]'))
+    .toHaveText(['已加载 grill-me · 预置', '已加载 grill-me · 个人']);
+});

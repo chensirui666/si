@@ -169,3 +169,17 @@ describe('summary context', () => {
     expect(rendered).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u)
   })
 })
+
+it('uses the saved Skill body for history, summary, and the recent-token budget', () => {
+  const invocation: ConversationMessage = {
+    ...user('skill', '/skill:review\nInspect this'),
+    skillInvocation: { name: 'review', source: 'project-si', status: 'loaded', body: 'CHECK-FILE '.repeat(300), directory: '/workspace/review' },
+  }
+  const entries = [user('old', 'original task'), invocation, user('last', 'finish')]
+  expect(serialized(buildModelHistory(entries, undefined, true))).toContain('CHECK-FILE')
+  expect(serialized(buildModelHistory(entries))).toContain('Inspect this')
+  expect(ready(prepareCompaction(entries, undefined, 300, false)).firstKeptMessageId).toBe('skill')
+  const toSummarize = ready(prepareCompaction(entries, undefined, 1, false))
+  expect(serialized(createSummaryContext(toSummarize).messages)).toContain('CHECK-FILE')
+  expect(invocation.message.content).toBe('/skill:review\nInspect this')
+})

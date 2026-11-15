@@ -8,7 +8,7 @@
 
 [AgentSession](../../packages/coding-agent/src/agent-session.ts) 在每轮普通模型请求前读取适用的项目说明，再调用 [buildSystemPrompt](../../packages/coding-agent/src/system-prompt.ts) 组装提示词。[convertMessages](../../packages/model/src/context.ts) 将结果放入 DeepSeek 请求的第一条 `system` 消息。工具定义和本轮聊天历史各自加入请求。
 
-说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。下面是使用八种工具且没有项目说明时的原文。摘要请求使用独立的摘要提示词。
+说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。有 read 工具时，模型可自动调用的 Skill 摘要放在 <available_skills> 中，正文按需读取。下面是使用全部工具且没有项目说明或 Skill 摘要时的原文。摘要请求使用独立的摘要提示词。
 
 展开 `this.configuration` 后，请求数据如下。
 
@@ -52,10 +52,12 @@ const context: ModelContext = {
 </rules>
 
 <docs>
-si 文档（仅当用户询问 si 本身时阅读）
+SI 文档（用户询问 SI 本身，或要求创建、修改 Skill 时查阅）
 - 主文档：{{siRoot}}/README.md
-- 查阅 si 文档时，从 si 自身的目录定位文档。文档里的相对链接以该文档所在目录为起点。
-- 用户询问启动、模型配置、工作区、网页工具、中止或对话压缩时，查阅主文档。询问页面操作或开发校验时，查阅 {{siRoot}}/web/README.md。
+- 补充文档位于 {{siRoot}}/docs。
+- 从 SI 应用目录定位文档。文档里的相对链接以该文档所在目录为起点。
+- 启动、模型配置、工作区、网页工具、中止和对话压缩见主文档。页面操作和开发校验见 {{siRoot}}/web/README.md。Skill 规则见 {{siRoot}}/docs/skills.md。
+- 创建或修改 Skill 前，先用 read 完整阅读 Skill 规则文档，并查阅其中与本次任务有关的引用。个人 Skill 目录是 "{{home}}/.si/skills"。
 </docs>
 
 <cwd>

@@ -55,7 +55,7 @@ async function setup(temporary: string, capture: boolean) {
   let lastMoonshotRequest = 0
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
-    globalContextDirectory: join(temporary, 'global'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     compaction: { triggerTokens: 100_000, keepRecentTokens: 60 },

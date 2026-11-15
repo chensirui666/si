@@ -3,6 +3,7 @@
 这里存放项目规范、已定稿的设计、验收记录和运行时提示词。里程碑、待确认的方案、验收标准和实施计划见[项目规划](../planning/README.md)。
 
 - [开发指南](development.md)
+- [Skill 使用与编写规则](skills.md)
 - [交流与讲解约定](communication.md)
 - [视觉设计规范](design.md)
 - [设计妥协记录](设计妥协记录.md)

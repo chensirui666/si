@@ -18,3 +18,4 @@ export type {
 export { SessionStore, SessionReadError, SessionWriteError, type SessionPersistence } from './session-store.js'
 export { isPermissionMode, type PermissionMode } from './permissions.js'
 export type { RunRecord, SaveFailure } from './types.js'
+export { discoverSkills, type SkillSummary, type SkillInvocation, type SkillSource } from './skills.js'

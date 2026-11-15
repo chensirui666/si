@@ -16,7 +16,7 @@ const directory = '/tmp/project'
 const input = { clientMessageId: 'draft', modelId: 'deepseek-flash', text: 'u'.repeat(1600) }
 function createSession({ tools, ...options }: Omit<ConstructorParameters<typeof AgentSession>[0], 'resolveDirectory' | 'tools'>
   & { tools?: ExecutableTool[] }) {
-  return new AgentSession({ ...options, resolveDirectory: async () => directory, tools: () => tools ?? [] })
+  return new AgentSession({ skillHome: directory, ...options, resolveDirectory: async () => directory, tools: () => tools ?? [] })
 }
 const reply = (text = 'a'.repeat(1600), extra: Partial<AssistantMessage> = {}): AssistantMessage => ({
   role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1,
@@ -103,7 +103,7 @@ describe('AgentSession compaction', () => {
     let runId: string
     let stopped: Promise<boolean> | undefined
     const path = join(project, 'note.txt')
-    const agent = new AgentSession({
+    const agent = new AgentSession({ skillHome: directory,
       resolveDirectory: async () => project,
       compaction: { triggerTokens: 10000, keepRecentTokens: 100 },
       tools: cwd => {
@@ -530,7 +530,7 @@ describe('项目说明与压缩', () => {
   it('手动摘要只整理聊天，下一条普通请求仍有说明和摘要', async () => {
     await projectFixture(async cwd => {
       const contexts: ModelContext[] = []
-      const agent = new AgentSession({
+      const agent = new AgentSession({ skillHome: directory,
         resolveDirectory: async () => cwd, tools: () => [tool],
         compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
         stream: (_m, context) => { contexts.push(context); return output(context.tools ? reply() : reply('旧任务摘要')) },
@@ -557,7 +557,7 @@ describe('项目说明与压缩', () => {
     await projectFixture(async (cwd, path) => {
       const contexts: ModelContext[] = []
       const triggerTokens = 3000
-      const agent = new AgentSession({
+      const agent = new AgentSession({ skillHome: directory,
         resolveDirectory: async () => cwd, tools: () => [tool],
         compaction: { triggerTokens, keepRecentTokens: 100 },
         stream: (_m, context) => { contexts.push(context); return output(context.tools ? reply() : reply('已整理的旧聊天')) },
@@ -587,7 +587,7 @@ describe('项目说明与压缩', () => {
       const next = { provider: 'moonshotai-cn', modelId: 'kimi-k3', reasoningEffort: 'low' } as const
       let running = false, calls = 0
       const execute = vi.fn(async () => '已完成的工具结果')
-      const agent = new AgentSession({
+      const agent = new AgentSession({ skillHome: directory,
         resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }],
         compaction: { triggerTokens: 10_000, keepRecentTokens: 100 },
         stream: (model, context, options) => {
@@ -631,7 +631,7 @@ describe('项目说明与压缩', () => {
         return '已修改说明'
       })
       const stream = vi.fn(() => output(reply('', { stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'kept', name: 'read', arguments: {} }] })))
-      const agent = new AgentSession({ resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }], stream })
+      const agent = new AgentSession({ skillHome: directory, resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }], stream })
       await agent.submit({ ...input, text: '更新项目说明' }); await idle(agent)
       expect(stream).toHaveBeenCalledTimes(1)
       expect(execute).toHaveBeenCalledTimes(1)

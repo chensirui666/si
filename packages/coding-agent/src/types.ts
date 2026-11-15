@@ -1,5 +1,6 @@
 import type { AssistantMessage, ModelMessage, ModelUsage, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
 
+import type { SkillInvocation } from './skills.js'
 import type { PermissionMode } from './permissions.js'
 
 type ToolLocation = {
@@ -13,6 +14,7 @@ export type ConversationMessage = {
   toolCall?: ToolLocation
   toolErrorCode?: string
   imageOmitted?: true
+  skillInvocation?: SkillInvocation
   fileOperation?: { kind: 'read' | 'modified'; path: string }
   message: ModelMessage
 }

@@ -7,7 +7,7 @@ import { extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
-  AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, isPermissionMode,
+  AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode,
   type ConversationMessage, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
@@ -18,7 +18,7 @@ import { WebSettings } from '../web-settings.js'
 import { isSettingsObject, readSettingsFile, updateSettingsFile } from '../settings-file.js'
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
-import type { ClientFrame, LanguageSettings, PermissionSettings, SessionPermission, ServerFrame, StartSessionAccepted, StartSessionRequest } from './protocol.js'
+import type { ClientFrame, ConversationMessage as BrowserMessage, LanguageSettings, PermissionSettings, SessionPermission, ServerFrame, StartSessionAccepted, StartSessionRequest, WorkspaceSkills } from './protocol.js'
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
@@ -38,22 +38,33 @@ function visibleAssistant({ providerThinkingLevel: _effort, ...message }: Assist
   }) }
 }
 
-function browserMessage(entry: ConversationMessage): ConversationMessage {
-  const { message } = entry
+function browserMessage({ message, skillInvocation, ...entry }: ConversationMessage): BrowserMessage {
+  if (skillInvocation) {
+    const { name, source, status } = skillInvocation
+    return { ...entry, message, skillInvocation: status === 'loaded'
+      ? { name, source, status } : { name, source, status, reason: skillInvocation.reason } }
+  }
   if (message.role === 'assistant') return { ...entry, message: visibleAssistant(message) }
-  if (message.role !== 'toolResult' || !message.content.some(block => block.type === 'image')) return entry
+  if (message.role !== 'toolResult' || !message.content.some(block => block.type === 'image')) return { ...entry, message }
   return { ...entry, message: { ...message, content: message.content.filter(block => block.type === 'text') } }
 }
 
-function browserEvent(event: SessionSubscriptionEvent): SessionSubscriptionEvent {
+type BrowserEvent = Omit<Extract<ServerFrame, { type: 'snapshot' }>, 'sessionId' | 'subscriptionId'>
+  | Omit<Extract<ServerFrame, { type: 'update' }>, 'sessionId' | 'subscriptionId'>
+
+function browserEvent(event: SessionSubscriptionEvent): BrowserEvent {
   if (event.type === 'snapshot') {
     return { ...event, snapshot: { ...event.snapshot, messages: event.snapshot.messages.map(browserMessage) } }
   }
   const { change } = event.update
-  if (change.type === 'task' && change.message) {
-    return { ...event, update: { ...event.update, change: { ...change, message: browserMessage(change.message) } } }
+  if (change.type === 'accepted') {
+    return { ...event, update: { ...event.update, change: { ...change, user: browserMessage(change.user) } } }
   }
-  if (change.type !== 'model') return event
+  if (change.type === 'task') {
+    return { ...event, update: { ...event.update, change: change.message
+      ? { ...change, message: browserMessage(change.message) } : change } }
+  }
+  if (change.type !== 'model') return { ...event, update: { ...event.update, change } }
   const frame = change.event
   const visible = frame.type === 'done' ? { ...frame, message: visibleAssistant(frame.message) }
     : frame.type === 'error' ? { ...frame, error: visibleAssistant(frame.error) }
@@ -73,6 +84,7 @@ export type WebServerOptions = {
   sessionPath?: string
   webSettingsPath?: string
   globalContextDirectory?: string
+  skillHome?: string
   directoryPicker?: DirectoryPicker
   webProviders?: WebProvider[]
   createSession?: (resolveDirectory: () => Promise<string>, persistence?: SessionPersistence, permissionMode?: PermissionMode) => SessionTarget
@@ -167,6 +179,7 @@ export class WebServer {
       createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode) => new AgentSession({
         resolveDirectory, persistence, permissionMode, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
+        skillHome: this.options.skillHome,
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
       })),
       closeTools: () => runtime.close(),
@@ -282,6 +295,17 @@ export class WebServer {
     if (url.pathname === '/api/workspaces' && req.method === 'GET') {
       try { this.json(res, 200, await this.workspaces.view()) }
       catch { this.json(res, 500, { error: '无法读取工作区登记，请检查本机配置文件。' }) }
+      return
+    }
+    const skillWorkspace = /^\/api\/workspaces\/([^/]+)\/skills$/.exec(url.pathname)?.[1]
+    if (skillWorkspace && req.method === 'GET') {
+      try {
+        const id = decodeURIComponent(skillWorkspace)
+        if (!validId(id)) throw new InputError(400, '工作区编号无效')
+        const cwd = await this.workspaces.resolveDirectory(id)
+        const { complete, skills } = await discoverSkills(cwd, { applicationRoot: siRoot, home: this.options.skillHome })
+        this.json(res, 200, { complete, skills: skills.map(({ path: _path, ...skill }) => skill) } satisfies WorkspaceSkills)
+      } catch (error) { this.sessionError(res, error, '无法查询 Skill 目录，请重试。') }
       return
     }
     if (url.pathname === '/api/workspaces/pick' && req.method === 'POST') {
@@ -599,7 +623,7 @@ export class WebServer {
       const subscription = current = { id: frame.subscriptionId, controller: new AbortController() }
       const { sessionId } = frame
       const signal = subscription.controller.signal
-      const send = async (event: SessionSubscriptionEvent | { type: 'subscription_error'; error: string }) => {
+      const send = async (event: BrowserEvent | { type: 'subscription_error'; error: string }) => {
         try { await this.send(client, { ...event, sessionId, subscriptionId: subscription.id }, signal) }
         catch { cleanup(); client.terminate() }
       }

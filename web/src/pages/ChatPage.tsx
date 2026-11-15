@@ -709,6 +709,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
                 onSelect={mode => { if (sessionId) void changeSessionPermission(sessionId, mode); else changeDraftPermission(mode) }} />
               {modelSelect}
             </>}
+            skillWorkspaceId={quote ? undefined : (isNew ? draftWorkspace?.id : workspace?.id)}
             commandsEnabled={!isNew && !quote} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()}
             action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>

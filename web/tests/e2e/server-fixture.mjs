@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 const options = {
   port: Number(process.argv[2]),
   browserSecretPath: process.argv[3],
+  skillHome: join(dirname(process.argv[3]), 'skill-home'),
   globalContextDirectory: join(dirname(process.argv[3]), 'global-context'),
   sessionPath: join(dirname(process.argv[3]), 'sessions.sqlite'),
   modelAuthPath: join(dirname(process.argv[3]), 'auth.json'),

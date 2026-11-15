@@ -1,5 +1,5 @@
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { CompactionRecord, ConversationMessage, ConversationSnapshot, RunRecord, SaveFailure, ServerFrame } from '@agent-learning/server/protocol'
+import type { CompactionRecord, ConversationMessage, ConversationSnapshot, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 import type { CopyKey } from '../i18n/en'
@@ -86,11 +86,19 @@ function modelMessage(value: unknown): value is ModelMessage {
     ))
 }
 
+export const isSkillSource = (value: unknown): value is SkillSource =>
+  value === 'project-si' || value === 'project-agents' || value === 'user-si' || value === 'user-agents' || value === 'bundled'
+
+function skillInvocation(value: unknown, message: ModelMessage): boolean {
+  return value === undefined || (message.role === 'user' && record(value) && typeof value.name === 'string'
+    && isSkillSource(value.source) && (value.status === 'loaded' || (value.status === 'failed' && typeof value.reason === 'string')))
+}
+
 function conversationMessage(value: unknown): value is ConversationMessage {
   return record(value) && typeof value.id === 'string' && (value.clientMessageId === undefined || typeof value.clientMessageId === 'string') && modelMessage(value.message)
     && (value.message.role === 'toolResult' ? toolPosition(value.toolCall) : value.toolCall === undefined)
     && (value.toolErrorCode === undefined || (typeof value.toolErrorCode === 'string' && value.message.role === 'toolResult' && value.message.isError))
-    && fileOperation(value.fileOperation, value.message)
+    && fileOperation(value.fileOperation, value.message) && skillInvocation(value.skillInvocation, value.message)
 }
 
 function validRelations(messages: ConversationMessage[], running: ConversationSnapshot['running']): boolean {

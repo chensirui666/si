@@ -1,5 +1,7 @@
 import { estimateMessageTokens } from '@agent-learning/model'
 import type { ModelContext, ModelInfo, ModelMessage } from '@agent-learning/model'
+import { skillCommand } from './skills.js'
+import { escapePromptAttribute } from './system-prompt.js'
 import type { CompactionRecord, ConversationMessage } from './types.js'
 
 type LatestCompaction = Extract<CompactionRecord, { status: 'success' }>
@@ -22,7 +24,18 @@ function effectiveEntries(entries: ConversationMessage[], latest?: LatestCompact
     && !(entry.toolCall && invalid.has(entry.toolCall.assistantMessageId)))
 }
 
-function messageForModel({ id, message, imageOmitted }: ConversationMessage): ModelMessage {
+function messageForModel({ id, message, imageOmitted, skillInvocation }: ConversationMessage): ModelMessage {
+  if (message.role === 'user' && typeof message.content === 'string' && skillInvocation?.status === 'loaded') {
+    const { name, body, directory } = skillInvocation
+    const task = message.content.replace(skillCommand, '').trimStart()
+    return { ...message, content: [
+      `<skill name="${name}" directory="${escapePromptAttribute(directory)}">`,
+      '配套文件的相对路径以此 Skill 目录为起点。',
+      body,
+      '</skill>',
+      ...(task ? ['', task] : []),
+    ].join('\n') }
+  }
   if (message.role !== 'toolResult') return message
   if (imageOmitted) return { ...message, content: [
     ...message.content, { type: 'text', text: '\n[历史图片未随会话保存。需要看图时可按原路径重新调用 read。]' },
@@ -40,9 +53,10 @@ function modelMessages(entries: ConversationMessage[], recoverTools: boolean): M
     batch.set(toolCall.contentIndex, messageForModel(entry))
     results.set(toolCall.assistantMessageId, batch)
   }
-  return entries.flatMap(({ id, message }): ModelMessage[] => {
+  return entries.flatMap((entry): ModelMessage[] => {
+    const { id, message } = entry
     if (message.role === 'toolResult') return []
-    if (message.role !== 'assistant') return [message]
+    if (message.role !== 'assistant') return [messageForModel(entry)]
     const calls = message.content.flatMap((call, index) => call.type === 'toolCall' ? [{ call, index }] : [])
     if (!calls.length) return [message]
     if (calls.some(({ call }) => !call.id.trim()) || new Set(calls.map(({ call }) => call.id)).size !== calls.length) {
@@ -79,7 +93,7 @@ export function prepareCompaction(
   let tokens = 0
   let firstKept = 0
   for (let index = effective.length - 1; index >= 0; index--) {
-    tokens += estimateMessageTokens(effective[index].message, includeThinking, model)
+    tokens += estimateMessageTokens(messageForModel(effective[index]), includeThinking, model)
     if (tokens >= keepRecentTokens) {
       firstKept = index
       // A tool result cannot survive without the assistant's entire call batch.

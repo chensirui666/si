@@ -72,12 +72,15 @@
 
 ### 第三步：Skill 的发现、读取、使用与创建
 
+[技术设计（已通过）](feature3/feature3-Skill技术设计.md) · [验收标准](feature3/feature3-Skill验收标准.md) · [设计讨论记录](feature3/feature3-设计讨论记录.md) · [验收记录](feature3/feature3-Skill验收记录.md)
+
 目标：Agent 能使用已有 Skill 中的方法完成工作，也能根据用户需要创建可实际使用的 Skill。
 
-- [ ] 能发现可用 Skill，并让用户和 Agent 了解其用途。
-- [ ] 能在相关任务中读取并遵循 Skill，用户也能明确指定使用某项 Skill。
-- [ ] 能使用 Skill 附带的说明、参考材料或脚本，并遵守当前权限模式。
-- [ ] 能按用户要求创建或修改 Skill，之后重新发现并使用它。
+- [x] 能发现可用 Skill，并让用户和 Agent 了解其用途。网页 `/` 菜单分开显示命令与技能，Skill 标注「项目」「个人」或「预置」。
+- [x] 能在相关任务中读取并遵循 Skill，用户也能明确指定使用某项 Skill。
+- [x] 能使用 Skill 附带的说明、参考材料或脚本，并遵守当前权限模式。
+- [x] 能按用户要求创建或修改 Skill，之后重新发现并使用它。
+- [x] 首批提供 `skill-creator`、`agents-md` 和 `grill-me`。 [首批 Skill](feature3/feature3-Skill技术设计.md#首批-skill)
 - 完成标准：使用一个已有 Skill 完成真实任务，再创建或修改一个 Skill，并通过后续任务验证其实际作用。不能只以生成文件、列出名称或声称已加载作为完成依据。
 
 ### 第四步：MCP 客户端与真实服务接入

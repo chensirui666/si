@@ -24,14 +24,15 @@ function textOf(message: AssistantMessage) {
   return message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
 }
 
-async function submit(page: Page, observed: ReturnType<typeof observe>, prompt: string) {
+async function submit(page: Page, observed: ReturnType<typeof observe>, prompt: string, viaMenu = false) {
   const before = observed.updates.length
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
-  await editor.fill(prompt)
+  await editor.fill(viaMenu ? '/' : prompt)
   const send = page.getByRole('button', { name: '发送', exact: true })
   await expect(send).toBeEnabled()
   const receipt = page.waitForResponse(response => new URL(response.url()).pathname === '/api/messages')
-  await send.click()
+  if (viaMenu) await page.getByRole('option', { name: /compact/ }).click()
+  else await send.click()
   const response = await receipt
   expect(response.status()).toBe(202)
   const accepted: { kind: 'message' | 'compaction'; compactionId?: string } = await response.json()
@@ -77,7 +78,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
   const requests: WireRequest[] = []
   const createServer = (port = 0) => new WebServer({
     port, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, compaction: budget,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
@@ -116,14 +117,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     const systemPrompt = taskTemplate.messages[0]!.content!
     const tools = taskTemplate.tools!.map(tool => tool.function)
 
-    const editor = page.getByRole('textbox', { name: '消息', exact: true })
-    const submissionsBeforeMenu = observed.submissions.length
-    await editor.fill('/')
-    await page.getByRole('option', { name: /compact/ }).click()
-    await expect(editor).toHaveText('/compact')
-    await expect(editor).toBeFocused()
-    expect(observed.submissions.length).toBe(submissionsBeforeMenu)
-    const manual = await submit(page, observed, '/compact')
+    const manual = await submit(page, observed, '/compact', true)
     expect(manual.accepted.kind).toBe('compaction')
     const firstSnapshot = await refresh(page, observed)
     const firstRecord = requireSuccess(firstSnapshot, manual.accepted.compactionId!)
@@ -143,7 +137,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
       const entries = snapshot.messages.slice(0, last + 1)
       const probe = { role: 'user' as const, content: '本次仅验证上下文输入。不要调用工具，只回答“对照完成”。', timestamp: 0 }
       const inputs: ModelContext[] = [previous, record].map(latest => ({
-        systemPrompt, tools, messages: [...buildModelHistory(entries, latest), probe],
+        systemPrompt, tools, messages: [...buildModelHistory(entries.map(({ skillInvocation: _, ...entry }) => entry), latest), probe],
       }))
       const actual: number[] = []
       for (const input of inputs) {
@@ -189,7 +183,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     expect(secondRecord.fileOperations).toMatchObject({
       readFiles: expect.arrayContaining([...firstReadFiles, join(workspacePath, 'progress.txt')]), modifiedFiles: [],
     })
-    const recent = buildModelHistory(secondSnapshot.messages, secondRecord).slice(1)
+    const recent = buildModelHistory(secondSnapshot.messages.map(({ skillInvocation: _, ...entry }) => entry), secondRecord).slice(1)
     expect(JSON.stringify(recent)).not.toContain(deliveryId)
     const prior = secondSnapshot.compactions.filter((record): record is Success => record.status === 'success' && record.id !== secondRecord.id && record.startedAt <= secondRecord.startedAt).at(-1)
     expect(prior?.id).toBe(firstRecord.id)
@@ -299,7 +293,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
   const requests: WireRequest[] = []
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, compaction: { triggerTokens: 20_000, keepRecentTokens: 400 },
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {

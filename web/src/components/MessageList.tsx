@@ -1,7 +1,7 @@
-import { NoticeText } from '../i18n/messages'
+import { NoticeText, skillSourceKey } from '../i18n/messages'
 import { useTranslation } from 'react-i18next'
 import { useRef } from 'react'
-import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
+import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure, SkillInvocationView } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
 import { effortLabel } from './ModelPicker'
@@ -9,7 +9,7 @@ import { SaveFailureNotice } from './SaveFailureNotice'
 import { QuoteSelection } from './QuoteSelection'
 
 type MessageRow =
-  | { type: 'user'; id: string; text: string; local?: LocalSubmission }
+  | { type: 'user'; id: string; text: string; local?: LocalSubmission; skill?: SkillInvocationView }
   | { type: 'assistant'; id: string; userId: string; messages: AssistantEntry[] }
 
 export function MessageList({ messages, activeContent = [], running = null, runs = [], saveFailures = [], onQuote }: {
@@ -35,7 +35,7 @@ export function MessageList({ messages, activeContent = [], running = null, runs
     const { id, message, toolCall } = item
     if (message.role === 'user') {
       userId = id
-      rows.push({ type: 'user', id, text: typeof message.content === 'string' ? message.content : message.content.map(block => block.text).join('') })
+      rows.push({ type: 'user', id, skill: item.skillInvocation, text: typeof message.content === 'string' ? message.content : message.content.map(block => block.text).join('') })
     } else if (message.role === 'assistant') {
       const previous = rows.at(-1)
       if (previous?.type === 'assistant') previous.messages.push({ id, message })
@@ -70,6 +70,12 @@ export function MessageList({ messages, activeContent = [], running = null, runs
                 running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
               : <>
                 <div className="message-text">{row.text}<br /></div>
+                {row.skill && <div className="submission-status" data-skill-status={row.skill.status}>
+                  {row.skill.status === 'loaded'
+                    ? t('chat.skillLoaded', { name: row.skill.name })
+                    : t('chat.skillLoadFailed', { name: row.skill.name, reason: row.skill.reason })}
+                  {' · '}{t(skillSourceKey[row.skill.source])}
+                </div>}
                 {row.local && <div className="submission-status" data-state={row.local.state}>
                   <span>{t(row.local.accepted ? 'chat.accepted' : row.local.state === 'pending' ? 'chat.sending' : row.local.state === 'failed' ? 'chat.sendFailed' : 'chat.notConfirmed')}</span>
                   {row.local.errorMessage && <p><NoticeText notice={row.local.errorMessage} /></p>}

@@ -45,6 +45,7 @@
   --control-border: #8a8a85;
   --success: #167544;
   --error: #b42318;
+  --skill-prefix-color: #2554c7;
   font: var(--type-control);
   letter-spacing: 0;
   color: var(--foreground);
@@ -437,9 +438,12 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .message-error, .message-ending[role="alert"], .submission-status[data-state="failed"] { color: #b42318; }
 .submission-status p { margin: 4px 0 0; }
 
-.command-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); padding: 5px; border: 1px solid #e5e5e5; border-radius: 10px; background: #fff; box-shadow: 0 5px 24px #00000012; z-index: 15; }
+.command-menu { position: absolute; max-height: min(320px, 45dvh); overflow: auto; left: 0; right: 0; bottom: calc(100% + 8px); padding: 5px; border: 1px solid #e5e5e5; border-radius: 10px; background: #fff; box-shadow: 0 5px 24px #00000012; z-index: 15; }
 .command-menu-label { padding: 3px 12px 7px; font: var(--type-detail); color: #888; }
-.command-menu button { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 10px 12px; gap: 12px; border: 0; border-radius: 6px; background: #f4f4f3; color: inherit; text-align: left; cursor: pointer; }
+.command-menu button { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 10px 12px; gap: 12px; border: 0; border-radius: 6px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.command-menu button[aria-selected="true"], .command-menu button:hover { background: #f4f4f3; }
+.command-menu .skill-description { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--type-support); color: #777; }
+.command-menu button span:last-child { flex-shrink: 0; }
 .command-menu button span:first-child { font-family: var(--code-font); font-weight: 400; }
 .command-menu button span:last-child { font: var(--type-support); color: #777; }
 .context-meter-trigger { gap: 4px; padding: 3px 5px; color: #777; font: var(--type-detail); cursor: default; }

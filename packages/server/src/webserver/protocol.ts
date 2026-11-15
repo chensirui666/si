@@ -1,14 +1,31 @@
 import type { ModelSelection } from '@agent-learning/model'
-import type { ConversationSnapshot, ConversationUpdate, PermissionMode, SessionSummary, SubmissionAccepted } from '@agent-learning/coding-agent'
+import type {
+  ConversationMessage as StoredMessage, ConversationSnapshot as StoredSnapshot, ConversationUpdate as StoredUpdate,
+  PermissionMode, SessionSummary, SkillInvocation, SkillSummary, SubmissionAccepted,
+} from '@agent-learning/coding-agent'
 import type { WorkspaceRegistration } from '../workspaces.js'
 
 export type {
-  ActiveContent, CompactionRecord, ContextUsage, ConversationMessage, ConversationSnapshot,
-  ConversationUpdate, ModelFrame, PermissionMode, RunRecord, RunningState, SaveFailure, SessionSummary, SubmissionAccepted,
+  ActiveContent, CompactionRecord, ContextUsage, ModelFrame, PermissionMode, RunRecord, RunningState, SaveFailure,
+  SessionSummary, SkillSource, SubmissionAccepted,
 } from '@agent-learning/coding-agent'
 export { isPermissionMode } from '@agent-learning/coding-agent/permissions'
 export type { WorkspaceView } from '../workspaces.js'
 export type { WebSettingsView } from '../web-settings.js'
+
+export type WorkspaceSkills = { skills: Omit<SkillSummary, 'path'>[]; complete: boolean }
+export type SkillInvocationView = Pick<SkillInvocation, 'name' | 'source'> &
+  ({ status: 'loaded' } | { status: 'failed'; reason: string })
+export type ConversationMessage = Omit<StoredMessage, 'skillInvocation'> & { skillInvocation?: SkillInvocationView }
+export type ConversationSnapshot = Omit<StoredSnapshot, 'messages'> & { messages: ConversationMessage[] }
+type Change = StoredUpdate['change']
+type Accepted = Extract<Change, { type: 'accepted' }>
+export type ConversationUpdate = Omit<StoredUpdate, 'change'> & {
+  change: Exclude<Change, { type: 'accepted' | 'task' }>
+    | (Omit<Accepted, 'user'> & { user: ConversationMessage })
+    | ({ type: 'task'; running: StoredSnapshot['running'] }
+      & ({ message: ConversationMessage; messageIndex: number } | { message?: never; messageIndex?: never }))
+}
 
 export type WorkspacePick = { cancelled: true } | ({ cancelled: false } & WorkspaceRegistration)
 export type CreateSessionRequest = { workspaceId: string }

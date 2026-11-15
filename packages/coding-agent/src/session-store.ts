@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import type { SessionSummary } from './sessions.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
+import { skillCommand } from './skills.js'
 import type { CompactionRecord, ConversationMessage, RunRecord, SubmissionAccepted } from './types.js'
 
 export type StoredRun = Omit<RunRecord, 'restored'> & { text: string; acceptedSeq: number; firstPermissionMode?: PermissionMode }
@@ -241,6 +242,13 @@ export class SessionStore {
         const message = entry.message
         if (!run || run.kind !== 'task' || !message || !Number.isFinite(message.timestamp)) throw new Error('Invalid message owner')
         if (entry.imageOmitted !== undefined && (entry.imageOmitted !== true || message.role !== 'toolResult')) throw new Error('Invalid image marker')
+        const invocation = entry.skillInvocation
+        if (invocation !== undefined && (!invocation || message.role !== 'user' || typeof message.content !== 'string'
+          || typeof invocation.name !== 'string' || skillCommand.exec(message.content)?.[1] !== invocation.name
+          || !['project-si', 'project-agents', 'user-si', 'user-agents', 'bundled'].includes(invocation.source)
+          || (invocation.status === 'loaded'
+            ? typeof invocation.body !== 'string' || typeof invocation.directory !== 'string' || !invocation.directory
+            : invocation.status !== 'failed' || typeof invocation.reason !== 'string'))) throw new Error('Invalid Skill invocation')
         if (message.role === 'user') {
           if (entry.id !== run.id || entry.clientMessageId !== run.clientMessageId || message.content !== run.text) throw new Error('Invalid submitted message')
           currentRunId = run.id

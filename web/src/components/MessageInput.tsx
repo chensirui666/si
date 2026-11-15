@@ -15,18 +15,25 @@ import {
   $getSelection,
   $isRangeSelection,
   HISTORY_PUSH_TAG,
+  KEY_ARROW_DOWN_COMMAND,
+  KEY_ARROW_UP_COMMAND,
   KEY_ESCAPE_COMMAND,
   CLEAR_HISTORY_COMMAND,
   COMMAND_PRIORITY_CRITICAL,
   KEY_ENTER_COMMAND,
   KEY_TAB_COMMAND,
+  RootNode,
   SELECTION_CHANGE_COMMAND,
   SKIP_DOM_SELECTION_TAG,
   SKIP_SCROLL_INTO_VIEW_TAG,
 } from 'lexical'
 import { mergeRegister } from '@lexical/utils'
 
+import type { WorkspaceSkills } from '@agent-learning/server/protocol'
+import { getWorkspaceSkills } from '../chat/client'
+import { errorNotice, NoticeText, skillSourceKey, type Notice } from '../i18n/messages'
 import { Button } from '@/components/ui/button'
+import { $styleSkillPrefix, skillPrefix } from './skill-prefix'
 
 type MessageInputProps = {
   onSend: (text: string, restoreDraft: () => void) => boolean
@@ -37,6 +44,7 @@ type MessageInputProps = {
   contextMeter?: ReactNode
   footerControl?: ReactNode
   commandsEnabled?: boolean
+  skillWorkspaceId?: string
   draft?: { text: string }
   onDraftChange?: (text: string) => void
   editorRef?: Ref<HTMLDivElement>
@@ -64,6 +72,7 @@ function $writeDraft(text: string) {
 }
 
 const restoreTag = 'restore-session-draft'
+const optionId = (option: string) => option === '/compact' ? 'compact-option' : `skill-option-${option.slice(7).trim()}`
 
 export function MessageInput(props: MessageInputProps) {
   const initialDraft = props.draft?.text
@@ -74,19 +83,34 @@ export function MessageInput(props: MessageInputProps) {
   )
 }
 
-function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, footerControl, commandsEnabled = true, draft, onDraftChange, editorRef, quote, onRemoveQuote }: MessageInputProps) {
+function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, footerControl, commandsEnabled = true, skillWorkspaceId, draft, onDraftChange, editorRef, quote, onRemoveQuote }: MessageInputProps) {
   const { t } = useTranslation()
   const [editor] = useLexicalComposerContext()
+  const [hasSkillPrefix, setHasSkillPrefix] = useState(() => skillPrefix.test(draft?.text ?? ''))
   const [canSend, setCanSend] = useState(Boolean(draft?.text.trim()))
   const draftRevision = useRef(0)
-  const [menuOpen, setMenuOpen] = useState(false)
-  const menu = useRef(false)
+  const [query, setQuery] = useState<string | null>(null)
+  const menu = useRef<string | null>(null)
+  const [highlight, setHighlight] = useState(0)
+  const [catalog, setCatalog] = useState<{ workspaceId: string; view?: WorkspaceSkills; error?: Notice } | null>(null)
+  const loadedCatalog = useRef<string | undefined>(undefined)
+  const menuOpen = query !== null
+  const skillMenu = menuOpen && Boolean(skillWorkspaceId)
+  const currentCatalog = catalog?.workspaceId === skillWorkspaceId ? catalog : null
+  const canRunCompact = commandsEnabled && !sendDisabled
+  const showCompact = query !== null && canRunCompact && '/compact'.startsWith(query)
+  const skillOptions = query === null ? [] : (currentCatalog?.view?.skills ?? []).filter(skill =>
+    `/skill:${skill.name}`.startsWith(query) || `/${skill.name}`.startsWith(query))
+  const options = [...(showCompact ? ['/compact'] : []), ...skillOptions.map(skill => `/skill:${skill.name} `)]
+  const active = options[Math.min(highlight, options.length - 1)]
+
   const dismissedText = useRef<string | undefined>(undefined)
   const composingRef = useRef(false)
   const composingUntilRef = useRef(0)
   const closeMenu = useCallback(() => {
-    menu.current = false
-    setMenuOpen(false)
+    menu.current = null
+    setQuery(null)
+    setHighlight(0)
   }, [])
   const refreshMenu = useCallback(() => {
     const text = $readDraft()
@@ -94,15 +118,44 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     const atEnd = $isRangeSelection(selection) && selection.isCollapsed()
       && selection.anchor.getNode() === $getRoot().getLastDescendant()
       && selection.anchor.offset === selection.anchor.getNode().getTextContentSize()
-    const visible = commandsEnabled && editor.getRootElement() === document.activeElement && !composingRef.current && !editor.isComposing()
-      && /^[ \t]*\/[a-z]*$/.test(text) && '/compact'.startsWith(text.trimStart()) && atEnd && dismissedText.current !== text
-    menu.current = visible
-    setMenuOpen(visible)
-  }, [commandsEnabled, editor])
-  const complete = useCallback(() => {
+    const prefix = text.trimStart().toLowerCase()
+    const available = (canRunCompact && '/compact'.startsWith(prefix)) || Boolean(skillWorkspaceId)
+    const visible = available && editor.getRootElement() === document.activeElement && !composingRef.current && !editor.isComposing()
+      && /^[ \t]*\/[a-z0-9:-]*$/i.test(text) && atEnd && dismissedText.current !== text
+    const next = visible ? prefix : null
+    if (menu.current === next) return
+    if (next === null) { closeMenu(); return }
+    menu.current = next
+    setQuery(next)
+    setHighlight(0)
+  }, [closeMenu, canRunCompact, editor, skillWorkspaceId])
+  const needsCatalog = skillMenu || hasSkillPrefix
+  useEffect(() => {
+    if (!skillWorkspaceId || !needsCatalog || (!skillMenu && loadedCatalog.current === skillWorkspaceId)) return
+    const controller = new AbortController()
+    void getWorkspaceSkills(skillWorkspaceId, controller.signal).then(view => {
+      if (controller.signal.aborted) return
+      loadedCatalog.current = skillWorkspaceId
+      setCatalog({ workspaceId: skillWorkspaceId, view })
+    }, error => {
+      if (controller.signal.aborted) return
+      loadedCatalog.current = undefined
+      setCatalog({ workspaceId: skillWorkspaceId, error: errorNotice('chat.skillsUnavailable', error) })
+    })
+    return () => controller.abort()
+  }, [needsCatalog, skillMenu, skillWorkspaceId])
+  const availableSkills = currentCatalog?.view?.skills
+  const styledCatalog = useRef(false)
+  useEffect(() => {
+    if (!availableSkills && !styledCatalog.current) return
+    styledCatalog.current = Boolean(availableSkills)
+    const names = new Set(availableSkills?.map(skill => skill.name))
+    return editor.registerNodeTransform(RootNode, root => $styleSkillPrefix(root, names))
+  }, [availableSkills, editor])
+  const completeSkill = useCallback((option: string) => {
     editor.update(() => {
       const text = $readDraft()
-      dismissedText.current = text.replace(/\/[a-z]*$/, '/compact')
+      dismissedText.current = text.replace(/\/[a-z0-9:-]*$/i, () => option)
       const root = $getRoot()
       root.clear().append($createParagraphNode().append($createTextNode(dismissedText.current)))
       root.selectEnd()
@@ -144,10 +197,18 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     })
   }, [editor, onSend, sendDisabled])
 
+  const pickOption = useCallback((option: string) => {
+    if (option !== '/compact') { completeSkill(option); return }
+    const current = editor.getEditorState().read($readDraft).trimStart().toLowerCase()
+    // The current menu only replaces a draft consisting entirely of its slash query.
+    if (canRunCompact && current === menu.current && option.startsWith(current)) submit(option)
+  }, [canRunCompact, completeSkill, editor, submit])
+
   useEffect(() => editor.registerUpdateListener(({ editorState, prevEditorState, tags }) => {
     const text = editorState.read($readDraft)
     if (text !== prevEditorState.read($readDraft)) {
       draftRevision.current++
+      setHasSkillPrefix(skillPrefix.test(text))
       if (!tags.has(restoreTag)) onDraftChange?.(text)
       if (text !== dismissedText.current) dismissedText.current = undefined
     }
@@ -187,6 +248,25 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
         root?.addEventListener('compositionend', endComposition)
         root?.addEventListener('blur', blur)
       }),
+      () => {
+        const root = editor.getRootElement()
+        root?.removeEventListener('compositionstart', startComposition)
+        root?.removeEventListener('compositionend', endComposition)
+        root?.removeEventListener('blur', blur)
+      },
+    )
+  }, [editor, closeMenu])
+
+  useEffect(() => {
+    const move = (step: number) => (event: KeyboardEvent) => {
+      if (!menu.current || !options.length || composingRef.current || editor.isComposing() || event.isComposing || event.keyCode === 229) return false
+      event.preventDefault()
+      setHighlight(index => (Math.min(index, options.length - 1) + step + options.length) % options.length)
+      return true
+    }
+    return mergeRegister(
+      editor.registerCommand(KEY_ARROW_DOWN_COMMAND, move(1), COMMAND_PRIORITY_CRITICAL),
+      editor.registerCommand(KEY_ARROW_UP_COMMAND, move(-1), COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ESCAPE_COMMAND, event => {
         if (!menu.current) return false
         event?.preventDefault()
@@ -196,9 +276,9 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       }, COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_TAB_COMMAND, event => {
         if (composingRef.current || editor.isComposing() || event.isComposing || event.keyCode === 229 || Date.now() < composingUntilRef.current) return true
-        if (!event.shiftKey && menu.current) {
+        if (!event.shiftKey && menu.current && active) {
           event.preventDefault()
-          complete()
+          pickOption(active)
           return true
         }
         if (event.shiftKey) { dismissedText.current = $readDraft(); closeMenu() }
@@ -217,17 +297,20 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
         if (event.shiftKey) return false
         if (composingRef.current || editor.isComposing() || event.isComposing || event.keyCode === 229 || Date.now() < composingUntilRef.current) return true
         event.preventDefault()
-        if (!event.repeat) { if (menu.current) complete(); else submit($readDraft()) }
+        if (!event.repeat) { if (menu.current && active) pickOption(active); else submit($readDraft()) }
         return true
       }, COMMAND_PRIORITY_CRITICAL),
-      () => {
-        const root = editor.getRootElement()
-        root?.removeEventListener('compositionstart', startComposition)
-        root?.removeEventListener('compositionend', endComposition)
-        root?.removeEventListener('blur', blur)
-      },
     )
-  }, [editor, submit, complete, closeMenu])
+  }, [editor, submit, pickOption, closeMenu, active, options.length])
+
+  useEffect(() => {
+    if (active) document.getElementById(optionId(active))?.scrollIntoView({ block: 'nearest' })
+  }, [active])
+  const renderOption = (option: string, children: ReactNode) =>
+    <Button key={option} variant="ghost" type="button" role="option" aria-selected={active === option}
+      id={optionId(option)} tabIndex={-1} onMouseDown={event => event.preventDefault()} onClick={() => pickOption(option)}>
+      {children}
+    </Button>
 
   return (
     <div className="message-input">
@@ -239,11 +322,27 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
           editor.getRootElement()?.focus({ preventScroll: true })
         }}><XIcon aria-hidden="true" /></Button>
       </div>}
-      {menuOpen && <div className="command-menu" role="listbox" aria-label={t('chat.commands')} id="compact-menu">
-        <div className="command-menu-label">{t('chat.commands')}</div>
-        <Button variant="ghost" type="button" role="option" aria-selected="true" id="compact-option" onMouseDown={event => event.preventDefault()} onClick={complete}>
-          <span>/compact</span><span>{t('chat.compactCommand')}</span>
-        </Button>
+      {menuOpen && <div className="command-menu" role="listbox" aria-label={t('chat.slashMenu')} id="compact-menu">
+        {showCompact && <div role="group" aria-label={t('chat.commands')}>
+          <div className="command-menu-label">{t('chat.commands')}</div>
+          {renderOption('/compact', <><span>/compact</span><span>{t('chat.compactCommand')}</span></>)}
+        </div>}
+        {skillMenu && <div role="group" aria-label={t('chat.skills')}>
+          <div className="command-menu-label">{t('chat.skills')}</div>
+          {skillOptions.map(skill => renderOption(`/skill:${skill.name} `, <>
+            <span>{skill.name}</span>
+            <span className="skill-description" title={skill.description}>
+              {skill.disableModelInvocation ? `${t('chat.skillUserOnly')} · ` : ''}{skill.description}
+            </span>
+            <span>{t(skillSourceKey[skill.source])}</span>
+          </>))}
+          {!currentCatalog && <div className="command-menu-label" role="status">{t('chat.skillsLoading')}</div>}
+          {currentCatalog?.error && <div className="command-menu-label" role="status">
+            <NoticeText notice={currentCatalog.error} /> · {t('chat.skillsRetry')}
+          </div>}
+          {currentCatalog?.view && !currentCatalog.view.complete && <div className="command-menu-label" role="status">{t('chat.skillsIncomplete')}</div>}
+          {currentCatalog?.view?.complete && !skillOptions.length && <div className="command-menu-label">{t('chat.skillsEmpty')}</div>}
+        </div>}
       </div>}
       <PlainTextPlugin
         contentEditable={
@@ -254,8 +353,8 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
             aria-label={t('chat.message')}
             aria-multiline="true"
             aria-controls={menuOpen ? 'compact-menu' : undefined}
-            aria-activedescendant={menuOpen ? 'compact-option' : undefined}
-            aria-autocomplete={commandsEnabled ? 'list' : undefined}
+            aria-activedescendant={menuOpen && active ? optionId(active) : undefined}
+            aria-autocomplete={commandsEnabled || skillWorkspaceId ? 'list' : undefined}
             aria-placeholder={t('chat.placeholder')}
             placeholder={<div className="message-placeholder">{t('chat.placeholder')}</div>}
           />

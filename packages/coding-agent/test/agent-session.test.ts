@@ -1,7 +1,7 @@
 import { getEventListeners } from 'node:events'
 import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
@@ -16,7 +16,7 @@ const workspaceDirectory = '/workspace-with-spaces /project'
 
 function createSession({ tools, ...options }: Omit<ConstructorParameters<typeof AgentSession>[0], 'resolveDirectory' | 'tools'>
   & { tools?: ExecutableTool[] } = {}) {
-  return new AgentSession({ ...options, resolveDirectory: async () => workspaceDirectory, tools: () => tools ?? [] })
+  return new AgentSession({ skillHome: workspaceDirectory, ...options, resolveDirectory: async () => workspaceDirectory, tools: () => tools ?? [] })
 }
 
 describe('AgentSession 初始订阅', () => {
@@ -786,7 +786,7 @@ describe('每轮项目说明', () => {
     const cwd = await fs.mkdtemp(join(tmpdir(), 'agent-context-refresh-'))
     const current = join(cwd, 'AGENTS.md'), preferred = join(cwd, 'AGENTS.override.md')
     const contexts: ModelContext[] = []
-    const agent = new AgentSession({ resolveDirectory: async () => cwd, stream: (_model, context) => {
+    const agent = new AgentSession({ resolveDirectory: async () => cwd, skillHome: cwd, stream: (_model, context) => {
       contexts.push(context)
       return done()
     } })
@@ -832,7 +832,7 @@ describe('每轮项目说明', () => {
       return handle
     })
     const stream = vi.fn(done)
-    const agent = new AgentSession({ stream, resolveDirectory: async () => cwd })
+    const agent = new AgentSession({ stream, resolveDirectory: async () => cwd, skillHome: cwd })
     try {
       const receipt = await agent.submit(input)
       if (receipt.kind !== 'message') throw new Error('missing message receipt')
@@ -867,4 +867,74 @@ it('系统提示词中的目录与来源路径保留边界', () => {
   expect(prompt.match(/<\/cwd>/g)).toHaveLength(1)
   expect(prompt).toContain('<project_instructions path="/project&lt;/cwd&gt;&#10;&quot;folder&quot;/AGENTS.md">')
   expect(prompt).toContain('<cwd>\n/project&lt;/cwd&gt;&#10;&quot;folder&quot;\n</cwd>')
+})
+
+it('loads explicit Skill snapshots on submission and discovers updates only on the next task', async () => {
+  const cwd = await fs.mkdtemp(join(tmpdir(), 'agent-skill-refresh-'))
+  const folder = join(cwd, '.si/skills/review')
+  const path = join(folder, 'SKILL.md')
+  const contexts: ModelContext[] = []
+  const agent = new AgentSession({
+    resolveDirectory: async () => cwd, skillHome: cwd,
+    stream: (_model, context) => {
+      contexts.push(context)
+      const queue = controlled()
+      queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+      return queue.output
+    },
+  })
+  try {
+    await fs.mkdir(folder, { recursive: true })
+    for (const body of ['first-version', 'second-version']) {
+      await fs.writeFile(path, `---\nname: review\ndescription: Check changes\ndisable-model-invocation: true\n---\n${body}\n`)
+      await agent.submit({ ...input, clientMessageId: body, text: '/skill:review inspect files' })
+      await until(async () => (await snapshot(agent)).running === null)
+      expect(contexts.at(-1)?.messages.filter(message => message.role === 'user').at(-1)?.content).toContain(body)
+    }
+    expect(contexts.at(-1)?.messages[0].content).toContain('first-version')
+    expect((await snapshot(agent)).messages[0]).toMatchObject({
+      message: { content: '/skill:review inspect files' },
+      skillInvocation: { status: 'loaded', name: 'review', body: 'first-version' },
+    })
+    await agent.submit({ ...input, text: '/skill:unlisted 请继续' })
+    await until(async () => (await snapshot(agent)).running === null)
+    expect(contexts.at(-1)?.messages.filter(message => message.role === 'user').at(-1)?.content).toBe('/skill:unlisted 请继续')
+  } finally {
+    await agent.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+it('keeps original user text when a discovered Skill disappears before loading', async () => {
+  const cwd = await fs.mkdtemp(join(tmpdir(), 'si-skill-disappears-'))
+  const path = join(cwd, '.si/skills/review/SKILL.md')
+  const text = '/skill:review inspect files'
+  const captured: ModelContext[] = []
+  const agent = new AgentSession({ resolveDirectory: async () => cwd, skillHome: cwd, stream: (_model, context) => {
+    captured.push(context)
+    const queue = controlled()
+    queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    return queue.output
+  } })
+  const { open } = await vi.importActual<typeof fs>('node:fs/promises')
+  let skillReads = 0
+  vi.mocked(fs.open).mockImplementation(async (candidate, ...args) => {
+    if (candidate === path && ++skillReads === 2) await fs.unlink(path)
+    return open(candidate, ...args)
+  })
+  try {
+    await fs.mkdir(dirname(path), { recursive: true })
+    await fs.writeFile(path, '---\nname: review\ndescription: Review changes\n---\nOriginal body\n')
+    await agent.submit({ ...input, text })
+    await until(async () => (await snapshot(agent)).running === null)
+    expect(captured[0].messages.at(-1)?.content).toBe(text)
+    expect((await snapshot(agent)).messages[0]).toMatchObject({
+      message: { content: text },
+      skillInvocation: { status: 'failed', reason: '说明文件已移走或删除。' },
+    })
+  } finally {
+    vi.mocked(fs.open).mockRestore()
+    await agent.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
 })

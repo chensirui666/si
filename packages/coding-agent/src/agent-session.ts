@@ -6,6 +6,7 @@ import type { AssistantMessage, ModelContext, ModelEvent, ModelInfo, ModelSelect
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
 import { SessionWriteError, runSelection, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
+import { discoverSkills, loadSkill, skillCommand, type SkillSummary } from './skills.js'
 import { buildSystemPrompt } from './system-prompt.js'
 import type { CodingTool } from './tools.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
@@ -28,6 +29,7 @@ function isFileOperation(detail: unknown): detail is NonNullable<ConversationMes
 }
 
 export class AgentSession {
+  private submitting?: { id: string; settled: Promise<SubmissionAccepted> }
   private readonly agent: Agent
   private readonly omittedToolImageResults = new Set<string>()
   private readonly state: ConversationSnapshot = { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
@@ -51,6 +53,7 @@ export class AgentSession {
     stream?: typeof stream
     tools?: (cwd: string) => CodingTool[]
     documentationRoot?: string
+    skillHome?: string
     globalContextDirectory?: string
     resolveDirectory: () => Promise<string>
     discoverModels?: typeof import('@agent-learning/model').discoverModels
@@ -101,11 +104,11 @@ export class AgentSession {
     this.publish({ type: 'permission', permissionMode })
   }
 
-  private configure(cwd: string, tools: CodingTool[], files: ProjectContextFile[]) {
+  private configure(cwd: string, tools: CodingTool[], files: ProjectContextFile[], skills: readonly SkillSummary[]) {
     const available = this.state.permissionMode === 'normal' ? tools : tools.filter(tool => readOnlyTools.has(tool.name))
     const declarations = available.map(({ name, description, parameters }) => ({ name, description, parameters }))
     this.configuration = {
-      systemPrompt: buildSystemPrompt(cwd, available, this.options.documentationRoot, files),
+      systemPrompt: buildSystemPrompt(cwd, available, this.options.documentationRoot, files, skills, this.options.skillHome),
       ...(declarations.length ? { tools: declarations } : {}),
     }
   }
@@ -126,12 +129,33 @@ export class AgentSession {
       ? !selection.reasoningEffort || !model.reasoningEfforts.includes(selection.reasoningEffort) : selection.reasoningEffort !== undefined) {
       throw new SessionSubmitError('invalid', '所选模型不支持此推理强度')
     }
+    while (this.submitting?.id === input.clientMessageId) {
+      await this.submitting.settled.catch(() => undefined)
+      if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+      const accepted = this.replay(input, selection)
+      if (accepted) return accepted
+    }
+    if (this.submitting || this.state.running) throw new SessionSubmitError('busy', '正在接收或生成，请等待本次回答结束')
+    const promise = this.accept(input, selection, model)
+    this.submitting = { id: input.clientMessageId, settled: promise }
+    try {
+      return await promise
+    } finally {
+      this.submitting = undefined
+    }
+  }
+
+  private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo): Promise<SubmissionAccepted> {
     const cwd = await this.options.resolveDirectory()
     const directory = await this.options.discoverModels?.()
+    const manual = input.text.trim() === '/compact'
+    const skills = manual ? [] : (await discoverSkills(cwd, {
+      home: this.options.skillHome, applicationRoot: this.options.documentationRoot,
+    })).skills
+    const namedSkill = skillCommand.exec(input.text)?.[1]
+    const selectedSkill = namedSkill ? skills.find(skill => skill.name === namedSkill) : undefined
+    const skillInvocation = selectedSkill ? await loadSkill(selectedSkill) : undefined
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
-    const concurrent = this.replay(input, selection)
-    if (concurrent) return concurrent
-    if (this.state.running) throw new SessionSubmitError('busy', '正在生成，请等待本次回答结束')
     const storedDefault = this.options.persistence?.store.getDefaultSelection()
     const fallback = directory?.defaultSelection
     const current = this.state.modelSelection ?? storedDefault ?? fallback
@@ -145,9 +169,9 @@ export class AgentSession {
     model.defaultReasoningEffort = selection.reasoningEffort
     this.model = model
     const tools = this.options.tools?.(cwd) ?? []
-    this.configure(cwd, tools, this.projectContext?.cwd === cwd ? this.projectContext.files : [])
+    this.configure(cwd, tools, this.projectContext?.cwd === cwd ? this.projectContext.files : [], skills)
     const controller = new AbortController()
-    if (input.text.trim() === '/compact') {
+    if (manual) {
       const record = this.newCompaction('manual', input.clientMessageId)
       const running = { kind: 'compaction' as const, runId: record.id, phase: 'compaction' as const }
       const run = this.saveStart(input, selection, record.id, 'compaction', { compaction: record })
@@ -168,7 +192,11 @@ export class AgentSession {
       })
       return { kind: 'compaction', clientMessageId: input.clientMessageId, compactionId: record.id, acceptedSeq }
     }
-    const user = { id: randomUUID(), clientMessageId: input.clientMessageId, message: { role: 'user' as const, content: input.text, timestamp: Date.now() } }
+    const user: ConversationMessage = {
+      id: randomUUID(), clientMessageId: input.clientMessageId,
+      message: { role: 'user', content: input.text, timestamp: Date.now() },
+      ...(skillInvocation && { skillInvocation }),
+    }
     const running = { kind: 'task' as const, runId: user.id, assistantMessageId: randomUUID(), phase: 'model' as const, activeTools: [] }
     const run = this.saveStart(input, selection, user.id, 'task', { messages: [user] })
     const initialSelection = this.confirmInitialSelection(selection)
@@ -177,7 +205,7 @@ export class AgentSession {
     this.state.running = running
     this.publish({ type: 'accepted', user, running }, run && this.publicRun(run), undefined, initialSelection)
     const acceptedSeq = this.state.seq
-    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, controller.signal))
+    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal))
     return { kind: 'message', clientMessageId: input.clientMessageId, userMessageId: user.id, acceptedSeq }
   }
 
@@ -409,7 +437,7 @@ export class AgentSession {
     this.publish(message ? { type: 'task', running, message, messageIndex } : { type: 'task', running })
   }
 
-  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], signal: AbortSignal) {
+  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], skills: readonly SkillSummary[], signal: AbortSignal) {
     let messageId = running.assistantMessageId
     let advanceRound = false
     let recovered = false
@@ -443,7 +471,7 @@ export class AgentSession {
       }
       signal.throwIfAborted()
       this.projectContext = { cwd, files }
-      this.configure(cwd, tools, files)
+      this.configure(cwd, tools, files, skills)
       if (this.estimate({ ...this.configuration, messages: [] }) > inputBudget) {
         return { error: files.length ? new ProjectContextOverflow().message : '系统提示和工具定义超出当前模型容量，请切换模型。' }
       }
@@ -461,7 +489,7 @@ export class AgentSession {
     }
 
     const finalizeContext: AgentRunInput['finalizeContext'] = () => {
-      this.configure(cwd, tools, this.projectContext?.files ?? [])
+      this.configure(cwd, tools, this.projectContext?.files ?? [], skills)
       const candidate = this.context()
       if (this.pressure(candidate, model) + model.maxTokens > model.contextWindow) return { error: capacityError }
       usedCompaction = this.latestCompaction()

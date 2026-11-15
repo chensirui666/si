@@ -1,16 +1,20 @@
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ProjectContextFile } from './project-context.js'
+import type { SkillSummary } from './skills.js'
 import type { CodingTool } from './tools.js'
 
-function promptPath(path: string) {
+export function escapePromptAttribute(path: string) {
   return path.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;').replaceAll('\n', '&#10;').replaceAll('\r', '&#13;')
 }
 
-export function buildSystemPrompt(cwd: string, tools: readonly CodingTool[], documentationRoot?: string, contextFiles: readonly ProjectContextFile[] = []): string {
+export function buildSystemPrompt(cwd: string, tools: readonly CodingTool[], documentationRoot?: string, contextFiles: readonly ProjectContextFile[] = [],
+  skills: readonly SkillSummary[] = [], skillHome = homedir(),
+): string {
   const projectContext = contextFiles.length ? [
     '<project_context>',
-    ...contextFiles.map(({ path, content }) => `<project_instructions path="${promptPath(path)}">\n${content}\n</project_instructions>`),
+    ...contextFiles.map(({ path, content }) => `<project_instructions path="${escapePromptAttribute(path)}">\n${content}\n</project_instructions>`),
     '</project_context>',
   ].join('\n') : ''
   if (!tools.length) return [`当前工作目录（JSON 路径字符串）：${JSON.stringify(cwd)}。`, projectContext].filter(Boolean).join('\n\n')
@@ -31,11 +35,24 @@ export function buildSystemPrompt(cwd: string, tools: readonly CodingTool[], doc
     '- 处理文件时，清楚地写出文件路径。',
   ].filter(Boolean).join('\n')
   const docs = documentationRoot && names.has('read') ? `<docs>
-si 文档（仅当用户询问 si 本身时阅读）
+SI 文档（用户询问 SI 本身，或要求创建、修改 Skill 时查阅）
 - 主文档：${join(documentationRoot, 'README.md')}
-- 查阅 si 文档时，从 si 自身的目录定位文档。文档里的相对链接以该文档所在目录为起点。
-- 用户询问启动、模型配置、工作区、网页工具、中止或对话压缩时，查阅主文档。询问页面操作或开发校验时，查阅 ${join(documentationRoot, 'web', 'README.md')}。
+- 补充文档位于 ${join(documentationRoot, 'docs')}。
+- 从 SI 应用目录定位文档。文档里的相对链接以该文档所在目录为起点。
+- 启动、模型配置、工作区、网页工具、中止和对话压缩见主文档。页面操作和开发校验见 ${join(documentationRoot, 'web', 'README.md')}。Skill 规则见 ${join(documentationRoot, 'docs', 'skills.md')}。
+- 创建或修改 Skill 前，先用 read 完整阅读 Skill 规则文档，并查阅其中与本次任务有关的引用。个人 Skill 目录是 ${JSON.stringify(join(skillHome, '.si', 'skills'))}。
 </docs>` : ''
+
+  const visibleSkills = names.has('read') ? skills.filter(skill => !skill.disableModelInvocation) : []
+  const catalog = visibleSkills.length ? [
+    '如果任务符合某个 Skill 的用途，先用 read 读取该 Skill 的说明。配套文件的相对路径以说明文件所在的目录为起点。',
+    '<available_skills>',
+    ...visibleSkills.map(({ name, description, path }) => [
+      '  <skill>', `    <name>${name}</name>`, `    <description>${escapePromptAttribute(description)}</description>`,
+      `    <location>${escapePromptAttribute(path)}</location>`, '  </skill>',
+    ].join('\n')),
+    '</available_skills>',
+  ].join('\n') : ''
 
   return [
     '你是一名专业的编程助手，运行在编程智能体框架 si 中。你通过读取文件、执行命令、编辑代码、新建文件和查阅网页资料来帮助用户。',
@@ -43,6 +60,7 @@ si 文档（仅当用户询问 si 本身时阅读）
     `<rules>\n${rules}\n</rules>`,
     docs,
     projectContext,
-    `<cwd>\n${promptPath(cwd)}\n</cwd>`,
+    catalog,
+    `<cwd>\n${escapePromptAttribute(cwd)}\n</cwd>`,
   ].filter(Boolean).join('\n\n')
 }

@@ -21,7 +21,7 @@ test('权限 17/23/24/29：草稿独立保存，同会话同步，服务重启�
   const provider = await startModelServer()
   const options = {
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { baseURL: provider.baseURL },

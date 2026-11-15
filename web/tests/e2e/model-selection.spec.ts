@@ -219,7 +219,7 @@ test('Feature 1 小模型容量不足后，从同一网页用大模型压缩，�
     port: 0, directoryPicker: async () => directory, compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
     workspacePath: join(directory, 'workspaces.json'), sessionPath: join(directory, 'sessions.sqlite'),
     browserSecretPath: join(directory, 'browser-auth.json'), modelAuthPath: join(directory, 'auth.json'),
-    webSettingsPath: join(directory, 'settings.json'), globalContextDirectory: join(directory, 'global'),
+    webSettingsPath: join(directory, 'settings.json'), skillHome: join(directory, 'skill-home'), globalContextDirectory: join(directory, 'global'),
     modelOptions: { baseURL: model.baseURL },
   })
   try {
@@ -247,8 +247,9 @@ test('Feature 1 小模型容量不足后，从同一网页用大模型压缩，�
     expect(model.exchanges).toHaveLength(2)
 
     await choose(page, 'DeepSeek Flash')
-    await editor(page).fill('/compact')
-    await send(page).click()
+    await editor(page).fill('/')
+    await page.getByRole('option', { name: /compact/ }).click()
+    await expect(editor(page)).toHaveText('')
     await expect.poll(() => model.exchanges.length).toBe(3)
     expect(model.exchanges[2].body.model).toBe('deepseek-flash')
     model.exchanges[2].delta({ content: '已整理的原任务事实' })

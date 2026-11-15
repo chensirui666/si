@@ -26,7 +26,7 @@ async function setup(options: Partial<ConstructorParameters<typeof WebServer>[0]
   await writeFile(join(webRoot, 'index.html'), '<!doctype html><h1>聊天</h1>')
   await writeFile(join(webRoot, 'assets/app.js'), 'console.log("app")')
   const workspace = await realpath(await mkdir(join(dir, 'workspace')).then(() => join(dir, 'workspace')))
-  const config = { port: 0, webRoot, globalContextDirectory: join(dir, 'global-context'), workspacePath: join(dir, 'private/workspaces.json'),
+  const config = { port: 0, webRoot, skillHome: join(dir, 'skill-home'), globalContextDirectory: join(dir, 'global-context'), workspacePath: join(dir, 'private/workspaces.json'),
     webSettingsPath: join(dir, 'private/settings.json'), ...(!options.createSession && { sessionPath: join(dir, 'private/sessions.sqlite') }), directoryPicker: async () => workspace, browserSecretPath: join(dir, 'private/browser-auth.json'), modelAuthPath: join(dir, 'private/auth.json'), ...options }
   const server = new WebServer(config)
   const started = await server.start()
@@ -1002,8 +1002,12 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
   const promptDocument = await readFile(new URL('../../../docs/prompts/systemPrompt.md', import.meta.url), 'utf8')
   const expectedPrompt = promptDocument.split('```text\n')[1].split('\n```')[0]
     .replaceAll('{{siRoot}}/', () => fileURLToPath(new URL('../../../', import.meta.url)))
+    .replace('{{home}}', () => app.config.skillHome)
     .replace('{{workspacePath}}', () => app.workspace)
-  expect(requests[0].messages[0]).toEqual({ role: 'system', content: expectedPrompt })
+  const systemPrompt = requests[0].messages[0].content
+  expect(systemPrompt).toContain('<name>agents-md</name>')
+  expect(systemPrompt.replace(/\n\n如果任务符合[^\n]+\n<available_skills>[\s\S]*?<\/available_skills>/, ''))
+    .toBe(expectedPrompt)
   expect(requests[1].messages[0]).toEqual(requests[0].messages[0])
   expect(requests[0].tools).toHaveLength(9)
   expect(requests[1].tools).toHaveLength(9)
