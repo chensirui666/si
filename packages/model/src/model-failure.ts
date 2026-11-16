@@ -94,9 +94,9 @@ export function classifyModelFailure(input: {
     || /\b(?:connect ECONNREFUSED|getaddrinfo (?:ENOTFOUND|EAI_AGAIN)|UND_ERR_CONNECT_TIMEOUT)\b/.test(message))) return { kind: 'connection' }
   if (has('TimeoutError', 'APIConnectionTimeoutError', 'ETIMEDOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT')
     || /\b(?:ETIMEDOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|timed out)\b/i.test(message)) return { kind: 'timeout' }
-  if (phase === 'stream' && (has('ECONNRESET', 'UND_ERR_SOCKET') || /\b(?:ECONNRESET|UND_ERR_SOCKET|other side closed)\b/.test(message))) {
-    return { kind: 'connection-reset' }
-  }
+  const socketClosed = has('UND_ERR_SOCKET') || /\bUND_ERR_SOCKET\b/.test(message)
+  const streamReset = phase === 'stream' && (has('ECONNRESET') || /\b(?:ECONNRESET|other side closed)\b/.test(message))
+  if (phase !== 'setup' && (socketClosed || streamReset)) return { kind: 'connection-reset' }
   if (fallback) return { kind: fallback }
   if (phase === 'stream') {
     return { kind: /stream ended (?:before|without) (?:message_stop|a terminal response event|a (?:finish|stop) reason|finish_reason)/i.test(message)

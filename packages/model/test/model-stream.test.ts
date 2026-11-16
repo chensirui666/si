@@ -724,6 +724,32 @@ it('sends the selected thinking level to Gemini 4 Hydrogen and records the respo
   } finally { vi.unstubAllGlobals() }
 })
 
+it('times out a Gemini request waiting for HTTP headers using one attempt', async () => {
+  vi.useFakeTimers()
+  const model = modelApi.findModel('gemini-3.7-flash', 'google')!
+  const started = Promise.withResolvers<AbortSignal>()
+  const fetcher = vi.fn((_url: string, { signal }: RequestInit) => {
+    started.resolve(signal!)
+    return new Promise<Response>((_resolve, reject) => {
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })
+    })
+  })
+  vi.stubGlobal('fetch', fetcher)
+  try {
+    const stream = modelApi.createModelStream(credentials)(model, context)
+    const result = consume(stream)
+    const signal = await started.promise
+    await vi.advanceTimersByTimeAsync(299_999)
+    expect(signal.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    const settled = await result
+    expect(signal.aborted).toBe(true)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(settled.events.map(event => event.type)).toEqual(['error'])
+    expect(settled.result).toMatchObject({ stopReason: 'error', failure: { kind: 'timeout' } })
+  } finally { vi.unstubAllGlobals() }
+})
+
 it.each([
   [418, undefined, 'http-error'],
   [503, undefined, 'unavailable'],
@@ -862,4 +888,26 @@ it.each([
   const { result } = await consume(run(selected, context))
   expect(result.failure?.kind).toBe('rate-limit')
   expect(result.failure?.retryAt).toBe(offset === undefined ? undefined : now + offset)
+})
+
+it('classifies a socket closed after sending the Gemini request and before response headers', async () => {
+  let requests = 0
+  const server = createServer(request => {
+    requests++
+    request.once('end', () => request.socket.end())
+    request.resume()
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const baseURL = 'http://127.0.0.1:' + (server.address() as { port: number }).port
+  try {
+    const model = modelApi.findModel('gemini-3.7-flash', 'google')!
+    const { events, result } = await consume(modelApi.createModelStream(credentials, { baseURL })(model, context))
+    expect(requests).toBe(1)
+    expect(events.map(event => event.type)).toEqual(['error'])
+    expect(result.failure).toEqual({ kind: 'connection-reset' })
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
 })

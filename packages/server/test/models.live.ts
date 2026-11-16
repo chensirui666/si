@@ -97,14 +97,14 @@ async function setup(temporary: string, capture: boolean) {
     const created = await request('POST', '/api/sessions', { workspaceId })
     expect(created.status).toBe(201)
     const { id: sessionId } = await created.json()
-    const updates: ConversationUpdate[] = []
+    const updates: { at: number; update: ConversationUpdate }[] = []
     let ready = false
     socket = new WebSocket(url.replace('http:', 'ws:') + '/api/events', { headers })
     socket.on('message', raw => {
       const frame = JSON.parse(String(raw)) as ServerFrame
       if (!('sessionId' in frame) || frame.sessionId !== sessionId) return
       if (frame.type === 'snapshot') ready = true
-      if (frame.type === 'update') updates.push(frame.update)
+      if (frame.type === 'update') updates.push({ at: performance.now(), update: frame.update })
     })
     await once(socket, 'open')
     socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'models-live' }))
@@ -120,13 +120,34 @@ async function setup(temporary: string, capture: boolean) {
     }
     async function submit(selection: ModelSelection, text: string) {
       const before = updates.length
+      const startedAt = performance.now()
       const clientMessageId = randomUUID()
       const result = await request('POST', '/api/messages', { ...selection, sessionId, clientMessageId, text })
       expect(result.status).toBe(202)
       const receipt = await result.json()
-      const frames = () => updates.slice(before)
+      const frames = () => updates.slice(before).map(({ update }) => update)
+      function timeline() {
+        const window = updates.slice(before)
+        const first = (match: (update: ConversationUpdate) => boolean) => {
+          const at = window.find(({ update }) => match(update))?.at
+          return at === undefined ? undefined : Math.round(at - startedAt)
+        }
+        return {
+          acceptedMs: first(update => update.run?.clientMessageId === clientMessageId && update.run.status === 'running'),
+          modelStartMs: first(({ change }) => change.type === 'model' && change.event.type === 'start'),
+          firstOutputMs: first(({ change }) => change.type === 'model' && (
+            ['text_delta', 'thinking_delta', 'toolcall_delta'].includes(change.event.type)
+            || change.event.type === 'replace' && change.event.message.content.length > 0
+          )),
+          modelEndMs: first(({ change }) => change.type === 'model' && (
+            change.event.type === 'done' || change.event.type === 'error'
+            || change.event.type === 'replace' && change.event.message.stopReason !== 'pending'
+          )),
+          runEndMs: first(update => update.run?.clientMessageId === clientMessageId && update.run.status !== 'running'),
+        }
+      }
       return {
-        frames, id: receipt.userMessageId ?? receipt.compactionId,
+        frames, timeline, id: receipt.userMessageId ?? receipt.compactionId,
         async finish() {
           const terminal = await vi.waitFor(() => {
             const run = frames().find(update => update.run?.clientMessageId === clientMessageId && update.run.status !== 'running')?.run
@@ -252,12 +273,14 @@ for (const provider of Object.keys(variables)) {
       const retryStates = () => request.frames().flatMap(({ change }) => change.type === 'task' && change.running?.kind === 'task' && change.running.retry
         ? [{ mode: change.running.retry.mode, reason: change.running.retry.reason, phase: change.running.retry.phase }] : [])
       const result = await request.finish().catch(error => {
-        console.info('模型请求恢复验收未收到终态', { provider, model: model!.id, api: model!.api, retry: retryStates() })
+        console.info('模型请求恢复验收未收到终态', {
+          provider, model: model!.id, api: model!.api, ...request.timeline(), retry: retryStates(),
+        })
         throw error
       })
       const last = result.assistants.at(-1)
       console.info('模型请求恢复验收', { provider, model: model!.id, api: model!.api, status: result.terminal.status,
-        requests: provider === 'google' ? undefined : api.requests.length, retry: retryStates(), reason: last?.failure?.kind })
+        requests: provider === 'google' ? undefined : api.requests.length, ...request.timeline(), retry: retryStates(), reason: last?.failure?.kind })
       expect(result.terminal.status, last?.errorMessage).toBe('completed')
       expect(last?.stopReason).toBe('stop')
       expect(textOf(last).trim()).toContain('恢复验收通过')
