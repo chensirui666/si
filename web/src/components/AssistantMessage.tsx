@@ -5,6 +5,7 @@ import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveF
 import type { AssistantMessage as Message, ToolCall } from '@agent-learning/model'
 import { MarkdownText } from './markdown/MarkdownText'
 import { CopyMarkdownButton } from './markdown/CopyMarkdownButton'
+import { ModelRequestDetail } from './ModelRequestDetail'
 import { RunStatus } from './RunStatus'
 
 export type AssistantEntry = { id: string; message: Message }
@@ -81,11 +82,12 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
   </details>
 }
 
-export function AssistantMessage({ messages, activeContent = [], running = null, run, toolResults, restored, saveFailure }: {
+export function AssistantMessage({ messages, activeContent = [], running = null, run, showRetry = true, toolResults, restored, saveFailure }: {
   messages: readonly AssistantEntry[]
   activeContent?: readonly ActiveContent[]
   running?: Extract<RunningState, { kind: 'task' }> | null
   run?: RunRecord
+  showRetry?: boolean
   toolResults?: ToolResults
   restored?: true
   saveFailure?: SaveFailure
@@ -97,7 +99,12 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
   const reply: string[] = []
   let process: ReactNode[] = []
   let processKey = ''
-  let activityRun = run
+  const retry = showRetry ? running?.retry : undefined
+  const last = messages.at(-1)?.message
+  const detailMessage = last && (last.stopReason === 'length' || last.stopReason === 'aborted'
+    || last.stopReason === 'error' && last.failure) ? last : undefined
+  const separateSummary = retry || detailMessage
+  let activityRun = separateSummary ? undefined : run
   function flushProcess() {
     if (!process.length) return
     rows.push(<ProcessGroup key={processKey} running={running !== null} run={activityRun}>{process}</ProcessGroup>)
@@ -136,6 +143,8 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
           result={toolResults?.get(id)?.get(index)} />)
       }
     })
+    const recoveringOverflow = message.errorCode === 'context_overflow' && !message.failure && (message !== last || running)
+    if (message === detailMessage || recoveringOverflow) continue
     const ending = message.stopReason === 'length' ? 'assistant.length'
       : message.stopReason === 'aborted' ? 'assistant.aborted'
       : message.stopReason === 'error' ? 'assistant.failed' : null
@@ -145,9 +154,11 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
     }
   }
   flushProcess()
+  const summaryRun = separateSummary ? run : activityRun
   const markdown = reply.join('\n\n')
   return <div className="assistant-message" ref={response}>
-    {activityRun && <p className="run-status-line"><RunStatus run={activityRun} /></p>}
+    {summaryRun && <p className="run-status-line"><RunStatus run={summaryRun} /></p>}
+    <ModelRequestDetail retry={retry} ending={detailMessage} />
     {rows}
     {!running && markdown.trim() && <div className="response-actions">
       <CopyMarkdownButton label={t('markdown.copyResponse')} markdown={markdown}

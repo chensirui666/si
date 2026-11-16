@@ -257,3 +257,128 @@ test('加载记录分别标明预置版和个人版', async ({ mount }) => {
   await expect(component.locator('[data-skill-status="loaded"]'))
     .toHaveText(['已加载 grill-me · 预置', '已加载 grill-me · 个人']);
 });
+
+test.describe('模型请求恢复文案', () => {
+  test.use({ timezoneId: 'Asia/Shanghai' })
+
+  test('按状态文案记录表验证 01–47 和显示位置', async ({ mount, page }) => {
+    const now = new Date('2026-11-16T08:00:00Z').getTime()
+    await page.clock.install({ time: now })
+    await page.clock.pauseAt(now)
+    type Running = Extract<NonNullable<import('@agent-learning/server/protocol').RunningState>, { kind: 'task' }>
+    type Assistant = import('@agent-learning/model').AssistantMessage
+    type Failure = NonNullable<Assistant['failure']>
+    type Retry = NonNullable<Running['retry']>
+    const user: ConversationMessage = { id: 'u', message: { role: 'user', content: '问题', timestamp: now } }
+    const assistant: Assistant = { role: 'assistant', model: 'deepseek-flash', api: 'openai-completions', provider: 'deepseek',
+      timestamp: now, content: [], stopReason: 'pending' }
+    const oldText = { type: 'text' as const, text: '上次正文' }
+    const newText = { type: 'text' as const, text: '本次正文' }
+    const toolCall = { type: 'toolCall' as const, id: 'read', name: 'read', arguments: { path: 'note.txt' } }
+    const run: RunRecord = { id: 'u', sessionId: 's', clientMessageId: 'c', modelId: 'deepseek-flash', kind: 'task', status: 'running', startedAt: now - 8000 }
+    const running: Running = { kind: 'task', runId: 'u', assistantMessageId: 'a', phase: 'model', activeTools: [] }
+    const limited = (reason: Failure['kind'], options: Partial<Extract<Retry, { mode: 'limited' }>> = {}): Retry =>
+      ({ mode: 'limited', phase: 'waiting', reason, attempt: 1, maxAttempts: 5, retryAt: now + 1000, ...options })
+    const fails = (kind: Failure['kind'], extra: Partial<Failure> = {}): Partial<Assistant> => ({ stopReason: 'error', failure: { kind, ...extra } })
+    type Case = {
+      status?: RunRecord['status']; retry?: Retry; patch?: Partial<Assistant>; text?: string;
+      pageOffline?: boolean; summary?: string; compacting?: boolean; next?: boolean;
+    }
+    const waits: [number, Failure['kind'], string, number?][] = [
+      [10, 'connection-reset', '模型连接中断'],
+      [11, 'stream-read', '模型回复读取失败'],
+      [12, 'stream-ended', '模型回复中断'],
+      [13, 'timeout', '模型请求超时'],
+      [14, 'temporary-rate-limit', '模型服务暂时限流'],
+      [15, 'rate-limit', '模型服务限制了请求'],
+      [16, 'internal', '模型服务内部错误'],
+      [17, 'bad-gateway', '模型服务网关错误'],
+      [18, 'unavailable', '模型服务暂不可用'],
+      [19, 'gateway-timeout', '模型服务网关超时'],
+      [20, 'overloaded', '模型服务繁忙'],
+      [21, 'capacity', '模型容量暂不可用'],
+      [45, 'request-error', '模型请求异常'],
+      [46, 'response-error', '模型回复异常'],
+      [47, 'http-error', '模型请求异常（HTTP 418）', 418],
+    ]
+    const terminal: [number, Failure['kind'], string, Partial<Failure>?][] = [
+      [24, 'response-error', '模型回复异常，已重试 5 次', { attempts: 5 }],
+      [25, 'rate-limit', '模型服务限制了请求，已重试 5 次。最早可于 2026-11-16 16:00:01 UTC+08:00 重试', { attempts: 5, retryAt: now + 501 }],
+      [26, 'rate-limit', '模型服务限制了请求，请稍后再试'],
+      [27, 'overloaded', '模型服务繁忙，请稍后再试或切换模型'],
+      [28, 'capacity', '模型容量暂不可用，请稍后再试或切换模型'],
+      [29, 'balance', '模型服务余额不足，请检查账户余额'],
+      [30, 'quota', '模型服务配额已用尽，请检查账户额度'],
+      [31, 'authentication', '模型服务拒绝了凭据，请检查凭据配置'],
+      [32, 'permission', '当前凭据无权使用该模型'],
+      [33, 'invalid-request', '模型服务拒绝了请求，请检查请求参数'],
+      [34, 'configuration', '模型配置无效，请检查模型配置'],
+      [35, 'unknown', '模型请求未能完成，请重试'],
+      [43, 'context-capacity', '当前模型容量不足，请切换模型后重新压缩'],
+      [44, 'context-capacity', '当前模型容量不足，请切换模型后重新压缩'],
+    ]
+    const cases: Record<number, Case> = {
+      1: {}, 2: { patch: { content: [oldText] } }, 3: { patch: { stopReason: 'toolUse', content: [toolCall] } },
+      4: { patch: { content: [newText] } }, 5: { patch: { stopReason: 'toolUse', content: [toolCall] } },
+      6: { status: 'completed', patch: { stopReason: 'stop', content: [newText] } },
+      7: { status: 'completed', patch: { stopReason: 'length', content: [newText] }, text: '达到长度限制，回答可能不完整' },
+      8: { patch: { stopReason: 'length', content: [toolCall] }, text: '达到长度限制，回答可能不完整' },
+      9: { retry: { mode: 'connection', reason: 'connection', phase: 'waiting', retryAt: now + 5000 }, text: '等待连接模型服务 · 5 秒后再试' },
+      22: { retry: limited('stream-ended', { phase: 'retrying', attempt: 2, retryAt: undefined, incomplete: true }),
+        patch: { content: [oldText] }, text: '正在重试 · 第 2/5 次 · 上次回复未完成' },
+      23: { retry: { mode: 'connection', reason: 'connection', phase: 'retrying' }, text: '正在重新连接模型服务' },
+      36: { status: 'aborted', patch: { stopReason: 'aborted' }, text: '已停止 · 本轮已取消' },
+      37: { status: 'interrupted', summary: '已中断' },
+      38: { next: true },
+      39: { retry: limited('stream-ended'), pageOffline: true },
+      40: { retry: limited('stream-ended', { attempt: 3 }), text: '模型回复中断 · 1 秒后进行第 3/5 次重试' },
+      41: { patch: { stopReason: 'error', errorCode: 'context_overflow' }, compacting: true },
+      42: {},
+    }
+    for (const [id, kind, label, status] of waits) cases[id] = {
+      retry: limited(kind, { status }), text: label + ' · 1 秒后进行第 1/5 次重试',
+    }
+    for (const [id, kind, label, extra] of terminal) cases[id] = {
+      status: 'failed', patch: fails(kind, extra), text: '回复失败 · ' + label,
+    }
+    const component = await mount(<MessageList messages={[]} />)
+    for (let id = 1; id <= 47; id++) await test.step(String(id).padStart(2, '0'), async () => {
+      const { status = 'running', patch, retry, text, pageOffline, summary, compacting, next } = cases[id]
+      const entry = patch ? [{ id: 'a', message: { ...assistant, ...patch } }] : []
+      const records = [{ ...run, status, ...(status !== 'running' && { finishedAt: now }) }]
+      const props = next
+        ? { messages: [user, { id: 'a', message: { ...assistant, ...fails('unknown') } }, { ...user, id: 'new' }],
+            runs: [{ ...run, status: 'failed' as const, finishedAt: now }, { ...run, id: 'new' }],
+            running: { ...running, runId: 'new', assistantMessageId: 'b' } }
+        : { messages: [user, ...entry], runs: records, showRetry: !pageOffline,
+            running: status === 'running' ? { ...running, phase: compacting ? 'compaction' as const : 'model' as const, retry } : null }
+      await component.update(<MessageList {...props} />)
+      const row = component.locator('.message-item-assistant').last()
+      await expect(row).toHaveAttribute('data-run-status', status)
+      const detail = row.locator('[data-run-detail]')
+      if (text) {
+        await expect(detail).toHaveText(text)
+        await expect(row.locator('.run-status-line + [data-run-detail]')).toHaveCount(1)
+      } else await expect(detail).toHaveCount(0)
+      if (summary) await expect(row.locator('.run-status')).toContainText(summary)
+      if (next) await expect(component.locator('.message-item-assistant').first()).toHaveAttribute('data-run-status', 'failed')
+    })
+  })
+
+  test('到零后等服务端确认，120 秒等待过 61 秒仍显示剩余 59 秒', async ({ mount, page }) => {
+    const now = new Date('2026-11-16T08:00:00Z').getTime()
+    await page.clock.install({ time: now })
+    await page.clock.pauseAt(now)
+    const messages: ConversationMessage[] = [{ id: 'u', message: { role: 'user', content: '问题', timestamp: now } }]
+    const running = { kind: 'task' as const, runId: 'u', assistantMessageId: 'a', phase: 'model' as const, activeTools: [],
+      retry: { mode: 'limited' as const, reason: 'rate-limit' as const, phase: 'waiting' as const, attempt: 1, maxAttempts: 5 as const, retryAt: now + 120_000 } }
+    const component = await mount(<MessageList messages={messages} running={running} />)
+    const detail = component.locator('[data-run-detail]')
+    await page.clock.fastForward(61_000)
+    await expect(detail).toHaveText('模型服务限制了请求 · 59 秒后进行第 1/5 次重试')
+    await page.clock.fastForward(59_000)
+    await expect(detail).toHaveText('模型服务限制了请求 · 0 秒后进行第 1/5 次重试')
+    await component.update(<MessageList messages={messages} running={{ ...running, retry: { ...running.retry, phase: 'retrying', retryAt: undefined } }} />)
+    await expect(detail).toHaveText('正在重试 · 第 1/5 次')
+  })
+})

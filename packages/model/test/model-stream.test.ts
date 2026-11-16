@@ -1,3 +1,5 @@
+import { once } from 'node:events'
+import { createServer, type ServerResponse } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import * as modelApi from '../src/index.js'
@@ -584,6 +586,7 @@ describe('Model single SDK stream', () => {
     await vi.advanceTimersByTimeAsync(1)
     const { result } = await reading
     expect(result.stopReason).toBe('error')
+    expect(result.failure).toEqual({ kind: 'timeout' })
     expect(result.errorMessage).toMatch(/超时|timeout/i)
     expect(signal.aborted).toBe(true)
     expect(calls).toBe(1)
@@ -719,4 +722,144 @@ it('sends the selected thinking level to Gemini 4 Hydrogen and records the respo
     expect(low).toMatchObject({ model: 'gemini-4-hydrogen', responseModel: 'gemini-4-hydrogen', stopReason: 'stop' })
     expect(high.responseModel).toBe(low.responseModel)
   } finally { vi.unstubAllGlobals() }
+})
+
+it.each([
+  [418, undefined, 'http-error'],
+  [503, undefined, 'unavailable'],
+  [429, 'insufficient_quota', 'quota'],
+  [503, 'server_is_overloaded', 'overloaded'],
+] as const)('keeps safe failure evidence from HTTP %s (%s)', async (status, code, kind) => {
+  const received = Date.now()
+  const fetcher = vi.fn(async () => new Response(JSON.stringify({ error: { code, message: 'private test-private-key' } }), {
+    status, headers: { 'content-type': 'application/json', 'retry-after': '120' },
+  }))
+  const { result } = await consume(modelApi.createModelStream(credentials, { fetch: fetcher })(selected, context))
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(result.failure).toMatchObject({ kind, ...(kind === 'http-error' && { status }) })
+  if (kind !== 'quota') expect(result.failure?.retryAt).toBeGreaterThanOrEqual(received + 120_000)
+  expect(JSON.stringify(result)).not.toContain('test-private-key')
+})
+
+it('distinguishes a confirmed connection refusal from a general model request failure', async () => {
+  for (const [error, kind] of [[Object.assign(new Error('connect refused'), { code: 'ECONNREFUSED' }), 'connection'],
+    [new Error('upstream did not explain'), 'request-error']] as const) {
+    const fetcher = vi.fn(async () => { throw new TypeError('fetch failed', { cause: error }) })
+    const { result } = await consume(modelApi.createModelStream(credentials, { fetch: fetcher })(selected, context))
+    expect(result.failure).toEqual({ kind })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  }
+})
+
+const responsesText = [
+  { type: 'response.output_item.added', output_index: 0, item: { id: 'message', type: 'message', role: 'assistant', content: [], status: 'in_progress' } },
+  { type: 'response.content_part.added', output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+  { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'partial' },
+]
+const routes = [
+  [selected, [chunk({ content: 'partial' })]],
+  [modelApi.findModel('chat-latest', 'openai')!, responsesText],
+  [modelApi.findModel('kimi-k3', 'moonshotai-cn')!, [chunk({ content: 'partial' })]],
+  [modelApi.findModel('claude-sonnet-5-5', 'anthropic')!, [
+    { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+  ]],
+  [modelApi.findModel('gemini-4-hydrogen', 'google')!, [
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] } }] },
+  ]],
+  [modelApi.findModel('codestral-2508', 'mistral')!, [chunk({ content: 'partial' })]],
+] as const
+
+function writeSse(res: ServerResponse, items: readonly unknown[]) {
+  res.writeHead(200, { 'content-type': 'text/event-stream' })
+  for (const item of items) {
+    const { type } = item as { type?: string }
+    if (type) res.write('event: ' + type + '\n')
+    res.write('data: ' + JSON.stringify(item) + '\n\n')
+  }
+}
+
+it.each(routes.map(([model, frames]) => ({ model, frames })))('$model.provider [$model.api] classifies refused connections, 503, clean EOF and reset with one request per attempt', async ({ model, frames }) => {
+  let requests = 0
+  let fault: '503' | 'eof' | 'reset' = '503'
+  let response: ServerResponse | undefined
+  const server = createServer((req, res) => {
+    req.resume()
+    requests++
+    response = res
+    if (fault === '503') {
+      res.writeHead(503, { 'retry-after': '120', 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 503, message: 'service temporary test-private-key' } }))
+      return
+    }
+    writeSse(res, frames)
+    if (fault === 'eof') res.end()
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const baseURL = 'http://127.0.0.1:' + (server.address() as { port: number }).port
+  const run = modelApi.createModelStream(credentials, { baseURL })
+  try {
+    const { result } = await consume(run(model, context))
+    expect(result.failure?.kind).toBe('unavailable')
+    if (model.provider === 'google') expect(result.failure?.retryAt).toBeUndefined()
+    else expect(result.failure?.retryAt).toBeGreaterThan(Date.now() + 115_000)
+    expect(JSON.stringify(result)).not.toContain('test-private-key')
+    expect(requests).toBe(1)
+    fault = 'eof'
+    const eof = await consume(run(model, context))
+    expect(eof.events).toContainEqual(expect.objectContaining({ type: 'text_delta', delta: 'partial' }))
+    expect(eof.result.failure).toEqual({ kind: 'stream-ended' })
+    expect(requests).toBe(2)
+    fault = 'reset'
+    const stream = run(model, context)
+    for await (const event of stream) {
+      if (event.type === 'text_delta') response!.socket!.resetAndDestroy()
+    }
+    expect((await stream.result()).failure).toEqual({ kind: 'connection-reset' })
+    expect(requests).toBe(3)
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
+  const fetcher = vi.fn(globalThis.fetch)
+  if (model.provider === 'google') vi.stubGlobal('fetch', fetcher)
+  try {
+    const failed = await consume(modelApi.createModelStream(credentials, { baseURL, ...(model.provider !== 'google' && { fetch: fetcher }) })(model, context))
+    expect(failed.result.failure).toEqual({ kind: 'connection' })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  } finally { vi.unstubAllGlobals() }
+}, 10_000)
+
+it('classifies a Responses failure event with no code, and a local exception before sending', async () => {
+  const model = modelApi.findModel('chat-latest', 'openai')!
+  const fetcher = vi.fn(async () => response([{ type: 'response.failed' }], false))
+  const run = modelApi.createModelStream(credentials, { fetch: fetcher })
+  expect((await consume(run(model, context))).result.failure).toEqual({ kind: 'response-error' })
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  const badContext = { get messages(): never { throw new Error('local private test-private-key') } }
+  const prepared = await consume(run(model, badContext))
+  expect(prepared.result.failure).toEqual({ kind: 'unknown' })
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(JSON.stringify(prepared.result)).not.toContain('test-private-key')
+})
+
+it.each([
+  ['60', 60_000],
+  ['Mon, 16 Nov 2026 08:00:02 GMT', 2000],
+  ['Mon, 16 Nov 2026 07:00:00 GMT', 0],
+  ['1.5', undefined],
+  ['-3', undefined],
+  ['9999999999999999999', undefined],
+] as const)('normalizes Retry-After %s from the time the model response arrived', async (header, offset) => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const now = Date.parse('2026-11-16T08:00:00Z')
+  vi.setSystemTime(now)
+  const run = modelApi.createModelStream(credentials, { fetch: async () => new Response('{}', {
+    status: 429, headers: { 'retry-after': header },
+  }) })
+  const { result } = await consume(run(selected, context))
+  expect(result.failure?.kind).toBe('rate-limit')
+  expect(result.failure?.retryAt).toBe(offset === undefined ? undefined : now + offset)
 })

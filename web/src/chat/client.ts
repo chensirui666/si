@@ -30,10 +30,12 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     subscriptionId = ''
     previous.close()
   }
-  function fail(key: CopyKey = 'chat.connectionFailed') {
+  function fail(key?: CopyKey) {
+    const running = state.snapshot?.running
+    const notice = key ?? (running?.kind === 'task' && running.retry ? 'chat.disconnected' : 'chat.connectionFailed')
     releaseSocket()
     if (stopped) return
-    publish({ ...state, connection: 'disconnected', slow: false, error: null, connectionNotice: key })
+    publish({ ...state, connection: 'disconnected', slow: false, error: null, connectionNotice: notice })
     if (!navigator.onLine) return
     const upper = Math.min(500 * 2 ** retryCount, 10_000)
     retryCount = Math.min(retryCount + 1, 5)

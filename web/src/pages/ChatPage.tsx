@@ -649,7 +649,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       </header>}
       <div className="chat-main-frame">
       <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
-        {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
+        {!isNew && <MessageList key={sessionId} messages={messages} showRetry={state.connection === 'ready'} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
           onQuote={text => {
             setQuotes(current => ({ ...current, [sessionId]: text }))
             editor.current?.focus({ preventScroll: true })

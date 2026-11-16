@@ -134,7 +134,7 @@ async function setup(temporary: string, capture: boolean) {
             return run!
           }, { timeout: 115_000, interval: 75 })
           const assistants = frames().flatMap(({ change }) => change.type === 'model'
-            ? change.event.type === 'done' ? [change.event.message] : change.event.type === 'error' ? [change.event.error] : [] : [])
+            ? change.event.type === 'done' ? [change.event.message] : change.event.type === 'error' ? [change.event.error] : change.event.type === 'replace' && change.event.message.stopReason !== 'pending' ? [change.event.message] : [] : [])
           return { terminal, assistants, frames: frames() }
         },
       }
@@ -240,4 +240,27 @@ for (const modelId of ['gemini-4-hydrogen', 'gemini-3.7-flash']) {
       console.info(`20 通过 DeepSeek → ${modelId} → DeepSeek`)
     }, false)
   }, 360_000)
+}
+
+for (const provider of Object.keys(variables)) {
+  const model = directory.models.find(item => item.provider === provider)
+  test.concurrent.skipIf(!model)(`模型请求恢复正常调用 ${provider}/${model?.id ?? '缺少测试凭据'}`, async () => {
+    await fixture(async api => {
+      await api.key(provider, keys.get(provider)!)
+      const selection = await api.select(model!)
+      const request = await api.submit(selection, '请直接回复“恢复验收通过”，无需调用工具。')
+      const retryStates = () => request.frames().flatMap(({ change }) => change.type === 'task' && change.running?.kind === 'task' && change.running.retry
+        ? [{ mode: change.running.retry.mode, reason: change.running.retry.reason, phase: change.running.retry.phase }] : [])
+      const result = await request.finish().catch(error => {
+        console.info('模型请求恢复验收未收到终态', { provider, model: model!.id, api: model!.api, retry: retryStates() })
+        throw error
+      })
+      const last = result.assistants.at(-1)
+      console.info('模型请求恢复验收', { provider, model: model!.id, api: model!.api, status: result.terminal.status,
+        requests: provider === 'google' ? undefined : api.requests.length, retry: retryStates(), reason: last?.failure?.kind })
+      expect(result.terminal.status, last?.errorMessage).toBe('completed')
+      expect(last?.stopReason).toBe('stop')
+      expect(textOf(last).trim()).toContain('恢复验收通过')
+    }, provider !== 'google')
+  }, 135_000)
 }

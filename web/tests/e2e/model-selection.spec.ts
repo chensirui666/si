@@ -140,7 +140,7 @@ test('Feature 1 配置两家提供方、运行中预选、跨页同步、过期�
     model.rejectHistory()
     await editor(second).fill('服务商拒绝历史')
     await send(second).click()
-    await expect(second.getByText('模型服务拒绝了消息历史或工具记录。')).toBeVisible()
+    await expect(second.getByText('回复失败 · 模型服务拒绝了请求，请检查请求参数')).toBeVisible()
     await expect(second.locator('[data-run-status="failed"]').last()).toBeVisible()
     await expect(second.getByText('新模型已接续')).toBeVisible()
     expect(model.rejected).toBe(1)

@@ -28,6 +28,7 @@ export type AssistantMessage = {
   stopReason: 'pending' | ModelStopReason
   errorMessage?: string
   errorCode?: 'context_overflow'
+  failure?: ModelFailureInfo & { attempts?: 5 }
   usage?: ModelUsage
   timestamp: number
   durationMs?: number
@@ -83,6 +84,14 @@ export type ModelUsage = {
   output?: number
   total?: number
 }
+
+export type ModelFailureKind =
+  | 'connection' | 'connection-reset' | 'stream-read' | 'stream-ended' | 'timeout'
+  | 'temporary-rate-limit' | 'rate-limit' | 'internal' | 'bad-gateway' | 'unavailable' | 'gateway-timeout'
+  | 'overloaded' | 'capacity' | 'balance' | 'quota' | 'authentication' | 'permission'
+  | 'invalid-request' | 'configuration' | 'context-capacity' | 'unknown' | 'request-error' | 'response-error' | 'http-error'
+
+export type ModelFailureInfo = { kind: ModelFailureKind; status?: number; retryAt?: number }
 
 export type ModelStopReason = 'stop' | 'length' | 'toolUse' | 'error' | 'aborted'
 

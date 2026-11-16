@@ -21,15 +21,27 @@ export async function startModelServer() {
     authorization?: string
     body: RequestBody
     delta: (delta: Record<string, unknown>) => void
+    end: () => void
     finish: (reason?: 'stop' | 'tool_calls' | 'length') => void
     closed: boolean
   }[] = []
+  const rejectedBodies: RequestBody[] = []
   const responses = new Set<ServerResponse>()
   let rejected = 0
+  let nextFailure: { status: number; retryAfter?: string; code?: string } | undefined
   let rejectNext = false
   const server = createServer(async (request, response) => {
     let body = ''
     for await (const chunk of request) body += String(chunk)
+    if (nextFailure) {
+      rejectedBodies.push(JSON.parse(body) as RequestBody)
+      const { status, retryAfter, code } = nextFailure
+      nextFailure = undefined
+      rejected++
+      response.writeHead(status, { 'Content-Type': 'application/json', ...(retryAfter && { 'Retry-After': retryAfter }) })
+      response.end(JSON.stringify({ error: { code, message: 'Controlled HTTP failure' } }))
+      return
+    }
     if (rejectNext) {
       rejectNext = false
       rejected++
@@ -54,6 +66,7 @@ export async function startModelServer() {
       authorization: request.headers.authorization,
       body: JSON.parse(body) as RequestBody,
       delta: (delta: Record<string, unknown>) => chunk(delta),
+      end: () => response.end(),
       finish: (reason: 'stop' | 'tool_calls' | 'length' = 'stop') => {
         chunk({}, reason)
         response.write(`data: ${JSON.stringify({
@@ -72,8 +85,9 @@ export async function startModelServer() {
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('受控模型服务未能取得端口')
   return {
-    exchanges,
+    exchanges, rejectedBodies,
     get rejected() { return rejected },
+    rejectOnce(failure: NonNullable<typeof nextFailure>) { nextFailure = failure },
     rejectHistory() { rejectNext = true },
     baseURL: `http://127.0.0.1:${address.port}/v1`,
     close: async () => {

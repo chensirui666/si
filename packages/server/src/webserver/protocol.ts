@@ -6,7 +6,7 @@ import type {
 import type { WorkspaceRegistration } from '../workspaces.js'
 
 export type {
-  ActiveContent, CompactionRecord, ContextUsage, ModelFrame, PermissionMode, RunRecord, RunningState, SaveFailure,
+  ActiveContent, CompactionRecord, ContextUsage, ModelFrame, ModelRetryState, PermissionMode, RunRecord, RunningState, SaveFailure,
   SessionSummary, SkillSource, SubmissionAccepted,
 } from '@agent-learning/coding-agent'
 export { isPermissionMode } from '@agent-learning/coding-agent/permissions'

@@ -66,7 +66,7 @@ function browserEvent(event: SessionSubscriptionEvent): BrowserEvent {
   }
   if (change.type !== 'model') return { ...event, update: { ...event.update, change } }
   const frame = change.event
-  const visible = frame.type === 'done' ? { ...frame, message: visibleAssistant(frame.message) }
+  const visible = frame.type === 'done' || frame.type === 'replace' ? { ...frame, message: visibleAssistant(frame.message) }
     : frame.type === 'error' ? { ...frame, error: visibleAssistant(frame.error) }
     : frame.type === 'toolcall_end' ? { ...frame, toolCall: visibleToolCall(frame.toolCall) } : frame
   return { ...event, update: { ...event.update, change: { ...change, event: visible } } }

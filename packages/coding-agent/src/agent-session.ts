@@ -7,6 +7,7 @@ import { buildModelHistory, createSummaryContext, prepareCompaction } from './co
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
 import { SessionWriteError, runSelection, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
 import { discoverSkills, loadSkill, skillCommand, type SkillSummary } from './skills.js'
+import { withModelRetry } from './model-retry.js'
 import { buildSystemPrompt } from './system-prompt.js'
 import type { CodingTool } from './tools.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
@@ -30,7 +31,6 @@ function isFileOperation(detail: unknown): detail is NonNullable<ConversationMes
 
 export class AgentSession {
   private submitting?: { id: string; settled: Promise<SubmissionAccepted> }
-  private readonly agent: Agent
   private readonly omittedToolImageResults = new Set<string>()
   private readonly state: ConversationSnapshot = { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
   private readonly listeners = new Set<(update: ConversationUpdate) => void>()
@@ -59,7 +59,6 @@ export class AgentSession {
     discoverModels?: typeof import('@agent-learning/model').discoverModels
     compaction?: { triggerTokens: number; keepRecentTokens: number }
   }) {
-    this.agent = new Agent({ stream: options.stream })
     const history = options.persistence?.history
     this.state.permissionMode = history?.permissionMode ?? options.permissionMode ?? 'normal'
     if (history) {
@@ -425,7 +424,7 @@ export class AgentSession {
   private publish(change: ConversationUpdate['change'], run?: RunRecord, saveFailure?: SaveFailure, modelSelection?: ModelSelection) {
     if (run) this.state.runs = [...(this.state.runs ?? []).filter(item => item.id !== run.id), run]
     if (saveFailure) this.state.saveFailures = [...this.state.saveFailures ?? [], saveFailure]
-    const refresh = change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error'
+    const refresh = change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error' || change.event.type === 'replace'
     if (refresh) this.refreshUsage()
     const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(modelSelection && { modelSelection }), ...(run && { run }), ...(saveFailure && { saveFailure }), ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
     for (const listener of this.listeners) listener(structuredClone(update))
@@ -507,12 +506,39 @@ export class AgentSession {
       }
     }
 
-    const unsubscribe = this.agent.subscribe(event => {
+    let preview: Pick<ConversationSnapshot, 'messages' | 'activeContent'> | undefined
+    const agent = new Agent({ stream: withModelRetry(this.options.stream ?? stream, retry => {
+      preview = { messages: [], activeContent: [] }
+      const current = this.state.messages.find(entry => entry.id === messageId)?.message
+      const incomplete = current?.role === 'assistant' && current.content.some(block => block.type === 'text' && block.text.trim())
+      this.updateTask({ ...running, assistantMessageId: messageId, phase: 'model', activeTools: [],
+        retry: { ...retry, ...(incomplete && { incomplete: true }) } })
+    }) })
+    const unsubscribe = agent.subscribe(event => {
       if (event.type === 'model') {
         const frame = this.frame(event.event)
-        if (frame.type === 'error' && frame.error.errorCode === 'context_overflow' && recovered) frame.error.errorMessage = capacityError
-        this.apply(messageId, frame)
+        let published: ModelFrame = frame
         const terminal = frame.type === 'done' ? frame.message : frame.type === 'error' ? frame.error : undefined
+        if (frame.type === 'error' && frame.error.errorCode === 'context_overflow' && recovered) {
+          frame.error.errorMessage = capacityError
+          frame.error.failure = { kind: 'context-capacity' }
+        }
+        if (preview) {
+          if (frame.type === 'error' && this.state.running?.kind === 'task' && this.state.running.retry?.incomplete) {
+            const current = this.state.messages.find(entry => entry.id === messageId)?.message
+            if (current?.role === 'assistant') frame.error.content = current.content
+          }
+          this.apply(messageId, frame, preview)
+          if (!terminal && !(frame.type === 'text_delta' && frame.delta.trim())) return
+          const message = preview.messages.find(entry => entry.id === messageId)!.message as AssistantMessage
+          const replace: ModelFrame = { type: 'replace', runId: running.runId, message, activeContent: preview.activeContent }
+          preview = undefined
+          this.state.running = { ...running, assistantMessageId: messageId, phase: 'model', activeTools: [] }
+          published = replace
+          this.apply(messageId, replace)
+        } else {
+          this.apply(messageId, frame)
+        }
         if (terminal?.usage?.input !== undefined) {
           const context = event.context
           this.sample = this.gateSample = {
@@ -521,7 +547,7 @@ export class AgentSession {
             input: terminal.usage.input, estimate: this.estimate(context),
           }
         }
-        this.publish({ type: 'model', messageId, event: frame })
+        this.publish({ type: 'model', messageId, event: published })
         if (terminal) {
           terminalEntry = { id: messageId, message: terminal }
           if (!this.options.persistence) {
@@ -569,7 +595,7 @@ export class AgentSession {
     }
     try {
       const options = { model, reasoningEffort, tools, signal, prepareContext, finalizeContext, beforeToolCall, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined }
-      let result = await this.agent.run({ ...options, context: this.context() })
+      let result = await agent.run({ ...options, context: this.context() })
       while (result.type === 'response' && result.message.stopReason === 'error' && result.message.errorCode === 'context_overflow'
         && !recovered && !signal.aborted) {
         recovered = true
@@ -578,13 +604,15 @@ export class AgentSession {
           catch (error) { this.noteFailure(error, 'finish'); throw error }
         }
         if (!await this.compact(model, reasoningEffort, 'overflow', { ...running, assistantMessageId: messageId }, signal)) {
-          if (signal.aborted) status = 'aborted'
-          else terminalEntry = this.fail(model, randomUUID(), capacityError)
+          if (signal.aborted) {
+            status = 'aborted'
+            terminalEntry = this.fail(model, randomUUID(), '本次生成已取消', true)
+          } else terminalEntry = this.fail(model, randomUUID(), capacityError, false, 'context-capacity')
           return
         }
         signal.throwIfAborted()
         advanceRound = true
-        result = await this.agent.continue({ ...options, context: this.context() })
+        result = await agent.continue({ ...options, context: this.context() })
       }
       if (this.failure) { terminalEntry = undefined; return }
       if (result.type === 'failure') {
@@ -614,14 +642,14 @@ export class AgentSession {
     }
   }
 
-  private fail(model: ModelInfo, messageId: string, errorMessage: string, aborted = false) {
+  private fail(model: ModelInfo, messageId: string, errorMessage: string, aborted = false, kind?: NonNullable<AssistantMessage['failure']>['kind']) {
     const current = this.state.messages.find(entry => entry.id === messageId)?.message
     const reason = aborted ? 'aborted' : 'error'
     const error: AssistantMessage = {
       ...(current?.role === 'assistant'
         ? current
         : { role: 'assistant', api: model.api, provider: model.provider, model: model.id, content: [], timestamp: Date.now() }),
-      stopReason: reason, errorMessage,
+      stopReason: reason, errorMessage, ...(kind && { failure: { kind } }),
     }
     const event: ModelFrame = { type: 'error', reason, error }
     this.apply(messageId, event)
@@ -639,34 +667,34 @@ export class AgentSession {
     return structuredClone(frame)
   }
 
-  private apply(messageId: string, event: ModelFrame) {
+  private apply(messageId: string, event: ModelFrame, view: Pick<ConversationSnapshot, 'messages' | 'activeContent'> = this.state) {
     if (event.type === 'start') {
-      this.state.messages.push({ id: messageId, message: { ...event.initial, content: [], stopReason: 'pending' } })
+      view.messages.push({ id: messageId, message: { ...event.initial, content: [], stopReason: 'pending' } })
       return
     }
-    if (event.type === 'done' || event.type === 'error') {
-      const message = structuredClone(event.type === 'done' ? event.message : event.error)
-      const current = this.state.messages.find(entry => entry.id === messageId)
+    if (event.type === 'done' || event.type === 'error' || event.type === 'replace') {
+      const message = structuredClone(event.type === 'error' ? event.error : event.message)
+      const current = view.messages.find(entry => entry.id === messageId)
       if (current) current.message = message
-      else this.state.messages.push({ id: messageId, message })
-      this.state.activeContent = []
+      else view.messages.push({ id: messageId, message })
+      view.activeContent = event.type === 'replace' ? structuredClone(event.activeContent) : []
       return
     }
-    const message = this.state.messages.find(entry => entry.id === messageId)?.message
+    const message = view.messages.find(entry => entry.id === messageId)?.message
     if (message?.role !== 'assistant') throw new Error('Missing assistant start')
     const block = message.content[event.contentIndex]
     switch (event.type) {
       case 'text_start':
         message.content[event.contentIndex] = { type: 'text', text: '' }
-        this.state.activeContent.push({ messageId, contentIndex: event.contentIndex, type: 'text' })
+        view.activeContent.push({ messageId, contentIndex: event.contentIndex, type: 'text' })
         break
       case 'thinking_start':
         message.content[event.contentIndex] = { type: 'thinking', thinking: '' }
-        this.state.activeContent.push({ messageId, contentIndex: event.contentIndex, type: 'thinking' })
+        view.activeContent.push({ messageId, contentIndex: event.contentIndex, type: 'thinking' })
         break
       case 'toolcall_start':
         message.content[event.contentIndex] = { type: 'toolCall', id: '', name: '', arguments: {} }
-        this.state.activeContent.push({ messageId, contentIndex: event.contentIndex, type: 'toolCall', argumentsText: '' })
+        view.activeContent.push({ messageId, contentIndex: event.contentIndex, type: 'toolCall', argumentsText: '' })
         break
       case 'text_delta':
         if (block?.type !== 'text') throw new Error('Missing text block')
@@ -677,7 +705,7 @@ export class AgentSession {
         block.thinking += event.delta
         break
       case 'toolcall_delta': {
-        const active = this.state.activeContent.find(entry => entry.messageId === messageId && entry.contentIndex === event.contentIndex)
+        const active = view.activeContent.find(entry => entry.messageId === messageId && entry.contentIndex === event.contentIndex)
         if (active?.type !== 'toolCall') throw new Error('Missing tool block')
         active.argumentsText += event.delta
         break
@@ -687,7 +715,7 @@ export class AgentSession {
       case 'toolcall_end': message.content[event.contentIndex] = structuredClone(event.toolCall); break
     }
     if (event.type === 'text_end' || event.type === 'thinking_end' || event.type === 'toolcall_end') {
-      this.state.activeContent = this.state.activeContent.filter(entry => entry.messageId !== messageId || entry.contentIndex !== event.contentIndex)
+      view.activeContent = view.activeContent.filter(entry => entry.messageId !== messageId || entry.contentIndex !== event.contentIndex)
     }
   }
 

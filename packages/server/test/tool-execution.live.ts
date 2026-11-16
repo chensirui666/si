@@ -83,8 +83,11 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
       if (frame.type === 'snapshot') ready()
       if (frame.type !== 'update') return
       const { change } = frame.update
-      if (change.type === 'model' && (change.event.type === 'done' || change.event.type === 'error')) {
-        messages.set(change.messageId, { id: change.messageId, message: change.event.type === 'done' ? change.event.message : change.event.error })
+      if (change.type === 'model') {
+        const event = change.event
+        const message = event.type === 'error' ? event.error
+          : event.type === 'done' || event.type === 'replace' && event.message.stopReason !== 'pending' ? event.message : undefined
+        if (message) messages.set(change.messageId, { id: change.messageId, message })
       } else if (change.type === 'task') {
         if (change.message) messages.set(change.message.id, change.message)
         if (!change.running) finish()

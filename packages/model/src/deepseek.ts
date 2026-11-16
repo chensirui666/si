@@ -2,6 +2,7 @@ import type { Credentials } from '@agent-learning/credentials'
 import OpenAI from 'openai'
 import { findModel } from './catalog.js'
 import { AssistantEventStream } from './event-stream.js'
+import { classifyModelFailure, observeModelFetch, providerCodes, record } from './model-failure.js'
 import { parseToolArguments } from './tool-arguments.js'
 import { convertMessages, convertTools } from './context.js'
 import type {
@@ -9,7 +10,9 @@ import type {
   ModelStopReason, TextContent, ThinkingContent, ToolCall,
 } from './types.js'
 
-class ModelFailure extends Error {}
+class ModelFailure extends Error {
+  constructor(message: string, readonly kind?: import('./types.js').ModelFailureKind) { super(message) }
+}
 
 function safeError(error: unknown): string {
   if (error instanceof ModelFailure) return error.message
@@ -70,6 +73,8 @@ export function createDeepSeekStream(
       const toolsById = new Map<string, ToolState>()
       let text: { block: TextContent; contentIndex: number } | undefined
       let thinking: { block: ThinkingContent; contentIndex: number } | undefined
+      const transport: Parameters<typeof observeModelFetch>[1] = {}
+      let reading = false
       let finalReason: Exclude<ModelStopReason, 'error' | 'aborted'> | undefined
       const endCurrentContent = () => {
         if (text) {
@@ -88,13 +93,14 @@ export function createDeepSeekStream(
         if (interruption) throw new ModelFailure('本次模型调用已取消。')
         const supported = findModel(model.id, model.provider)
         if (!supported || supported.provider !== model.provider || supported.api !== model.api) {
-          throw new ModelFailure('不支持所选模型。')
+          throw new ModelFailure('不支持所选模型。', 'configuration')
         }
         resetTimeout()
         const apiKey = await Promise.race([credentials.readApiKey('deepseek'), interrupted])
         if (interruption) throw new ModelFailure('本次模型调用已取消。')
+        if (!apiKey) throw new ModelFailure('请为所选提供方配置 API Key。', 'configuration')
         const client = new OpenAI({
-          apiKey, baseURL: configuration.baseURL ?? 'https://api.deepseek.com', fetch: configuration.fetch,
+          apiKey, baseURL: configuration.baseURL ?? 'https://api.deepseek.com', fetch: observeModelFetch(configuration.fetch, transport),
           maxRetries: 0, logLevel: 'off',
           // The rolling timer owns inactivity; 0 means immediate timeout in the SDK.
           timeout: 2_147_483_647,
@@ -110,6 +116,7 @@ export function createDeepSeekStream(
           }, { signal: controller.signal, maxRetries: 0 }),
           interrupted,
         ])
+        reading = true
         events.push({ type: 'start', partial: output })
         const iterator = upstream[Symbol.asyncIterator]()
         while (true) {
@@ -207,13 +214,22 @@ export function createDeepSeekStream(
         if (interruption) throw new ModelFailure('本次模型调用已停止。')
         // SDK can swallow a transport AbortError and end iteration without throwing.
         if (upstream.controller.signal.aborted) throw new ModelFailure('模型响应读取中断。')
-        if (!finalReason) throw new ModelFailure('模型响应中断，未收到有效结束原因。')
+        if (!finalReason) throw new ModelFailure('模型响应中断，未收到有效结束原因。', 'stream-ended')
         output.stopReason = finalReason
       } catch (error) {
         controller.abort()
         output.stopReason = interruption ?? 'error'
         output.errorMessage = interruptionMessage ?? safeError(error)
         if (!interruption && isContextOverflow(error)) output.errorCode = 'context_overflow'
+        if (output.stopReason === 'error' && !output.errorCode) {
+          const apiError = error instanceof OpenAI.APIError ? error : undefined
+          output.failure = classifyModelFailure({
+            phase: reading || transport.responded && (transport.status ?? 0) < 400 ? 'stream' : transport.sent ? 'request' : 'setup',
+            raw: transport.error ?? error, status: transport.status, retryAt: transport.retryAt,
+            codes: providerCodes(apiError?.error), message: apiError?.message, streamFailure: reading && !!apiError && !!record(apiError.error).message,
+            timedOut: interruption === 'error', fallback: error instanceof ModelFailure ? error.kind : undefined,
+          })
+        }
       } finally {
         clearTimeout(timer)
         options?.signal?.removeEventListener('abort', cancel)

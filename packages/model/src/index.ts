@@ -18,6 +18,8 @@ export type {
   JsonObject,
   ModelUsage,
   ModelStopReason,
+  ModelFailureInfo,
+  ModelFailureKind,
   ModelContext,
   ContextEstimate,
   ModelEvent,

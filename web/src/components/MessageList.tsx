@@ -12,10 +12,11 @@ type MessageRow =
   | { type: 'user'; id: string; text: string; local?: LocalSubmission; skill?: SkillInvocationView }
   | { type: 'assistant'; id: string; userId: string; messages: AssistantEntry[] }
 
-export function MessageList({ messages, activeContent = [], running = null, runs = [], saveFailures = [], onQuote }: {
+export function MessageList({ messages, activeContent = [], running = null, showRetry = true, runs = [], saveFailures = [], onQuote }: {
   messages: readonly (ConversationMessage | LocalSubmission)[]
   activeContent?: readonly ActiveContent[]
   running?: RunningState
+  showRetry?: boolean
   runs?: readonly RunRecord[]
   saveFailures?: readonly SaveFailure[]
   onQuote?: (text: string) => void
@@ -52,7 +53,7 @@ export function MessageList({ messages, activeContent = [], running = null, runs
   return (
     <section ref={list} className="message-list" role="region" aria-label={t('chat.messages')} tabIndex={0}>
         <ol className="message-items">
-          {rows.flatMap(row => row.type === 'user' && taskRuns.has(row.id) && !answered.has(row.id)
+          {rows.flatMap(row => row.type === 'user' && (taskRuns.has(row.id) || running?.kind === 'task' && running.runId === row.id && running.retry) && !answered.has(row.id)
             ? [row, { type: 'assistant' as const, id: `pending:${row.id}`, userId: row.id, messages: [] }]
             : [row]).map((row, index, displayedRows) => {
             const runId = row.type === 'assistant' ? row.userId : row.id
@@ -62,11 +63,11 @@ export function MessageList({ messages, activeContent = [], running = null, runs
             const endsTurn = row.type === 'assistant' || next?.type !== 'assistant' || next.userId !== runId
             const activity = row.type === 'assistant' && !shown.has(runId) ? taskRuns.get(runId) : undefined
             if (activity) shown.add(runId)
-            return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.id} data-message-id={row.id} data-run-status={run?.status}>
+            return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.type === 'assistant' && activity ? `run:${runId}` : row.id} data-message-id={row.id} data-run-status={run?.status}>
             {row.type === 'assistant' && run && <p className="message-model">{run.provider ?? 'deepseek'} / {run.modelId}{(run.reasoningEffort ?? (!run.provider ? 'high' : undefined)) &&
               ` · ${effortLabel(t, run.reasoningEffort ?? 'high')}`}</p>}
             {row.type === 'assistant'
-              ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure} run={activity}
+              ? <AssistantMessage showRetry={showRetry} messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure} run={activity}
                 running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
               : <>
                 <div className="message-text">{row.text}<br /></div>

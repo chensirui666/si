@@ -336,7 +336,9 @@ describe('AgentSession compaction', () => {
       await seed(agent); mode = 'fail'
       await agent.submit({ ...input, text: '继续' }); await idle(agent)
       expect(calls).toBe(overflow ? 3 : 1)
-      expect((await state(agent)).compactions).toHaveLength(overflow ? 1 : 0)
+      const snapshot = await state(agent)
+      expect(snapshot.compactions).toHaveLength(overflow ? 1 : 0)
+      if (overflow) expect(snapshot.messages.at(-1)?.message).toMatchObject({ stopReason: 'error', failure: { kind: 'context-capacity' } })
     }
   })
 
@@ -399,6 +401,34 @@ describe('AgentSession compaction', () => {
     expect(normalCalls).toBe(2)
     expect(summaries).toBe(1)
     expect((await state(agent)).messages.filter(entry => entry.message.role === 'toolResult')).toHaveLength(2)
+  })
+
+  it('publishes a cancelled assistant result when the user stops overflow compaction', async () => {
+    let overflowing = false
+    const started = Promise.withResolvers<void>()
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
+      stream: (_model, context, options) => {
+        if (!overflowing) return output(reply())
+        if (context.tools) return output(reply('', { stopReason: 'error', errorCode: 'context_overflow' }))
+        const answer = reply('', { stopReason: 'aborted' })
+        return { result: async () => answer, async *[Symbol.asyncIterator]() {
+          const signal = options!.signal!
+          started.resolve()
+          if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+          yield { type: 'error', reason: 'aborted', error: answer }
+        } }
+      },
+    })
+    await seed(agent)
+    overflowing = true
+    const receipt = await agent.submit({ ...input, text: '继续' })
+    if (receipt.kind !== 'message') throw new Error('wrong receipt')
+    await started.promise
+    expect(await agent.abort(receipt.userMessageId)).toBe(true)
+    const snapshot = await state(agent)
+    expect(snapshot.running).toBeNull()
+    expect(snapshot.compactions.at(-1)).toMatchObject({ trigger: 'overflow', status: 'aborted' })
+    expect(snapshot.messages.at(-1)?.message).toMatchObject({ stopReason: 'aborted' })
   })
 
   it('overflow with no candidate or failed summary ends the request without retry', async () => {

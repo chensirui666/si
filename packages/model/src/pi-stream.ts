@@ -4,12 +4,9 @@ import { isContextOverflow } from '@earendil-works/pi-ai/utils/overflow'
 import { toPiContext } from './context.js'
 import { piModels } from './catalog.js'
 import { createDeepSeekStream } from './deepseek.js'
+import { classifyModelFailure, observeModelFetch, providerCodes, record } from './model-failure.js'
 import { AssistantEventStream } from './event-stream.js'
 import type { AssistantMessage, ModelContext, ModelEventStream, ModelInfo, ModelStreamOptions, ModelUsage } from './types.js'
-
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
-}
 
 function reportedUsage(value: unknown, seen: Set<keyof ModelUsage>) {
   const event = record(value)
@@ -57,12 +54,16 @@ export function createModelStream(credentials: Pick<Credentials, 'readApiKey'>, 
     }
     let timer: ReturnType<typeof setTimeout> | undefined
     let timedOut = false
+    const transport: Parameters<typeof observeModelFetch>[1] = {}
+    let googleRequest = false
+    let reading = false
+    let streamFailure: unknown
     const resetTimeout = () => {
       clearTimeout(timer)
       timer = setTimeout(() => { timedOut = true; controller.abort() }, 300_000)
       timer.unref()
     }
-    const fail = (error?: PiMessage, setupMessage?: string) => {
+    const fail = (error?: PiMessage, setupMessage?: string, raw?: unknown) => {
       const reason = options?.signal?.aborted ? 'aborted' : 'error'
       const upstream = error?.errorMessage ?? ''
       const overflow = reason === 'error' && !timedOut && error && isContextOverflow(error)
@@ -76,7 +77,14 @@ export function createModelStream(credentials: Pick<Credentials, 'readApiKey'>, 
           : code === 429 || /rate.limit|resource_exhausted/i.test(upstream) ? '模型请求受限，请稍后手动重试。'
           : /tool.call|tool.result|conversation history|message.*(?:format|invalid)|invalid.*message/i.test(upstream) ? '模型服务拒绝了消息历史或工具记录。'
           : code >= 400 && code < 600 ? `模型服务请求失败（HTTP ${code}）。` : '模型请求或响应读取失败，请检查配置与网络。')
-      events.push({ type: 'error', reason, error: { ...output, stopReason: reason, errorMessage, ...(overflow && { errorCode: 'context_overflow' }) } })
+      const failure = reason === 'error' && !overflow ? classifyModelFailure({
+        phase: reading || transport.responded && (transport.status ?? 0) < 400 ? 'stream' : transport.sent || googleRequest ? 'request' : 'setup',
+        raw: transport.error ?? raw, status: transport.status, retryAt: transport.retryAt, message: upstream,
+        codes: providerCodes(streamFailure), streamFailure: streamFailure !== undefined, timedOut,
+        fallback: setupMessage ? 'configuration' : undefined,
+      }) : undefined
+      events.push({ type: 'error', reason, error: { ...output, stopReason: reason, errorMessage,
+        ...(failure && { failure }), ...(overflow && { errorCode: 'context_overflow' }) } })
     }
     void (async () => {
       try {
@@ -92,11 +100,17 @@ export function createModelStream(credentials: Pick<Credentials, 'readApiKey'>, 
         let responseModel: string | undefined
         const google = target.api === 'google-generative-ai'
         const upstream = piModels.streamSimple(target, toPiContext(context, target), {
-          apiKey, fetch: configuration.fetch, signal, maxTokens: model.maxTokens, maxRetries: 0,
+          apiKey, fetch: google ? configuration.fetch : observeModelFetch(configuration.fetch, transport, target.api === 'mistral-conversations'),
+          signal, maxTokens: model.maxTokens, maxRetries: 0, timeoutMs: 300_000,
+          ...(google && { onPayload: () => { googleRequest = true } }),
           ...(effort && effort !== 'off' && { reasoning: effort }),
           onProviderStreamEvent: value => {
             resetTimeout()
             reportedUsage(value, seen)
+            const event = record(value)
+            if (event.type === 'response.failed' || event.type === 'error' || event.error !== undefined) {
+              streamFailure = event.type === 'response.failed' ? event.response ?? {} : event
+            }
             if (google) {
               const version = record(value).modelVersion
               if (typeof version === 'string') responseModel ??= version
@@ -114,6 +128,7 @@ export function createModelStream(credentials: Pick<Credentials, 'readApiKey'>, 
             return
           }
           if (event.type === 'error') { output = assistant(event.error, seen); fail(event.error); return }
+          if (event.type === 'start') reading = true
           output = assistant(event.partial, seen)
           if (event.type === 'toolcall_end') {
             const call = output.content[event.contentIndex]
@@ -121,7 +136,7 @@ export function createModelStream(credentials: Pick<Credentials, 'readApiKey'>, 
           } else events.push({ ...event, partial: output })
         }
         fail()
-      } catch { fail() }
+      } catch (error) { fail(undefined, undefined, error) }
       finally { clearTimeout(timer); controller.abort() }
     })()
     return events

@@ -44,7 +44,7 @@ test('Markdown GFM 流式尾部更新、最终引用校准与恶意内容隔离'
 test('终止状态保留正文，正常的工具阶段没有报错提示', async ({ mount }) => {
   const component = await mount(<AssistantMessage messages={[{ id: 'a', message: base }]} />)
   await expect(component).toHaveText('')
-  for (const [stopReason, status] of [['stop', ''], ['length', '达到长度限制，回答可能不完整'], ['toolUse', ''], ['error', '实际错误'], ['aborted', '回答已中止']] as const) {
+  for (const [stopReason, status] of [['stop', ''], ['length', '达到长度限制，回答可能不完整'], ['toolUse', ''], ['error', '实际错误'], ['aborted', '已停止 · 本轮已取消']] as const) {
     await component.update(<AssistantMessage messages={[{ id: 'a', message: { ...base, content: [{ type: 'text', text: '保留正文' }], stopReason, errorMessage: stopReason === 'error' ? '实际错误' : undefined } }]} />)
     await expect(component.getByText('保留正文')).toBeVisible()
     if (status) await expect(component.getByText(status)).toBeVisible()

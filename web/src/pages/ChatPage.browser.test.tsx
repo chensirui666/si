@@ -864,3 +864,22 @@ test('28 历史读取失败时不能发送，收到完整快照后恢复', async
   await expect(page.getByRole('region', { name: '消息列表' })).toContainText('完整原文')
   await expect(send).toBeEnabled()
 })
+
+test('超限压缩由页面状态显示，本轮详情在压缩和恢复时隐藏', async ({ mount, page }) => {
+  await mount(<ChatPageHarness messages={['任务']} />)
+  for (const phase of ['compaction', 'model'] as const) {
+    await page.evaluate(phase => {
+      window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null,
+        snapshot: { seq: 1, messages: [{ id: 'u', message: { role: 'user', content: '任务', timestamp: 1 } },
+          { id: 'a', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+            timestamp: 2, stopReason: 'error', errorCode: 'context_overflow', content: [] } }],
+        running: { kind: 'task', runId: 'u', assistantMessageId: 'a', phase, activeTools: [] }, compactions: [], contextUsage: null, activeContent: [] },
+      } }))
+    }, phase)
+    const status = page.locator('header').getByRole('status')
+    if (phase === 'compaction') await expect(status).toHaveText('正在压缩对话…')
+    else await expect(status).not.toHaveText('正在压缩对话…')
+    await expect(page.locator('[data-run-detail]')).toHaveCount(0)
+    await expect(page.getByRole('region', { name: '消息列表' })).not.toContainText('回答生成失败')
+  }
+})

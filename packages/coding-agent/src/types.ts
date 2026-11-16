@@ -1,4 +1,4 @@
-import type { AssistantMessage, ModelMessage, ModelUsage, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
+import type { AssistantMessage, ModelMessage, ModelUsage, ModelFailureKind, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
 
 import type { SkillInvocation } from './skills.js'
 import type { PermissionMode } from './permissions.js'
@@ -24,12 +24,22 @@ export type SubmissionAccepted = { clientMessageId: string; acceptedSeq: number 
   | { kind: 'compaction'; compactionId: string }
 )
 
+export type ModelRetryState = {
+  phase: 'waiting' | 'retrying'
+  retryAt?: number
+  incomplete?: true
+} & (
+  | { mode: 'connection'; reason: 'connection' }
+  | { mode: 'limited'; reason: ModelFailureKind; attempt: number; maxAttempts: 5; status?: number }
+)
+
 export type RunningState = null | {
   kind: 'task'
   runId: string
   assistantMessageId: string
   phase: 'model' | 'tools' | 'compaction'
   activeTools: ToolLocation[]
+  retry?: ModelRetryState
 } | { kind: 'compaction'; runId: string; phase: 'compaction' }
 
 export type CompactionRecord = {
@@ -93,6 +103,7 @@ export type ActiveContent = {
 )
 
 export type ModelFrame =
+  | { type: 'replace'; runId: string; message: AssistantMessage; activeContent: ActiveContent[] }
   | { type: 'start'; initial: Pick<AssistantMessage, 'role' | 'api' | 'provider' | 'model' | 'timestamp'> }
   | { type: 'text_start' | 'thinking_start' | 'toolcall_start'; contentIndex: number }
   | { type: 'text_delta' | 'thinking_delta' | 'toolcall_delta'; contentIndex: number; delta: string }

@@ -53,9 +53,9 @@ function waitForStart(child: ChildProcess): Promise<Started> {
   })
 }
 
-export async function startBackend(secretPath: string, port = 0, modelBaseURL = '', vitePort?: number) {
+export async function startBackend(secretPath: string, port = 0, modelBaseURL = '', vitePort?: number, modelClock = false) {
   const child = fork(fixturePath, [String(port), secretPath, vitePort ? String(vitePort) : ''], {
-    env: { ...process.env, TMPDIR: dirname(secretPath), AGENT_LEARNING_E2E_MODEL_BASE_URL: modelBaseURL },
+    env: { ...process.env, TMPDIR: dirname(secretPath), AGENT_LEARNING_E2E_MODEL_BASE_URL: modelBaseURL, AGENT_LEARNING_E2E_MODEL_CLOCK: modelClock ? '1' : '' },
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
   try { return { child, result: await waitForStart(child) } }

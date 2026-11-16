@@ -21,7 +21,7 @@ describe('回复内容', () => {
     fireEvent.click(screen.getByText('search'))
     expect(screen.getByText('无效 JSON: {')).toBeVisible()
   })
-  it.each([['length', '达到长度限制，回答可能不完整'], ['aborted', '回答已中止'], ['error', '网络中断']] as const)('明确展示 %s 终止原因并保留部分正文', (stopReason, text) => {
+  it.each([['length', '达到长度限制，回答可能不完整'], ['aborted', '已停止 · 本轮已取消'], ['error', '网络中断']] as const)('明确展示 %s 终止原因并保留部分正文', (stopReason, text) => {
     render(<AssistantMessage messages={[{ id: 'answer', message: { ...message, stopReason, errorMessage: stopReason === 'error' ? '网络中断' : undefined } }]} />)
     expect(screen.getByText(text)).toBeVisible()
     expect(screen.getByText('答案')).toBeVisible()
