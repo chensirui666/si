@@ -115,7 +115,13 @@ export type ModelSelection = {
   reasoningEffort?: ReasoningEffort
 }
 
-export type ModelStreamOptions = { signal?: AbortSignal; reasoningEffort?: ReasoningEffort }
+export type ModelStreamOptions = {
+  signal?: AbortSignal
+  reasoningEffort?: ReasoningEffort
+  snapshotPartials?: boolean
+  onProviderStreamEvent?(data: unknown): void | Promise<void>
+  onProviderResponse?(response: { status: number; headers: Record<string, string> }): void | Promise<void>
+}
 
 export type ModelDiscovery = {
   models: ModelInfo[]

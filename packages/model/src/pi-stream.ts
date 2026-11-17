@@ -44,7 +44,7 @@ export function createModelStream(credentials: Pick<Credentials, 'readApiKey'>, 
   return (model, context, options) => {
     // Preserve the original Flash stream's strict tool parsing, timeout and replay behavior.
     if (model.provider === 'deepseek' && model.id === 'deepseek-flash') return deepseek(model, context, options)
-    const events = new AssistantEventStream()
+    const events = new AssistantEventStream(options?.snapshotPartials)
     const controller = new AbortController()
     const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
     const seen = new Set<keyof ModelUsage>()
@@ -100,12 +100,16 @@ export function createModelStream(credentials: Pick<Credentials, 'readApiKey'>, 
         let responseModel: string | undefined
         const google = target.api === 'google-generative-ai'
         const upstream = piModels.streamSimple(target, toPiContext(context, target), {
-          apiKey, fetch: google ? configuration.fetch : observeModelFetch(configuration.fetch, transport, target.api === 'mistral-conversations'),
+          apiKey, fetch: google ? configuration.fetch : observeModelFetch(configuration.fetch, transport, target.api === 'mistral-conversations', options?.onProviderResponse),
           signal, maxTokens: model.maxTokens, maxRetries: 0, timeoutMs: 300_000,
           ...(google && { onPayload: () => { googleRequest = true } }),
           ...(effort && effort !== 'off' && { reasoning: effort }),
-          onProviderStreamEvent: value => {
+          onProviderStreamEvent: async value => {
             resetTimeout()
+            if (options?.onProviderStreamEvent) {
+              await options.onProviderStreamEvent(value)
+              signal.throwIfAborted()
+            }
             reportedUsage(value, seen)
             const event = record(value)
             if (event.type === 'response.failed' || event.type === 'error' || event.error !== undefined) {

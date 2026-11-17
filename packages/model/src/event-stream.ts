@@ -7,8 +7,11 @@ export class AssistantEventStream implements ModelEventStream {
   private resolveResult!: (message: AssistantMessage) => void
   private readonly finalResult = new Promise<AssistantMessage>((resolve) => { this.resolveResult = resolve })
 
+  constructor(private readonly snapshotPartials = false) {}
+
   push(event: ModelEvent): void {
     if (this.done) return
+    if (this.snapshotPartials && 'partial' in event) event = structuredClone(event)
     if (event.type === 'done' || event.type === 'error') {
       this.done = true
       this.resolveResult(event.type === 'done' ? event.message : event.error)

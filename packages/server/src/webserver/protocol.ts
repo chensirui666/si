@@ -1,12 +1,12 @@
 import type { ModelSelection } from '@agent-learning/model'
 import type {
   ConversationMessage as StoredMessage, ConversationSnapshot as StoredSnapshot, ConversationUpdate as StoredUpdate,
-  PermissionMode, SessionSummary, SkillInvocation, SkillSummary, SubmissionAccepted,
+  PermissionMode, SessionSummary, SkillInvocation, SkillSummary, SubmissionAccepted, SubmissionHandled,
 } from '@agent-learning/coding-agent'
 import type { WorkspaceRegistration } from '../workspaces.js'
 
 export type {
-  ActiveContent, CompactionRecord, ContextUsage, ModelFrame, ModelRetryState, PermissionMode, RunRecord, RunningState, SaveFailure,
+  ExtensionNotice, ActiveContent, CompactionRecord, ContextUsage, ModelFrame, ModelRetryState, PermissionMode, RunRecord, RunningState, SaveFailure,
   SessionSummary, SkillSource, SubmissionAccepted,
 } from '@agent-learning/coding-agent'
 export { isPermissionMode } from '@agent-learning/coding-agent/permissions'
@@ -34,10 +34,12 @@ export type SubmitMessageRequest = Pick<ModelSelection, 'modelId'> & Partial<Mod
   & { clientMessageId: string; text: string; sessionId: string }
 export type SaveModelSelectionRequest = ModelSelection & { sessionId?: string }
 export type SubmitMessageAccepted = SubmissionAccepted & { sessionId: string }
-export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { workspaceId: string; permissionMode?: PermissionMode }
+export type SubmitMessageResult = SubmitMessageAccepted | (SubmissionHandled & { sessionId: string })
+export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { workspaceId: string; permissionMode?: PermissionMode; draftSessionId?: string }
 export type PermissionSettings = { defaultPermissionMode: PermissionMode }
 export type SessionPermission = { permissionMode: PermissionMode }
 export type StartSessionAccepted = { session: SessionSummary; accepted: SubmitMessageAccepted }
+export type StartSessionResult = StartSessionAccepted | (SubmissionHandled & { draftSessionId: string })
 export type AbortRequest = { sessionId: string; runId: string }
 export type AbortResult = AbortRequest & { handled: boolean }
 export type InterfaceLanguage = 'en' | 'zh-CN'

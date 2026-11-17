@@ -713,7 +713,10 @@ it('sends the selected thinking level to Gemini 4 Hydrogen and records the respo
   })
   try {
     const run = modelApi.createModelStream(credentials)
-    const low = await run(model, context, { reasoningEffort: 'low' }).result()
+    const onProviderResponse = vi.fn(), onProviderStreamEvent = vi.fn()
+    const low = await run(model, context, { reasoningEffort: 'low', onProviderResponse, onProviderStreamEvent }).result()
+    expect(onProviderResponse).not.toHaveBeenCalled()
+    expect(onProviderStreamEvent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ modelVersion: 'gemini-4-hydrogen' }))
     const high = await run(model, context, { reasoningEffort: 'high' }).result()
     expect(sent).toEqual([
       { includeThoughts: true, thinkingLevel: 'LOW' },
@@ -910,4 +913,44 @@ it('classifies a socket closed after sending the Gemini request and before respo
     server.closeAllConnections()
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   }
+})
+
+it.each([selected, modelApi.findModel('kimi-k3', 'moonshotai-cn')!])('observes HTTP metadata and raw chunks before consumption for $provider', async model => {
+  const timeline: string[] = []
+  const packets = [chunk({ content: '早' }), chunk({ content: '上' }), chunk({}, 'stop')]
+  const body = new ReadableStream<Uint8Array>({
+    pull(reader) {
+      timeline.push('body')
+      reader.enqueue(encoder.encode(packets.map(packet => `data: ${JSON.stringify(packet)}\n\n`).join('') + 'data: [DONE]\n\n'))
+      reader.close()
+    },
+  }, { highWaterMark: 0 })
+  const metadata = vi.fn(async () => { timeline.push('http') })
+  const raw: unknown[] = []
+  const stream = modelApi.createModelStream(credentials, { fetch: async () => new Response(body, { headers: {
+    'content-type': 'text/event-stream', 'x-test-observation': 'present',
+  } }) })(model, context, {
+    onProviderResponse: metadata,
+    onProviderStreamEvent: async packet => { raw.push(packet); timeline.push('raw:' + raw.length) },
+  })
+  for await (const event of stream) if (event.type === 'text_delta') timeline.push('text:' + event.delta)
+  expect(await stream.result()).toMatchObject({ stopReason: 'stop', content: [{ text: '早上' }] })
+  expect(metadata).toHaveBeenCalledExactlyOnceWith({ status: 200, headers: {
+    'content-type': 'text/event-stream', 'x-test-observation': 'present',
+  } })
+  expect(raw).toEqual(packets)
+  expect(timeline.slice(0, 2)).toEqual(['http', 'body'])
+  expect(timeline.indexOf('raw:1')).toBeLessThan(timeline.indexOf('text:早'))
+  expect(timeline.indexOf('raw:2')).toBeLessThan(timeline.indexOf('text:上'))
+})
+
+it('takes a per-delta snapshot for message Hooks even when the consumer is behind', async () => {
+  const stream = modelApi.createModelStream(credentials, { fetch: async () => response([
+    chunk({ content: '早' }), chunk({ content: '上' }), chunk({}, 'stop'),
+  ]) })(selected, context, { snapshotPartials: true })
+  await stream.result()
+  const { events } = await consume(stream)
+  expect(events.flatMap(event => event.type === 'text_delta' ? [[event.delta, event.partial.content[0]]] : [])).toEqual([
+    ['早', { type: 'text', text: '早' }], ['上', { type: 'text', text: '早上' }],
+  ])
 })

@@ -1199,8 +1199,12 @@ describe('首次发送', () => {
     const first = http(app.url + '/api/sessions/start', headers, 'POST', JSON.stringify(input)).then(response => response.status, () => 'disconnected')
     try {
       expect(await Promise.race([validating.promise.then(() => 'validating'), first])).toBe('validating')
-      await app.server.close()
+      let closed = false
+      const closing = app.server.close().then(() => { closed = true })
+      await Promise.resolve()
+      expect(closed).toBe(false)
       release.resolve()
+      await closing
       expect([503, 'disconnected']).toContain(await first)
       const reopened = await app.server.start()
       const reopenedCookie = await cookie(reopened.authUrl)
@@ -2047,5 +2051,142 @@ describe('权限管理', () => {
     expect((await send(modern)).status).toBe(202)
     await vi.waitFor(() => expect(app.provider.calls).toHaveLength(1))
     expect(app.provider.calls[0]?.tools?.map(tool => tool.name).sort()).toEqual(readOnly)
+  })
+})
+
+describe('Feature 4 personal extensions from the HTTP entry', () => {
+  it.each([false, true])('waits for the startup Hook before replying or closing (shutdown: %s)', async shutdown => {
+    const profile = await mkdtemp(join(tmpdir(), 'si-hook-gate-'))
+    cleanups.push(() => rm(profile, { recursive: true, force: true }))
+    const directory = join(profile, 'extensions')
+    await mkdir(join(directory, 'package'), { recursive: true })
+    const installed = join(profile, 'installed')
+    await writeFile(join(directory, 'package', 'index.ts'), `
+      import { appendFile } from 'node:fs/promises'
+      export default si => si.on('session_start', () => appendFile(${JSON.stringify(installed)}, ${JSON.stringify('loaded\n')}))
+    `)
+    const marker = join(directory, 'timeline')
+    const release = join(directory, 'release')
+    await writeFile(join(directory, 'gate.ts'), `
+      import { appendFile, access } from 'node:fs/promises'
+      import { setTimeout } from 'node:timers/promises'
+      const mark = text => appendFile(${JSON.stringify(marker)}, text + '\\n')
+      export default si => {
+        si.on('session_start', async event => { await mark(event.reason) })
+        si.on('input', ({ text }, ctx) => {
+          if (text === 'ping') { ctx.ui.notify('pong'); return { action: 'handled' } }
+          return { action: 'transform', text: 'transformed' }
+        })
+        si.on('before_agent_start', async (_event, ctx) => {
+          const abort = () => { void mark('aborted') }
+          ctx.signal.addEventListener('abort', abort, { once: true })
+          try {
+            await mark('waiting')
+            while (!await access(${JSON.stringify(release)}).then(() => true, () => false)) await setTimeout(5)
+            await mark('released')
+            return { systemPrompt: 'override' }
+          } finally { ctx.signal.removeEventListener('abort', abort) }
+        })
+        si.on('after_provider_response', async e => { await mark('http ' + e.status) })
+        si.on('provider_stream_event', async e => { await mark([e.provider, e.api, e.model, e.data.id].join(' ')) })
+        si.on('session_shutdown', async () => { await mark('shutdown') })
+      }
+    `)
+    await writeFile(join(directory, 'bad.ts'), 'export default {}')
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const requests: string[] = []
+    const openStore = vi.spyOn(SessionStore, 'open')
+    const app = await setup({ globalContextDirectory: profile, modelOptions: {
+      fetch: async (_url, request) => {
+        requests.push(String(request?.body))
+        return new Response('data: ' + JSON.stringify({
+          id: 'response', object: 'chat.completion.chunk', created: 1, model: 'deepseek-flash',
+          choices: [{ index: 0, delta: { content: '模型完成' }, finish_reason: 'stop' }],
+        }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } })
+      },
+    } })
+    expect(error).toHaveBeenCalledWith('个人扩展加载失败', join(directory, 'bad.ts'), expect.any(Error))
+    const projectDirectory = join(app.workspace, '.si', 'extensions')
+    await mkdir(projectDirectory, { recursive: true })
+    await writeFile(join(projectDirectory, 'index.ts'), `
+      import { appendFile } from 'node:fs/promises'
+      export default si => si.on('session_start', () => appendFile(${JSON.stringify(installed)}, ${JSON.stringify('project\n')}))
+    `)
+    const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const post = (path: string, value: object) => http(app.url + path, headers, 'POST', JSON.stringify(value))
+    const base = { workspaceId: await pickWorkspace(app.url, auth), modelId: 'deepseek-flash' }
+    expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"configured-for-test"}')).status).toBe(200)
+    const list = async () => JSON.parse((await http(app.url + '/api/sessions', headers)).text).sessions
+    const trace = async () => (await readFile(marker, 'utf8').catch(() => '')).trim().split('\n')
+    const ping = { ...base, clientMessageId: randomUUID(), text: 'ping' }
+    const pingResponse = await post('/api/sessions/start', ping)
+    expect(pingResponse.status).toBe(202)
+    const handled = { kind: 'handled', clientMessageId: ping.clientMessageId, draftSessionId: ping.clientMessageId,
+      notices: [{ message: 'pong', level: 'info' }] }
+    expect(JSON.parse(pingResponse.text)).toEqual(handled)
+    expect(JSON.parse((await post('/api/sessions/start', ping)).text)).toEqual(handled)
+    expect(await list()).toEqual([])
+    expect(requests).toEqual([])
+    expect(await readFile(installed, 'utf8')).toBe('loaded\n')
+    const first = { ...base, clientMessageId: randomUUID(), text: 'original', draftSessionId: ping.clientMessageId }
+    let status: number | undefined
+    const waiting = post('/api/sessions/start', first).then(response => { status = response.status; return response }, () => undefined)
+    const store = openStore.mock.results[0]!.value as SessionStore
+    try {
+      await vi.waitFor(async () => expect(await trace()).toEqual(['new', 'waiting']))
+      expect(status).toBeUndefined()
+      expect(await list()).toEqual([])
+      expect(store.loadSession(first.draftSessionId)).toBeUndefined()
+      expect(requests).toEqual([])
+      if (shutdown) {
+        let closed = false
+        const close = app.server.close().then(() => { closed = true })
+        await vi.waitFor(async () => expect(await trace()).toEqual(['new', 'waiting', 'aborted']))
+        expect(closed).toBe(false)
+        expect(store.listSessions()).toEqual([])
+        await writeFile(release, '')
+        await close
+        await waiting
+        expect(status).not.toBe(202)
+        expect(requests).toEqual([])
+        const stored = SessionStore.open(app.config.sessionPath!)
+        try { expect(stored.listSessions()).toEqual([]) }
+        finally { stored.close() }
+        expect(await trace()).toEqual(['new', 'waiting', 'aborted', 'released', 'shutdown'])
+      } else {
+        const duplicate = post('/api/sessions/start', first)
+        expect((await post('/api/sessions/start', { ...first, text: 'collision' })).status).toBe(409)
+        await writeFile(release, '')
+        const response = (await waiting)!
+        expect(response.status).toBe(202)
+        expect(JSON.parse((await duplicate).text)).toEqual(JSON.parse(response.text))
+        const accepted = JSON.parse(response.text)
+        expect(accepted).toMatchObject({ session: { id: first.draftSessionId },
+          accepted: { clientMessageId: first.clientMessageId, kind: 'message' } })
+        expect(store.loadSession(first.draftSessionId)).toMatchObject({
+          runs: [{ text: 'original', finalText: 'transformed' }], messages: [{ message: { role: 'user', content: 'transformed' } }],
+        })
+        await vi.waitFor(() => expect(requests).toHaveLength(1))
+        expect(requests[0]).toContain('override')
+        expect(requests[0]).toContain('transformed')
+        await vi.waitFor(() => expect(store.loadSession(first.draftSessionId)?.runs[0]?.status).toBe('completed'))
+        await app.server.close()
+        const restarted = await app.server.start()
+        const auth = await cookie(restarted.authUrl)
+        const responseAfterRestart = await http(restarted.url + '/api/sessions/start',
+          { Cookie: auth, 'Content-Type': 'application/json' }, 'POST', JSON.stringify(first))
+        expect(JSON.parse(responseAfterRestart.text)).toEqual(accepted)
+        const socket = await connect(restarted.url, auth)
+        const restored = nextConversationFrame(socket)
+        socket.send(JSON.stringify({ type: 'subscribe', sessionId: first.draftSessionId, subscriptionId: 'restored' }))
+        expect(await restored).toMatchObject({ type: 'snapshot', snapshot: { messages: [
+          { message: { content: 'transformed' } }, { message: { content: [{ text: '模型完成' }] } },
+        ] } })
+        await vi.waitFor(async () => expect(await trace()).toEqual(['new', 'waiting', 'released', 'http 200',
+          'deepseek openai-completions deepseek-flash response', 'shutdown', 'resume']))
+      }
+    } finally {
+      await writeFile(release, '')
+    }
   })
 })

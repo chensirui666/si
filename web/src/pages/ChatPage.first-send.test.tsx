@@ -109,3 +109,28 @@ it('刷新时仍能用同一个编号确认未收到回执的首发', async () =
   expect(startSession.mock.calls[0]?.[0]).toMatchObject({ permissionMode: 'normal' })
   expect(startSession.mock.calls[1]).toEqual(startSession.mock.calls[0])
 })
+
+it('另一标签页先转正同一扩展草稿时保留本页未确认的原文', async () => {
+  const sharedDraft = '1338ccf0-0c6f-4d23-8700-4a64dfb91c12'
+  sessionStorage.setItem('agent-learning:extension-draft:stardust', sharedDraft)
+  let rejectRequest!: (error: Error) => void
+  const request = new Promise<ReturnType<typeof acceptance>>((_resolve, reject) => { rejectRequest = reject })
+  const startSession = vi.fn(() => request)
+  let refreshSessions: (() => void) | undefined
+  let sessions: SessionSummary[] = []
+  const subscription: Subscribe = (listener, _models, _workspaces, _webSettings, changed) => {
+    refreshSessions = changed
+    return subscribe(listener)
+  }
+  const view = render(<ChatPage getDefaultPermission={getDefaultPermission} subscribe={subscription} getModels={getModels} getWorkspaces={getWorkspaces}
+    getSessions={async () => sessions} startSession={startSession} />)
+  await chooseAndType()
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '发送' })) })
+  expect(startSession).toHaveBeenCalledWith(expect.objectContaining({ draftSessionId: sharedDraft, text: firstText }))
+  sessions = [{ ...existing, id: sharedDraft, workspaceId: stardust.id }]
+  await act(async () => { refreshSessions?.() })
+  expect(view.container.querySelector('.chat-page')).not.toHaveAttribute('data-session-id', sharedDraft)
+  expect(localStorage.getItem(draftKey('new-session'))).toBe(firstText)
+  await act(async () => { rejectRequest(Object.assign(new Error('会话编号已被使用'), { status: 409 })) })
+  expect(localStorage.getItem(draftKey('new-session'))).toBe(firstText)
+})

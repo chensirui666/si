@@ -80,7 +80,7 @@ test('Skill 从正式入口发现、显式与自动加载、重试恢复，以�
       { name: 'review', source: 'project-si', description: '复核交付文件。', disableModelInvocation: true },
     ]))
     expect(JSON.stringify(await catalog(workspaceId))).not.toContain(root)
-    const firstPost = page.waitForRequest(req => req.method() === 'POST' && req.url().endsWith('/api/sessions/start'))
+    await expect(page.getByRole('button', { name: '设置', exact: true })).toBeFocused()
     await editor.fill('/')
     await page.getByRole('option', { name: /review/ }).click()
     const prefix = editor.locator('[style*="--skill-prefix-color"]')
@@ -89,6 +89,7 @@ test('Skill 从正式入口发现、显式与自动加载、重试恢复，以�
     expect(model.exchanges).toHaveLength(0)
     await editor.pressSequentially('核对交付')
     await expect(prefix).toHaveText('/skill:review')
+    const firstPost = page.waitForRequest(req => req.method() === 'POST' && req.url().endsWith('/api/sessions/start'))
     await send.click()
     const firstInput = (await firstPost).postDataJSON()
     const first = await request(0)

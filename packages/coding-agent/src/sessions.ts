@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { SessionSubmitError, type AgentSession } from './agent-session.js'
 import { runSelection, submissionReceipt, type SessionPersistence, type SessionStore } from './session-store.js'
 import type { PermissionMode } from './permissions.js'
-import type { SubmissionAccepted } from './types.js'
+import type { SubmissionAccepted, SubmissionHandled } from './types.js'
 
 export type SessionSummary = {
   id: string
@@ -12,18 +12,19 @@ export type SessionSummary = {
   createdAt: string
 }
 
-type FirstMessage = Parameters<AgentSession['submit']>[0] & { workspaceId: string }
-type StartedSession = { session: SessionSummary; accepted: SubmissionAccepted }
+type FirstMessage = Parameters<AgentSession['submit']>[0] & { workspaceId: string; draftSessionId?: string }
+type StartedSession = { session: SessionSummary; accepted: SubmissionAccepted } | (SubmissionHandled & { draftSessionId: string })
+type Draft<T> = { summary: SessionSummary; session: T; close(): Promise<void>; submitting?: boolean }
 
-export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (selection: ModelSelection) => void }> {
+export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (selection: ModelSelection) => void | Promise<void>; initialize?: () => Promise<void> | undefined }> {
   private readonly sessions = new Map<string, { summary: SessionSummary; session: T }>()
   private readonly starts = new Map<string, { input: FirstMessage; result: Promise<StartedSession> }>()
-  private readonly provisional = new Set<() => Promise<void>>()
+  private readonly drafts = new Map<string, { workspaceId: string; pending: Promise<Draft<T>> }>()
   private closing?: Promise<void>
 
   constructor(private readonly options: {
     resolveDirectory(workspaceId: string): Promise<string>
-    createSession(resolveDirectory: () => Promise<string>, persistence?: SessionPersistence, permissionMode?: PermissionMode): T
+    createSession(resolveDirectory: () => Promise<string>, persistence?: SessionPersistence, permissionMode?: PermissionMode, sessionId?: string): T
     getDefaultPermissionMode?(): Promise<PermissionMode>
     store?: SessionStore
     closeTools?(): Promise<void>
@@ -36,7 +37,8 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
       const session = this.get(sessionId)
       if (!session) return false
       if (!session.selectModel) throw new SessionSubmitError('invalid', '当前会话不支持模型选择')
-      session.selectModel(selection)
+      const notification = session.selectModel(selection)
+      if (notification) return notification.then(() => true)
     } else this.options.store?.saveModelSelection(selection)
     return true
   }
@@ -46,26 +48,28 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     const permissionMode = await this.options.getDefaultPermissionMode?.() ?? 'normal'
     this.ensureOpen()
     let id: string
-    do { id = randomUUID() } while (this.sessions.has(id) || this.starts.has(id))
+    do { id = randomUUID() } while (this.sessions.has(id) || this.starts.has(id) || this.drafts.has(id))
     const summary = this.newSummary(id, workspaceId)
     const store = this.options.store
-    const session = this.options.createSession(resolveDirectory, store && { summary, store }, permissionMode)
+    const session = this.options.createSession(resolveDirectory, store && { summary, store }, permissionMode, id)
     store?.save(id, { summary, permissionMode })
     this.sessions.set(id, { summary, session })
+    void session.initialize?.()?.catch(() => undefined)
     return summary
   }
 
-  async start(input: FirstMessage, submit: (session: T) => Promise<SubmissionAccepted>): Promise<StartedSession> {
+  async start(input: FirstMessage, submit: (session: T) => Promise<SubmissionAccepted | SubmissionHandled>): Promise<StartedSession> {
     this.ensureOpen()
     const id = input.clientMessageId
+    const draftId = input.draftSessionId ?? id
     const previous = this.starts.get(id)
     if (previous) {
-      if (previous.input.workspaceId !== input.workspaceId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text || previous.input.permissionMode !== input.permissionMode) {
+      if (previous.input.workspaceId !== input.workspaceId || previous.input.draftSessionId !== input.draftSessionId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text || previous.input.permissionMode !== input.permissionMode) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
       return previous.result
     }
-    const history = this.options.store?.loadSession(id)
+    const history = this.options.store?.loadSession(draftId)
     if (history) {
       const run = history.runs[0]
       if (run?.kind !== 'task' || run.clientMessageId !== id || history.summary.workspaceId !== input.workspaceId
@@ -74,36 +78,62 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
       }
       return { session: history.summary, accepted: submissionReceipt(run) }
     }
-    if (this.sessions.has(id)) throw new SessionSubmitError('busy', '此会话编号已被使用')
+    if (this.sessions.has(draftId)) throw new SessionSubmitError('busy', '此会话编号已被使用')
     if (input.text.trim() === '/compact') throw new SessionSubmitError('invalid', '新会话没有可压缩的内容')
     const result = this.acceptFirst(input, submit)
     this.starts.set(id, { input, result })
-    try { return await result }
-    catch (error) { this.starts.delete(id); throw error }
-    finally { if (this.options.store) this.starts.delete(id) }
+    try {
+      const accepted = await result
+      if (this.options.store && 'session' in accepted) this.starts.delete(id)
+      return accepted
+    } catch (error) { this.starts.delete(id); throw error }
   }
 
-  private async acceptFirst(input: FirstMessage, submit: (session: T) => Promise<SubmissionAccepted>): Promise<StartedSession> {
+  private async acceptFirst(input: FirstMessage, submit: (session: T) => Promise<SubmissionAccepted | SubmissionHandled>): Promise<StartedSession> {
+    const id = input.draftSessionId ?? input.clientMessageId
+    const previous = this.drafts.get(id)
+    if (previous && previous.workspaceId !== input.workspaceId) throw new SessionSubmitError('busy', '草稿属于另一个工作区')
+    const pending = previous?.pending ?? this.createDraft(id, input)
+    if (!previous) this.drafts.set(id, { workspaceId: input.workspaceId, pending })
+    let draft: Draft<T> | undefined
+    let submitting = false
+    try {
+      draft = await pending
+      this.ensureOpen()
+      if (draft.submitting || this.sessions.has(id)) throw new SessionSubmitError('busy', '草稿正在发送首条消息')
+      submitting = draft.submitting = true
+      const { session, summary } = draft
+      const accepted = await submit(session)
+      if (accepted.kind === 'handled') return { ...accepted, draftSessionId: id }
+      if (!this.sessions.has(id)) {
+        this.sessions.set(id, { summary, session })
+        this.drafts.delete(id)
+        this.options.onStarted?.()
+      }
+      return { session: summary, accepted }
+    } catch (error) {
+      if (!previous && !this.sessions.has(id)) {
+        this.drafts.delete(id)
+        if (draft) await draft.close()
+      }
+      throw error
+    } finally {
+      if (submitting && draft) draft.submitting = false
+    }
+  }
+
+  private async createDraft(id: string, input: FirstMessage): Promise<Draft<T>> {
     const resolveDirectory = await this.validateWorkspace(input.workspaceId)
     const permissionMode = input.permissionMode ?? await this.options.getDefaultPermissionMode?.() ?? 'normal'
     this.ensureOpen()
-    const summary = this.newSummary(input.clientMessageId, input.workspaceId)
+    const summary = this.newSummary(id, input.workspaceId)
     const store = this.options.store
     const session = this.options.createSession(resolveDirectory, store && {
       summary, store, first: () => Object.assign(summary, this.newSummary(summary.id, summary.workspaceId)),
-    }, permissionMode)
+    }, permissionMode, id)
     let closing: Promise<void> | undefined
-    const close = () => closing ??= Promise.resolve().then(() => session.close?.())
-    this.provisional.add(close)
-    try {
-      const accepted = await submit(session)
-      this.sessions.set(summary.id, { summary, session })
-      this.options.onStarted?.()
-      return { session: summary, accepted }
-    } catch (error) {
-      await close()
-      throw error
-    } finally { this.provisional.delete(close) }
+    return { summary, session,
+      close: () => closing ??= Promise.resolve().then(() => session.close?.()) }
   }
 
   private ensureOpen() {
@@ -135,6 +165,7 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     const { summary } = history
     const session = this.options.createSession(() => this.options.resolveDirectory(summary.workspaceId), { store, summary, history })
     this.sessions.set(sessionId, { summary, session })
+    void session.initialize?.()?.catch(() => undefined)
     return session
   }
 
@@ -142,7 +173,10 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     return this.closing ??= Promise.resolve().then(async () => {
       const results = await Promise.allSettled([
         ...[...this.sessions.values()].map(async ({ session }) => session.close?.()),
-        ...[...this.provisional].map(close => close()),
+        ...[...this.drafts.values()].map(async ({ pending }) => {
+          const draft = await pending.catch(() => undefined)
+          await draft?.close()
+        }),
       ])
       await this.options.closeTools?.()
       const failed = results.find(result => result.status === 'rejected')

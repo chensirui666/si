@@ -1,5 +1,5 @@
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
+import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, ExtensionNotice, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelFailureKind, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 import { retryReasons, terminalOnly } from './model-retry'
@@ -15,10 +15,12 @@ export type ChatState = {
   connectionNotice?: CopyKey
 }
 export type Subscription = (() => void) & { requestSnapshot?: () => void; setSession: (sessionId: string | null) => void }
-export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void, onPermissionSettingsChanged?: () => void) => Subscription
+export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void, onPermissionSettingsChanged?: () => void, onExtensionNotice?: (notice: ExtensionNotice, sessionId: string) => void) => Subscription
 export const initialState: ChatState = { sessionId: null, connection: 'connecting', snapshot: null, slow: false, error: null }
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+export const extensionNotice = (value: unknown): value is ExtensionNotice =>
+  record(value) && typeof value.message === 'string' && typeof value.level === 'string' && ['info', 'warning', 'error'].includes(value.level)
 export const reasoningEffort = (value: unknown): value is ReasoningEffort =>
   typeof value === 'string' && ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value)
 
@@ -32,6 +34,7 @@ const sequence = (value: unknown): value is number => Number.isSafeInteger(value
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const textContent = (value: unknown) => record(value) && value.type === 'text' && typeof value.text === 'string'
 const toolPosition = (value: unknown) => record(value) && typeof value.assistantMessageId === 'string' && sequence(value.contentIndex)
+  && (value.actualArguments === undefined || record(value.actualArguments))
 const retryTime = (value: unknown) => sequence(value) && value <= 8.64e15
 const failureKind = (value: unknown): value is ModelFailureKind => typeof value === 'string' && Object.hasOwn(retryReasons, value)
 const failureStatus = (kind: ModelFailureKind, status: unknown) =>
@@ -194,7 +197,7 @@ function validSnapshot(value: unknown): value is ConversationSnapshot {
     && validRelations(value.messages as ConversationMessage[], value.running as ConversationSnapshot['running'])
 }
 
-export function applyFrame(state: ChatState, frame: unknown, subscriptionId: string): { state: ChatState; resubscribe: boolean } {
+export function applyFrame(state: ChatState, frame: unknown, subscriptionId: string): { state: ChatState; resubscribe: boolean; notice?: ExtensionNotice } {
   const unchanged = { state, resubscribe: false }
   if (!state.sessionId || !record(frame) || frame.sessionId !== state.sessionId || frame.subscriptionId !== subscriptionId) return unchanged
   if (frame.type === 'subscription_error' && typeof frame.error === 'string') {
@@ -222,6 +225,10 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   const capacity = frame.update.contextUsage === undefined ? state.snapshot.contextUsage : frame.update.contextUsage as ConversationSnapshot['contextUsage']
   const change = frame.update.change
   if (!record(change)) return { state, resubscribe: true }
+  if (change.type === 'notice') {
+    if (!extensionNotice(change.notice)) return { state, resubscribe: true }
+    return { state: { ...state, snapshot: { ...state.snapshot, seq: frame.update.seq } }, resubscribe: false, notice: change.notice }
+  }
   if (change.type === 'permission') {
     if (!isPermissionMode(change.permissionMode)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {

@@ -21,6 +21,20 @@ export function writeDraftPermission(value: PermissionMode | null) {
   } catch { /* In-memory state remains usable. */ }
 }
 
+const extensionDraftKey = (workspaceId: string) => `agent-learning:extension-draft:${workspaceId}`
+
+export function readExtensionDraft(workspaceId: string) {
+  try { return sessionStorage.getItem(extensionDraftKey(workspaceId)) ?? undefined }
+  catch { return undefined }
+}
+
+export function writeExtensionDraft(workspaceId: string, id?: string) {
+  try {
+    if (id) sessionStorage.setItem(extensionDraftKey(workspaceId), id)
+    else sessionStorage.removeItem(extensionDraftKey(workspaceId))
+  } catch { /* The current page retains the draft identifier. */ }
+}
+
 const firstSendKey = 'agent-learning:first-send'
 
 export function readFirstSend(): StartSessionRequest | undefined {
@@ -28,6 +42,7 @@ export function readFirstSend(): StartSessionRequest | undefined {
     const value = JSON.parse(sessionStorage.getItem(firstSendKey) ?? 'null')
     if (value && typeof value.workspaceId === 'string' && typeof value.clientMessageId === 'string'
       && typeof value.modelId === 'string' && typeof value.text === 'string'
+      && (value.draftSessionId === undefined || typeof value.draftSessionId === 'string')
       && (value.permissionMode === undefined || isPermissionMode(value.permissionMode))) return value
   } catch { /* Drafts still work within the page when storage is unavailable. */ }
 }

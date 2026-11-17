@@ -1,11 +1,13 @@
-import type { AssistantMessage, ModelMessage, ModelUsage, ModelFailureKind, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
+import type { AssistantMessage, JsonObject, ModelMessage, ModelUsage, ModelFailureKind, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
 
+import type { ExtensionMessage } from './extensions/runtime.js'
 import type { SkillInvocation } from './skills.js'
 import type { PermissionMode } from './permissions.js'
 
 type ToolLocation = {
   assistantMessageId: string
   contentIndex: number
+  actualArguments?: JsonObject
 }
 
 export type ConversationMessage = {
@@ -15,10 +17,12 @@ export type ConversationMessage = {
   toolErrorCode?: string
   imageOmitted?: true
   skillInvocation?: SkillInvocation
+  extension?: Omit<ExtensionMessage, 'content'>
   fileOperation?: { kind: 'read' | 'modified'; path: string }
   message: ModelMessage
 }
 
+export type SubmissionHandled = { kind: 'handled'; clientMessageId: string; notices: ExtensionNotice[] }
 export type SubmissionAccepted = { clientMessageId: string; acceptedSeq: number } & (
   | { kind: 'message'; userMessageId: string }
   | { kind: 'compaction'; compactionId: string }
@@ -86,6 +90,7 @@ export type ConversationUpdate = {
   run?: RunRecord
   saveFailure?: SaveFailure
   change:
+    | { type: 'notice'; notice: ExtensionNotice }
     | { type: 'permission'; permissionMode: PermissionMode }
     | { type: 'selection'; selection: ModelSelection }
     | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
@@ -136,3 +141,5 @@ export type SaveFailure = {
   reason: 'storage-full' | 'write-failed' | 'unconfirmed'
   toolCall?: ToolLocation
 }
+
+export type ExtensionNotice = { message: string; level: 'info' | 'warning' | 'error' }

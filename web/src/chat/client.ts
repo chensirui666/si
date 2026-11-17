@@ -1,11 +1,11 @@
 import type { ModelDiscovery } from '@agent-learning/model'
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import type { WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
-import { applyFrame, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
+import { applyFrame, extensionNotice, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
-export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged) => {
+export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged, onExtensionNotice) => {
   let state: ChatState = initialState
   let stopped = false
   let socket: WebSocket | null = null
@@ -90,6 +90,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
       if (result.state === state) return
       if (result.state.connection === 'ready') { clearPreparation(); retryCount = 0 }
       publish(result.state)
+      if (result.notice && result.state.sessionId) onExtensionNotice?.(result.notice, result.state.sessionId)
     }
     const failure = () => { if (!stopped && socket === current) fail() }
     current.addEventListener('open', open)
@@ -335,17 +336,28 @@ function acceptedSubmission(value: unknown, sessionId: string, clientMessageId: 
     && Number.isSafeInteger(value.acceptedSeq) && (value.acceptedSeq as number) >= 0
 }
 
-export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
+function handledSubmission(value: unknown, id: string, key: 'sessionId' | 'draftSessionId', sessionId: string) {
+  return record(value) && value.kind === 'handled' && value.clientMessageId === id && value[key] === sessionId
+    && Array.isArray(value.notices) && value.notices.every(extensionNotice)
+    ? { kind: 'handled' as const, clientMessageId: id, notices: value.notices } : undefined
+}
+
+export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageResult> {
   const value = await postSubmission('/api/messages', input)
+  const handled = input.text.trim() !== '/compact' && handledSubmission(value, input.clientMessageId, 'sessionId', input.sessionId)
+  if (handled) return { ...handled, sessionId: input.sessionId }
   if (!acceptedSubmission(value, input.sessionId, input.clientMessageId, input.text.trim() === '/compact' ? 'compaction' : 'message')) {
     throw new RequestError({ key: 'request.sendInvalid' })
   }
   return value
 }
 
-export async function startSession(input: StartSessionRequest): Promise<StartSessionAccepted> {
+export async function startSession(input: StartSessionRequest): Promise<StartSessionResult> {
   const value = await postSubmission('/api/sessions/start', input, AbortSignal.timeout(10_000))
-  if (!record(value) || !sessionSummary(value.session) || value.session.id !== input.clientMessageId || value.session.workspaceId !== input.workspaceId
+  const draftSessionId = input.draftSessionId ?? input.clientMessageId
+  const handled = handledSubmission(value, input.clientMessageId, 'draftSessionId', draftSessionId)
+  if (handled) return { ...handled, draftSessionId }
+  if (!record(value) || !sessionSummary(value.session) || value.session.id !== draftSessionId || value.session.workspaceId !== input.workspaceId
     || !acceptedSubmission(value.accepted, value.session.id, input.clientMessageId, 'message')) {
     throw new RequestError({ key: 'request.firstInvalid' })
   }

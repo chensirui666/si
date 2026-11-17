@@ -57,7 +57,7 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
     <span className="tool-status" data-state="error" data-result="failure">{t('tool.status.error')}</span>
   </div>
   const outcome = result?.message.role === 'toolResult' ? result.message : undefined
-  const state: ToolState = outcome ? result?.toolErrorCode === 'permission_denied' ? 'denied'
+  const state: ToolState = outcome ? ['permission_denied', 'hook_blocked'].includes(result?.toolErrorCode ?? '') ? 'denied'
     : result?.toolErrorCode === 'interrupted' ? 'stopped' : outcome.isError ? 'error' : 'ok'
     : executing ? 'running' : unknown ? 'unknown' : stopped ? 'stopped' : failure ? 'error' : running ? 'preparing' : 'error'
   const reason = outcome || state === 'preparing' || state === 'running' ? undefined
@@ -133,14 +133,17 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
         </details>)
       } else {
         const unsaved = saveFailure?.toolCall
-        process.push(<ToolBlock key={key} block={block} argumentsText={active?.type === 'toolCall' ? active.argumentsText : undefined}
+        const result = toolResults?.get(id)?.get(index)
+        const executing = running?.activeTools.find(tool => tool.assistantMessageId === id && tool.contentIndex === index)
+        const actualArguments = result?.toolCall?.actualArguments ?? executing?.actualArguments
+        process.push(<ToolBlock key={key} block={actualArguments ? { ...block, arguments: actualArguments } : block} argumentsText={active?.type === 'toolCall' ? active.argumentsText : undefined}
           running={running !== null}
-          executing={running?.activeTools.some(tool => tool.assistantMessageId === id && tool.contentIndex === index) ?? false}
+          executing={!!executing}
           unknown={!running && restored && (message.stopReason === 'toolUse' || message.stopReason === 'stop')}
           unsaved={unsaved?.assistantMessageId === id && unsaved.contentIndex === index ? saveFailure?.reason : undefined}
           stopped={!running && terminal?.stopReason === 'aborted'}
           failure={message.stopReason === 'length' ? t('tool.truncated') : !running && terminal?.stopReason === 'error' ? t('tool.taskFailed') : undefined}
-          result={toolResults?.get(id)?.get(index)} />)
+          result={result} />)
       }
     })
     const recoveringOverflow = message.errorCode === 'context_overflow' && !message.failure && (message !== last || running)

@@ -3,7 +3,7 @@ import { errorNotice, NoticeText, noticeSummary, type Notice } from '../i18n/mes
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, PlusIcon } from 'lucide-react'
 import type { ModelDiscovery, ModelSelection } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, PermissionMode, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, ExtensionNotice, PermissionMode, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageResult, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
 import { PermissionPicker } from '../components/PermissionPicker'
@@ -17,17 +17,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger } from '../components/ui/sidebar'
 import { initialState, mergeSubmissions, settleSubmission, type Subscribe, type Subscription } from '../chat/state'
 import type { LocalSubmission } from '../types'
-import { newSessionDraft, readDraftPermission, writeDraftPermission, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend } from '../chat/drafts'
+import { newSessionDraft, readDraftPermission, readExtensionDraft, writeExtensionDraft, writeDraftPermission, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend } from '../chat/drafts'
 
 type Props = {
   subscribe?: Subscribe
   getDefaultPermission?: typeof queryDefaultPermission
   getModels?: () => Promise<ModelDiscovery>
   getSessions?: () => Promise<SessionSummary[]>
-  startSession?: (input: StartSessionRequest) => Promise<StartSessionAccepted>
+  startSession?: (input: StartSessionRequest) => Promise<StartSessionResult>
   pickWorkspace?: typeof chooseWorkspace
   getWorkspaces?: () => Promise<WorkspaceView>
-  submitMessage?: (input: SubmitMessageRequest) => Promise<SubmitMessageAccepted>
+  submitMessage?: (input: SubmitMessageRequest) => Promise<SubmitMessageResult>
   abortMessage?: (input: AbortRequest) => Promise<AbortResult>
 }
 
@@ -134,6 +134,16 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const pickingRef = useRef(false)
   const [draftWorkspaceId, setDraftWorkspaceId] = useState<string | null>(null)
   const firstSend = useRef<FirstSend | null>(null)
+  const extensionDrafts = useRef(new Map<string, string>())
+  const [extensionNotices, setExtensionNotices] = useState<{ sessionId: string | null; notices: ExtensionNotice[] }>()
+  const showExtensionNotices = useCallback((id: string | null, notices: ExtensionNotice[]) => {
+    if (notices.length && selected.current === id) setExtensionNotices({ sessionId: id, notices })
+  }, [])
+  useEffect(() => {
+    if (!extensionNotices) return
+    const timer = setTimeout(() => setExtensionNotices(undefined), 5000)
+    return () => clearTimeout(timer)
+  }, [extensionNotices])
   const [firstPhase, setFirstPhase] = useState<'sending' | 'unconfirmed' | null>(null)
   const [firstError, setFirstError] = useState<Notice | null>(null)
   const [saveNotice, setSaveNotice] = useState<{ sessionId: string | null; text: Notice } | null>(null)
@@ -207,9 +217,11 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
 
   const finishFirstSend = useCallback((session: SessionSummary) => {
     const pending = firstSend.current
-    if (!pending || pending.input.clientMessageId !== session.id || pending.input.workspaceId !== session.workspaceId) return
+    if (!pending || (pending.input.draftSessionId ?? pending.input.clientMessageId) !== session.id || pending.input.workspaceId !== session.workspaceId) return
     firstSend.current = null
     writeFirstSend(null)
+    extensionDrafts.current.delete(session.workspaceId)
+    writeExtensionDraft(session.workspaceId)
     writeDraftPermission(null)
     setDraftPermission(null)
     setDefaultPermissionView(null)
@@ -226,8 +238,20 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     pending.sending = true
     setFirstPhase('sending')
     setFirstError(null)
-    void Promise.resolve().then(() => startSession(pending.input)).then(({ session: created }) => {
+    void Promise.resolve().then(() => startSession(pending.input)).then(result => {
       if (!mounted.current || firstSend.current !== pending) return
+      if ('kind' in result) {
+        const { workspaceId, text } = pending.input
+        extensionDrafts.current.set(workspaceId, result.draftSessionId)
+        writeExtensionDraft(workspaceId, result.draftSessionId)
+        firstSend.current = null
+        writeFirstSend(null)
+        setFirstPhase(null)
+        if (clearSentDraft(newSessionDraft, text, pending.revision) && selected.current === null) loadDraft(newSessionDraft)
+        showExtensionNotices(null, result.notices)
+        return
+      }
+      const created = result.session
       invalidateSessions()
       setSessions(previous => previous?.some(item => item.id === created.id) ? previous : [...previous ?? [], created])
       finishFirstSend(created)
@@ -251,6 +275,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
           void refreshModels()
         }
         void refreshWorkspaces()
+        if (pending.input.draftSessionId) void refreshSessions()
       } else {
         setFirstPhase('unconfirmed')
         if (authorizationRejected && error instanceof Error) setFirstError(errorNotice('chat.firstRejected', error))
@@ -346,7 +371,8 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       stateRef.current = next
       updateSubmissions(submissionsRef.current)
       setState(next)
-    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, refreshPermission)
+    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, refreshPermission,
+    (notice, id) => showExtensionNotices(id, [notice]))
     subscription.current = stop
     stop.setSession(selected.current)
     return () => {
@@ -361,7 +387,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       for (const timer of timers.current) clearTimeout(timer)
       timers.current.clear()
     }
-  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage])
+  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage, showExtensionNotices])
 
   useEffect(() => {
     if (!sessions) return
@@ -379,7 +405,9 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   }, [sessions, openSession, readStorage])
 
   useEffect(() => {
-    const sent = sessions?.find(item => item.id === firstSend.current?.input.clientMessageId)
+    const pending = firstSend.current?.input
+    if (!pending || pending.draftSessionId && pending.draftSessionId !== pending.clientMessageId) return
+    const sent = sessions?.find(item => item.id === pending.clientMessageId)
     if (sent) finishFirstSend(sent)
   }, [sessions, finishFirstSend])
 
@@ -471,8 +499,14 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         setFirstError({ key: 'chat.compactNeedsHistory' })
         return false
       }
+      const existingDraft = extensionDrafts.current.get(draftWorkspace.id) ?? readExtensionDraft(draftWorkspace.id)
+      const draftSessionId = sessions?.some(session => session.id === existingDraft) ? undefined : existingDraft
+      if (existingDraft && !draftSessionId) {
+        extensionDrafts.current.delete(draftWorkspace.id)
+        writeExtensionDraft(draftWorkspace.id)
+      }
       const pending = firstSend.current = {
-        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text, permissionMode: draftPermission },
+        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text, permissionMode: draftPermission, ...(draftSessionId && { draftSessionId }) },
         revision: draftRevision(newSessionDraft), sending: false,
       }
       writeFirstSend(pending.input)
@@ -495,7 +529,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     // 同步写门禁，React 渲染前的第二次发送手势也会被拦住。
     const previous = submissionsRef.current
     submissionsRef.current = [...previous, local]
-    let request: Promise<SubmitMessageAccepted>
+    let request: Promise<SubmitMessageResult>
     try { request = submitMessage(input) }
     catch { submissionsRef.current = previous; return false }
     const quoteSent = quote ? Symbol() : undefined
@@ -510,6 +544,11 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     timers.current.add(timer)
     void request.then(accepted => {
       if (!mounted.current) return
+      if (accepted.kind === 'handled') {
+        updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== input.clientMessageId))
+        showExtensionNotices(sessionId, accepted.notices)
+        return
+      }
       updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { accepted, state: 'pending', errorMessage: undefined }))
     }, error => {
       if (!mounted.current) return
@@ -642,6 +681,9 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       }} />
       <div className="chat-workspace">
       <div className="chat-page" data-new-session={isNew || undefined} data-connection={state.connection} data-session-id={sessionId ?? undefined}>
+      {extensionNotices?.sessionId === sessionId && <div className="save-notice" role="status">
+        {extensionNotices.notices.map(({ message, level }, index) => <div key={index} data-level={level}>{message}</div>)}
+      </div>}
       {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert"><NoticeText notice={saveNotice.text} /></p>}
       {!isNew && <header className="chat-header">
         <h1 title={session?.name}>{session?.name || t('chat.title')}</h1>

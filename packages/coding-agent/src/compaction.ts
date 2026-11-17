@@ -97,7 +97,7 @@ export function prepareCompaction(
     if (tokens >= keepRecentTokens) {
       firstKept = index
       // A tool result cannot survive without the assistant's entire call batch.
-      while (firstKept > 0 && !['user', 'assistant'].includes(effective[firstKept].message.role)) firstKept--
+      while (firstKept > 0 && (effective[firstKept].extension || !['user', 'assistant'].includes(effective[firstKept].message.role))) firstKept--
       break
     }
   }

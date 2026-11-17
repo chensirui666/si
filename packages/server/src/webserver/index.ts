@@ -7,8 +7,8 @@ import { extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
-  AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode,
-  type ConversationMessage, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
+  AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode, loadExtensions,
+  type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, defaultSelection, discoverModels, isModelProvider, type AssistantMessage, type ModelSelection, type ToolCall } from '@agent-learning/model'
@@ -18,11 +18,11 @@ import { WebSettings } from '../web-settings.js'
 import { isSettingsObject, readSettingsFile, updateSettingsFile } from '../settings-file.js'
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
-import type { ClientFrame, ConversationMessage as BrowserMessage, LanguageSettings, PermissionSettings, SessionPermission, ServerFrame, StartSessionAccepted, StartSessionRequest, WorkspaceSkills } from './protocol.js'
+import type { ClientFrame, ConversationMessage as BrowserMessage, LanguageSettings, PermissionSettings, SessionPermission, ServerFrame, StartSessionResult, StartSessionRequest, WorkspaceSkills } from './protocol.js'
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
-} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'selectModel' | 'selectPermissionMode'>>
+} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'initialize' | 'selectModel' | 'selectPermissionMode'>>
 
 type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
 
@@ -85,6 +85,7 @@ export type WebServerOptions = {
   webSettingsPath?: string
   globalContextDirectory?: string
   skillHome?: string
+  extensionsDirectory?: string
   directoryPicker?: DirectoryPicker
   webProviders?: WebProvider[]
   createSession?: (resolveDirectory: () => Promise<string>, persistence?: SessionPersistence, permissionMode?: PermissionMode) => SessionTarget
@@ -121,12 +122,13 @@ async function providerKey(req: IncomingMessage): Promise<string> {
 function validId(value: unknown): value is string {
   return typeof value === 'string' && value.length <= 128 && !!value.trim()
 }
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspaceId') {
   const value = await readJson(req)
   const targetLabel = target === 'sessionId' ? '会话' : '工作区'
   const targetId = value && typeof value === 'object' ? (value as Record<string, unknown>)[target] : undefined
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => ![target, 'text', 'modelId', 'provider', 'reasoningEffort', 'clientMessageId'].includes(key)
-    && !(target === 'workspaceId' && key === 'permissionMode'))
+    && !(target === 'workspaceId' && ['permissionMode', 'draftSessionId'].includes(key)))
     || !validId(targetId)
     || !('text' in value) || typeof value.text !== 'string' || !value.text.trim()
     || !('modelId' in value) || !validId(value.modelId)
@@ -137,7 +139,9 @@ async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspa
   }
   const permissionMode = 'permissionMode' in value ? value.permissionMode : undefined
   if (permissionMode !== undefined && !isPermissionMode(permissionMode)) throw new InputError(400, '权限模式无效')
-  return { targetId, permissionMode, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text,
+  const draftSessionId = 'draftSessionId' in value ? value.draftSessionId : undefined
+  if (draftSessionId !== undefined && (typeof draftSessionId !== 'string' || !uuid.test(draftSessionId))) throw new InputError(400, '草稿会话编号无效')
+  return { targetId, permissionMode, draftSessionId, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text,
     ...('provider' in value && { provider: value.provider as string }),
     ...('reasoningEffort' in value && { reasoningEffort: value.reasoningEffort as ModelSelection['reasoningEffort'] }), } }
 }
@@ -168,7 +172,7 @@ export class WebServer {
     this.workspaces = new Workspaces(options.workspacePath)
     this.webSettings = new WebSettings(options.webProviders ?? [createTavilyProvider(this.credentials)], this.credentials, options.webSettingsPath)
   }
-  private createSessions() {
+  private createSessions(extensions: readonly ExtensionEntry[]) {
     const runtime = new ToolRuntime()
     const webTools = createWebTools(this.webSettings, runtime)
     const stream = createModelStream(this.credentials, this.options.modelOptions)
@@ -176,8 +180,8 @@ export class WebServer {
       resolveDirectory: id => this.workspaces.resolveDirectory(id),
       store: this.store,
       getDefaultPermissionMode: () => this.readDefaultPermissionMode(),
-      createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode) => new AgentSession({
-        resolveDirectory, persistence, permissionMode, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+      createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode, sessionId) => new AgentSession({
+        resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
         skillHome: this.options.skillHome,
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
@@ -190,13 +194,16 @@ export class WebServer {
     if (this.server) throw new Error('服务已经启动')
     if (this.closing) await this.closing
     const secret = await loadOrCreateBrowserSecret(this.options.browserSecretPath)
+    const extensions = this.options.createSession ? [] : await loadExtensions(this.options.extensionsDirectory
+      ?? join(this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'), 'extensions'),
+    (path, error) => console.error('个人扩展加载失败', path, error))
     if (this.server) throw new Error('服务已经启动')
     this.auth = new BrowserAuth(secret, this.options.now)
     this.closing = undefined
     if (!this.options.createSession || this.options.sessionPath) {
       this.store = SessionStore.open(this.options.sessionPath ?? join(homedir(), '.agent-learning', 'sessions.sqlite'))
     }
-    try { this.sessions = this.createSessions() }
+    try { this.sessions = this.createSessions(extensions) }
     catch (error) { this.store?.close(); this.store = undefined; throw error }
     const server = this.server = createServer((req, res) => { void this.handleHttp(req, res).catch(() => {
       if (!res.headersSent) this.respond(res, 500, '服务暂时不可用')
@@ -286,7 +293,7 @@ export class WebServer {
         const selection: ModelSelection = { provider: model.provider, modelId: model.id,
           ...(effort !== undefined && { reasoningEffort: effort as ModelSelection['reasoningEffort'] }) }
         const id = 'sessionId' in value ? value.sessionId as string : undefined
-        if (!this.sessions.selectModel(selection, id)) throw new InputError(404, '会话已不可用')
+        if (!await this.sessions.selectModel(selection, id)) throw new InputError(404, '会话已不可用')
         this.json(res, 200, selection)
         this.notify('models_changed')
       } catch (error) { this.sessionError(res, error, '无法保存模型选择') }
@@ -332,13 +339,14 @@ export class WebServer {
     }
     if (url.pathname === '/api/sessions/start' && req.method === 'POST') {
       try {
-        const { targetId: workspaceId, message, permissionMode } = await messageInput(req, 'workspaceId')
-        const input: StartSessionRequest = { workspaceId, ...message, ...(permissionMode !== undefined && { permissionMode }) }
-        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.clientMessageId)) {
+        const { targetId: workspaceId, message, permissionMode, draftSessionId } = await messageInput(req, 'workspaceId')
+        const input: StartSessionRequest = { workspaceId, ...message, ...(draftSessionId && { draftSessionId }), ...(permissionMode !== undefined && { permissionMode }) }
+        if (!uuid.test(input.clientMessageId)) {
           throw new InputError(400, '首次发送需要有效的 UUID 临时编号')
         }
-        const { session, accepted } = await this.sessions.start(input, target => this.submit(target, { ...message, ...(permissionMode !== undefined && { permissionMode }) }))
-        const response: StartSessionAccepted = { session, accepted: { ...accepted, sessionId: session.id } }
+        const result = await this.sessions.start(input, target => this.submit(target, { ...message, ...(permissionMode !== undefined && { permissionMode }) }))
+        const response: StartSessionResult = 'session' in result
+          ? { session: result.session, accepted: { ...result.accepted, sessionId: result.session.id } } : result
         this.json(res, 202, response)
       } catch (error) {
         this.sessionError(res, error, '暂时无法发送首条消息')

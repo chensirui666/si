@@ -4,10 +4,11 @@ import { dirname } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import type { SessionSummary } from './sessions.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
+import { extensionMessage, isJson, object } from './extensions/runtime.js'
 import { skillCommand } from './skills.js'
 import type { CompactionRecord, ConversationMessage, RunRecord, SubmissionAccepted } from './types.js'
 
-export type StoredRun = Omit<RunRecord, 'restored'> & { text: string; acceptedSeq: number; firstPermissionMode?: PermissionMode }
+export type StoredRun = Omit<RunRecord, 'restored'> & { text: string; finalText?: string; acceptedSeq: number; firstPermissionMode?: PermissionMode }
 export type SessionHistory = {
   summary: SessionSummary
   runs: StoredRun[]
@@ -224,6 +225,7 @@ export class SessionStore {
       .map(row => {
         const run = parse<StoredRun>(row)
         if (run.sessionId !== summary.id || run.clientMessageId !== row.client_id || typeof run.text !== 'string'
+          || (run.finalText !== undefined && (run.kind !== 'task' || typeof run.finalText !== 'string' || !run.finalText.trim()))
           || (run.firstPermissionMode !== undefined && !isPermissionMode(run.firstPermissionMode))
           || typeof run.modelId !== 'string' || !['task', 'compaction'].includes(run.kind)
           || !['running', 'completed', 'failed', 'aborted'].includes(run.status)
@@ -249,8 +251,11 @@ export class SessionStore {
           || (invocation.status === 'loaded'
             ? typeof invocation.body !== 'string' || typeof invocation.directory !== 'string' || !invocation.directory
             : invocation.status !== 'failed' || typeof invocation.reason !== 'string'))) throw new Error('Invalid Skill invocation')
-        if (message.role === 'user') {
-          if (entry.id !== run.id || entry.clientMessageId !== run.clientMessageId || message.content !== run.text) throw new Error('Invalid submitted message')
+        if (entry.extension !== undefined) {
+          if (run.id !== currentRunId || message.role !== 'user' || entry.id === run.id || entry.clientMessageId !== undefined
+            || !extensionMessage({ ...entry.extension, content: message.content })) throw new Error('Invalid extension message')
+        } else if (message.role === 'user') {
+          if (entry.id !== run.id || entry.clientMessageId !== run.clientMessageId || message.content !== (run.finalText ?? run.text)) throw new Error('Invalid submitted message')
           currentRunId = run.id
         } else if (run.id !== currentRunId) throw new Error('Invalid message order')
         else if (message.role === 'assistant') {
@@ -272,6 +277,8 @@ export class SessionStore {
             || !message.content.every(block => block && (block.type === 'text' && typeof block.text === 'string'
               || block.type === 'image' && ['image/png', 'image/jpeg', 'image/webp'].includes(block.mimeType)
                 && typeof block.data === 'string' && block.data.length > 0))) throw new Error('Invalid tool result')
+          const actual = entry.toolCall.actualArguments
+          if (actual !== undefined && (!object(actual) || !isJson(actual))) throw new Error('Invalid actual tool arguments')
           resultPositions.set(assistantMessageId, contentIndex)
         } else throw new Error('Invalid message')
         if (message.role !== 'toolResult' && entry.toolCall !== undefined) throw new Error('Invalid tool result reference')

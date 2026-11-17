@@ -38,9 +38,10 @@ async function state(agent: AgentSession): Promise<ConversationSnapshot> {
 async function idle(agent: AgentSession) {
   await vi.waitFor(async () => expect((await state(agent)).running).toBeNull(), { interval: 5 })
 }
-function setup(summary = reply('目标：继续任务；事实：项目青禾。', { usage: { input: 900, output: 30 } }), triggerTokens = 5000) {
+function setup(summary = reply('目标：继续任务；事实：项目青禾。', { usage: { input: 900, output: 30 } }), triggerTokens = 5000,
+  extensions?: ConstructorParameters<typeof AgentSession>[0]['extensions']) {
   const contexts: ModelContext[] = []
-  const agent = createSession({ compaction: { triggerTokens, keepRecentTokens: 100 }, tools: [tool], stream: (_model, context) => {
+  const agent = createSession({ extensions, compaction: { triggerTokens, keepRecentTokens: 100 }, tools: [tool], stream: (_model, context) => {
     contexts.push(structuredClone(context))
     return output(context.tools ? reply() : summary)
   } })
@@ -53,7 +54,10 @@ async function seed(agent: AgentSession) {
 
 describe('AgentSession compaction', () => {
   it('manual command has its own receipt, preserves raw history and system/tools, and reuses the summary', async () => {
-    const { agent, contexts } = setup()
+    const completed = vi.fn()
+    const { agent, contexts } = setup(undefined, undefined, [{ path: 'compaction', entry(si) {
+      si.on('session_compact', async event => { completed(event, (await state(agent)).compactions.at(-1)) })
+    } }])
     await seed(agent)
     const before = await state(agent), normal = contexts[0]
     const receipt = await agent.submit({ ...input, text: ' /compact ' })
@@ -66,6 +70,8 @@ describe('AgentSession compaction', () => {
     expect(after.compactions[0]).toMatchObject({ id: receipt.compactionId, trigger: 'manual', status: 'success', summaryUsage: { input: 900 } })
     const record = after.compactions[0]
     if (record.status !== 'success') throw new Error('not successful')
+    expect(completed).toHaveBeenCalledExactlyOnceWith({ type: 'session_compact', reason: 'manual',
+      fromExtension: false, willRetry: false, compactionEntry: record }, record)
     expect(record.estimatedAfter).toBeLessThan(record.estimatedBefore)
     expect(after.contextUsage!.tokens!).toBeLessThan(before.contextUsage!.tokens!)
     await agent.submit({ ...input, text: '继续' }); await idle(agent)
@@ -230,12 +236,17 @@ describe('AgentSession compaction', () => {
     ['not shorter', reply('s'.repeat(20000))],
     ['error', reply('', { stopReason: 'error', errorMessage: '安全错误' })],
   ] as const)('invalid summary (%s) never replaces effective context', async (_name, summary) => {
-    const { agent, contexts } = setup(summary)
+    const failed = vi.fn()
+    const { agent, contexts } = setup(summary, undefined, [{ path: 'compaction', entry(si) {
+      si.on('session_compact_failed', async event => { failed(event, (await state(agent)).compactions.at(-1)) })
+    } }])
     await seed(agent)
     const before = (await state(agent)).messages
     await agent.submit({ ...input, text: '/compact' }); await idle(agent)
     expect((await state(agent)).messages).toEqual(before)
     expect((await state(agent)).compactions.at(-1)).toMatchObject({ status: 'failed' })
+    expect(failed).toHaveBeenCalledExactlyOnceWith({ type: 'session_compact_failed', reason: 'manual', aborted: false,
+      fromExtension: false, willRetry: false, errorMessage: expect.any(String) }, expect.objectContaining({ status: 'failed' }))
     await agent.submit({ ...input, text: '继续' }); await idle(agent)
     expect(JSON.stringify(contexts.at(-1)!.messages)).toContain('u'.repeat(1600))
   })
@@ -405,8 +416,14 @@ describe('AgentSession compaction', () => {
 
   it('publishes a cancelled assistant result when the user stops overflow compaction', async () => {
     let overflowing = false
+    const timeline: unknown[] = []
     const started = Promise.withResolvers<void>()
     const agent = createSession({ tools: [tool], compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
+      extensions: [{ path: 'compaction', entry(si) {
+        si.on('agent_end', ({ messages }) => { if (overflowing) timeline.push(messages.at(-1)) })
+        si.on('session_compact_failed', event => { timeline.push(event) })
+        si.on('agent_settled', event => { if (overflowing) timeline.push(event) })
+      } }],
       stream: (_model, context, options) => {
         if (!overflowing) return output(reply())
         if (context.tools) return output(reply('', { stopReason: 'error', errorCode: 'context_overflow' }))
@@ -428,6 +445,11 @@ describe('AgentSession compaction', () => {
     const snapshot = await state(agent)
     expect(snapshot.running).toBeNull()
     expect(snapshot.compactions.at(-1)).toMatchObject({ trigger: 'overflow', status: 'aborted' })
+    expect(timeline).toMatchObject([
+      { role: 'assistant', errorCode: 'context_overflow' },
+      { type: 'session_compact_failed', reason: 'overflow', fromExtension: false, willRetry: true, aborted: true },
+      { type: 'agent_settled', aborted: true },
+    ])
     expect(snapshot.messages.at(-1)?.message).toMatchObject({ stopReason: 'aborted' })
   })
 
@@ -451,7 +473,16 @@ describe('AgentSession compaction', () => {
   it('a successful recovered reply resets the one-retry allowance for the next tool round', async () => {
     let failing = false, normalCalls = 0, summaries = 0, executions = 0
     const normalInputs: ModelContext[] = []
-    const agent = createSession({ tools: [{ ...tool, execute: async () => { executions++; return '实际完成'.repeat(200) } }], compaction: { triggerTokens: 10000, keepRecentTokens: 100 }, stream: (_m, context) => {
+    const hookOrder: string[] = []
+    const agent = createSession({ tools: [{ ...tool, execute: async () => { executions++; return '实际完成'.repeat(200) } }], compaction: { triggerTokens: 10000, keepRecentTokens: 100 },
+      extensions: [{ path: 'overflow', entry(si) {
+        si.on('agent_end', event => {
+          if (failing) hookOrder.push('agent_end:' + event.messages.flatMap(message => message.role === 'assistant' ? [message.stopReason] : []).join(','))
+        })
+        si.on('session_compact', event => { if (failing) hookOrder.push('compact:' + event.reason) })
+        si.on('agent_settled', () => { if (failing) hookOrder.push('settled') })
+      } }],
+      stream: (_m, context) => {
       if (!failing) return output(reply())
       if (!context.tools) { summaries++; return output(reply('项目青禾；继续完成任务。')) }
       normalCalls++
@@ -482,6 +513,8 @@ describe('AgentSession compaction', () => {
     expect(normalCalls).toBe(4)
     expect(summaries).toBe(2)
     expect(executions).toBe(1)
+    expect(hookOrder).toEqual(['agent_end:error', 'compact:overflow', 'agent_end:toolUse,error',
+      'compact:overflow', 'agent_end:stop', 'settled'])
     expect((await state(agent)).compactions.filter(record => record.status === 'success')).toHaveLength(2)
   })
 
@@ -512,7 +545,11 @@ describe('AgentSession compaction', () => {
   it('aborted summaries retain already reported provider usage without committing a candidate', async () => {
     let signal: AbortSignal | undefined, compressing = false
     const ready = Promise.withResolvers<void>(), terminal = Promise.withResolvers<void>()
-    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 5000, keepRecentTokens: 100 }, stream: (_m, context, options) => {
+    const observed = vi.fn()
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
+      extensions: [{ path: 'manual-abort', entry(si) {
+        si.on('session_compact_failed', async event => { observed(event, (await state(agent)).compactions.at(-1)) })
+      } }], stream: (_m, context, options) => {
       if (!compressing || context.tools) return output(reply())
       signal = options!.signal
       return { result: () => new Promise(() => {}), async *[Symbol.asyncIterator]() {
@@ -528,6 +565,9 @@ describe('AgentSession compaction', () => {
     expect(signal!.aborted).toBe(true)
     terminal.resolve(); await stopping
     expect((await state(agent)).compactions.at(-1)).toMatchObject({ status: 'aborted', summaryUsage: { input: 850, output: 5 } })
+    expect(observed).toHaveBeenCalledExactlyOnceWith({
+      type: 'session_compact_failed', aborted: true, reason: 'manual', fromExtension: false, willRetry: false,
+    }, expect.objectContaining({ status: 'aborted', id: receipt.compactionId }))
   })
 
   it.each([false, true])('an oversized retained message stops the task and preserves the original context (summary fails: %s)', async failure => {

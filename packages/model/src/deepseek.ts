@@ -41,7 +41,7 @@ export function createDeepSeekStream(
   configuration: { fetch?: typeof fetch; baseURL?: string } = {},
 ): (model: ModelInfo, context: ModelContext, options?: ModelStreamOptions) => ModelEventStream {
   return (model, context, options) => {
-    const events = new AssistantEventStream()
+    const events = new AssistantEventStream(options?.snapshotPartials)
     const started = performance.now()
     const output: AssistantMessage = {
       role: 'assistant', content: [], api: model.api, provider: model.provider, model: model.id,
@@ -75,6 +75,7 @@ export function createDeepSeekStream(
       let thinking: { block: ThinkingContent; contentIndex: number } | undefined
       const transport: Parameters<typeof observeModelFetch>[1] = {}
       let reading = false
+      let observingResponse: Promise<void> | undefined
       let finalReason: Exclude<ModelStopReason, 'error' | 'aborted'> | undefined
       const endCurrentContent = () => {
         if (text) {
@@ -100,7 +101,10 @@ export function createDeepSeekStream(
         if (interruption) throw new ModelFailure('本次模型调用已取消。')
         if (!apiKey) throw new ModelFailure('请为所选提供方配置 API Key。', 'configuration')
         const client = new OpenAI({
-          apiKey, baseURL: configuration.baseURL ?? 'https://api.deepseek.com', fetch: observeModelFetch(configuration.fetch, transport),
+          apiKey, baseURL: configuration.baseURL ?? 'https://api.deepseek.com', fetch: observeModelFetch(configuration.fetch, transport, false, options?.onProviderResponse && (response => {
+            observingResponse = Promise.resolve(options.onProviderResponse!(response))
+            return observingResponse
+          })),
           maxRetries: 0, logLevel: 'off',
           // The rolling timer owns inactivity; 0 means immediate timeout in the SDK.
           timeout: 2_147_483_647,
@@ -123,6 +127,8 @@ export function createDeepSeekStream(
           const item = await Promise.race([iterator.next(), interrupted])
           if (item.done) break
           const data = item.value
+          if (options?.onProviderStreamEvent) await options.onProviderStreamEvent(data)
+          options?.signal?.throwIfAborted()
           if (!data || typeof data !== 'object' || !Array.isArray(data.choices)) {
             throw new ModelFailure('模型响应格式无效。')
           }
@@ -217,6 +223,7 @@ export function createDeepSeekStream(
         if (!finalReason) throw new ModelFailure('模型响应中断，未收到有效结束原因。', 'stream-ended')
         output.stopReason = finalReason
       } catch (error) {
+        await observingResponse?.catch(() => undefined)
         controller.abort()
         output.stopReason = interruption ?? 'error'
         output.errorMessage = interruptionMessage ?? safeError(error)

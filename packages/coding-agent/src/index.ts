@@ -5,6 +5,8 @@ export { ToolRuntime } from './tool-runtime.js'
 export { createWebTools, type WebProvider, type WebFetchPage, type WebSearchHit } from './web-tools.js'
 export type {
   SubmissionAccepted,
+  SubmissionHandled,
+  ExtensionNotice,
   CompactionRecord,
   ContextUsage,
   ConversationMessage,
@@ -20,3 +22,6 @@ export { SessionStore, SessionReadError, SessionWriteError, type SessionPersiste
 export { isPermissionMode, type PermissionMode } from './permissions.js'
 export type { RunRecord, SaveFailure } from './types.js'
 export { discoverSkills, type SkillSummary, type SkillInvocation, type SkillSource } from './skills.js'
+
+export { loadExtensions } from './extensions/loader.js'
+export type { ExtensionAPI, ExtensionContext, ExtensionEntry, ExtensionEvents, ExtensionMessage, ExtensionMessageEntry } from './extensions/runtime.js'

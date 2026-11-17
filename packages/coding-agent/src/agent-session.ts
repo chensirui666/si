@@ -2,16 +2,20 @@ import { randomUUID } from 'node:crypto'
 import { Agent } from '@agent-learning/agent'
 import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
 import { estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
-import type { AssistantMessage, ModelContext, ModelEvent, ModelInfo, ModelSelection, ReasoningEffort } from '@agent-learning/model'
+import type { AssistantMessage, ModelContext, ModelDiscovery, ModelEvent, ModelInfo, ModelSelection, ModelStreamOptions, ReasoningEffort } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
 import { SessionWriteError, runSelection, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
 import { discoverSkills, loadSkill, skillCommand, type SkillSummary } from './skills.js'
 import { withModelRetry } from './model-retry.js'
 import { buildSystemPrompt } from './system-prompt.js'
-import type { CodingTool } from './tools.js'
+import { defaultTools, type CodingTool } from './tools.js'
+import { beforeStart, requestMessages, toolHooks } from './extensions/dispatch.js'
+import { ExtensionRuntime, extensionMessage, object, type ExtensionContext, type ExtensionEntry, type ExtensionEvents, type ExtensionMessage } from './extensions/runtime.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
-import type { CompactionRecord, SubmissionAccepted, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure } from './types.js'
+import type { CompactionRecord, ExtensionNotice, SubmissionAccepted, SubmissionHandled, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure } from './types.js'
+
+type SubmissionResult = SubmissionAccepted | SubmissionHandled
 
 type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & { clientMessageId: string; text: string; permissionMode?: PermissionMode }
 
@@ -30,12 +34,22 @@ function isFileOperation(detail: unknown): detail is NonNullable<ConversationMes
 }
 
 export class AgentSession {
-  private submitting?: { id: string; settled: Promise<SubmissionAccepted> }
+  private submitting?: { input: SubmissionInput; settled: Promise<SubmissionResult> }
+  private preparing?: AbortController
+  private initialization?: Promise<void>
+  private initializing?: AbortController
+  private closing?: Promise<void>
+  private readonly runtime?: ExtensionRuntime
+  private readonly sessionId: string
+  private cwd?: string
+  private readonly handled = new Map<string, { input: SubmissionInput; result: SubmissionHandled }>()
+  private readonly selectionNotifications = new Set<Promise<void>>()
   private readonly omittedToolImageResults = new Set<string>()
   private readonly state: ConversationSnapshot = { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
   private readonly listeners = new Set<(update: ConversationUpdate) => void>()
   private controller?: AbortController
   private task?: Promise<void>
+  private settling = false
   private closed = false
   private model?: ModelInfo
   private configuration: Omit<ModelContext, 'messages'> = {}
@@ -49,6 +63,9 @@ export class AgentSession {
 
   constructor(private readonly options: {
     persistence?: SessionPersistence
+    sessionId?: string
+    extensions?: readonly ExtensionEntry[]
+    reportExtensionError?: (message: string, error: unknown) => void
     permissionMode?: PermissionMode
     stream?: typeof stream
     tools?: (cwd: string) => CodingTool[]
@@ -59,6 +76,8 @@ export class AgentSession {
     discoverModels?: typeof import('@agent-learning/model').discoverModels
     compaction?: { triggerTokens: number; keepRecentTokens: number }
   }) {
+    this.sessionId = options.persistence?.summary.id ?? options.sessionId ?? randomUUID()
+    if (options.extensions?.length) this.runtime = new ExtensionRuntime(options.extensions, options.reportExtensionError)
     const history = options.persistence?.history
     this.state.permissionMode = history?.permissionMode ?? options.permissionMode ?? 'normal'
     if (history) {
@@ -81,12 +100,71 @@ export class AgentSession {
     }
   }
 
+  private extensionContext(cwd: string, model?: ModelInfo, signal?: AbortSignal, notices?: ExtensionNotice[]): ExtensionContext {
+    return {
+      cwd, model, sessionId: this.sessionId, signal, thinkingLevel: model?.defaultReasoningEffort,
+      hasUI: notices !== undefined || this.listeners.size > 0,
+      ui: { notify: (message, level = 'info') => {
+        if (typeof message !== 'string' || !['info', 'warning', 'error'].includes(level)) throw new Error('无效的扩展提示')
+        const notice = { message, level }
+        if (notices) notices.push(notice)
+        else this.publishNotice(notice)
+      } },
+    }
+  }
+
+  private publishNotice(notice: ExtensionNotice) {
+    if (this.listeners.size) this.publish({ type: 'notice', notice })
+  }
+
+  initialize(cwd?: string, model?: ModelInfo): Promise<void> | undefined {
+    if (!this.runtime || this.closed) return this.initialization
+    return this.initialization ??= Promise.resolve().then(async () => {
+      const signal = (this.initializing = new AbortController()).signal
+      if (this.closed) this.initializing.abort()
+      const path = cwd ?? await this.options.resolveDirectory()
+      this.cwd = path
+      const selection = this.state.modelSelection
+      const selected = model ?? (selection && findModel(selection.modelId, selection.provider))
+      if (selected && selection && !model) selected.defaultReasoningEffort = selection.reasoningEffort
+      const ctx = this.extensionContext(path, selected, signal)
+      await this.runtime!.initialize(ctx, [...defaultTools, ...this.options.tools?.(path) ?? []].map(tool => tool.name))
+      await this.runtime!.emit('session_start', { reason: this.options.persistence?.history ? 'resume' : 'new' }, ctx)
+    }).catch(error => {
+      this.initialization = undefined
+      throw error
+    }).finally(() => { this.initializing = undefined })
+  }
+
   selectModel(selection: ModelSelection) {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+    const previous = this.state.modelSelection
     const storage = this.options.persistence
     storage?.store.saveModelSelection(selection, storage.summary.id)
     this.state.modelSelection = selection
     this.publish({ type: 'selection', selection })
+    const initializing = this.initialize()
+    if (initializing && !sameSelection(previous, selection)) {
+      const model = findModel(selection.modelId, selection.provider)
+      if (!model) return
+      model.defaultReasoningEffort = selection.reasoningEffort
+      const previousNotifications = [...this.selectionNotifications]
+      const notification = initializing.then(async () => {
+        await Promise.allSettled(previousNotifications)
+        if (!this.cwd || this.closed) return
+        const ctx = this.extensionContext(this.cwd, model)
+        if (previous?.modelId !== selection.modelId || previous?.provider !== selection.provider) {
+          const previousModel = previous && findModel(previous.modelId, previous.provider)
+          if (previousModel) previousModel.defaultReasoningEffort = previous?.reasoningEffort
+          await this.runtime!.emit('model_select', { model, previousModel, source: 'set' }, ctx)
+        }
+        if (previous?.reasoningEffort !== selection.reasoningEffort) {
+          await this.runtime!.emit('thinking_level_select', { level: selection.reasoningEffort, previousLevel: previous?.reasoningEffort }, ctx)
+        }
+      })
+      this.selectionNotifications.add(notification)
+      return notification.finally(() => this.selectionNotifications.delete(notification))
+    }
   }
 
   selectPermissionMode(permissionMode: PermissionMode) {
@@ -112,7 +190,7 @@ export class AgentSession {
     }
   }
 
-  async submit(input: SubmissionInput): Promise<SubmissionAccepted> {
+  async submit(input: SubmissionInput): Promise<SubmissionResult> {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
     if (typeof input?.modelId !== 'string' || !input.provider && input.modelId !== 'deepseek-flash'
       || typeof input.text !== 'string' || !input.text.trim()
@@ -128,49 +206,71 @@ export class AgentSession {
       ? !selection.reasoningEffort || !model.reasoningEfforts.includes(selection.reasoningEffort) : selection.reasoningEffort !== undefined) {
       throw new SessionSubmitError('invalid', '所选模型不支持此推理强度')
     }
-    while (this.submitting?.id === input.clientMessageId) {
+    while (this.submitting?.input.clientMessageId === input.clientMessageId) {
+      this.checkReplay(this.submitting.input, input, selection)
       await this.submitting.settled.catch(() => undefined)
       if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
       const accepted = this.replay(input, selection)
       if (accepted) return accepted
     }
     if (this.submitting || this.state.running) throw new SessionSubmitError('busy', '正在接收或生成，请等待本次回答结束')
-    const promise = this.accept(input, selection, model)
-    this.submitting = { id: input.clientMessageId, settled: promise }
+    const controller = this.preparing = new AbortController()
+    const promise = this.accept(input, selection, model, controller)
+    this.submitting = { input, settled: promise }
     try {
       return await promise
     } finally {
       this.submitting = undefined
+      this.preparing = undefined
     }
   }
 
-  private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo): Promise<SubmissionAccepted> {
+  private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo, controller: AbortController): Promise<SubmissionResult> {
+    const { signal } = controller
     const cwd = await this.options.resolveDirectory()
     const directory = await this.options.discoverModels?.()
     const manual = input.text.trim() === '/compact'
-    const skills = manual ? [] : (await discoverSkills(cwd, {
-      home: this.options.skillHome, applicationRoot: this.options.documentationRoot,
-    })).skills
-    const namedSkill = skillCommand.exec(input.text)?.[1]
-    const selectedSkill = namedSkill ? skills.find(skill => skill.name === namedSkill) : undefined
-    const skillInvocation = selectedSkill ? await loadSkill(selectedSkill) : undefined
-    if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
-    const storedDefault = this.options.persistence?.store.getDefaultSelection()
-    const fallback = directory?.defaultSelection
-    const current = this.state.modelSelection ?? storedDefault ?? fallback
-    const legacyUnconfigured = !input.provider && !current && !directory?.models.length
-    if (!legacyUnconfigured && (directory || current) && !sameSelection(selection, current)) {
-      throw new SessionSubmitError('model_selection_changed', staleSelection)
-    }
-    if (!legacyUnconfigured && directory && !directory.models.some(item => item.provider === selection.provider && item.id === selection.modelId)) {
-      throw new SessionSubmitError('invalid', '当前模型不可用，请重新选择')
-    }
+    this.checkPreparing(signal)
+    this.checkModelSelection(input, selection, directory)
     model.defaultReasoningEffort = selection.reasoningEffort
     this.model = model
+    if (this.options.persistence?.first && !this.storedRuns.size && input.permissionMode !== undefined) {
+      if (!isPermissionMode(input.permissionMode)) throw new SessionSubmitError('invalid', '权限模式无效')
+      this.state.permissionMode = input.permissionMode
+    }
+    const initializing = this.initialize(cwd, model)
+    if (initializing) await initializing
+    this.checkPreparing(signal)
+    let text = input.text
+    if (!manual && this.runtime?.has('input')) {
+      const notices: ExtensionNotice[] = []
+      const result = await this.runtime.input(text, this.extensionContext(cwd, model, signal, notices))
+      this.checkPreparing(signal)
+      if (result.handled) {
+        const result: SubmissionHandled = { kind: 'handled', clientMessageId: input.clientMessageId, notices: [...notices] }
+        this.handled.set(input.clientMessageId, { input, result })
+        return structuredClone(result)
+      }
+      text = result.text
+      for (const notice of notices) this.publishNotice(notice)
+    }
+    const skills = manual ? [] : (await discoverSkills(cwd, { home: this.options.skillHome, applicationRoot: this.options.documentationRoot })).skills
+    const namedSkill = skillCommand.exec(text)?.[1]
+    const selectedSkill = namedSkill ? skills.find(skill => skill.name === namedSkill) : undefined
+    const skillInvocation = selectedSkill ? await loadSkill(selectedSkill) : undefined
     const tools = this.options.tools?.(cwd) ?? []
-    this.configure(cwd, tools, this.projectContext?.cwd === cwd ? this.projectContext.files : [], skills)
-    const controller = new AbortController()
+    let files = this.projectContext?.cwd === cwd ? this.projectContext.files : []
+    if (!manual && this.runtime?.has('before_agent_start')) {
+      try { files = await this.loadContextFiles(cwd, model, signal) }
+      catch (error) {
+        // The normal task path reports oversized project instructions after accepting the message.
+        if (!(error instanceof ProjectContextOverflow)) throw error
+      }
+    }
+    this.checkPreparing(signal)
+    this.configure(cwd, [...tools, ...this.runtime?.tools() ?? []], files, skills)
     if (manual) {
+      this.checkModelSelection(input, selection, directory)
       const record = this.newCompaction('manual', input.clientMessageId)
       const running = { kind: 'compaction' as const, runId: record.id, phase: 'compaction' as const }
       const run = this.saveStart(input, selection, record.id, 'compaction', { compaction: record })
@@ -187,25 +287,65 @@ export class AgentSession {
           status = this.storedRuns.get(input.clientMessageId)?.status ?? 'completed'
         } catch (error) {
           if (!(error instanceof SessionWriteError)) throw error
-        } finally { this.finish(controller.signal, status) }
+        } finally { await this.finish(controller.signal, status) }
       })
       return { kind: 'compaction', clientMessageId: input.clientMessageId, compactionId: record.id, acceptedSeq }
     }
     const user: ConversationMessage = {
       id: randomUUID(), clientMessageId: input.clientMessageId,
-      message: { role: 'user', content: input.text, timestamp: Date.now() },
+      message: { role: 'user', content: text, timestamp: Date.now() },
       ...(skillInvocation && { skillInvocation }),
     }
     const running = { kind: 'task' as const, runId: user.id, assistantMessageId: randomUUID(), phase: 'model' as const, activeTools: [] }
-    const run = this.saveStart(input, selection, user.id, 'task', { messages: [user] })
+    let systemPrompt: string | undefined
+    let extra: ConversationMessage[] = []
+    if (this.runtime?.has('before_agent_start')) {
+      const prompt = buildModelHistory([user])[0]?.content
+      const start = await beforeStart(this.runtime, this.extensionContext(cwd, model, signal), this.configuration.systemPrompt ?? '',
+        typeof prompt === 'string' ? prompt : text, user.id)
+      this.checkPreparing(signal)
+      if (start.overridden) systemPrompt = start.systemPrompt
+      extra = start.extra.map(message => this.extensionEntry(message))
+    }
+    this.checkModelSelection(input, selection, directory)
+    const run = this.saveStart(input, selection, user.id, 'task', { messages: [user, ...extra] }, text)
     const initialSelection = this.confirmInitialSelection(selection)
     this.controller = controller
-    this.state.messages.push(user)
+    this.state.messages.push(user, ...extra)
     this.state.running = running
     this.publish({ type: 'accepted', user, running }, run && this.publicRun(run), undefined, initialSelection)
     const acceptedSeq = this.state.seq
-    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal))
+    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal, user, systemPrompt))
     return { kind: 'message', clientMessageId: input.clientMessageId, userMessageId: user.id, acceptedSeq }
+  }
+
+  private checkModelSelection(input: SubmissionInput, selection: ModelSelection, directory?: ModelDiscovery) {
+    const storedDefault = this.options.persistence?.store.getDefaultSelection()
+    const fallback = directory?.defaultSelection
+    const current = this.state.modelSelection ?? storedDefault ?? fallback
+    const legacyUnconfigured = !input.provider && !current && !directory?.models.length
+    if (!legacyUnconfigured && (directory || current) && !sameSelection(selection, current)) {
+      throw new SessionSubmitError('model_selection_changed', staleSelection)
+    }
+    if (!legacyUnconfigured && directory && !directory.models.some(item => item.provider === selection.provider && item.id === selection.modelId)) {
+      throw new SessionSubmitError('invalid', '当前模型不可用，请重新选择')
+    }
+  }
+
+  private checkPreparing(signal: AbortSignal) {
+    if (this.closed || signal.aborted) throw new SessionSubmitError('closed', '服务正在关闭')
+  }
+
+  private loadContextFiles(cwd: string, model: ModelInfo, signal: AbortSignal) {
+    return loadProjectContextFiles({
+      cwd, globalDirectory: this.options.globalContextDirectory, signal,
+      // The estimator allows four UTF-16 units per token, each using at most three UTF-8 bytes.
+      maxBytes: (model.contextWindow - model.maxTokens) * 12,
+    })
+  }
+
+  private extensionEntry({ content, ...extension }: ExtensionMessage): ConversationMessage {
+    return { id: randomUUID(), extension, message: { role: 'user', content, timestamp: Date.now() } }
   }
 
   private confirmInitialSelection(selection: ModelSelection) {
@@ -215,26 +355,35 @@ export class AgentSession {
   }
 
   private replay(input: SubmissionInput, selection: ModelSelection) {
+    const handled = this.handled.get(input.clientMessageId)
+    if (handled) {
+      this.checkReplay(handled.input, input, selection)
+      return structuredClone(handled.result)
+    }
     const previous = this.storedRuns.get(input.clientMessageId)
     if (!previous) return
-    if (previous.text !== input.text || previous.firstPermissionMode !== input.permissionMode || !sameSelection(runSelection(previous), selection)) {
-      throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
-    }
+    this.checkReplay({ ...previous, permissionMode: previous.firstPermissionMode }, input, selection)
     return submissionReceipt(previous)
   }
 
-  private publicRun({ text: _text, acceptedSeq: _acceptedSeq, firstPermissionMode: _firstPermissionMode, ...run }: StoredRun): RunRecord {
+  private checkReplay(previous: SubmissionInput, input: SubmissionInput, selection: ModelSelection) {
+    if (previous.text !== input.text || previous.permissionMode !== input.permissionMode || !sameSelection(runSelection(previous), selection)) {
+      throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
+    }
+  }
+
+  private publicRun({ text: _text, finalText: _finalText, acceptedSeq: _acceptedSeq, firstPermissionMode: _firstPermissionMode, ...run }: StoredRun): RunRecord {
     return run
   }
 
   private saveStart(input: SubmissionInput, selection: ModelSelection, id: string, kind: RunRecord['kind'],
-    data: { messages?: ConversationMessage[]; compaction?: CompactionRecord }) {
+    data: { messages?: ConversationMessage[]; compaction?: CompactionRecord }, finalText?: string) {
     const storage = this.options.persistence
     if (!storage) return
     const { permissionMode, ...message } = input
     const summary = this.storedRuns.size === 0 ? storage.first?.() : undefined
     const run: StoredRun = {
-      ...message, ...(summary && permissionMode !== undefined && { firstPermissionMode: permissionMode }), ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
+      ...message, ...(finalText !== undefined && finalText !== input.text && { finalText }), ...(summary && permissionMode !== undefined && { firstPermissionMode: permissionMode }), ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
     }
     this.save({ ...data, run, summary, ...(summary && { permissionMode: this.state.permissionMode }),
       modelSelection: this.state.modelSelection ? undefined : selection })
@@ -304,6 +453,16 @@ export class AgentSession {
     return record
   }
 
+  private providerHooks(ctx: () => ExtensionContext, model: ModelInfo, runId: string) {
+    const runtime = this.runtime
+    if (!runtime) return
+    const options: Pick<ModelStreamOptions, 'onProviderResponse' | 'onProviderStreamEvent'> = {}
+    if (runtime.has('after_provider_response')) options.onProviderResponse = response => runtime.emit('after_provider_response', response, ctx(), runId)
+    if (runtime.has('provider_stream_event')) options.onProviderStreamEvent = data => runtime.emit('provider_stream_event',
+      { provider: model.provider, api: model.api, model: model.id, data }, ctx(), runId)
+    return options
+  }
+
   private async compact(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, trigger: CompactionRecord['trigger'], running: NonNullable<RunningState>, signal: AbortSignal, initial?: CompactionRecord) {
     const record = initial ?? this.newCompaction(trigger)
     const working: NonNullable<RunningState> = { ...running, phase: 'compaction' }
@@ -314,6 +473,9 @@ export class AgentSession {
       this.state.compactions.push(record)
       this.publish({ type: 'compaction', record, running: working })
     }
+    const runtime = this.runtime
+    const ctx = () => this.extensionContext(this.cwd ?? '', model, signal)
+    const boundary = { reason: trigger === 'auto' ? 'threshold' as const : trigger, fromExtension: false as const, willRetry: trigger === 'overflow' }
     let final: CompactionRecord
     let summaryUsage: AssistantMessage['usage']
     try {
@@ -326,7 +488,7 @@ export class AgentSession {
         if (this.estimate(context) + model.maxTokens > model.contextWindow) throw new Error('摘要请求预计超出模型容量。')
         let terminal: AssistantMessage | undefined
         try {
-          for await (const event of (this.options.stream ?? stream)(model, context, { signal, reasoningEffort })) {
+          for await (const event of (this.options.stream ?? stream)(model, context, { signal, reasoningEffort, ...this.providerHooks(ctx, model, running.runId) })) {
             if (event.type === 'done' || event.type === 'error') { terminal = structuredClone(event.type === 'done' ? event.message : event.error); break }
           }
         } catch (error) { if (!terminal) throw error }
@@ -366,11 +528,19 @@ export class AgentSession {
       const failed: CompactionRecord = { ...record, status: 'failed', finishedAt: Date.now(), reason: '压缩记录未保存，保留上一次有效上下文。' }
       this.state.compactions[index] = failed
       this.publish({ type: 'compaction', record: failed, running: working })
+      if (runtime?.has('session_compact_failed')) await runtime.emit('session_compact_failed',
+        { ...boundary, aborted: signal.aborted, ...(!signal.aborted && { errorMessage: failed.reason }) }, ctx(), running.runId)
       throw error
     }
     if (final.status === 'success') this.gateSample = undefined
     this.state.compactions[index] = final
     this.publish({ type: 'compaction', record: final, running: working }, run && this.publicRun(run))
+    if (final.status === 'success' && runtime?.has('session_compact')) {
+      await runtime.emit('session_compact', { ...boundary, compactionEntry: final }, ctx(), running.runId)
+    } else if ((final.status === 'failed' || final.status === 'aborted') && runtime?.has('session_compact_failed')) {
+      await runtime.emit('session_compact_failed', { ...boundary, aborted: final.status === 'aborted',
+        ...(final.status === 'failed' && { errorMessage: final.reason }) }, ctx(), running.runId)
+    }
     return final.status === 'success'
   }
 
@@ -378,9 +548,10 @@ export class AgentSession {
     return { ...run, status, finishedAt: Date.now() }
   }
 
-  private finish(signal: AbortSignal, status: RunRecord['status'], entry?: ConversationMessage,
+  private async finish(signal: AbortSignal, status: RunRecord['status'], entry?: ConversationMessage,
     compaction?: Extract<CompactionRecord, { status: 'success' }>) {
     if (this.controller?.signal !== signal) return
+    if (this.state.running?.kind === 'task' && signal.aborted) status = 'aborted'
     const current = this.state.runs?.find(run => run.id === this.state.running?.runId)
     const stored = current && this.storedRuns.get(current.clientMessageId)
     let run = stored
@@ -402,8 +573,14 @@ export class AgentSession {
         run = this.endedRun(stored, 'failed')
       }
     }
+    this.settling = true
+    if (this.runtime?.has('agent_settled') && this.state.running?.kind === 'task') {
+      await this.runtime.emit('agent_settled', { aborted: status === 'aborted' || signal.aborted },
+        this.extensionContext(this.cwd ?? '', this.model, signal), this.state.running.runId)
+    }
     this.controller = undefined
     this.task = undefined
+    this.settling = false
     this.state.running = null
     this.publish({ type: 'task', running: null }, run && this.publicRun(run), this.failure)
     this.failure = undefined
@@ -424,7 +601,7 @@ export class AgentSession {
   private publish(change: ConversationUpdate['change'], run?: RunRecord, saveFailure?: SaveFailure, modelSelection?: ModelSelection) {
     if (run) this.state.runs = [...(this.state.runs ?? []).filter(item => item.id !== run.id), run]
     if (saveFailure) this.state.saveFailures = [...this.state.saveFailures ?? [], saveFailure]
-    const refresh = change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error' || change.event.type === 'replace'
+    const refresh = change.type !== 'notice' && (change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error' || change.event.type === 'replace')
     if (refresh) this.refreshUsage()
     const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(modelSelection && { modelSelection }), ...(run && { run }), ...(saveFailure && { saveFailure }), ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
     for (const listener of this.listeners) listener(structuredClone(update))
@@ -432,11 +609,12 @@ export class AgentSession {
 
   private updateTask(running: RunningState, message?: ConversationMessage, messageIndex = this.state.messages.length) {
     this.state.running = running
+    const visibleIndex = message ? this.state.messages.slice(0, messageIndex).filter(entry => !entry.extension).length : 0
     if (message) this.state.messages.splice(messageIndex, 0, message)
-    this.publish(message ? { type: 'task', running, message, messageIndex } : { type: 'task', running })
+    this.publish(message ? { type: 'task', running, message, messageIndex: visibleIndex } : { type: 'task', running })
   }
 
-  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], skills: readonly SkillSummary[], signal: AbortSignal) {
+  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], skills: readonly SkillSummary[], signal: AbortSignal, user: ConversationMessage, systemPrompt?: string) {
     let messageId = running.assistantMessageId
     let advanceRound = false
     let recovered = false
@@ -447,6 +625,17 @@ export class AgentSession {
     let savedToolResult: ConversationMessage | undefined
     let status: RunRecord['status'] = 'failed'
 
+    const runtime = this.runtime
+    if (runtime) this.cwd = cwd
+    const ctx = () => this.extensionContext(cwd, model, signal)
+    const runId = running.runId
+    let roundTools = tools
+    const configure = (files: ProjectContextFile[]) => {
+      roundTools = [...tools, ...runtime?.tools() ?? []]
+      if (this.state.permissionMode !== 'normal') roundTools = roundTools.filter(tool => readOnlyTools.has(tool.name))
+      this.configure(cwd, roundTools, files, skills)
+      if (systemPrompt !== undefined) this.configuration.systemPrompt = systemPrompt
+    }
     const modelPhase = () => this.updateTask({ ...running, assistantMessageId: messageId, phase: 'model', activeTools: [] })
     const currentTask = () => ({ ...running, assistantMessageId: messageId, phase: 'tools' as const, activeTools })
     const prepareContext: AgentRunInput['prepareContext'] = async () => {
@@ -459,18 +648,14 @@ export class AgentSession {
       const inputBudget = model.contextWindow - model.maxTokens
       let files: ProjectContextFile[]
       try {
-        files = await loadProjectContextFiles({
-          cwd, globalDirectory: this.options.globalContextDirectory, signal,
-          // The estimator allows four UTF-16 units per token, each using at most three UTF-8 bytes.
-          maxBytes: inputBudget * 12,
-        })
+        files = await this.loadContextFiles(cwd, model, signal)
       } catch (error) {
         if (error instanceof ProjectContextOverflow) return { error: error.message }
         throw error
       }
       signal.throwIfAborted()
       this.projectContext = { cwd, files }
-      this.configure(cwd, tools, files, skills)
+      configure(files)
       if (this.estimate({ ...this.configuration, messages: [] }) > inputBudget) {
         return { error: files.length ? new ProjectContextOverflow().message : '系统提示和工具定义超出当前模型容量，请切换模型。' }
       }
@@ -488,15 +673,24 @@ export class AgentSession {
     }
 
     const finalizeContext: AgentRunInput['finalizeContext'] = () => {
-      this.configure(cwd, tools, this.projectContext?.files ?? [], skills)
+      configure(this.projectContext?.files ?? [])
       const candidate = this.context()
-      if (this.pressure(candidate, model) + model.maxTokens > model.contextWindow) return { error: capacityError }
-      usedCompaction = this.latestCompaction()
-      for (const index of omittedToolImageIndexes(candidate)) {
-        const result = candidate.messages[index]
-        if (result.role === 'toolResult' && result.imageResultId !== undefined) this.omittedToolImageResults.add(result.imageResultId)
+      const withinBudget = (context: ModelContext) => this.pressure(context, model) + model.maxTokens <= model.contextWindow
+      const finish = (context: ModelContext) => {
+        if (!withinBudget(context)) return { error: capacityError }
+        usedCompaction = this.latestCompaction()
+        for (const index of omittedToolImageIndexes(context)) {
+          const result = context.messages[index]
+          if (result.role === 'toolResult' && result.imageResultId !== undefined) this.omittedToolImageResults.add(result.imageResultId)
+        }
+        return context
       }
-      return candidate
+      if (!runtime?.has('context')) return finish(candidate)
+      return runtime.chain('context', ctx(), candidate.messages, messages => ({ messages }), (_current, event, result) => {
+        const messages = result?.messages === undefined ? event.messages : result.messages
+        if (!requestMessages(messages) || !withinBudget({ ...candidate, messages })) throw new Error('无效的模型上下文改写')
+        return structuredClone(messages)
+      }, { runId }).then(messages => finish({ ...candidate, messages }))
     }
 
     const beforeToolCall: AgentRunInput['beforeToolCall'] = call => {
@@ -562,7 +756,8 @@ export class AgentSession {
         return
       }
 
-      const toolCall = { assistantMessageId: messageId, contentIndex: event.contentIndex }
+      const toolCall = { assistantMessageId: messageId, contentIndex: event.contentIndex,
+        ...(event.actualArguments && { actualArguments: event.actualArguments }) }
       if (event.type === 'tool_start') {
         activeTools = [...activeTools, toolCall]
         this.updateTask(currentTask())
@@ -594,32 +789,66 @@ export class AgentSession {
       }
     }
     try {
-      const options = { model, reasoningEffort, tools, signal, prepareContext, finalizeContext, beforeToolCall, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined }
-      let result = await agent.run({ ...options, context: this.context() })
-      while (result.type === 'response' && result.message.stopReason === 'error' && result.message.errorCode === 'context_overflow'
-        && !recovered && !signal.aborted) {
-        recovered = true
+      const options: Omit<AgentRunInput, 'context'> = {
+        model, reasoningEffort, tools, signal, prepareContext, finalizeContext, beforeToolCall,
+        resolveTools: () => roundTools, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined,
+        ...(runtime && {
+          observe: <K extends keyof ExtensionEvents>(type: K, event: ExtensionEvents[K]) =>
+            runtime.has(type) ? runtime.emit(type, event, ctx(), runId) : undefined,
+          ...toolHooks(runtime, ctx, runId),
+        }),
+      }
+      const nextInput = () => ({ ...options, context: this.context(), streamOptions: () => ({
+        ...this.providerHooks(ctx, model, runId),
+        snapshotPartials: runtime?.has('message_start') || runtime?.has('message_update'),
+      }) })
+      let result = await agent.run({ ...nextInput(), userMessage: user.message })
+      for (;;) {
+        while (result.type === 'response' && result.message.stopReason === 'error' && result.message.errorCode === 'context_overflow'
+          && !recovered && !signal.aborted) {
+          recovered = true
+          if (this.options.persistence && terminalEntry) {
+            try { saveReply(terminalEntry) }
+            catch (error) { this.noteFailure(error, 'finish'); throw error }
+          }
+          if (!await this.compact(model, reasoningEffort, 'overflow', { ...running, assistantMessageId: messageId }, signal)) {
+            if (signal.aborted) {
+              status = 'aborted'
+              terminalEntry = this.fail(model, randomUUID(), '本次生成已取消', true)
+            } else terminalEntry = this.fail(model, randomUUID(), capacityError, false, 'context-capacity')
+            return
+          }
+          signal.throwIfAborted()
+          advanceRound = true
+          result = await agent.continue(nextInput())
+        }
+        if (this.failure) { terminalEntry = undefined; return }
+        if (result.type === 'failure') {
+          status = result.reason === 'aborted' ? 'aborted' : 'failed'
+          terminalEntry = this.fail(model, result.afterReply ? randomUUID() : messageId, result.message, status === 'aborted')
+        } else {
+          status = result.message.stopReason === 'aborted' ? 'aborted' : result.message.stopReason === 'error' ? 'failed' : 'completed'
+        }
+        if (!runtime?.has('agent_before_settle') || signal.aborted || status === 'aborted') break
         if (this.options.persistence && terminalEntry) {
           try { saveReply(terminalEntry) }
-          catch (error) { this.noteFailure(error, 'finish'); throw error }
+          catch (error) {
+            if (status !== 'completed' || !(error instanceof SessionWriteError) || error.reason === 'unconfirmed') {
+              this.noteFailure(error, status === 'completed' ? 'answer' : 'finish')
+              throw error
+            }
+            try { saveReply(terminalEntry) }
+            catch (retryError) { this.noteFailure(retryError, 'answer'); throw retryError }
+          }
         }
-        if (!await this.compact(model, reasoningEffort, 'overflow', { ...running, assistantMessageId: messageId }, signal)) {
-          if (signal.aborted) {
-            status = 'aborted'
-            terminalEntry = this.fail(model, randomUUID(), '本次生成已取消', true)
-          } else terminalEntry = this.fail(model, randomUUID(), capacityError, false, 'context-capacity')
-          return
+        const outcome = status === 'completed' ? 'completed' : 'error'
+        if (!await this.beforeSettle(runtime, ctx(), runId, outcome, model)) {
+          if (signal.aborted) status = 'aborted'
+          break
         }
-        signal.throwIfAborted()
         advanceRound = true
-        result = await agent.continue({ ...options, context: this.context() })
-      }
-      if (this.failure) { terminalEntry = undefined; return }
-      if (result.type === 'failure') {
-        status = result.reason === 'aborted' ? 'aborted' : 'failed'
-        terminalEntry = this.fail(model, result.afterReply ? randomUUID() : messageId, result.message, status === 'aborted')
-      } else {
-        status = result.message.stopReason === 'aborted' ? 'aborted' : result.message.stopReason === 'error' ? 'failed' : 'completed'
+        recovered = false
+        result = await agent.continue(nextInput())
       }
     } catch {
       if (this.failure) { terminalEntry = undefined; return }
@@ -629,15 +858,52 @@ export class AgentSession {
       terminalEntry = this.fail(model, messageId, signal.aborted ? '本次生成已取消' : '模型调用意外中断，请重新发送', signal.aborted)
     } finally {
       unsubscribe()
-      this.finish(signal, status, terminalEntry, usedCompaction)
+      await this.finish(signal, status, terminalEntry, usedCompaction)
     }
+  }
+
+  private async beforeSettle(runtime: ExtensionRuntime, ctx: ExtensionContext, runId: string, outcome: 'completed' | 'error', model: ModelInfo) {
+    const base = this.context()
+    if (!base.messages.length || !requestMessages(base.messages)) return false
+    type Entry = ExtensionMessage & { type: 'custom_message' }
+    const state = { entries: [] as Entry[], continue: false }
+    const timestamp = Date.now()
+    const preview = (entries: Entry[]) => {
+      const llmMessages = [...base.messages, ...entries.map(entry => ({ role: 'user' as const, content: entry.content, timestamp }))]
+      const valid = this.pressure({ ...base, messages: llmMessages }, model) + model.maxTokens <= model.contextWindow
+      return { valid, llmMessages, canContinue: valid && llmMessages.at(-1)?.role !== 'assistant' }
+    }
+    if (!preview([]).valid) return false
+    const decision = await runtime.chain('agent_before_settle', ctx, state, current => {
+      const { llmMessages, canContinue } = preview(current.entries)
+      return { outcome, ...current, context: { llmMessages, canContinue } }
+    }, (current, _event, next) => {
+      if (!next) return current
+      if (next.continue !== undefined && typeof next.continue !== 'boolean'
+        || next.entries !== undefined && (!Array.isArray(next.entries)
+          || !next.entries.every(entry => object(entry) && entry.type === 'custom_message' && extensionMessage(entry)))) {
+        throw new Error('无效的任务续跑建议')
+      }
+      const entries = next.entries ?? current.entries
+      if (!preview(entries).valid) throw new Error('扩展追加指令超出当前模型容量')
+      return { entries: structuredClone(entries), continue: next.continue ?? current.continue }
+    }, { runId })
+    if (ctx.signal?.aborted) return false
+    const extra = decision.entries.map(({ type: _type, ...entry }) => this.extensionEntry(entry))
+    if (extra.length) {
+      try { this.save({ messages: extra }) }
+      catch (error) { this.noteFailure(error, 'finish'); throw error }
+      this.state.messages.push(...extra)
+    }
+    return decision.continue && preview(decision.entries).canContinue
   }
 
   private toolResult(messageId: string, event: Extract<AgentEvent, { type: 'tool_result' }>): ConversationMessage {
     const fileOperation = event.details.find(isFileOperation)
     return {
-      id: randomUUID(), toolCall: { assistantMessageId: messageId, contentIndex: event.contentIndex }, message: event.result,
-      ...((event.errorCode === 'interrupted' || event.errorCode === 'permission_denied') && { toolErrorCode: event.errorCode }),
+      id: randomUUID(), toolCall: { assistantMessageId: messageId, contentIndex: event.contentIndex,
+        ...(event.actualArguments && { actualArguments: event.actualArguments }) }, message: event.result,
+      ...(event.result.isError && (event.errorCode === 'interrupted' || event.errorCode === 'permission_denied' || event.errorCode === 'hook_blocked') && { toolErrorCode: event.errorCode }),
       ...(fileOperation && { fileOperation }),
     }
   }
@@ -721,6 +987,7 @@ export class AgentSession {
 
   subscribe(signal: AbortSignal): AsyncIterableIterator<SessionSubscriptionEvent, undefined> {
     const done: IteratorReturnResult<undefined> = { done: true, value: undefined }
+    if (this.options.persistence?.history) void this.initialize()?.catch(() => undefined)
     const queue: SessionSubscriptionEvent[] = []
     const waiting: ((result: IteratorResult<SessionSubscriptionEvent, undefined>) => void)[] = []
     let closed = signal.aborted
@@ -739,7 +1006,7 @@ export class AgentSession {
     }
     if (!closed) {
       this.listeners.add(receive)
-      queue.push({ type: 'snapshot', snapshot: structuredClone(this.state) })
+      queue.push({ type: 'snapshot', snapshot: structuredClone({ ...this.state, messages: this.state.messages.filter(message => !message.extension) }) })
       signal.addEventListener('abort', close, { once: true })
     }
     return {
@@ -756,15 +1023,27 @@ export class AgentSession {
   async abort(runId: string): Promise<boolean> {
     if (this.state.running?.runId !== runId) return false
     const controller = this.controller
+    if (!controller) return false
     const task = this.task
-    controller?.abort()
+    if (!this.settling) controller.abort()
+    const aborted = controller.signal.aborted
     await task
-    return true
+    return aborted
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closing) return this.closing
     this.closed = true
-    this.controller?.abort()
-    await this.task
+    this.initializing?.abort()
+    this.preparing?.abort()
+    if (!this.settling) this.controller?.abort()
+    const task = this.task
+    return this.closing = (async () => {
+      await Promise.allSettled([this.initialization, this.submitting?.settled, ...this.selectionNotifications])
+      await task
+      if (this.cwd && this.runtime?.has('session_shutdown')) {
+        await this.runtime.emit('session_shutdown', { reason: 'quit' }, this.extensionContext(this.cwd, this.model))
+      }
+    })()
   }
 }

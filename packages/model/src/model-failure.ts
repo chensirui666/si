@@ -111,7 +111,7 @@ export function observeModelFetch(fetcher: typeof fetch | undefined, observation
   status?: number
   retryAt?: number
   error?: unknown
-}, observeBody = false): typeof fetch {
+}, observeBody = false, onResponse?: import('./types.js').ModelStreamOptions['onProviderResponse']): typeof fetch {
   return async (input, init) => {
     observation.sent = true
     try {
@@ -119,6 +119,7 @@ export function observeModelFetch(fetcher: typeof fetch | undefined, observation
       observation.responded = true
       observation.status = response.status
       observation.retryAt = retryDeadline(response.headers.get('retry-after'), Date.now())
+      if (onResponse) await onResponse({ status: response.status, headers: Object.fromEntries(response.headers) })
       if (!observeBody || !response.ok || !response.body) return response
       // Mistral's error formatting drops the transport cause of body read failures.
       const reader = response.body.getReader()
