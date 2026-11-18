@@ -7,7 +7,7 @@ import type { AbortRequest, AbortResult, ExtensionNotice, PermissionMode, Sessio
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
 import { PermissionPicker } from '../components/PermissionPicker'
-import { ModelPicker, effortLabel } from '../components/ModelPicker'
+import { ModelPicker } from '../components/ModelPicker'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
@@ -609,18 +609,15 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     ready: !sessionId ? firstPhase === 'sending' ? 'chat.firstSending' : 'chat.new'
       : state.snapshot?.running?.phase === 'compaction' ? 'chat.compacting'
       : state.snapshot?.running?.phase === 'tools' ? 'chat.runningTools'
-      : state.snapshot?.running ? 'chat.generating' : waiting ? 'chat.waitingReceipt' : 'chat.connected',
+      : state.snapshot?.running ? 'chat.generating' : waiting ? 'chat.waitingReceipt' : null,
   } as const)[state.connection])
-  const status = state.error ? t('chat.sessionReadFailed') : t(statusKey)
+  const status = state.error ? t('chat.sessionReadFailed') : statusKey ? t(statusKey) : ''
 
   const modelSelect = <ModelPicker discovery={discovery} selection={selection} model={selectedModel}
     disabled={!discovery?.models.length || selectionBusy || state.connection !== 'ready' || (isNew ? firstPhase !== null : !state.snapshot)}
     placeholder={t(modelError ? 'model.loadFailed' : selection ? 'model.reselect' : discovery ? 'model.none' : 'model.loading')}
     onSelect={next => { void selectModel(next) }} />
   const providerError = discovery?.providers.find(item => item.status.state === 'error')?.status
-  const runningRun = state.snapshot?.runs?.find(run => run.id === target)
-  const currentModel = runningRun && (discovery?.models.find(model => model.id === runningRun.modelId
-    && model.provider === (runningRun.provider ?? 'deepseek'))?.name ?? runningRun.modelId)
   const workspaceNotice = workspaceError ?? pickError
   const sessionNotice = sessionError ?? listError
 
@@ -730,7 +727,6 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
           {(modelError || providerError?.state === 'error') && <p className="model-error configuration-error" role="alert"><NoticeText notice={modelError ?? { key: 'settings.error', detail: providerError?.state === 'error' ? providerError.message : undefined }} /></p>}
           {selection && discovery && !hasModel() && !selectionBusy && <p className="model-error configuration-error" role="alert">{t('model.unavailable')}</p>}
           {selectionError?.sessionId === sessionId && <p className="model-error configuration-error" role="alert"><NoticeText notice={selectionError.message} /></p>}
-          {runningRun && <p className="connection-status">{t('chat.runningModel', { model: currentModel })}{runningRun.reasoningEffort && ` · ${effortLabel(t, runningRun.reasoningEffort)}`}</p>}
           {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">{activeAbort.error ? t('chat.abortUnconfirmedDetail', { detail: noticeSummary(t, activeAbort.error) }) : t('chat.abortUnconfirmed')}{activeAbort.error?.detail && <> · <span>{activeAbort.error.detail}</span></>}</p>}
           {storageUnavailable && <p className="configuration-error" role="alert">{t('chat.draftStorageUnavailable')}</p>}
           <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />

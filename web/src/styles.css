@@ -73,8 +73,7 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 }
 
 .chat-header {
-  width: var(--chat-column-width);
-  margin-inline: auto;
+  padding-inline: var(--chat-side-space) calc((100% - var(--chat-column-width)) / 2);
   flex: none;
   display: flex;
   align-items: center;
@@ -84,9 +83,20 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
   border-bottom: 1px solid var(--border);
 }
 .chat-header h1 { min-width: 0; margin: 0; font: var(--type-page-title); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-layout[data-sidebar-expanded="false"] .chat-header h1 { margin-inline-start: 40px; }
 .connection-status { max-width: 72%; margin: 0; color: var(--secondary-text); text-align: right; font: var(--type-detail); }
 .chat-main-frame { position: relative; min-height: 0; flex: 1; display: flex; flex-direction: column; }
-.chat-main { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: auto; overflow-anchor: none; scrollbar-gutter: stable both-edges; }
+.chat-main {
+  position: relative; /* Keep positioned message controls inside the scroll area. */
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  overscroll-behavior-y: none;
+  overflow-anchor: none;
+  scrollbar-gutter: stable both-edges;
+}
 
 .message-list {
   flex: 1;
@@ -311,9 +321,6 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .provider-delete-dialog .configuration-error { margin-top: 12px; }
 .provider-delete-dialog .provider-actions { margin-top: 24px; }
 .provider-delete-dialog .delete-provider { border-color: var(--error); }
-@media (max-width: 880px) {
-  .chat-layout[data-sidebar-expanded="false"] .chat-header { padding-inline-start: 40px; }
-}
 @media (max-width: 767px) {
   .settings-dialog { grid-template: 54px auto minmax(0, 1fr) / minmax(0, 1fr); width: 100%; height: 100dvh; border-radius: 0; box-shadow: none; }
   .settings-title { padding-inline-start: 16px; }
@@ -488,4 +495,3 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .model-picker-list small { color: var(--secondary-text); font: var(--type-detail); overflow-wrap: anywhere; }
 .model-picker-list button[aria-pressed="true"] { background: var(--muted); }
 .model-picker-label { font: var(--type-detail); padding: 5px 8px; color: var(--secondary-text); }
-.message-model { margin: 0 0 4px; font: var(--type-detail); color: var(--secondary-text); }

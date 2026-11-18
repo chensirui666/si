@@ -90,7 +90,7 @@ test('Feature 1 配置两家提供方、运行中预选、跨页同步、过期�
     await expect(picker(second)).toHaveText('Kimi K3')
     await expect(effort(second)).toHaveText('低')
     await expect(editor(second)).toHaveText('另一页的草稿')
-    await expect(page.getByText('本次任务使用 DeepSeek Flash · 低')).toBeVisible()
+    await expect(page.getByText('本次任务使用 DeepSeek Flash · 低', { exact: true })).toHaveCount(0)
     await editor(page).fill('本页的草稿')
     await editor(page).press('Enter')
     await expect(editor(page)).toHaveText('本页的草稿')
@@ -107,6 +107,8 @@ test('Feature 1 配置两家提供方、运行中预选、跨页同步、过期�
     model.exchanges[1].delta({ content: '原模型已完成' })
     model.exchanges[1].finish()
     await expect(send(second)).toBeEnabled()
+    await expect(second.getByText('原模型已完成', { exact: true })).toBeVisible()
+    await expect(second.getByText('deepseek / deepseek-flash · 低', { exact: true })).toHaveCount(0)
 
     let intercepted = false
     await second.route('**/api/messages', async route => {

@@ -116,6 +116,40 @@ test('正文外的留白能滚动，消息到输入框上沿才被遮住', async
   expect(last.y).toBeGreaterThanOrEqual(scrollBox.y)
 })
 
+test('含代码块的长会话滚到底后不会带动整页', async ({ mount, page }) => {
+  await mount(<ChatPageHarness />)
+  await expect(page.locator('.chat-page')).toHaveAttribute('data-session-id', 'session-a')
+  const text = `${'较早的回答内容。\n\n'.repeat(36)}\`\`\`js\nconsole.log('最后的代码块')\n\`\`\``
+  await page.evaluate(text => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null,
+      snapshot: { seq: 1, messages: [{ id: 'answer', message: {
+        role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+        timestamp: 1, stopReason: 'stop', content: [{ type: 'text', text }],
+      } }], running: null, compactions: [], contextUsage: null, activeContent: [] },
+    } }))
+  }, text)
+  const scroll = page.locator('.chat-main')
+  const code = scroll.locator('.markdown-code pre')
+  await expect(code).toHaveText("console.log('最后的代码块')")
+  const composer = page.locator('.message-input')
+  const sidebar = page.locator('.chat-sidebar')
+  const input = (await composer.boundingBox())!
+  const rail = await sidebar.boundingBox()
+  const box = (await scroll.boundingBox())!
+  await page.mouse.move(box.x + 20, box.y + 100)
+  await page.mouse.wheel(0, 10_000)
+  await expect.poll(() => scroll.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThanOrEqual(1)
+  await page.mouse.wheel(0, 500)
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  expect(await page.evaluate(() => ({ scrollY, extraHeight: document.documentElement.scrollHeight - innerHeight })))
+    .toEqual({ scrollY: 0, extraHeight: 0 })
+  expect(await sidebar.boundingBox()).toEqual(rail)
+  expect(await composer.boundingBox()).toEqual(input)
+  const lastCode = (await code.boundingBox())!
+  expect(lastCode.y + lastCode.height).toBeLessThanOrEqual(input.y)
+})
+
 test('输入组件发送按钮随空白和有效草稿切换颜色，发送后恢复空白状态', async ({ mount, page }) => {
   await mount(<MessageInputHarness />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
@@ -159,6 +193,13 @@ test('白色页面的正文与输入框同轴，输入框两侧各宽出 16px', 
   const composerBox = (await composer.boundingBox())!
   expect(composerBox.width).toBeLessThanOrEqual(760)
   const workspaceBox = (await page.locator('.chat-workspace').boundingBox())!
+  const header = page.locator('.chat-header')
+  await expect(header).toHaveCSS('border-bottom-width', '1px')
+  const headerBox = (await header.boundingBox())!
+  expect(headerBox.x).toBe(workspaceBox.x)
+  expect(headerBox.width).toBe(workspaceBox.width)
+  const title = header.getByRole('heading')
+  expect((await title.boundingBox())!.x - workspaceBox.x).toBe(24)
   expect(composerBox.x + composerBox.width / 2).toBeCloseTo(workspaceBox.x + workspaceBox.width / 2, 0)
   expect(listBox.x - composerBox.x).toBeCloseTo(16, 0)
   expect(composerBox.x + composerBox.width - (listBox.x + listBox.width)).toBeCloseTo(16, 0)
@@ -166,6 +207,8 @@ test('白色页面的正文与输入框同轴，输入框两侧各宽出 16px', 
   await expect(list.getByRole('listitem')).toHaveCSS('max-width', '72%')
   await expect(list.getByRole('listitem')).toHaveCSS('padding', '10px 16px')
   await page.setViewportSize({ width: 390, height: 700 })
+  const mobileToggleBox = (await page.getByRole('button', { name: '展开侧边栏' }).boundingBox())!
+  expect((await title.boundingBox())!.x).toBeGreaterThanOrEqual(mobileToggleBox.x + mobileToggleBox.width)
   await expect(list.getByRole('listitem')).toHaveCSS('max-width', '88%')
   const text = list.locator('.message-text')
   await expect(text).toHaveCSS('font-size', '14px')
@@ -591,6 +634,8 @@ test('侧栏不横滚，收起后保留草稿和容量，展开后可以继续�
   const reopen = page.getByRole('button', { name: '展开侧边栏' })
   await expect(reopen).toBeFocused()
   await expect(sidebar).toBeHidden()
+  const reopenBox = (await reopen.boundingBox())!
+  expect((await page.getByRole('heading', { name: longName, exact: true }).boundingBox())!.x).toBeGreaterThanOrEqual(reopenBox.x + reopenBox.width)
   await expect(editor).toHaveText('侧栏收起前的草稿')
   await expect(meter).toBeVisible()
   await reopen.press('Enter')

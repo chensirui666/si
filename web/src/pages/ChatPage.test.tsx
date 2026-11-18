@@ -55,7 +55,7 @@ describe('ChatPage', () => {
       ],
     } }) })
     expect(screen.getAllByRole('listitem').map(item => item.textContent)).toEqual(['  你好\n世界  ', '第二条原文'])
-    expect(screen.getByRole('status')).toHaveTextContent('对话已同步')
+    expect(screen.getByRole('status')).toBeEmptyDOMElement()
     expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
     view.unmount()
     expect(source.cleanup).toHaveBeenCalledTimes(2)
