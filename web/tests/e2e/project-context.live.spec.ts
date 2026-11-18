@@ -30,6 +30,7 @@ test('Feature9 live 20：网页首发使用项目说明里的随机标记', asyn
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
       const request = JSON.parse(String(init?.body)) as typeof requests[number]
+      if (String(request.messages[0]?.content).startsWith('你是会话标题生成器。')) return globalThis.fetch(url, init)
       requests.push(request)
       const system = request.messages[0]
       const sections = system?.role === 'system' ? system.content.match(/<project_context>[\s\S]*?<\/project_context>/g) : null

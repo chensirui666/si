@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
   AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode, loadExtensions,
-  type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
+  AttachmentInputError, SessionAttachments, ATTACHMENT_TTL_MS, MAX_ATTACHMENT_UPLOAD_BYTES,
+  type AttachmentScope, type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, defaultSelection, discoverModels, isModelProvider, type AssistantMessage, type ModelSelection, type ToolCall } from '@agent-learning/model'
@@ -22,7 +23,7 @@ import type { ClientFrame, ConversationMessage as BrowserMessage, LanguageSettin
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
-} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'initialize' | 'selectModel' | 'selectPermissionMode'>>
+} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'initialize' | 'selectModel' | 'selectPermissionMode' | 'reviewPlan'>>
 
 type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
 
@@ -38,7 +39,8 @@ function visibleAssistant({ providerThinkingLevel: _effort, ...message }: Assist
   }) }
 }
 
-function browserMessage({ message, skillInvocation, ...entry }: ConversationMessage): BrowserMessage {
+function browserMessage({ message, skillInvocation, references, ...stored }: ConversationMessage): BrowserMessage {
+  const entry = { ...stored, ...(references && { references: references.map(({ sourceSessionId, label }) => ({ sourceSessionId, label })) }) }
   if (skillInvocation) {
     const { name, source, status } = skillInvocation
     return { ...entry, message, skillInvocation: status === 'loaded'
@@ -103,15 +105,20 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
     req.resume()
     throw new InputError(415, '请使用 JSON 提交请求')
   }
+  const bytes = await readBody(req, 64 * 1024, '请求过大')
+  try { return JSON.parse(bytes.toString('utf8')) }
+  catch { throw new InputError(400, '请求必须是有效 JSON') }
+}
+async function readBody(req: IncomingMessage, limit: number, message: string): Promise<Buffer> {
+  if (Number(req.headers['content-length']) > limit) { req.resume(); throw new InputError(413, message) }
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     size += chunk.length
-    if (size > 64 * 1024) { req.resume(); throw new InputError(413, '请求过大') }
+    if (size > limit) { req.resume(); throw new InputError(413, message) }
     chunks.push(chunk)
   }
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) }
-  catch { throw new InputError(400, '请求必须是有效 JSON') }
+  return Buffer.concat(chunks, size)
 }
 async function providerKey(req: IncomingMessage): Promise<string> {
   const value = await readJson(req)
@@ -122,15 +129,28 @@ async function providerKey(req: IncomingMessage): Promise<string> {
 function validId(value: unknown): value is string {
   return typeof value === 'string' && value.length <= 128 && !!value.trim()
 }
+function checkedPathId(segment: string): string {
+  let id: string
+  try { id = decodeURIComponent(segment) }
+  catch { throw new InputError(400, '编号无效') }
+  if (!validId(id)) throw new InputError(400, '编号无效')
+  return id
+}
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+function sourceIds(value: unknown, validate: (id: string) => boolean): string[] {
+  if (!Array.isArray(value) || !value.every(id => validId(id) && validate(id))) {
+    throw new InputError(400, '附件或会话引用编号无效')
+  }
+  return [...new Set(value as string[])]
+}
 async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspaceId') {
   const value = await readJson(req)
   const targetLabel = target === 'sessionId' ? '会话' : '工作区'
   const targetId = value && typeof value === 'object' ? (value as Record<string, unknown>)[target] : undefined
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => ![target, 'text', 'modelId', 'provider', 'reasoningEffort', 'clientMessageId'].includes(key)
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => ![target, 'text', 'modelId', 'provider', 'reasoningEffort', 'clientMessageId', 'attachmentIds', 'referenceSessionIds'].includes(key)
     && !(target === 'workspaceId' && ['permissionMode', 'draftSessionId'].includes(key)))
     || !validId(targetId)
-    || !('text' in value) || typeof value.text !== 'string' || !value.text.trim()
+    || !('text' in value) || typeof value.text !== 'string'
     || !('modelId' in value) || !validId(value.modelId)
     || ('provider' in value && !validId(value.provider))
     || ('reasoningEffort' in value && (!('provider' in value) || !validId(value.reasoningEffort)))
@@ -141,7 +161,11 @@ async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspa
   if (permissionMode !== undefined && !isPermissionMode(permissionMode)) throw new InputError(400, '权限模式无效')
   const draftSessionId = 'draftSessionId' in value ? value.draftSessionId : undefined
   if (draftSessionId !== undefined && (typeof draftSessionId !== 'string' || !uuid.test(draftSessionId))) throw new InputError(400, '草稿会话编号无效')
+  const attachmentIds = 'attachmentIds' in value ? sourceIds(value.attachmentIds, id => uuid.test(id)) : []
+  const referenceSessionIds = 'referenceSessionIds' in value ? sourceIds(value.referenceSessionIds, () => true) : []
+  if (!value.text.trim() && !attachmentIds.length) throw new InputError(400, '请填写原文或添加附件')
   return { targetId, permissionMode, draftSessionId, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text,
+    ...(attachmentIds.length && { attachmentIds }), ...(referenceSessionIds.length && { referenceSessionIds }),
     ...('provider' in value && { provider: value.provider as string }),
     ...('reasoningEffort' in value && { reasoningEffort: value.reasoningEffort as ModelSelection['reasoningEffort'] }), } }
 }
@@ -163,6 +187,9 @@ export class WebServer {
   private closing?: Promise<void>
   private readonly credentials: Credentials
   private readonly workspaces: Workspaces
+  private readonly sessionPath: string
+  private readonly attachments: SessionAttachments
+  private attachmentCleanup?: ReturnType<typeof setInterval>
   private readonly webSettings: WebSettings
   private selection?: AbortController
   private stopWatching?: () => void
@@ -170,6 +197,8 @@ export class WebServer {
   constructor(private readonly options: WebServerOptions = {}) {
     this.credentials = new Credentials(options.modelAuthPath)
     this.workspaces = new Workspaces(options.workspacePath)
+    this.sessionPath = options.sessionPath ?? join(homedir(), '.agent-learning', 'sessions.sqlite')
+    this.attachments = new SessionAttachments(resolve(this.sessionPath + '.files', 'attachments'))
     this.webSettings = new WebSettings(options.webProviders ?? [createTavilyProvider(this.credentials)], this.credentials, options.webSettingsPath)
   }
   private createSessions(extensions: readonly ExtensionEntry[]) {
@@ -182,6 +211,9 @@ export class WebServer {
       getDefaultPermissionMode: () => this.readDefaultPermissionMode(),
       createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode, sessionId) => new AgentSession({
         resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+        titleStream: stream, onTitleChanged: () => this.notify('sessions_changed'), attachments: this.attachments,
+        referenceDirectory: resolve(this.sessionPath + '.files', 'references'),
+        isWorkspaceRegistered: id => this.workspaces.isRegistered(id),
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
         skillHome: this.options.skillHome,
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
@@ -201,10 +233,17 @@ export class WebServer {
     this.auth = new BrowserAuth(secret, this.options.now)
     this.closing = undefined
     if (!this.options.createSession || this.options.sessionPath) {
-      this.store = SessionStore.open(this.options.sessionPath ?? join(homedir(), '.agent-learning', 'sessions.sqlite'))
+      this.store = SessionStore.open(this.sessionPath)
     }
     try { this.sessions = this.createSessions(extensions) }
     catch (error) { this.store?.close(); this.store = undefined; throw error }
+    if (this.store) {
+      void this.pruneAttachments(this.store).catch(() => undefined)
+      this.attachmentCleanup = setInterval(() => {
+        if (this.store) void this.pruneAttachments(this.store).catch(() => undefined)
+      }, 60 * 60 * 1000)
+      this.attachmentCleanup.unref()
+    }
     const server = this.server = createServer((req, res) => { void this.handleHttp(req, res).catch(() => {
       if (!res.headersSent) this.respond(res, 500, '服务暂时不可用')
       else res.destroy()
@@ -252,7 +291,7 @@ export class WebServer {
     if (!trustedRequest(req.headers, this.origins)) return 403
     return this.auth!.authenticated(req.headers.host!, req.headers.cookie) ? 200 : 401
   }
-  private respond(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}) {
+  private respond(res: ServerResponse, status: number, text: string | Buffer, headers: Record<string, string> = {}) {
     res.writeHead(status, { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff', 'content-type': 'text/plain; charset=utf-8', ...headers })
     res.end(text)
   }
@@ -327,14 +366,21 @@ export class WebServer {
     if (url.pathname === '/api/sessions' && req.method === 'POST') {
       try {
         const input = await readJson(req)
-        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 1
-          || !('workspaceId' in input) || !validId(input.workspaceId)) throw new InputError(400, '请仅提交有效的工作区编号')
-        const session = await this.sessions.create(input.workspaceId)
+        if (!isSettingsObject(input) || Object.keys(input).some(key => key !== 'workspaceId' && key !== 'permissionMode')
+          || !validId(input.workspaceId)) throw new InputError(400, '请提交有效的工作区编号')
+        const permissionMode = input.permissionMode
+        if (permissionMode !== undefined && !isPermissionMode(permissionMode)) throw new InputError(400, '权限模式无效')
+        const session = await this.sessions.create(input.workspaceId, permissionMode)
         this.json(res, 201, session)
         this.notify('sessions_changed')
       } catch (error) {
         this.sessionError(res, error, '暂时无法新建会话')
       }
+      return
+    }
+    if ((url.pathname === '/api/attachments' && req.method === 'POST')
+      || (url.pathname.startsWith('/api/attachments/') && req.method === 'GET')) {
+      await this.handleAttachment(req, res, url)
       return
     }
     if (url.pathname === '/api/sessions/start' && req.method === 'POST') {
@@ -354,6 +400,21 @@ export class WebServer {
       return
     }
     const permissionSession = /^\/api\/sessions\/([^/]+)\/permission$/.exec(url.pathname)?.[1]
+    const reviewSession = /^\/api\/sessions\/([^/]+)\/plan\/review$/.exec(url.pathname)?.[1]
+    if (reviewSession && req.method === 'POST') {
+      try {
+        const id = checkedPathId(reviewSession)
+        const input = await readJson(req)
+        if (!isSettingsObject(input) || Object.keys(input).length !== 2 || !validId(input.planId)
+          || (input.action !== 'approve' && input.action !== 'discuss')) throw new InputError(400, '请提交有效的计划和评审动作')
+        const target = this.target(id)
+        if (!target.reviewPlan) throw new InputError(503, '当前会话不支持计划评审')
+        const result = await target.reviewPlan(input.planId, input.action)
+        if ('plan' in result) this.json(res, 200, result)
+        else this.json(res, 202, { ...result, sessionId: id })
+      } catch (error) { this.sessionError(res, error, '暂时无法提交计划评审') }
+      return
+    }
     if (permissionSession && req.method === 'PUT') {
       try {
         let id: string
@@ -450,6 +511,69 @@ export class WebServer {
     if (!session) throw new InputError(404, '会话已不可用')
     return session
   }
+  private async handleAttachment(req: IncomingMessage, res: ServerResponse, url: URL) {
+    const controller = new AbortController()
+    res.once('close', () => controller.abort())
+    try {
+      const store = this.store
+      if (!store || this.closing) throw new InputError(503, '附件服务暂时不可用')
+      if (req.method === 'GET') {
+        const id = checkedPathId(url.pathname.slice('/api/attachments/'.length))
+        const saved = uuid.test(id) ? store.sentAttachment(id) : undefined
+        if (!saved || !await this.workspaces.isRegistered(saved.workspaceId)) throw new InputError(404, '附件已不可用')
+        const bytes = await this.attachments.read(saved.id, controller.signal)
+        this.respond(res, 200, bytes, {
+          'content-type': saved.mediaType === 'text/plain' ? 'text/plain; charset=utf-8' : saved.mediaType,
+          'content-security-policy': "default-src 'none'; sandbox",
+        })
+        return
+      }
+      const sessionId = url.searchParams.get('sessionId')
+      const workspaceId = url.searchParams.get('workspaceId')
+      const draftSessionId = url.searchParams.get('draftSessionId')
+      let scope: AttachmentScope
+      if (validId(sessionId) && workspaceId === null && draftSessionId === null) {
+        const owner = this.sessions.list().find(session => session.id === sessionId)
+        if (!owner) throw new InputError(404, '会话已不可用')
+        await this.workspaces.resolveDirectory(owner.workspaceId)
+        scope = { sessionId }
+      } else if (sessionId === null && validId(workspaceId) && draftSessionId && uuid.test(draftSessionId)) {
+        await this.workspaces.resolveDirectory(workspaceId)
+        scope = { workspaceId, draftSessionId }
+      } else throw new InputError(400, '请指定附件所属的会话或工作区草稿')
+      const header = req.headers['x-attachment-name']
+      let name = ''
+      try { if (typeof header === 'string') name = decodeURIComponent(header) }
+      catch { throw new InputError(400, '文件名无效') }
+      if (!name.trim()) throw new InputError(400, '文件名无效')
+      const bytes = await readBody(req, MAX_ATTACHMENT_UPLOAD_BYTES, '单个附件最多 50 MiB。')
+      const staged = await this.attachments.upload(scope, name, bytes, controller.signal)
+      try {
+        controller.signal.throwIfAborted()
+        if (this.closing || this.store !== store) throw new InputError(503, '附件服务暂时不可用')
+        store.registerAttachment(staged)
+      } catch (error) {
+        await this.attachments.remove(staged.id).catch(() => undefined)
+        throw error
+      }
+      const { scope: _scope, uploadedAt: _uploadedAt, ...attachment } = staged
+      this.json(res, 201, attachment)
+    } catch (error) {
+      req.resume()
+      if (!res.destroyed) this.sessionError(res, error, '无法处理附件，请重试')
+    }
+  }
+  private async pruneAttachments(store: SessionStore) {
+    const cutoff = Date.now() - ATTACHMENT_TTL_MS
+    for (const id of store.expiredAttachments(cutoff)) {
+      if (this.store !== store || this.closing) break
+      try {
+        await this.attachments.remove(id)
+        if (this.store === store && !this.closing) store.forgetExpiredAttachment(id, cutoff)
+      } catch { /* Retry expired files during the next cleanup. */ }
+    }
+    await this.attachments.removeUnregistered(cutoff, id => this.store !== store || !!this.closing || store.hasAttachment(id))
+  }
   private submit(session: SessionTarget, message: Parameters<AgentSession['submit']>[0]) {
     if (!session.submit) throw new InputError(503, '当前生成服务不可用')
     return session.submit(message)
@@ -470,6 +594,8 @@ export class WebServer {
       this.json(res, 500, { error: error.message })
     } else if (error instanceof InputError) {
       this.json(res, error.status, { error: error.message })
+    } else if (error instanceof AttachmentInputError) {
+      this.json(res, 400, { error: error.message })
     } else this.json(res, 500, { error: fallback })
   }
   private json(res: ServerResponse, status: number, payload: unknown) {
@@ -657,6 +783,8 @@ export class WebServer {
     this.closing = (async () => {
       if (this.heartbeat) clearInterval(this.heartbeat)
       this.heartbeat = undefined
+      if (this.attachmentCleanup) clearInterval(this.attachmentCleanup)
+      this.attachmentCleanup = undefined
       this.selection?.abort()
       this.stopWatching?.()
       this.stopWatching = undefined

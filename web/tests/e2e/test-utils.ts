@@ -169,15 +169,15 @@ export async function seedSession(page: Page, observed: ReturnType<typeof observ
   const response = await page.request.post(url.href, { data: { workspaceId }, headers: { Origin: url.origin } })
   expect(response.status()).toBe(201)
   const session: SessionSummary = await response.json()
-  const opened = await openSession(page, observed, session.name)
+  const opened = await openSession(page, observed, session.id)
   expect(opened.sessionId).toBe(session.id)
   expect(opened.snapshot).toEqual(emptySnapshot)
   return session.id
 }
 
-export async function openSession(page: Page, observed: ReturnType<typeof observe>, name: string) {
+export async function openSession(page: Page, observed: ReturnType<typeof observe>, sessionId: string) {
   const before = observed.snapshots.length
-  await page.getByRole('button', { name, exact: true }).click()
+  await page.locator('.workspace-conversation[data-session-id="' + sessionId + '"]').click()
   await ready(page, observed, before, false)
   return observed.snapshots.at(-1)!
 }

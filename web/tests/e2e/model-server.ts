@@ -14,7 +14,7 @@ type RequestBody = {
 }
 
 // 只替换服务商边界，SDK、Agent、HTTP/WS 与页面全部使用生产实现。
-export async function startModelServer() {
+export async function startModelServer({ deferTitles = false } = {}) {
   const exchanges: {
     path: string | undefined
     authorized: boolean
@@ -25,6 +25,7 @@ export async function startModelServer() {
     finish: (reason?: 'stop' | 'tool_calls' | 'length') => void
     closed: boolean
   }[] = []
+  const titleExchanges: typeof exchanges = []
   const rejectedBodies: RequestBody[] = []
   const responses = new Set<ServerResponse>()
   let rejected = 0
@@ -33,8 +34,10 @@ export async function startModelServer() {
   const server = createServer(async (request, response) => {
     let body = ''
     for await (const chunk of request) body += String(chunk)
-    if (nextFailure) {
-      rejectedBodies.push(JSON.parse(body) as RequestBody)
+    const parsed = JSON.parse(body) as RequestBody
+    const title = parsed.messages.some(message => message.role === 'system' && typeof message.content === 'string' && message.content.startsWith('你是会话标题生成器。'))
+    if (!title && nextFailure) {
+      rejectedBodies.push(parsed)
       const { status, retryAfter, code } = nextFailure
       nextFailure = undefined
       rejected++
@@ -42,7 +45,7 @@ export async function startModelServer() {
       response.end(JSON.stringify({ error: { code, message: 'Controlled HTTP failure' } }))
       return
     }
-    if (rejectNext) {
+    if (!title && rejectNext) {
       rejectNext = false
       rejected++
       response.writeHead(400, { 'Content-Type': 'application/json' })
@@ -64,7 +67,7 @@ export async function startModelServer() {
       path: request.url,
       authorized: request.headers.authorization === 'Bearer controlled-stage3-key',
       authorization: request.headers.authorization,
-      body: JSON.parse(body) as RequestBody,
+      body: parsed,
       delta: (delta: Record<string, unknown>) => chunk(delta),
       end: () => response.end(),
       finish: (reason: 'stop' | 'tool_calls' | 'length' = 'stop') => {
@@ -78,14 +81,17 @@ export async function startModelServer() {
       closed: false,
     }
     response.once('close', () => { exchange.closed = true })
-    exchanges.push(exchange)
+    if (title) {
+      titleExchanges.push(exchange)
+      if (!deferTitles) exchange.finish()
+    } else exchanges.push(exchange)
   })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('受控模型服务未能取得端口')
   return {
-    exchanges, rejectedBodies,
+    exchanges, titleExchanges, rejectedBodies,
     get rejected() { return rejected },
     rejectOnce(failure: NonNullable<typeof nextFailure>) { nextFailure = failure },
     rejectHistory() { rejectNext = true },

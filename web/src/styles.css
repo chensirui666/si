@@ -139,7 +139,7 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 }
 .message-editor p { margin: 0; }
 .message-placeholder { pointer-events: none; position: absolute; top: 16px; left: 16px; right: 16px; color: var(--secondary-text); font: var(--type-reading); }
-.composer-permission.select-trigger { margin-right: auto; width: auto; min-width: 0; }
+.composer-permission.select-trigger { width: auto; min-width: 0; }
 .composer-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .send-button {
   width: 36px;
@@ -489,3 +489,33 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .model-picker-list button[aria-pressed="true"] { background: var(--muted); }
 .model-picker-label { font: var(--type-detail); padding: 5px 8px; color: var(--secondary-text); }
 .message-model { margin: 0 0 4px; font: var(--type-detail); color: var(--secondary-text); }
+
+.attachment-list, .reference-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.draft-attachment, .reference-draft, .attachment-file {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%;
+  padding: 3px 6px; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--secondary-text); background: var(--surface); font: var(--type-detail);
+}
+.draft-attachment > .attachment-file { border: 0; padding: 0; }
+.attachment-file svg { width: 14px; height: 14px; flex: none; }
+.attachment-file span, .reference-draft > span, .session-reference-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.attachment-preview { display: inline-flex; }
+.attachment-preview img { width: 52px; height: 46px; object-fit: cover; border-radius: 5px; border: 1px solid var(--border); }
+.attachment-error { color: var(--error); max-width: 200px; }
+.composer-tools { display: flex; align-items: center; gap: 4px; margin-right: auto; }
+.composer-add-trigger { anchor-name: --composer-add-trigger; }
+.composer-add-menu {
+  position: fixed; position-anchor: --composer-add-trigger; inset: auto;
+  bottom: 80px; left: 12px; bottom: anchor(top, 80px); left: anchor(left, 12px);
+  position-try-fallbacks: flip-block, flip-inline; margin: 0 0 6px; width: min(210px, calc(100vw - 24px));
+  padding: 5px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--background); color: inherit; box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+}
+.composer-add-menu button { display: flex; width: 100%; justify-content: flex-start; }
+.plan-chip { border-radius: 999px; background: #fff3df; color: #86490b; }
+.plan-chip:hover { background: #ffe8c5; }
+.plan-review { padding: 12px 14px; margin: 0 0 8px; background: var(--background); border: 1px solid var(--border); border-radius: 12px; }
+.plan-review h2 { margin: 0; font: var(--type-section-title); }
+.plan-review ol { padding-inline-start: 22px; list-style: decimal; margin: 4px 0 12px; }
+.plan-review li { white-space: pre-wrap; }
+.plan-review-actions { display: flex; justify-content: flex-end; gap: 8px; }

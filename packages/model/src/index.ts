@@ -28,4 +28,4 @@ export type {
 export { defaultSelection, discoverModels, findModel, isModelProvider, sameSelection } from './catalog.js'
 export { stream, createModelStream } from './pi-stream.js'
 export { estimateMessageTokens, estimateContextTokens } from './context.js'
-export { omittedToolImageIndexes } from './request-images.js'
+export { IMAGE_BUDGET_BYTES, omittedToolImageIndexes } from './request-images.js'

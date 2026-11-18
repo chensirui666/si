@@ -3,6 +3,18 @@ import type { AssistantMessage, JsonObject, ModelMessage, ModelUsage, ModelFailu
 import type { ExtensionMessage } from './extensions/runtime.js'
 import type { SkillInvocation } from './skills.js'
 import type { PermissionMode } from './permissions.js'
+import type { MessageAttachment } from './session-attachments.js'
+import type { SessionReference } from './session-references.js'
+
+export type SubmissionSources = { attachmentIds?: string[]; referenceSessionIds?: string[] }
+
+export type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & SubmissionSources
+  & { clientMessageId: string; text: string; permissionMode?: PermissionMode }
+
+export function sameSubmissionSources(before: SubmissionSources, after: SubmissionSources): boolean {
+  return JSON.stringify(before.attachmentIds ?? []) === JSON.stringify(after.attachmentIds ?? [])
+    && JSON.stringify([...new Set(before.referenceSessionIds)]) === JSON.stringify([...new Set(after.referenceSessionIds)])
+}
 
 type ToolLocation = {
   assistantMessageId: string
@@ -17,6 +29,8 @@ export type ConversationMessage = {
   toolErrorCode?: string
   imageOmitted?: true
   skillInvocation?: SkillInvocation
+  attachments?: MessageAttachment[]
+  references?: SessionReference[]
   extension?: Omit<ExtensionMessage, 'content'>
   fileOperation?: { kind: 'read' | 'modified'; path: string }
   message: ModelMessage
@@ -70,9 +84,12 @@ export type ContextUsage = {
   breakdown: ContextEstimate
 }
 
+export type PlanState = { state: 'planning' } | { state: 'review'; assistantMessageId: string; steps: string[] }
+
 export type ConversationSnapshot = {
   seq: number
   permissionMode: PermissionMode
+  plan?: PlanState | null
   messages: ConversationMessage[]
   running: RunningState
   modelSelection?: ModelSelection
@@ -92,6 +109,7 @@ export type ConversationUpdate = {
   change:
     | { type: 'notice'; notice: ExtensionNotice }
     | { type: 'permission'; permissionMode: PermissionMode }
+    | { type: 'plan'; plan: PlanState | null }
     | { type: 'selection'; selection: ModelSelection }
     | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }

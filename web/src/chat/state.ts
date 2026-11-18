@@ -1,5 +1,5 @@
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, ExtensionNotice, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
+import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, ExtensionNotice, PlanState, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelFailureKind, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 import { retryReasons, terminalOnly } from './model-retry'
@@ -123,10 +123,30 @@ function skillInvocation(value: unknown, message: ModelMessage): boolean {
     && isSkillSource(value.source) && (value.status === 'loaded' || (value.status === 'failed' && typeof value.reason === 'string')))
 }
 
+export function messageAttachment(value: unknown): value is NonNullable<ConversationMessage['attachments']>[number] {
+  return record(value) && typeof value.id === 'string' && !!value.id
+    && typeof value.name === 'string' && !!value.name
+    && ['image/png', 'image/jpeg', 'image/webp', 'text/plain'].includes(value.mediaType as string)
+    && sequence(value.size)
+}
+
+function sessionReference(value: unknown) {
+  return record(value) && typeof value.sourceSessionId === 'string' && !!value.sourceSessionId
+    && typeof value.label === 'string' && !!value.label
+}
+
+function planState(value: unknown): value is PlanState | null {
+  return value === null || record(value) && (value.state === 'planning' || value.state === 'review'
+    && typeof value.assistantMessageId === 'string' && !!value.assistantMessageId
+    && Array.isArray(value.steps) && value.steps.length > 0 && value.steps.every(step => typeof step === 'string' && !!step.trim()))
+}
+
 function conversationMessage(value: unknown): value is ConversationMessage {
   return record(value) && typeof value.id === 'string' && (value.clientMessageId === undefined || typeof value.clientMessageId === 'string') && modelMessage(value.message)
     && (value.message.role === 'toolResult' ? toolPosition(value.toolCall) : value.toolCall === undefined)
     && (value.toolErrorCode === undefined || (typeof value.toolErrorCode === 'string' && value.message.role === 'toolResult' && value.message.isError))
+    && (value.attachments === undefined || value.message.role === 'user' && Array.isArray(value.attachments) && value.attachments.every(messageAttachment))
+    && (value.references === undefined || value.message.role === 'user' && Array.isArray(value.references) && value.references.every(sessionReference))
     && fileOperation(value.fileOperation, value.message) && skillInvocation(value.skillInvocation, value.message)
 }
 
@@ -186,6 +206,7 @@ function saveFailure(value: unknown): value is SaveFailure {
 function validSnapshot(value: unknown): value is ConversationSnapshot {
   return record(value) && sequence(value.seq) && isPermissionMode(value.permissionMode) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
     && (value.modelSelection === undefined || modelSelection(value.modelSelection))
+    && (value.plan === undefined || planState(value.plan))
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
     && value.activeContent.every(activeBlock)
     && Array.isArray(value.compactions) && value.compactions.every(compactionRecord)
@@ -239,6 +260,12 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     if (!modelSelection(change.selection)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
       ...state.snapshot, seq: frame.update.seq, modelSelection: change.selection, contextUsage: capacity,
+    } }, resubscribe: false }
+  }
+  if (change.type === 'plan') {
+    if (!planState(change.plan)) return { state, resubscribe: true }
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, ...metadata, seq: frame.update.seq, plan: change.plan, contextUsage: capacity,
     } }, resubscribe: false }
   }
   if (change.type === 'model') {

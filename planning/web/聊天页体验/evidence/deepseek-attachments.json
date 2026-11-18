@@ -1,0 +1,35 @@
+{
+  "screenshot": {
+    "model": "deepseek-flash",
+    "requestRoles": [
+      "system",
+      "user"
+    ],
+    "imageBytes": 54420,
+    "imageSha256": "bfb55b518a065f05f023ff2676566f89269c48ace7388ecaef8de227c0fb5cf5",
+    "transcribed": [
+      "35D42FAD",
+      "AC2710CF",
+      "75372EB0"
+    ],
+    "answer": "35D42FAD\nAC2710CF\n75372EB0"
+  },
+  "text": {
+    "model": "deepseek-flash",
+    "uploadedName": "启动日志.txt",
+    "read": {
+      "id": "call_00_ET_WsgCq7C34fIP61dzym5h1890",
+      "type": "function",
+      "function": {
+        "name": "read",
+        "arguments": "{\"path\":\"<temporary directory>/attachments/<attachment ID>/original\"}"
+      }
+    },
+    "returned": {
+      "role": "tool",
+      "tool_call_id": "call_00_ET_WsgCq7C34fIP61dzym5h1890",
+      "content": "启动失败。\n仅在此文件中记录的故障码：AGL-7117FDC2\n"
+    },
+    "answer": "AGL-7117FDC2"
+  }
+}

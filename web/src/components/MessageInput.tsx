@@ -14,6 +14,7 @@ import {
   $getRoot,
   $getSelection,
   $isRangeSelection,
+  $isTextNode,
   HISTORY_PUSH_TAG,
   KEY_ARROW_DOWN_COMMAND,
   KEY_ARROW_UP_COMMAND,
@@ -22,6 +23,7 @@ import {
   COMMAND_PRIORITY_CRITICAL,
   KEY_ENTER_COMMAND,
   KEY_TAB_COMMAND,
+  PASTE_COMMAND,
   RootNode,
   SELECTION_CHANGE_COMMAND,
   SKIP_DOM_SELECTION_TAG,
@@ -29,10 +31,11 @@ import {
 } from 'lexical'
 import { mergeRegister } from '@lexical/utils'
 
-import type { WorkspaceSkills } from '@agent-learning/server/protocol'
+import type { SessionSummary, WorkspaceSkills } from '@agent-learning/server/protocol'
 import { getWorkspaceSkills } from '../chat/client'
 import { errorNotice, NoticeText, skillSourceKey, type Notice } from '../i18n/messages'
 import { Button } from '@/components/ui/button'
+import { ComposerAddMenu } from './ComposerAddMenu'
 import { $styleSkillPrefix, skillPrefix } from './skill-prefix'
 
 type MessageInputProps = {
@@ -42,6 +45,7 @@ type MessageInputProps = {
   abortDisabled?: boolean
   onAbort?: () => void
   contextMeter?: ReactNode
+  permissionControl?: ReactNode
   footerControl?: ReactNode
   commandsEnabled?: boolean
   skillWorkspaceId?: string
@@ -50,6 +54,16 @@ type MessageInputProps = {
   editorRef?: Ref<HTMLDivElement>
   quote?: string
   onRemoveQuote?: () => void
+  attachments?: ReactNode
+  onAddFiles?: (files: File[]) => void
+  hasAttachments?: boolean
+  attachmentsPending?: boolean
+  referenceDraft?: ReactNode
+  referenceSessions?: readonly SessionSummary[]
+  onSelectReference?: (session: SessionSummary) => void
+  onPlan?: (draftText: string) => void
+  planActive?: boolean
+  onExitPlan?: (draftText?: string) => void
 }
 
 const initialConfig = {
@@ -72,7 +86,20 @@ function $writeDraft(text: string) {
 }
 
 const restoreTag = 'restore-session-draft'
-const optionId = (option: string) => option === '/compact' ? 'compact-option' : `skill-option-${option.slice(7).trim()}`
+const optionId = (option: string) =>
+  option.startsWith('@') ? `session-option-${option.slice(1)}` : option === '/compact' || option === '/plan'
+    ? `${option.slice(1)}-option` : `skill-option-${option.slice(7).trim()}`
+const isControl = (text: string) => ['/compact', '/plan'].includes(text.trim())
+const isPlanExit = (text: string) => /^\/plan\s+off$/u.test(text.trim())
+
+function $mentionAtCursor() {
+  const selection = $getSelection()
+  if (!$isRangeSelection(selection) || !selection.isCollapsed()) return
+  const node = selection.anchor.getNode()
+  if (!($isTextNode(node))) return
+  const text = node.getTextContent().slice(0, selection.anchor.offset)
+  return /(?:^|\s)(@[^@\r\n]{0,80})$/u.exec(text)?.[1]
+}
 
 export function MessageInput(props: MessageInputProps) {
   const initialDraft = props.draft?.text
@@ -83,11 +110,16 @@ export function MessageInput(props: MessageInputProps) {
   )
 }
 
-function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, footerControl, commandsEnabled = true, skillWorkspaceId, draft, onDraftChange, editorRef, quote, onRemoveQuote }: MessageInputProps) {
+function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, permissionControl, footerControl, commandsEnabled = true, skillWorkspaceId, draft, onDraftChange, editorRef, quote, onRemoveQuote,
+  attachments, onAddFiles, hasAttachments = false, attachmentsPending = false, referenceDraft,
+  referenceSessions, onSelectReference, onPlan, planActive = false, onExitPlan }: MessageInputProps) {
   const { t } = useTranslation()
   const [editor] = useLexicalComposerContext()
   const [hasSkillPrefix, setHasSkillPrefix] = useState(() => skillPrefix.test(draft?.text ?? ''))
-  const [canSend, setCanSend] = useState(Boolean(draft?.text.trim()))
+  const [inputText, setInputText] = useState(draft?.text ?? '')
+  const canSend = (inputText.trim() || hasAttachments) && (!attachmentsPending || isControl(inputText))
+  const canSubmit = isPlanExit(inputText) ? Boolean(onExitPlan) : canSend && !sendDisabled
+  const placeholder = t(planActive ? 'plan.placeholder' : 'chat.placeholder')
   const draftRevision = useRef(0)
   const [query, setQuery] = useState<string | null>(null)
   const menu = useRef<string | null>(null)
@@ -95,13 +127,20 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
   const [catalog, setCatalog] = useState<{ workspaceId: string; view?: WorkspaceSkills; error?: Notice } | null>(null)
   const loadedCatalog = useRef<string | undefined>(undefined)
   const menuOpen = query !== null
-  const skillMenu = menuOpen && Boolean(skillWorkspaceId)
+  const referenceMenu = Boolean(query?.startsWith('@'))
+  const slashMenu = menuOpen && !referenceMenu
+  const skillMenu = slashMenu && Boolean(skillWorkspaceId)
   const currentCatalog = catalog?.workspaceId === skillWorkspaceId ? catalog : null
   const canRunCompact = commandsEnabled && !sendDisabled
-  const showCompact = query !== null && canRunCompact && '/compact'.startsWith(query)
-  const skillOptions = query === null ? [] : (currentCatalog?.view?.skills ?? []).filter(skill =>
-    `/skill:${skill.name}`.startsWith(query) || `/${skill.name}`.startsWith(query))
-  const options = [...(showCompact ? ['/compact'] : []), ...skillOptions.map(skill => `/skill:${skill.name} `)]
+  const canRunPlan = Boolean(onPlan) && !sendDisabled
+  const showCompact = slashMenu && canRunCompact && '/compact'.startsWith(query!)
+  const showPlan = slashMenu && canRunPlan && '/plan'.startsWith(query!)
+  const referenceOptions = query?.startsWith('@') ? (referenceSessions ?? []).filter(session =>
+    session.name.toLowerCase().includes(query.slice(1).trim().toLowerCase())) : []
+  const skillOptions = !slashMenu ? [] : (currentCatalog?.view?.skills ?? []).filter(skill =>
+    `/skill:${skill.name}`.startsWith(query!) || `/${skill.name}`.startsWith(query!))
+  const options = referenceMenu ? referenceOptions.map(session => `@${session.id}`)
+    : [...(showCompact ? ['/compact'] : []), ...(showPlan ? ['/plan'] : []), ...skillOptions.map(skill => `/skill:${skill.name} `)]
   const active = options[Math.min(highlight, options.length - 1)]
 
   const dismissedText = useRef<string | undefined>(undefined)
@@ -119,16 +158,19 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       && selection.anchor.getNode() === $getRoot().getLastDescendant()
       && selection.anchor.offset === selection.anchor.getNode().getTextContentSize()
     const prefix = text.trimStart().toLowerCase()
-    const available = (canRunCompact && '/compact'.startsWith(prefix)) || Boolean(skillWorkspaceId)
-    const visible = available && editor.getRootElement() === document.activeElement && !composingRef.current && !editor.isComposing()
-      && /^[ \t]*\/[a-z0-9:-]*$/i.test(text) && atEnd && dismissedText.current !== text
-    const next = visible ? prefix : null
+    const available = (canRunCompact && '/compact'.startsWith(prefix))
+      || (canRunPlan && '/plan'.startsWith(prefix)) || Boolean(skillWorkspaceId)
+    const visible = editor.getRootElement() === document.activeElement && !composingRef.current && !editor.isComposing()
+      && dismissedText.current !== text
+    const slash = visible && available && /^[ \t]*\/[a-z0-9:-]*$/i.test(text) && atEnd
+    const mention = visible && referenceSessions && $mentionAtCursor()
+    const next = mention || (slash ? prefix : null)
     if (menu.current === next) return
     if (next === null) { closeMenu(); return }
     menu.current = next
     setQuery(next)
     setHighlight(0)
-  }, [closeMenu, canRunCompact, editor, skillWorkspaceId])
+  }, [closeMenu, canRunCompact, canRunPlan, editor, skillWorkspaceId, referenceSessions])
   const needsCatalog = skillMenu || hasSkillPrefix
   useEffect(() => {
     if (!skillWorkspaceId || !needsCatalog || (!skillMenu && loadedCatalog.current === skillWorkspaceId)) return
@@ -152,7 +194,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     const names = new Set(availableSkills?.map(skill => skill.name))
     return editor.registerNodeTransform(RootNode, root => $styleSkillPrefix(root, names))
   }, [availableSkills, editor])
-  const completeSkill = useCallback((option: string) => {
+  const completeCommand = useCallback((option: string) => {
     editor.update(() => {
       const text = $readDraft()
       dismissedText.current = text.replace(/\/[a-z0-9:-]*$/i, () => option)
@@ -162,6 +204,16 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       closeMenu()
     }, { discrete: true, tag: HISTORY_PUSH_TAG })
   }, [closeMenu, editor])
+  const preparePlan = () => {
+    editor.getRootElement()?.focus({ preventScroll: true })
+    editor.update(() => {
+      const text = $readDraft()
+      if (!/^\s*\/plan(?:\s|$)/.test(text)) $writeDraft(`/plan ${text}`)
+      else if (text.trimStart() === '/plan') $writeDraft(text + ' ')
+      $getRoot().selectEnd()
+      closeMenu()
+    }, { discrete: true, tag: HISTORY_PUSH_TAG })
+  }
   const label = t(action === 'send' ? 'chat.send' : action === 'abort' ? 'chat.abort' : 'chat.aborting')
 
   const submit = useCallback((text: string) => {
@@ -174,7 +226,13 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     }, { discrete: true, tag: SKIP_SCROLL_INTO_VIEW_TAG })
 
     try {
-      if (sendDisabled || !text.trim() || onSend(text, restoreDraft) !== true) return
+      if (isPlanExit(text)) { onExitPlan?.(text); return }
+      if (sendDisabled || !text.trim() && !hasAttachments || attachmentsPending && !isControl(text)) return
+      if (text.trim() === '/plan' && onPlan) {
+        onPlan(text)
+        return
+      }
+      if (onSend(text, restoreDraft) !== true) return
     } catch (error) {
       // Report receiver errors after Lexical has finished its active update.
       queueMicrotask(() => { throw error })
@@ -195,14 +253,31 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
         editor.getRootElement()?.focus({ preventScroll: true })
       },
     })
-  }, [editor, onSend, sendDisabled])
+  }, [editor, onPlan, onExitPlan, onSend, sendDisabled, hasAttachments, attachmentsPending])
 
   const pickOption = useCallback((option: string) => {
-    if (option !== '/compact') { completeSkill(option); return }
+    if (option.startsWith('@')) {
+      const session = referenceSessions?.find(item => item.id === option.slice(1))
+      if (!session || !onSelectReference) return
+      editor.update(() => {
+        const token = $mentionAtCursor()
+        const selection = $getSelection()
+        if (!token || !$isRangeSelection(selection)) return
+        const anchor = selection.anchor
+        selection.setTextNodeRange(anchor.getNode() as ReturnType<typeof $createTextNode>, anchor.offset - token.length,
+          anchor.getNode() as ReturnType<typeof $createTextNode>, anchor.offset)
+        selection.removeText()
+        closeMenu()
+      }, { discrete: true, tag: HISTORY_PUSH_TAG })
+      onSelectReference(session)
+      return
+    }
+    if (!isControl(option)) { completeCommand(option); return }
     const current = editor.getEditorState().read($readDraft).trimStart().toLowerCase()
-    // The current menu only replaces a draft consisting entirely of its slash query.
-    if (canRunCompact && current === menu.current && option.startsWith(current)) submit(option)
-  }, [canRunCompact, completeSkill, editor, submit])
+    if (current !== menu.current || !option.startsWith(current)) return
+    if (option === '/plan' && canRunPlan) completeCommand('/plan ')
+    if (option === '/compact' && canRunCompact) submit(option)
+  }, [canRunCompact, canRunPlan, completeCommand, editor, submit, referenceSessions, onSelectReference, closeMenu])
 
   useEffect(() => editor.registerUpdateListener(({ editorState, prevEditorState, tags }) => {
     const text = editorState.read($readDraft)
@@ -212,13 +287,14 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       if (!tags.has(restoreTag)) onDraftChange?.(text)
       if (text !== dismissedText.current) dismissedText.current = undefined
     }
-    setCanSend(Boolean(text.trim()))
+    setInputText(text)
     editorState.read(refreshMenu)
   }), [editor, refreshMenu, onDraftChange])
 
   useEffect(() => {
     if (draft === undefined || editor.getEditorState().read($readDraft) === draft.text) return
     editor.update(() => {
+      if (!draft.text) editor.dispatchCommand(CLEAR_HISTORY_COMMAND, undefined)
       $writeDraft(draft.text)
       if (editor.getRootElement() === document.activeElement) $getRoot().selectEnd()
       else $addUpdateTag(SKIP_DOM_SELECTION_TAG)
@@ -265,6 +341,13 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       return true
     }
     return mergeRegister(
+      editor.registerCommand(PASTE_COMMAND, event => {
+        const files = 'clipboardData' in event ? Array.from(event.clipboardData?.files ?? []) : []
+        if (!onAddFiles || !files.length) return false
+        event.preventDefault()
+        onAddFiles(files)
+        return true
+      }, COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ARROW_DOWN_COMMAND, move(1), COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ARROW_UP_COMMAND, move(-1), COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ESCAPE_COMMAND, event => {
@@ -297,11 +380,15 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
         if (event.shiftKey) return false
         if (composingRef.current || editor.isComposing() || event.isComposing || event.keyCode === 229 || Date.now() < composingUntilRef.current) return true
         event.preventDefault()
-        if (!event.repeat) { if (menu.current && active) pickOption(active); else submit($readDraft()) }
+        if (!event.repeat) {
+          const text = $readDraft()
+          if (menu.current && active && !(active === '/plan' && text.trim() === '/plan')) pickOption(active)
+          else submit(text)
+        }
         return true
       }, COMMAND_PRIORITY_CRITICAL),
     )
-  }, [editor, submit, pickOption, closeMenu, active, options.length])
+  }, [editor, submit, pickOption, closeMenu, active, options.length, onAddFiles])
 
   useEffect(() => {
     if (active) document.getElementById(optionId(active))?.scrollIntoView({ block: 'nearest' })
@@ -322,10 +409,17 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
           editor.getRootElement()?.focus({ preventScroll: true })
         }}><XIcon aria-hidden="true" /></Button>
       </div>}
-      {menuOpen && <div className="command-menu" role="listbox" aria-label={t('chat.slashMenu')} id="compact-menu">
-        {showCompact && <div role="group" aria-label={t('chat.commands')}>
+      {attachments}
+      {referenceDraft}
+      {referenceMenu && <div className="command-menu" role="listbox" aria-label={t('chat.sessionReferences')} id="reference-menu">
+        {referenceOptions.map(session => renderOption(`@${session.id}`, <span className="session-reference-name">Session · {session.name}</span>))}
+        {!referenceOptions.length && <div className="command-menu-label">{t('chat.referenceEmpty')}</div>}
+      </div>}
+      {slashMenu && <div className="command-menu" role="listbox" aria-label={t('chat.slashMenu')} id="compact-menu">
+        {(showCompact || showPlan) && <div role="group" aria-label={t('chat.commands')}>
           <div className="command-menu-label">{t('chat.commands')}</div>
-          {renderOption('/compact', <><span>/compact</span><span>{t('chat.compactCommand')}</span></>)}
+          {showCompact && renderOption('/compact', <><span>/compact</span><span>{t('chat.compactCommand')}</span></>)}
+          {showPlan && renderOption('/plan', <><span>/plan</span><span>{t('plan.command')}</span></>)}
         </div>}
         {skillMenu && <div role="group" aria-label={t('chat.skills')}>
           <div className="command-menu-label">{t('chat.skills')}</div>
@@ -352,21 +446,29 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
             role="textbox"
             aria-label={t('chat.message')}
             aria-multiline="true"
-            aria-controls={menuOpen ? 'compact-menu' : undefined}
+            aria-controls={referenceMenu ? 'reference-menu' : slashMenu ? 'compact-menu' : undefined}
             aria-activedescendant={menuOpen && active ? optionId(active) : undefined}
-            aria-autocomplete={commandsEnabled || skillWorkspaceId ? 'list' : undefined}
-            aria-placeholder={t('chat.placeholder')}
-            placeholder={<div className="message-placeholder">{t('chat.placeholder')}</div>}
+            aria-autocomplete={commandsEnabled || skillWorkspaceId || referenceSessions ? 'list' : undefined}
+            aria-placeholder={placeholder}
+            placeholder={<div className="message-placeholder">{placeholder}</div>}
           />
         }
         ErrorBoundary={LexicalErrorBoundary}
       />
       <HistoryPlugin />
       <div className="composer-actions">
+        {(onAddFiles || onPlan || permissionControl || planActive) && <div className="composer-tools">
+          {(onAddFiles || onPlan) && <ComposerAddMenu onAddFiles={onAddFiles} onPlan={onPlan && !planActive ? preparePlan : undefined} />}
+          {permissionControl}
+          {planActive && <Button variant="ghost" size="xs" type="button" className="plan-chip"
+            aria-label={t('plan.exit')} title={t('plan.exit')} disabled={!onExitPlan} onClick={() => onExitPlan?.()}>
+            Plan <XIcon aria-hidden="true" />
+          </Button>}
+        </div>}
         {footerControl}
         {contextMeter}
         <Button className="send-button" size="icon" type="button" aria-label={label} title={label}
-          disabled={action === 'send' ? sendDisabled || !canSend : action === 'aborting' || abortDisabled || !onAbort}
+          disabled={action === 'send' ? !canSubmit : action === 'aborting' || abortDisabled || !onAbort}
           onClick={() => { if (action === 'send') submit(editor.read($readDraft)); else if (action === 'abort') onAbort?.() }}>
           {action === 'send' ? <ArrowUpIcon aria-hidden="true" /> : <SquareIcon aria-hidden="true" fill="currentColor" />}
         </Button>

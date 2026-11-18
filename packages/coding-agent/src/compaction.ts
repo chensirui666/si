@@ -1,8 +1,10 @@
 import { estimateMessageTokens } from '@agent-learning/model'
-import type { ModelContext, ModelInfo, ModelMessage } from '@agent-learning/model'
+import type { ImageContent, ModelContext, ModelInfo, ModelMessage, TextContent } from '@agent-learning/model'
 import { skillCommand } from './skills.js'
 import { escapePromptAttribute } from './system-prompt.js'
 import type { CompactionRecord, ConversationMessage } from './types.js'
+import type { SessionAttachments } from './session-attachments.js'
+import { referencePrompt } from './session-references.js'
 
 type LatestCompaction = Extract<CompactionRecord, { status: 'success' }>
 
@@ -24,17 +26,38 @@ function effectiveEntries(entries: ConversationMessage[], latest?: LatestCompact
     && !(entry.toolCall && invalid.has(entry.toolCall.assistantMessageId)))
 }
 
-function messageForModel({ id, message, imageOmitted, skillInvocation }: ConversationMessage): ModelMessage {
-  if (message.role === 'user' && typeof message.content === 'string' && skillInvocation?.status === 'loaded') {
-    const { name, body, directory } = skillInvocation
-    const task = message.content.replace(skillCommand, '').trimStart()
-    return { ...message, content: [
-      `<skill name="${name}" directory="${escapePromptAttribute(directory)}">`,
-      '配套文件的相对路径以此 Skill 目录为起点。',
-      body,
-      '</skill>',
-      ...(task ? ['', task] : []),
-    ].join('\n') }
+type AttachmentReader = Pick<SessionAttachments, 'path'> & Partial<Pick<SessionAttachments, 'image'>>
+
+function messageForModel({ id, message, imageOmitted, skillInvocation, attachments, references }: ConversationMessage, files?: AttachmentReader): ModelMessage {
+  if (message.role === 'user' && typeof message.content === 'string') {
+    let text = message.content
+    if (skillInvocation?.status === 'loaded') {
+      const { name, body, directory } = skillInvocation
+      const task = message.content.replace(skillCommand, '').trimStart()
+      text = [
+        `<skill name="${name}" directory="${escapePromptAttribute(directory)}">`,
+        '配套文件的相对路径以此 Skill 目录为起点。',
+        body,
+        '</skill>',
+        ...(task ? ['', task] : []),
+      ].join('\n')
+    }
+    if (references?.length) text += '\n\n' + referencePrompt(references)
+    if (!attachments?.length || !files) return text === message.content ? message : { ...message, content: text }
+    const header = text + '\n\n用户上传的附件如下。图片有随附图块时直接查看图块。文本附件或需要重读原件的图片可用 read 打开 path。'
+    const content: (TextContent | ImageContent)[] = [{ type: 'text', text: header }]
+    for (const attachment of attachments) {
+      const path = files.path(attachment.id)
+      const descriptor = JSON.stringify({ name: attachment.name, path }).replace(/[<>&]/g, character =>
+        '\\u' + character.charCodeAt(0).toString(16).padStart(4, '0'))
+      content.push({ type: 'text', text: '\n' + descriptor })
+      if (attachment.mediaType !== 'text/plain' && files.image) {
+        try { content.push(files.image(attachment.id)) }
+        catch { content.push({ type: 'text', text: '\n[此附件的处理版图片不可用，可按上面的路径重新读取原件。]' }) }
+      }
+    }
+    return content.some(block => block.type === 'image') ? { ...message, uploadMessageId: id, content }
+      : { ...message, content: content.map(block => block.type === 'text' ? block.text : '').join('') }
   }
   if (message.role !== 'toolResult') return message
   if (imageOmitted) return { ...message, content: [
@@ -43,8 +66,8 @@ function messageForModel({ id, message, imageOmitted, skillInvocation }: Convers
   return message.content.some(block => block.type === 'image') ? { ...message, imageResultId: id } : message
 }
 
-function modelMessages(entries: ConversationMessage[], recoverTools: boolean): ModelMessage[] {
-  if (!recoverTools) return entries.map(messageForModel)
+function modelMessages(entries: ConversationMessage[], recoverTools: boolean, files?: AttachmentReader): ModelMessage[] {
+  if (!recoverTools) return entries.map(entry => messageForModel(entry, files))
   const results = new Map<string, Map<number, ModelMessage>>()
   for (const entry of entries) {
     const { toolCall } = entry
@@ -56,7 +79,7 @@ function modelMessages(entries: ConversationMessage[], recoverTools: boolean): M
   return entries.flatMap((entry): ModelMessage[] => {
     const { id, message } = entry
     if (message.role === 'toolResult') return []
-    if (message.role !== 'assistant') return [messageForModel(entry)]
+    if (message.role !== 'assistant') return [messageForModel(entry, files)]
     const calls = message.content.flatMap((call, index) => call.type === 'toolCall' ? [{ call, index }] : [])
     if (!calls.length) return [message]
     if (calls.some(({ call }) => !call.id.trim()) || new Set(calls.map(({ call }) => call.id)).size !== calls.length) {
@@ -70,8 +93,8 @@ function modelMessages(entries: ConversationMessage[], recoverTools: boolean): M
   })
 }
 
-export function buildModelHistory(entries: ConversationMessage[], latest?: LatestCompaction, recoverTools = false): ModelMessage[] {
-  const messages = modelMessages(effectiveEntries(entries, latest), recoverTools)
+export function buildModelHistory(entries: ConversationMessage[], latest?: LatestCompaction, recoverTools = false, files?: AttachmentReader): ModelMessage[] {
+  const messages = modelMessages(effectiveEntries(entries, latest), recoverTools, files)
   if (latest) {
     const files = latest.fileOperations ? `\n\n工具确认的文件操作（readFiles 仅读，modifiedFiles 已改）：${JSON.stringify(latest.fileOperations)}` : ''
     const summary = latest.summary + files
@@ -85,7 +108,7 @@ export function buildModelHistory(entries: ConversationMessage[], latest?: Lates
 
 export function prepareCompaction(
   entries: ConversationMessage[], latest: LatestCompaction | undefined,
-  keepRecentTokens: number, includeThinking: boolean, recoverTools = false, model?: ModelInfo,
+  keepRecentTokens: number, includeThinking: boolean, recoverTools = false, model?: ModelInfo, files?: Pick<SessionAttachments, 'path'>,
 ): CompactionPreparation {
   const effective = effectiveEntries(entries, latest)
   const last = effective.at(-1)
@@ -93,7 +116,7 @@ export function prepareCompaction(
   let tokens = 0
   let firstKept = 0
   for (let index = effective.length - 1; index >= 0; index--) {
-    tokens += estimateMessageTokens(messageForModel(effective[index]), includeThinking, model)
+    tokens += estimateMessageTokens(messageForModel(effective[index], files), includeThinking, model)
     if (tokens >= keepRecentTokens) {
       firstKept = index
       // A tool result cannot survive without the assistant's entire call batch.
@@ -116,7 +139,7 @@ export function prepareCompaction(
   const modifiedFiles = [...modified].sort()
   return {
     status: 'ready', ...(latest && { previousSummary: latest.summary }),
-    messagesToSummarize: structuredClone(modelMessages(effective.slice(0, firstKept), recoverTools)),
+    messagesToSummarize: structuredClone(modelMessages(effective.slice(0, firstKept), recoverTools, files)),
     firstKeptMessageId, contextLastMessageId: last.id,
     ...(readFiles.length || modifiedFiles.length ? { fileOperations: { readFiles, modifiedFiles } } : {}),
   }

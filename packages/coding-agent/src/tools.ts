@@ -5,10 +5,12 @@ import type { Tool, ToolResultMessage } from '@agent-learning/model'
 import { createLocalTools, type LocalToolContext } from './local-tools.js'
 import type { WebTools } from './web-tools.js'
 import type { ToolRuntime } from './tool-runtime.js'
+import { planBashDescription, planGitArgs } from './plan-mode.js'
 
 const readParameters = Type.Object({
   path: Type.String({ description: '要读取的本地文件路径' }),
   offset: Type.Optional(Type.Number({ description: '读取文本时的起始行号，从 1 开始' })),
+  column: Type.Optional(Type.Number({ description: '读取文本时起始行内的 UTF-8 字节列，从 1 开始；续读长行时用返回的值' })),
   limit: Type.Optional(Type.Number({ description: '读取文本时的最大行数' })),
 })
 
@@ -73,7 +75,7 @@ const declarations = {
   web_fetch: { name: 'web_fetch', description: '获取指定网页的正文。', parameters: webFetchParameters },
 } satisfies Record<string, Tool>
 
-export type CodingTool = ExecutableTool & { promptSnippet?: string }
+export type CodingTool = ExecutableTool & { promptSnippet?: string; planVersion?: CodingTool }
 
 const promptSnippets: Record<string, string> = {
   bash: '在当前工作目录执行 Bash 命令。',
@@ -123,9 +125,16 @@ function executable<Schema extends TSchema>(
 
 export function createTools(runtime: ToolRuntime, web: WebTools, cwd: string): CodingTool[] {
   const local = createLocalTools(runtime)
+  const planBash = executable({ ...declarations.bash, description: planBashDescription }, async ({ command, timeout }, { cwd, signal }) => {
+    const args = planGitArgs(command)
+    if (!args) throw new Error(planBashDescription)
+    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) throw new Error('timeout 必须是正数')
+    return runtime.gitReadOnly(args, cwd, signal, timeout)
+  }, cwd)
+  planBash.promptSnippet = planBashDescription
   return [
     executable(declarations.read, local.read, cwd, 'read'),
-    executable(declarations.bash, local.bash, cwd),
+    { ...executable(declarations.bash, local.bash, cwd), planVersion: planBash },
     executable(declarations.edit, local.edit, cwd, 'modified'),
     executable(declarations.write, local.write, cwd, 'modified'),
     executable(declarations.find, local.find, cwd),

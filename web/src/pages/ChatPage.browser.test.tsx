@@ -883,3 +883,207 @@ test('超限压缩由页面状态显示，本轮详情在压缩和恢复时隐�
     await expect(page.getByRole('region', { name: '消息列表' })).not.toContainText('回答生成失败')
   }
 })
+
+test('截图或文件粘贴不接管普通文字，PDF 显示支持格式', async ({ mount, page }) => {
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.focus()
+
+  await editor.evaluate(root => {
+    const data = new DataTransfer()
+    data.setData('text/plain', '保留正文\n第二行')
+    root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }))
+  })
+  await expect(editor).toHaveText('保留正文第二行')
+  await editor.evaluate(root => {
+    const data = new DataTransfer()
+    data.items.add(new File(['%PDF'], 'report.pdf', { type: 'application/pdf' }))
+    root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }))
+  })
+  await expect(page.getByRole('alert')).toContainText('支持 PNG、JPG、WebP 图片，以及 TXT、Markdown、CSV、JSON 和 UTF-8 源代码。')
+  await expect(editor).toHaveText('保留正文第二行')
+  await expect(page.getByText('report.pdf')).toHaveCount(0)
+})
+
+test('@ 候选优先显示同工作区，最多选择三个不同的会话', async ({ mount, page }) => {
+  const session = (id: string, name: string, workspaceId = 'workspace-1') => ({ id, name, workspaceId, createdAt: '2026-11-18T08:00:00Z' })
+  await page.evaluate(key => localStorage.setItem(key, 'session-a'), recentSessionKey)
+  await mount(<ChatPageHarness modelConfigured sessions={[
+    session('session-a', '当前会话'), session('session-e', '另一工作区', 'workspace-2'),
+    session('session-b', '服务启动'), session('session-c', '测试结果'), session('session-d', '上线过程'),
+  ]} />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const menu = page.getByRole('listbox', { name: '引用会话' })
+  const choose = async (name: string) => {
+    await editor.pressSequentially('@')
+    await menu.getByRole('option', { name: `Session · ${name}`, exact: true }).click()
+  }
+  await editor.pressSequentially('@')
+  await expect(menu.getByRole('option').first()).toHaveText('Session · 服务启动')
+  await expect(menu.getByRole('option', { name: 'Session · 当前会话' })).toHaveCount(0)
+  await menu.getByRole('option', { name: 'Session · 服务启动', exact: true }).click()
+  await choose('服务启动')
+  await choose('测试结果')
+  await choose('上线过程')
+  await choose('另一工作区')
+  await expect(page.getByRole('alert')).toContainText('一条消息最多引用 3 个会话')
+  const references = page.getByRole('group', { name: '已引用会话' })
+  await expect(references.getByRole('button')).toHaveCount(3)
+  await expect(references).not.toContainText('另一工作区')
+  await editor.pressSequentially('/')
+  await expect(page.getByRole('option', { name: /compact/ })).toBeVisible()
+})
+
+test('待审计划来自服务端状态，继续讨论后聚焦输入框', async ({ mount, page }) => {
+  await page.route('**/api/sessions/session-a/plan/review', async route => {
+    expect(route.request().postDataJSON()).toEqual({ planId: 'assistant-plan', action: 'discuss' })
+    await route.fulfill({ status: 200, json: {} })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const update = (state: 'review' | 'planning') => page.evaluate(state => {
+    const plan = state === 'review' ? { state, assistantMessageId: 'assistant-plan', steps: ['查看日志', '复查错误'] } : { state }
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null, snapshot: {
+        seq: state === 'review' ? 1 : 2, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [], permissionMode: 'normal', plan,
+      },
+    } }))
+  }, state)
+  await expect(page.getByRole('button', { name: '确认执行' })).toHaveCount(0)
+  await update('review')
+  const card = page.getByRole('region', { name: '待确认计划' })
+  await expect(card.getByRole('listitem')).toHaveText(['查看日志', '复查错误'])
+  await expect(card.getByRole('button')).toHaveCount(2)
+  const discussed = page.waitForResponse('**/api/sessions/session-a/plan/review')
+  await card.getByRole('button', { name: '去聊天里说' }).click()
+  await discussed
+  await update('planning')
+  await expect(card).toBeHidden()
+  await expect(editor).toBeFocused()
+  await expect(page.getByRole('button', { name: '退出计划模式', exact: true })).toBeVisible()
+})
+
+test('移除上传中的文件后忽略晚到回执，失败附件重试成功后按有效 ID 发送', async ({ mount, page }) => {
+  let releaseUpload!: () => void
+  const delayedUpload = new Promise<void>(resolve => { releaseUpload = resolve })
+  let attempts = 0
+  await page.route('**/api/attachments?*', async route => {
+    const name = route.request().headers()['x-attachment-name']
+    expect(new URL(route.request().url()).searchParams.get('sessionId')).toBe('session-a')
+    if (name === 'removed.png') {
+      await delayedUpload
+      await route.fulfill({ json: { id: 'removed', name, size: 9, mediaType: 'image/png' } }).catch(() => undefined)
+      return
+    }
+    if (++attempts === 1) {
+      await route.fulfill({ status: 500, json: { error: '上传暂时不可用' } })
+      return
+    }
+    await route.fulfill({ json: { id: 'current', name, size: 24, mediaType: 'text/plain' } })
+  })
+  let sent: { clientMessageId: string; text: string; attachmentIds: string[] } | undefined
+  let acceptSend!: () => void
+  const delayedSend = new Promise<void>(resolve => { acceptSend = resolve })
+  await page.route('**/api/messages', async route => {
+    sent = route.request().postDataJSON()
+    await delayedSend
+    await route.fulfill({ status: 202, json: { sessionId: 'session-a', userMessageId: 'accepted', clientMessageId: sent!.clientMessageId, acceptedSeq: 1, kind: 'message' } })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  const drafts = page.getByRole('group', { name: '待发送附件' })
+  await editor.fill('分析正文')
+  await page.locator('input[type=file]').setInputFiles([
+    { name: 'removed.png', mimeType: 'image/png', buffer: Buffer.from('mock-png') },
+    { name: 'log.txt', mimeType: 'text/plain', buffer: Buffer.from('mock-log') },
+  ])
+  await expect(drafts.getByRole('img', { name: 'removed.png' })).toBeVisible()
+  await drafts.getByRole('button', { name: '移除 removed.png' }).click()
+  releaseUpload()
+  await expect(drafts.getByRole('button', { name: '重试 log.txt' })).toBeVisible()
+  await expect(send).toBeDisabled()
+  await expect(editor).toHaveText('分析正文')
+  await drafts.getByRole('button', { name: '重试 log.txt' }).click()
+  await expect(send).toBeEnabled()
+  await expect(drafts.getByRole('img', { name: 'removed.png' })).toHaveCount(0)
+  await send.click()
+  await expect.poll(() => sent?.attachmentIds).toEqual(['current'])
+  await expect(editor).toHaveText('分析正文')
+  await expect(drafts).toBeVisible()
+  acceptSend()
+  await expect(editor).toBeEmpty()
+  await expect(drafts).toHaveCount(0)
+})
+
+test('引用读取失败时保留原草稿，未收到回执时用同一编号和引用重试', async ({ mount, page }) => {
+  const sessions = [
+    { id: 'session-a', name: '当前会话', workspaceId: 'workspace-1', createdAt: '2026-11-18T08:00:00Z' },
+    { id: 'source', name: '源会话', workspaceId: 'workspace-1', createdAt: '2026-11-18T08:00:00Z' },
+  ]
+  const submissions: { clientMessageId: string; text: string; referenceSessionIds: string[] }[] = []
+  await page.route('**/api/messages', async route => {
+    const input = route.request().postDataJSON()
+    submissions.push(input)
+    if (submissions.length === 1) {
+      await route.fulfill({ status: 400, json: { error: '无法读取引用会话，请重试或移除此引用' } })
+    } else if (submissions.length === 2) {
+      await route.abort('failed')
+    } else {
+      await route.fulfill({ status: 202, json: { kind: 'message', sessionId: 'session-a', userMessageId: 'accepted', clientMessageId: input.clientMessageId, acceptedSeq: 1 } })
+    }
+  })
+  await page.evaluate(key => localStorage.setItem(key, 'session-a'), recentSessionKey)
+  await mount(<ChatPageHarness modelConfigured sessions={sessions} />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.pressSequentially('@')
+  await page.getByRole('option', { name: 'Session · 源会话' }).click()
+  await editor.fill('服务是如何启动的？')
+  await editor.press('Enter')
+  await expect(page.getByRole('alert')).toContainText('无法读取引用会话')
+  await expect(editor).toHaveText('服务是如何启动的？')
+  await expect(page.getByRole('group', { name: '已引用会话' })).toContainText('源会话')
+
+  await editor.press('Enter')
+  await page.getByRole('button', { name: '重试发送', exact: true }).click()
+  await expect(editor).toBeEmpty()
+  await expect(page.getByRole('group', { name: '已引用会话' })).toHaveCount(0)
+  expect(submissions).toHaveLength(3)
+  expect(submissions[1]).toEqual(submissions[2])
+  expect(submissions[2]).toMatchObject({ text: '服务是如何启动的？', referenceSessionIds: ['source'] })
+})
+
+test('草稿进入计划时复用已创建的会话，失败保留命令可重试', async ({ mount, page }) => {
+  let creates = 0
+  let submissions = 0
+  await page.route('**/api/sessions', async route => {
+    creates++
+    await route.fulfill({ status: 201, json: {
+      id: 'created-after-plan', name: '新会话', workspaceId: 'workspace-1', createdAt: '2026-11-18T08:00:00Z',
+    } })
+  })
+  await page.route('**/api/model-selection', route => route.fulfill({ status: 200, json: { modelId: 'deepseek-flash', provider: 'deepseek' } }))
+  await page.route('**/api/messages', route => {
+    const input = route.request().postDataJSON()
+    expect(input).toMatchObject({ text: '/plan', sessionId: 'created-after-plan' })
+    submissions++
+    return submissions === 1
+      ? route.fulfill({ status: 500, json: { error: '请求失败，请重试' } })
+      : route.fulfill({ status: 202, json: { kind: 'handled', sessionId: input.sessionId, clientMessageId: input.clientMessageId, notices: [] } })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const workspace = page.getByRole('group', { name: 'workspace', exact: true })
+  await workspace.getByRole('button', { name: '新建会话', exact: true }).click()
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  await editor.fill('/plan')
+  await expect(send).toBeEnabled()
+  await editor.press('Enter')
+  await expect(page.getByRole('alert')).toBeVisible()
+  await expect(editor).toHaveText('/plan')
+  await expect(send).toBeEnabled()
+  await editor.press('Enter')
+  await expect(page.locator('.chat-page')).toHaveAttribute('data-session-id', 'created-after-plan')
+  expect(creates).toBe(1)
+  expect(submissions).toBe(2)
+})

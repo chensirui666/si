@@ -28,12 +28,20 @@ async function setup(options: Partial<ConstructorParameters<typeof WebServer>[0]
   const workspace = await realpath(await mkdir(join(dir, 'workspace')).then(() => join(dir, 'workspace')))
   const config = { port: 0, webRoot, skillHome: join(dir, 'skill-home'), globalContextDirectory: join(dir, 'global-context'), workspacePath: join(dir, 'private/workspaces.json'),
     webSettingsPath: join(dir, 'private/settings.json'), ...(!options.createSession && { sessionPath: join(dir, 'private/sessions.sqlite') }), directoryPicker: async () => workspace, browserSecretPath: join(dir, 'private/browser-auth.json'), modelAuthPath: join(dir, 'private/auth.json'), ...options }
+  const fixtureFetch = config.modelOptions?.fetch
+  if (fixtureFetch) config.modelOptions = { ...config.modelOptions, fetch: (url, init) => {
+    const input = JSON.parse(String(init?.body))
+    if (String(input.messages?.[0]?.content).startsWith('你是会话标题生成器。')) {
+      return Promise.resolve(new Response(JSON.stringify({ error: { message: 'No fixture title' } }), { status: 400 }))
+    }
+    return fixtureFetch(url, init)
+  } }
   const server = new WebServer(config)
   const started = await server.start()
   cleanups.push(() => server.close())
   return { server, ...started, config, workspace }
 }
-function http(url: string, headers: Record<string, string> = {}, method = 'GET', body?: string) {
+function http(url: string, headers: Record<string, string> = {}, method = 'GET', body?: string | Buffer) {
   return new Promise<{ status: number; headers: import('node:http').IncomingHttpHeaders; text: string }>((resolve, reject) => {
     const req = request(url, { headers, method }, res => {
       let text = ''
@@ -1164,7 +1172,7 @@ describe('首次发送', () => {
       expect(b.status).toBe(202)
       const accepted = JSON.parse(a.text)
       expect(accepted).toEqual({
-        session: { id: input.clientMessageId, workspaceId: input.workspaceId, name: '会话 1', createdAt: expect.any(String) },
+        session: { id: input.clientMessageId, workspaceId: input.workspaceId, name: '新会话', createdAt: expect.any(String) },
         accepted: { sessionId: input.clientMessageId, clientMessageId: input.clientMessageId, kind: 'message', userMessageId: expect.any(String), acceptedSeq: 1 },
       })
       expect(JSON.parse(b.text)).toEqual(accepted)
@@ -1251,8 +1259,8 @@ describe('会话路由', () => {
     const second = await http(path, headers, 'POST', JSON.stringify({ workspaceId }))
     expect(second.status).toBe(201)
     const a = JSON.parse(first.text), b = JSON.parse(second.text)
-    expect(a).toMatchObject({ id: expect.any(String), workspaceId, name: '会话 1', createdAt: expect.any(String) })
-    expect(b).toMatchObject({ id: expect.any(String), workspaceId, name: '会话 2', createdAt: expect.any(String) })
+    expect(a).toMatchObject({ id: expect.any(String), workspaceId, name: '新会话', createdAt: expect.any(String) })
+    expect(b).toMatchObject({ id: expect.any(String), workspaceId, name: '新会话', createdAt: expect.any(String) })
     expect(a.id).not.toBe(b.id)
     expect(JSON.parse((await http(path, headers)).text)).toEqual({ sessions: [a, b] })
     const subscribe = (sessionId: string, subscriptionId: string) => {
@@ -1403,7 +1411,7 @@ it('服务关闭同时停止两个会话并等待各自收尾', async () => {
   const auth = await cookie(app.authUrl), headers = { Cookie: auth, 'Content-Type': 'application/json' }
   const workspaceId = await pickWorkspace(app.url, auth)
   const sessions = await Promise.all([createSession(app.url, auth, workspaceId), createSession(app.url, auth, workspaceId)])
-  expect(sessions.map(session => session.name).sort()).toEqual(['会话 1', '会话 2'])
+  expect(sessions.map(session => session.name)).toEqual(['新会话', '新会话'])
   try {
     const replies = await Promise.all(sessions.map(({ id: sessionId }) => http(app.url + '/api/messages', headers, 'POST', JSON.stringify({
       sessionId, clientMessageId: 'closing', modelId: 'deepseek-flash', text: '等待关闭',
@@ -2188,5 +2196,82 @@ describe('Feature 4 personal extensions from the HTTP entry', () => {
     } finally {
       await writeFile(release, '')
     }
+  })
+})
+
+describe('聊天页附件与引用', () => {
+  it('其他会话不能使用附件 ID（12）', async () => {
+    const upstream = vi.fn<typeof fetch>(async () => new Response('', { status: 400 }))
+    const app = await setup({ modelOptions: { fetch: upstream } })
+    const auth = await cookie(app.authUrl)
+    const workspace = await pickWorkspace(app.url, auth)
+    const owner = await createSession(app.url, auth, workspace)
+    const other = await createSession(app.url, auth, workspace)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', JSON.stringify({ apiKey: 'fake-test-key' }))).status).toBe(200)
+    const upload = await http(app.url + '/api/attachments?sessionId=' + owner.id,
+      { Cookie: auth, 'Content-Type': 'application/octet-stream', 'X-Attachment-Name': 'notes.txt' }, 'POST', '启动日志')
+    expect(upload.status).toBe(201)
+    const id = JSON.parse(upload.text).id as string
+    const send = (sessionId: string) => http(app.url + '/api/messages', headers, 'POST',
+      JSON.stringify({ sessionId, clientMessageId: 'upload-test', text: '查看', modelId: 'deepseek-flash', attachmentIds: [id] }),
+    )
+    expect((await send(other.id)).text).toContain('不属于此会话草稿')
+    expect((await serverSnapshot(app.url, auth, owner.id)).messages).toEqual([])
+    expect((await serverSnapshot(app.url, auth, other.id)).messages).toEqual([])
+    expect(upstream).not.toHaveBeenCalled()
+    expect((await http(app.url + '/api/attachments/' + id, headers)).status).toBe(404)
+    expect((await send(owner.id)).status).toBe(202)
+    const sent = await http(app.url + '/api/attachments/' + id, headers)
+    expect(sent.headers['content-type']).toBe('text/plain; charset=utf-8')
+    expect(sent.text).toBe('启动日志')
+    expect((await http(app.url + '/api/attachments/' + id)).status).toBe(401)
+  })
+
+  it('从发送时的已提交可见正文引用其他工作区，去重、限制数量并保留原请求回执（14/17/20）', async () => {
+    const requests: { messages: { role: string; content: string }[] }[] = []
+    const app = await setup({ modelOptions: { fetch: async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)))
+      return new Response(`data: ${JSON.stringify({
+        id: 'refs-controlled', choices: [{ index: 0, delta: { content: '已确认原决定' }, finish_reason: 'stop' }],
+      })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } })
+    } } })
+    const auth = await cookie(app.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const post = (path: string, body: unknown) => http(app.url + path, headers, 'POST', JSON.stringify(body))
+    const work = await pickWorkspace(app.url, auth)
+    const externalPath = join(app.workspace, '..', 'reference-workspace')
+    await mkdir(externalPath)
+    const externalId = randomUUID()
+    const file = JSON.parse(await readFile(app.config.workspacePath, 'utf8'))
+    file.workspaces.push({ id: externalId, path: externalPath })
+    await writeFile(app.config.workspacePath, JSON.stringify(file))
+    expect((await http(app.url + '/api/providers/deepseek', headers, 'PUT', JSON.stringify({ apiKey: 'controlled-test-key' }))).status).toBe(200)
+
+    const sources = await Promise.all(Array.from({ length: 4 }, () => createSession(app.url, auth, externalId)))
+    const source = sources[0]!
+    const target = await createSession(app.url, auth, work)
+    const send = (sessionId: string, text: string, referenceSessionIds: string[] = []) => post('/api/messages', {
+      sessionId, modelId: 'deepseek-flash', text, clientMessageId: 'same-id-within-session', referenceSessionIds,
+    })
+    expect((await send(source.id, '原决定：使用青色与白色')).status).toBe(202)
+    await vi.waitFor(async () => expect((await serverSnapshot(app.url, auth, source.id)).running).toBeNull())
+    expect((await send(target.id, '依照引用总结', sources.map(item => item.id))).text).toContain('最多引用 3 个会话')
+    expect((await send(target.id, '依照引用总结', ['missing'])).text).toContain('无法读取引用会话')
+    expect((await serverSnapshot(app.url, auth, target.id)).messages).toEqual([])
+    const references = [source.id, source.id, sources[1]!.id, sources[2]!.id]
+    const accepted = await send(target.id, '依照引用总结', references)
+    expect(accepted.status).toBe(202)
+    expect(JSON.parse((await send(target.id, '依照引用总结', [...new Set(references)])).text)).toEqual(JSON.parse(accepted.text))
+    expect((await send(target.id, '依照引用总结', [source.id])).status).toBe(409)
+    await vi.waitFor(() => expect(requests).toHaveLength(2))
+    const input = requests[1]!.messages.at(-1)!.content
+    expect(input).toContain('原决定：使用青色与白色')
+    expect(input).toContain('已确认原决定')
+    expect(input).not.toContain('"snapshot"')
+    const user = (await serverSnapshot(app.url, auth, target.id)).messages[0]!
+    expect(user.message.content).toBe('依照引用总结')
+    expect(user.references).toHaveLength(3)
+    expect(user.references?.[0]).toEqual({ sourceSessionId: source.id, label: '原决定：使用青色与白色' })
   })
 })

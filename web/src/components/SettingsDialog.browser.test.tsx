@@ -155,7 +155,7 @@ test('切换英文后，已有错误摘要更新并保留诊断原文', async ({
     json: { language: route.request().method() === 'GET' ? 'zh-CN' : 'en' },
   }))
   await mount(<ChatPageHarness />, { hooksConfig: { loadSavedLanguage: true } })
-  await expect(page.locator('[data-session-id]')).toHaveAttribute('data-session-id', 'session-a')
+  await expect(page.locator('.chat-page[data-session-id]')).toHaveAttribute('data-session-id', 'session-a')
   await page.evaluate(() => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: 'Provider quota exceeded', snapshot: null,

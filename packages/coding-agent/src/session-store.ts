@@ -5,16 +5,25 @@ import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import type { SessionSummary } from './sessions.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
 import { extensionMessage, isJson, object } from './extensions/runtime.js'
+import { planCommandArgument } from './plan-mode.js'
 import { skillCommand } from './skills.js'
-import type { CompactionRecord, ConversationMessage, RunRecord, SubmissionAccepted } from './types.js'
+import type { AttachmentScope, MessageAttachment, StagedAttachment } from './session-attachments.js'
+import type { ReferenceSource } from './session-references.js'
+import { numberedSessionTitle, temporarySessionTitle } from './session-title.js'
+import type { CompactionRecord, ConversationMessage, PlanState, RunRecord, SubmissionAccepted, SubmissionInput } from './types.js'
 
-export type StoredRun = Omit<RunRecord, 'restored'> & { text: string; finalText?: string; acceptedSeq: number; firstPermissionMode?: PermissionMode }
+export type StoredRun = Omit<RunRecord, 'restored'> & {
+  text: string; finalText?: string; acceptedSeq: number; firstPermissionMode?: PermissionMode; approvedPlanId?: string
+  attachmentIds?: string[]; referenceSessionIds?: string[]; firstTitle?: string
+}
 export type SessionHistory = {
   summary: SessionSummary
   runs: StoredRun[]
   messages: ConversationMessage[]
   compactions: CompactionRecord[]
   permissionMode: PermissionMode
+  plan?: PlanState
+  planCommands?: SubmissionInput[]
   modelSelection?: ModelSelection
 }
 export type SessionPersistence = {
@@ -25,15 +34,25 @@ export type SessionPersistence = {
 }
 type SessionWrite = {
   summary?: SessionSummary
+  name?: { value: string; expected: string }
+  attachments?: { ids: readonly string[]; scope: AttachmentScope; cutoff: number }
   run?: StoredRun
   runId?: string
   messages?: ConversationMessage[]
   compaction?: CompactionRecord
   modelSelection?: ModelSelection
   permissionMode?: PermissionMode
+  plan?: PlanState | null
+  planCommand?: SubmissionInput
   defaultSelection?: ModelSelection
 }
 type Row = Record<string, SQLOutputValue>
+
+function scopeWhere(scope: AttachmentScope): [string, string[]] {
+  return 'sessionId' in scope
+    ? ['staged_session = ?', [scope.sessionId]]
+    : ['workspace_id = ? AND draft_id = ?', [scope.workspaceId, scope.draftSessionId]]
+}
 
 function storedMessage(entry: ConversationMessage): ConversationMessage {
   const { message } = entry
@@ -42,6 +61,14 @@ function storedMessage(entry: ConversationMessage): ConversationMessage {
 }
 
 const schema = `
+  CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY, staged_session TEXT, workspace_id TEXT, draft_id TEXT, uploaded_at INTEGER NOT NULL,
+    data TEXT NOT NULL CHECK(json_valid(data)), bound_session TEXT REFERENCES sessions(id), bound_message TEXT,
+    CHECK((staged_session IS NOT NULL AND workspace_id IS NULL AND draft_id IS NULL)
+      OR (staged_session IS NULL AND workspace_id IS NOT NULL AND draft_id IS NOT NULL)),
+    CHECK((bound_session IS NULL) = (bound_message IS NULL)),
+    FOREIGN KEY (bound_session, bound_message) REFERENCES messages(session_id, id)
+  ) STRICT;
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY, workspaceId TEXT NOT NULL, name TEXT NOT NULL, createdAt TEXT NOT NULL
   ) STRICT;
@@ -66,6 +93,17 @@ const schema = `
     seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL,
     id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
     UNIQUE(session_id, id), FOREIGN KEY(session_id, run_id) REFERENCES runs(session_id, id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS session_plan_commands (
+    session_id TEXT NOT NULL REFERENCES sessions(id), client_id TEXT NOT NULL,
+    data TEXT NOT NULL CHECK(json_valid(data)), PRIMARY KEY(session_id, client_id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS session_plan_state (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id), state TEXT NOT NULL,
+    assistant_message_id TEXT, steps TEXT CHECK(json_valid(steps)),
+    CHECK((state = 'planning' AND assistant_message_id IS NULL AND steps IS NULL)
+      OR (state = 'review' AND assistant_message_id IS NOT NULL AND steps IS NOT NULL)),
+    FOREIGN KEY(session_id, assistant_message_id) REFERENCES messages(session_id, id)
   ) STRICT;
 `
 
@@ -121,6 +159,16 @@ export class SessionStore {
       db = new DatabaseSync(path)
       db.exec('PRAGMA locking_mode=EXCLUSIVE; PRAGMA synchronous=FULL; BEGIN EXCLUSIVE;')
       db.exec(schema)
+      if (db.prepare('PRAGMA user_version').get()?.user_version === 0) {
+        const legacy = db.prepare(`SELECT id, name, (SELECT json_extract(data, '$.text') FROM runs
+          WHERE session_id = sessions.id AND json_extract(data, '$.kind') = 'task' ORDER BY seq LIMIT 1) AS first
+          FROM sessions WHERE name GLOB '会话 [0-9]*'`).all()
+        const update = db.prepare('UPDATE sessions SET name = ? WHERE id = ?')
+        for (const { id, name, first } of legacy) if (typeof name === 'string' && numberedSessionTitle.test(name)) {
+          update.run((typeof first === 'string' && temporarySessionTitle(first)) || '新会话', id!)
+        }
+        db.exec('PRAGMA user_version=1')
+      }
       db.exec('COMMIT')
       return new SessionStore(db)
     } catch (error) {
@@ -131,7 +179,7 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, run, runId = run?.id, messages, compaction, modelSelection, defaultSelection, permissionMode }: SessionWrite) {
+  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand }: SessionWrite) {
     if (this.uncertain) throw new SessionWriteError('unconfirmed')
     let committing = false
     try {
@@ -140,10 +188,17 @@ export class SessionStore {
         this.db.prepare('INSERT INTO sessions (id, workspaceId, name, createdAt) VALUES (?, ?, ?, ?)')
           .run(summary.id, summary.workspaceId, summary.name, summary.createdAt)
       }
+      const renamed = name && this.db.prepare('UPDATE sessions SET name = ? WHERE id = ? AND name = ?')
+        .run(name.value, sessionId, name.expected).changes === 1
       if (permissionMode !== undefined) {
         this.db.prepare(`INSERT INTO session_permissions (session_id, mode) VALUES (?, ?)
           ON CONFLICT(session_id) DO UPDATE SET mode = excluded.mode`).run(sessionId, permissionMode)
       }
+      if (planCommand) {
+        this.db.prepare('INSERT INTO session_plan_commands (session_id, client_id, data) VALUES (?, ?, ?)')
+          .run(sessionId, planCommand.clientMessageId, JSON.stringify(planCommand))
+      }
+      if (plan === null) this.db.prepare('DELETE FROM session_plan_state WHERE session_id = ?').run(sessionId)
       if (run) {
         this.db.prepare(`INSERT INTO runs (session_id, id, client_id, data) VALUES (?, ?, ?, ?)
           ON CONFLICT(session_id, id) DO UPDATE SET data = excluded.data`)
@@ -152,6 +207,19 @@ export class SessionStore {
       if (messages?.length) {
         const insert = this.db.prepare('INSERT INTO messages (session_id, run_id, id, data) VALUES (?, ?, ?, ?)')
         for (const message of messages) insert.run(sessionId, runId!, message.id, JSON.stringify(storedMessage(message)))
+      }
+      if (attachments) {
+        const [condition, values] = scopeWhere(attachments.scope)
+        const bind = this.db.prepare(`UPDATE attachments SET bound_session = ?, bound_message = ?
+          WHERE id = ? AND bound_session IS NULL AND uploaded_at > ? AND ${condition}`)
+        for (const id of attachments.ids) if (bind.run(sessionId, runId!, id, attachments.cutoff, ...values).changes !== 1) {
+          throw new Error('Attachment ownership changed')
+        }
+      }
+      if (plan) {
+        this.db.prepare(`INSERT INTO session_plan_state (session_id, state, assistant_message_id, steps) VALUES (?, ?, ?, ?)
+          ON CONFLICT(session_id) DO UPDATE SET state = excluded.state, assistant_message_id = excluded.assistant_message_id, steps = excluded.steps`)
+          .run(sessionId, plan.state, plan.state === 'review' ? plan.assistantMessageId : null, plan.state === 'review' ? JSON.stringify(plan.steps) : null)
       }
       if (compaction) {
         this.db.prepare(`INSERT INTO compactions (session_id, run_id, id, data) VALUES (?, ?, ?, ?)
@@ -166,6 +234,7 @@ export class SessionStore {
       }
       committing = true
       this.db.exec('COMMIT')
+      return renamed === true
     } catch (error) {
       // SQLite may automatically roll back a failed statement. A failed COMMIT without an active transaction is ambiguous.
       if (this.db.isTransaction) {
@@ -173,6 +242,46 @@ export class SessionStore {
       } else if (committing) this.uncertain = true
       throw new SessionWriteError(this.uncertain ? 'unconfirmed' : sqliteCode(error) === 13 ? 'storage-full' : 'write-failed', error)
     }
+  }
+
+  registerAttachment({ scope, uploadedAt, ...attachment }: StagedAttachment) {
+    if (this.uncertain) throw new SessionWriteError('unconfirmed')
+    try {
+      this.db.prepare(`INSERT INTO attachments (id, staged_session, workspace_id, draft_id, uploaded_at, data)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(attachment.id,
+        'sessionId' in scope ? scope.sessionId : null, 'workspaceId' in scope ? scope.workspaceId : null,
+        'draftSessionId' in scope ? scope.draftSessionId : null, uploadedAt, JSON.stringify(attachment))
+    } catch (error) { throw new SessionWriteError(sqliteCode(error) === 13 ? 'storage-full' : 'write-failed', error) }
+  }
+
+  pendingAttachment(id: string, scope: AttachmentScope, cutoff: number): MessageAttachment | undefined {
+    if (this.uncertain) throw new SessionReadError('无法确认附件归属，请重启服务后重试')
+    const [condition, values] = scopeWhere(scope)
+    const row = this.db.prepare(`SELECT id, data FROM attachments
+      WHERE id = ? AND bound_session IS NULL AND uploaded_at > ? AND ${condition}`).get(id, cutoff, ...values)
+    return row && parse<MessageAttachment>(row)
+  }
+
+  sentAttachment(id: string): (MessageAttachment & { workspaceId: string }) | undefined {
+    if (this.uncertain) throw new SessionReadError('无法确认附件归属，请重启服务后重试')
+    const row = this.db.prepare(`SELECT a.id, a.data, s.workspaceId FROM attachments a
+      JOIN sessions s ON s.id = a.bound_session
+      JOIN messages m ON m.id = a.bound_message AND m.session_id = a.bound_session WHERE a.id = ?`).get(id)
+    return row && { ...parse<MessageAttachment>(row), workspaceId: String(row.workspaceId) }
+  }
+
+  expiredAttachments(cutoff: number): string[] {
+    if (this.uncertain) return []
+    return this.db.prepare('SELECT id FROM attachments WHERE bound_session IS NULL AND uploaded_at <= ?')
+      .all(cutoff).map(row => String(row.id))
+  }
+
+  hasAttachment(id: string): boolean {
+    return this.uncertain || this.db.prepare('SELECT 1 FROM attachments WHERE id = ?').get(id) !== undefined
+  }
+
+  forgetExpiredAttachment(id: string, cutoff: number) {
+    if (!this.uncertain) this.db.prepare('DELETE FROM attachments WHERE id = ? AND bound_session IS NULL AND uploaded_at <= ?').run(id, cutoff)
   }
 
   saveModelSelection(selection: ModelSelection, sessionId?: string) {
@@ -220,11 +329,27 @@ export class SessionStore {
     }
   }
 
+  readReferenceSource(id: string): ReferenceSource | undefined {
+    const history = this.loadSession(id)
+    if (!history) return
+    const capturedThroughSeq = this.db.prepare('SELECT MAX(seq) AS seq FROM messages WHERE session_id = ?').get(id)?.seq
+    return { summary: history.summary, capturedThroughSeq: Number(capturedThroughSeq ?? 0),
+      messages: history.messages.flatMap<ReferenceSource['messages'][number]>(({ message, extension }) => {
+        if (extension || (message.role !== 'user' && message.role !== 'assistant')) return []
+        const text = typeof message.content === 'string' ? message.content
+          : message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+        return text.trim() ? [{ role: message.role, text }] : []
+      }),
+    }
+  }
+
   private readHistory(summary: SessionSummary): SessionHistory {
     const runs = this.db.prepare('SELECT id, client_id, data FROM runs WHERE session_id = ? ORDER BY seq').all(summary.id)
       .map(row => {
         const run = parse<StoredRun>(row)
         if (run.sessionId !== summary.id || run.clientMessageId !== row.client_id || typeof run.text !== 'string'
+          || (run.approvedPlanId !== undefined && (typeof run.approvedPlanId !== 'string' || !run.approvedPlanId
+            || run.kind !== 'task' || run.clientMessageId !== `plan:${run.approvedPlanId}`))
           || (run.finalText !== undefined && (run.kind !== 'task' || typeof run.finalText !== 'string' || !run.finalText.trim()))
           || (run.firstPermissionMode !== undefined && !isPermissionMode(run.firstPermissionMode))
           || typeof run.modelId !== 'string' || !['task', 'compaction'].includes(run.kind)
@@ -312,6 +437,27 @@ export class SessionStore {
     const permission = this.db.prepare('SELECT mode FROM session_permissions WHERE session_id = ?').get(summary.id)
     const permissionMode = permission ? permission.mode : 'normal'
     if (!isPermissionMode(permissionMode)) throw new Error('Invalid session permission mode')
-    return { summary, runs, messages, compactions, permissionMode, ...(modelSelection && { modelSelection }) }
+    const row = this.db.prepare('SELECT state, assistant_message_id, steps FROM session_plan_state WHERE session_id = ?').get(summary.id)
+    let plan: PlanState | undefined
+    if (row?.state === 'planning') plan = { state: 'planning' }
+    else if (row?.state === 'review') {
+      const assistantMessageId = String(row.assistant_message_id)
+      const assistant = seen.get(assistantMessageId)
+      const reply = assistant?.entry.message
+      const steps: unknown = JSON.parse(String(row.steps))
+      if (!assistant || reply?.role !== 'assistant' || reply.stopReason !== 'stop' || byRun.get(assistant.runId)?.status !== 'completed'
+        || !Array.isArray(steps) || !steps.length || !steps.every(step => typeof step === 'string' && step.trim())) throw new Error('Invalid plan review')
+      plan = { state: 'review', assistantMessageId, steps }
+    } else if (row) throw new Error('Invalid plan state')
+    const planCommands = this.db.prepare('SELECT client_id, data FROM session_plan_commands WHERE session_id = ?').all(summary.id)
+      .map(row => {
+        const input: SubmissionInput = JSON.parse(String(row.data))
+        const argument = typeof input?.text === 'string' ? planCommandArgument(input.text) : undefined
+        if (input?.clientMessageId !== row.client_id || typeof input?.modelId !== 'string' || (argument !== '' && argument !== 'off')) {
+          throw new Error('Invalid plan command receipt')
+        }
+        return input
+      })
+    return { summary, runs, messages, compactions, permissionMode, ...(planCommands.length && { planCommands }), ...(modelSelection && { modelSelection }), ...(plan && { plan }) }
   }
 }

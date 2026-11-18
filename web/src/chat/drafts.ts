@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react'
-import { isPermissionMode, type PermissionMode, type StartSessionRequest } from '@agent-learning/server/protocol'
+import { isPermissionMode, type PermissionMode, type StartSessionRequest, type SubmitMessageRequest } from '@agent-learning/server/protocol'
 
 export const recentSessionKey = 'agent-learning:recent-session'
 export const recentWorkspaceKey = 'agent-learning:recent-workspace'
@@ -53,6 +53,46 @@ export function writeFirstSend(input: StartSessionRequest | null) {
     else sessionStorage.removeItem(firstSendKey)
   } catch { /* The current page retains the request for retries. */ }
 }
+type PlanDraft = { id: string; permissionMode: PermissionMode }
+const planDraftKey = (workspaceId: string) => `agent-learning:plan-draft:${workspaceId}`
+
+export function readPlanDraft(workspaceId: string): PlanDraft | undefined {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(planDraftKey(workspaceId)) ?? 'null')
+    if (typeof value?.id === 'string' && isPermissionMode(value.permissionMode)) return value
+  } catch { /* The active page still retains the created session. */ }
+}
+
+export function writePlanDraft(workspaceId: string, draft?: PlanDraft) {
+  try {
+    if (draft) sessionStorage.setItem(planDraftKey(workspaceId), JSON.stringify(draft))
+    else sessionStorage.removeItem(planDraftKey(workspaceId))
+  } catch { /* The active page still retains the created session. */ }
+}
+
+export type StoredSourceSend = { input: SubmitMessageRequest; text: string; edited?: true; afterMessageId?: string }
+const sourceSendsKey = 'agent-learning:source-sends'
+
+export function readSourceSends(): StoredSourceSend[] {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(sourceSendsKey) ?? 'null')
+    if (Array.isArray(value)) return value.filter(item => {
+      const input = item?.input
+      return typeof item?.text === 'string' && typeof input?.sessionId === 'string'
+        && typeof input.clientMessageId === 'string' && typeof input.modelId === 'string' && typeof input.text === 'string'
+    })
+  } catch { /* The active page retains requests if per-tab storage is unavailable. */ }
+  return []
+}
+
+export function writeSourceSends(requests: Iterable<StoredSourceSend>) {
+  try {
+    const entries = Array.from(requests, ({ input, text, edited, afterMessageId }) => ({ input, text, edited, afterMessageId }))
+    if (entries.length) sessionStorage.setItem(sourceSendsKey, JSON.stringify(entries))
+    else sessionStorage.removeItem(sourceSendsKey)
+  } catch { /* The active page retains requests if per-tab storage is unavailable. */ }
+}
+
 export const draftKey = (sessionId: string) => `agent-learning:draft:${sessionId}`
 
 const tabDraftKey = (sessionId: string) => `agent-learning:tab-draft:${sessionId}`
@@ -135,5 +175,6 @@ export function useDrafts() {
     return true
   }, [read, save])
   const revision = useCallback((sessionId: string) => entries.current.get(sessionId)?.revision ?? 0, [])
-  return { draft, storageUnavailable, load, save, restore, read, write, revision, clearSent }
+  const currentText = useCallback((key: string) => entries.current.get(key)?.text ?? '', [])
+  return { draft, currentText, storageUnavailable, load, save, restore, read, write, revision, clearSent }
 }

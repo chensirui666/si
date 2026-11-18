@@ -3,24 +3,37 @@ import type OpenAI from 'openai'
 import { transformMessages } from '@earendil-works/pi-ai/api/transform-messages'
 import { piModels } from './catalog.js'
 import type { Api, AssistantMessage as PiMessage, Context, Model } from '@earendil-works/pi-ai'
-import type { ContextEstimate, ModelContext, ModelMessage, ModelInfo, ToolCall } from './types.js'
-import { omittedToolImageIndexes } from './request-images.js'
+import type { ContextEstimate, ImageContent, ModelContext, ModelMessage, ModelInfo, ToolCall, UserMessage } from './types.js'
+import { omittedRequestImages } from './request-images.js'
 
 const emptyUsage: PiMessage['usage'] = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 }
 
+function userContent(content: UserMessage['content'], omitted = 0): UserMessage['content'] {
+  if (typeof content === 'string' || omitted === 0) return content
+  return content.map(block => {
+    if (block.type !== 'image' || omitted === 0) return block
+    omitted--
+    return { type: 'text', text: '[图片因请求预算已省略。]' }
+  })
+}
+
+function imagePart({ mimeType, data }: ImageContent): OpenAI.Chat.Completions.ChatCompletionContentPartImage {
+  return { type: 'image_url', image_url: { url: `data:${mimeType};base64,${data}` } }
+}
+
 export function toPiContext(context: ModelContext, target?: Model<Api>): Context {
   // Gemini 4 rejects foreign tool records without a native thought signature.
   const gemini4 = target?.api === 'google-generative-ai' && target.id.startsWith('gemini-4-')
   const foreignToolIds = new Set<string>()
-  const omittedImages = omittedToolImageIndexes(context)
+  const omittedImages = omittedRequestImages(context)
   return {
     ...context,
     messages: context.messages.map((message, index) => {
       if (message.role === 'toolResult') {
-        const content = omittedImages.has(index) ? [
+        const content = omittedImages.toolResults.has(index) ? [
           ...message.content.filter(block => block.type === 'text'),
           { type: 'text' as const, text: '[图片因请求预算已省略。]' },
         ] : message.content
@@ -34,6 +47,10 @@ export function toPiContext(context: ModelContext, target?: Model<Api>): Context
           }
         }
         return { ...message, content }
+      }
+      if (message.role === 'user') {
+        const { uploadMessageId: _uploadMessageId, ...user } = message
+        return { ...user, content: userContent(user.content, omittedImages.userMessages.get(index)) }
       }
       if (message.role !== 'assistant') return message
       const { usage, ...history } = message
@@ -67,7 +84,7 @@ export function convertMessages(context: ModelContext, includeThinking = Boolean
   const received = new Set<string>()
   const wireIds = new Map<string, string>()
   const heldSystems: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = []
-  const omittedImages = omittedToolImageIndexes(context)
+  const omittedImages = omittedRequestImages(context)
   let attachments: OpenAI.Chat.Completions.ChatCompletionContentPart[] = []
   const closeTools = () => {
     for (const call of pending) {
@@ -84,22 +101,26 @@ export function convertMessages(context: ModelContext, includeThinking = Boolean
   }
   for (const [index, message] of context.messages.entries()) {
     if (message.role === 'assistant' || message.role === 'user') closeTools()
-    if (message.role === 'system' || message.role === 'user') {
+    if (message.role === 'system') {
       const content = typeof message.content === 'string' ? message.content : message.content.map((block) => block.text).join('')
-      if (message.role === 'system' && pending.length) heldSystems.push({ role: 'system', content })
-      else messages.push({ role: message.role, content })
+      if (pending.length) heldSystems.push({ role: 'system', content })
+      else messages.push({ role: 'system', content })
+    } else if (message.role === 'user') {
+      const content = userContent(message.content, omittedImages.userMessages.get(index))
+      messages.push({ role: 'user', content: typeof content === 'string' ? content
+        : content.some(block => block.type === 'image')
+          ? content.map(block => block.type === 'text' ? { type: 'text', text: block.text } : imagePart(block))
+          : content.flatMap(block => block.type === 'text' ? [block.text] : []).join('') })
     } else if (message.role === 'toolResult') {
       received.add(message.toolCallId)
       const text = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
-      const omitted = omittedImages.has(index)
+      const omitted = omittedImages.toolResults.has(index)
       const attached = omitted ? [] : message.content.filter(block => block.type === 'image')
       const content = omitted ? `${text}\n[图片因请求预算已省略。]`.trimStart() : text
       messages.push({ role: 'tool', tool_call_id: wireIds.get(message.toolCallId) ?? message.toolCallId, content })
       if (attached.length) {
         attachments.push({ type: 'text', text: `工具 ${message.toolName}（${message.toolCallId}）返回的图片。${text}` })
-        for (const block of attached) {
-          attachments.push({ type: 'image_url', image_url: { url: `data:${block.mimeType};base64,${block.data}` } })
-        }
+        attachments.push(...attached.map(imagePart))
       }
     } else {
       const text = message.content.filter((block) => block.type === 'text').map((block) => block.text).join('')

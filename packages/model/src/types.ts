@@ -12,7 +12,8 @@ export type SystemMessage = {
 
 export type UserMessage = {
   role: 'user'
-  content: string | TextContent[]
+  content: string | (TextContent | ImageContent)[]
+  uploadMessageId?: string
   timestamp: number
 }
 
@@ -103,6 +104,7 @@ export type ModelInfo = {
   api: string
   contextWindow: number
   maxTokens: number
+  supportsImages?: boolean
   reasoningEfforts?: ReasoningEffort[]
   defaultReasoningEffort?: ReasoningEffort
 }
@@ -140,6 +142,7 @@ export type ModelContext = {
   messages: ModelMessage[]
   tools?: Tool[]
   omittedToolImageResults?: ReadonlySet<string>
+  currentUserMessageId?: string
 }
 
 export type Tool<TParameters extends TSchema = TSchema> = {

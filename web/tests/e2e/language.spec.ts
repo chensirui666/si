@@ -188,7 +188,7 @@ test('language changes while a response is streaming without reopening the chat'
     const stream = model.exchanges[0]!
     stream.delta({ role: 'assistant', content: '第一段回复。' })
     await expect(page.getByRole('region', { name: 'Messages' })).toContainText('第一段回复。')
-    const chat = page.locator('[data-session-id]')
+    const chat = page.locator('.chat-page[data-session-id]')
     const session = await chat.getAttribute('data-session-id')
     await editor.fill('  draft\n第二行  ')
     const closed = events.closed

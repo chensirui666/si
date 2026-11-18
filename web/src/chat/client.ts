@@ -3,7 +3,7 @@ import { isPermissionMode } from '@agent-learning/server/protocol'
 import type { WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
-import { applyFrame, extensionNotice, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
+import { applyFrame, messageAttachment, extensionNotice, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
 export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged, onExtensionNotice) => {
   let state: ChatState = initialState
@@ -343,7 +343,8 @@ function handledSubmission(value: unknown, id: string, key: 'sessionId' | 'draft
 }
 
 export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageResult> {
-  const value = await postSubmission('/api/messages', input)
+  const awaitsReceipt = input.attachmentIds?.length || input.referenceSessionIds?.length || ['/plan', '/plan off'].includes(input.text.trim())
+  const value = await postSubmission('/api/messages', input, awaitsReceipt ? AbortSignal.timeout(10_000) : undefined)
   const handled = input.text.trim() !== '/compact' && handledSubmission(value, input.clientMessageId, 'sessionId', input.sessionId)
   if (handled) return { ...handled, sessionId: input.sessionId }
   if (!acceptedSubmission(value, input.sessionId, input.clientMessageId, input.text.trim() === '/compact' ? 'compaction' : 'message')) {
@@ -362,4 +363,35 @@ export async function startSession(input: StartSessionRequest): Promise<StartSes
     throw new RequestError({ key: 'request.firstInvalid' })
   }
   return { session: value.session, accepted: value.accepted }
+}
+
+export type { MessageAttachment as Attachment } from '@agent-learning/server/protocol'
+export type AttachmentScope = { sessionId: string } | { workspaceId: string; draftSessionId: string }
+export const attachmentPath = (id: string) => `/api/attachments/${encodeURIComponent(id)}`
+
+export function uploadAttachment(scope: AttachmentScope, file: File, signal: AbortSignal) {
+  return requestView(`/api/attachments?${new URLSearchParams(scope)}`, 'attachment.uploadFailed',
+    messageAttachment,
+    { method: 'POST', headers: { 'X-Attachment-Name': encodeURIComponent(file.name) }, body: file, signal })
+}
+
+export function createSession(workspaceId: string, permissionMode: PermissionMode) {
+  return requestView('/api/sessions', 'chat.create', sessionSummary, {
+    ...putJson({ workspaceId, permissionMode }), method: 'POST', signal: AbortSignal.timeout(10_000),
+  })
+}
+
+export type PlanReviewAction = 'approve' | 'discuss'
+export async function reviewPlan(sessionId: string, planId: string, action: PlanReviewAction) {
+  let response: Response
+  try {
+    response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/plan/review`, {
+      ...putJson({ planId, action }), method: 'POST', credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10_000),
+    })
+  } catch {
+    throw new RequestError({ key: 'request.network' })
+  }
+  if (response.ok) return
+  const value: unknown = await response.json().catch(() => null)
+  throw new RequestError({ key: 'plan.reviewFailed', detail: record(value) && typeof value.error === 'string' ? value.error : undefined })
 }

@@ -73,10 +73,11 @@ test('Feature 4 06/19：原版 Pi 扩展在网页真模任务拦截、允许和�
     expect(await readFile(join(cwd, '.env'), 'utf8')).toBe('DEMO=before\n')
     expect(await readFile(join(cwd, 'README.md'), 'utf8')).toBe('README_DEMO=after\n')
 
+    const sessionId = (await page.locator('.chat-page').getAttribute('data-session-id'))!
     await server.close()
     await rename(installed, join(root, 'protected-paths.ts.disabled'))
     await authorize(page, (await server.start()).authUrl)
-    await openSession(page, observed, '会话 1')
+    await openSession(page, observed, sessionId)
     const disabled = (await send(['.env']))('.env')
     expect(disabled.message.isError).toBe(false)
     expect(await readFile(join(cwd, '.env'), 'utf8')).toBe('DEMO=after\n')

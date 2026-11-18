@@ -116,7 +116,8 @@ test('真实 DeepSeek 从原图读取并准确抄出缩图中的三段小字', a
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
-      modelRequests.push(JSON.parse(String(init?.body)))
+      const body = JSON.parse(String(init?.body))
+      if (!String(body.messages[0]?.content).startsWith('你是会话标题生成器。')) modelRequests.push(body)
       return globalThis.fetch(url, init)
     } },
   })
@@ -272,7 +273,8 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
-      modelRequests.push(JSON.parse(String(init?.body)))
+      const body = JSON.parse(String(init?.body))
+      if (!String(body.messages[0]?.content).startsWith('你是会话标题生成器。')) modelRequests.push(body)
       return globalThis.fetch(url, init)
     } },
   })
@@ -323,7 +325,7 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
     skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
-    modelOptions: { fetch: async (url, init) => { requests.push(JSON.parse(String(init?.body))); return globalThis.fetch(url, init) } },
+    modelOptions: { fetch: async (url, init) => { const body = JSON.parse(String(init?.body)); if (!String(body.messages[0]?.content).startsWith('你是会话标题生成器。')) requests.push(body); return globalThis.fetch(url, init) } },
   })
   try {
     await mkdir(cwd)
