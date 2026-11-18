@@ -14,10 +14,11 @@ it('提供八种具备用途说明的工具声明', async () => {
 it.each([
   {
     name: 'read',
-    fields: ['path', 'offset', 'limit'],
+    fields: ['path', 'offset', 'column', 'limit'],
     valid: [
       { path: 'note.txt' },
       { path: 'note.txt', offset: 1, limit: 5 },
+      { path: 'note.txt', offset: 1, column: 10 },
       { path: 'note.txt', offset: -0.5, limit: 0 },
       { path: 'note.txt', offset: 0, limit: 1.5 },
       { path: 'note.txt', offset: 1e12, limit: 1e12 },
@@ -26,6 +27,7 @@ it.each([
       {},
       { path: 1 },
       { path: 'note.txt', offset: '1' },
+      { path: 'note.txt', column: '10' },
       { path: 'note.txt', limit: '5' },
     ],
   },

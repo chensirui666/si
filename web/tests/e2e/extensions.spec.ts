@@ -14,6 +14,7 @@ test('Feature 4 草稿和正式会话处理 ping，正式工具卡使用实际�
     modelAuthPath: join(root, 'auth.json'), browserSecretPath: join(root, 'browser.json'),
     sessionPath: join(root, 'sessions.sqlite'), workspacePath: join(root, 'workspaces.json'), webSettingsPath: join(root, 'settings.json'),
     modelOptions: { fetch: async (_url, options) => {
+      if (String(options?.body).includes('你是会话标题生成器。')) return new Response('', { status: 400 })
       requests.push(String(options?.body))
       const first = requests.length === 1
       const delta = first ? { tool_calls: [{ index: 0, id: 'edit-1', function: { name: 'edit',
@@ -51,7 +52,7 @@ test('Feature 4 草稿和正式会话处理 ping，正式工具卡使用实际�
     await send('ping')
     await expect(page.getByText('pong 1', { exact: true })).toBeVisible()
     await expect(input).toHaveText('')
-    await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
+    await expect(page.locator('.workspace-conversation[data-session-id]')).toHaveCount(0)
     expect(requests).toHaveLength(0)
 
     await send('原始文本')

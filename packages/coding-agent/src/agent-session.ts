@@ -1,23 +1,27 @@
 import { randomUUID } from 'node:crypto'
 import { Agent } from '@agent-learning/agent'
 import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
-import { estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
+import { IMAGE_BUDGET_BYTES, estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelDiscovery, ModelEvent, ModelInfo, ModelSelection, ModelStreamOptions, ReasoningEffort } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
 import { SessionWriteError, runSelection, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
 import { discoverSkills, loadSkill, skillCommand, type SkillSummary } from './skills.js'
 import { withModelRetry } from './model-retry.js'
+import { extractPlan, planCommandArgument, planGitArgs, planInstruction, planReadTools } from './plan-mode.js'
 import { buildSystemPrompt } from './system-prompt.js'
 import { defaultTools, type CodingTool } from './tools.js'
 import { beforeStart, requestMessages, toolHooks } from './extensions/dispatch.js'
 import { ExtensionRuntime, extensionMessage, object, type ExtensionContext, type ExtensionEntry, type ExtensionEvents, type ExtensionMessage } from './extensions/runtime.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
-import type { CompactionRecord, ExtensionNotice, SubmissionAccepted, SubmissionHandled, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, RunRecord, RunningState, SaveFailure } from './types.js'
+import { access } from 'node:fs/promises'
+import { ATTACHMENT_TTL_MS, type AttachmentScope, type SessionAttachments } from './session-attachments.js'
+import { ReferenceInputError, prepareSessionReferences, removeReferenceSnapshots } from './session-references.js'
+import { generateSessionTitle, temporarySessionTitle } from './session-title.js'
+import { sameSubmissionSources, type SubmissionInput } from './types.js'
+import type { CompactionRecord, ExtensionNotice, SubmissionAccepted, SubmissionHandled, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, PlanState, RunRecord, RunningState, SaveFailure } from './types.js'
 
 type SubmissionResult = SubmissionAccepted | SubmissionHandled
-
-type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & { clientMessageId: string; text: string; permissionMode?: PermissionMode }
 
 const readOnlyTools = new Set(['read', 'grep', 'find', 'ls'])
 
@@ -43,7 +47,9 @@ export class AgentSession {
   private readonly sessionId: string
   private cwd?: string
   private readonly handled = new Map<string, { input: SubmissionInput; result: SubmissionHandled }>()
+  private readonly approvedPlans = new Map<string, SubmissionAccepted>()
   private readonly selectionNotifications = new Set<Promise<void>>()
+  private titleRequest?: { controller: AbortController; pending: Promise<void> }
   private readonly omittedToolImageResults = new Set<string>()
   private readonly state: ConversationSnapshot = { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
   private readonly listeners = new Set<(update: ConversationUpdate) => void>()
@@ -68,6 +74,11 @@ export class AgentSession {
     reportExtensionError?: (message: string, error: unknown) => void
     permissionMode?: PermissionMode
     stream?: typeof stream
+    titleStream?: typeof stream
+    onTitleChanged?: () => void
+    attachments?: SessionAttachments
+    referenceDirectory?: string
+    isWorkspaceRegistered?: (id: string) => Promise<boolean>
     tools?: (cwd: string) => CodingTool[]
     documentationRoot?: string
     skillHome?: string
@@ -82,12 +93,19 @@ export class AgentSession {
     this.state.permissionMode = history?.permissionMode ?? options.permissionMode ?? 'normal'
     if (history) {
       const last = history.runs.at(-1)
+      if (history.plan) this.state.plan = history.plan
       this.state.modelSelection = history.modelSelection ?? (last && runSelection(last))
       this.state.messages = history.messages
       this.state.compactions = history.compactions.map(record => record.status === 'running'
         ? { ...record, status: 'interrupted', finishedAt: Date.now(), reason: '服务中断，压缩未完成。' } : record)
       for (const entry of history.messages) this.savedMessages.add(entry.id)
-      for (const run of history.runs) this.storedRuns.set(run.clientMessageId, run)
+      for (const input of history.planCommands ?? []) {
+        this.handled.set(input.clientMessageId, { input, result: { kind: 'handled', clientMessageId: input.clientMessageId, notices: [] } })
+      }
+      for (const run of history.runs) {
+        this.storedRuns.set(run.clientMessageId, run)
+        if (run.approvedPlanId) this.approvedPlans.set(run.approvedPlanId, submissionReceipt(run))
+      }
       this.state.seq = history.runs.at(-1)?.acceptedSeq ?? 0
       if (history.runs.length) this.state.runs = history.runs.map(run => ({
         ...this.publicRun(run), restored: true, status: run.status === 'running' ? 'interrupted' : run.status,
@@ -181,25 +199,90 @@ export class AgentSession {
     this.publish({ type: 'permission', permissionMode })
   }
 
+  private availableTools(tools: CodingTool[], planning = Boolean(this.state.plan)): CodingTool[] {
+    if (this.state.permissionMode !== 'normal') return tools.filter(tool => readOnlyTools.has(tool.name))
+    if (!planning) return tools
+    return tools.flatMap(tool => planReadTools.has(tool.name) ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : [])
+  }
+
   private configure(cwd: string, tools: CodingTool[], files: ProjectContextFile[], skills: readonly SkillSummary[]) {
-    const available = this.state.permissionMode === 'normal' ? tools : tools.filter(tool => readOnlyTools.has(tool.name))
-    const declarations = available.map(({ name, description, parameters }) => ({ name, description, parameters }))
+    const declarations = tools.map(({ name, description, parameters }) => ({ name, description, parameters }))
     this.configuration = {
-      systemPrompt: buildSystemPrompt(cwd, available, this.options.documentationRoot, files, skills, this.options.skillHome),
+      systemPrompt: buildSystemPrompt(cwd, tools, this.options.documentationRoot, files, skills, this.options.skillHome),
       ...(declarations.length ? { tools: declarations } : {}),
     }
   }
 
+  private changePlan(plan: PlanState | null, planCommand?: SubmissionInput) {
+    const changed = plan !== (this.state.plan ?? null)
+    this.save({ plan: changed ? plan : undefined, planCommand })
+    if (!changed) return
+    this.state.plan = plan
+    this.publish({ type: 'plan', plan })
+  }
+
+  async reviewPlan(planId: string, action: 'approve' | 'discuss'): Promise<SubmissionAccepted | { plan: PlanState }> {
+    if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+    if (action !== 'approve' && action !== 'discuss') throw new SessionSubmitError('invalid', '评审动作无效')
+    const previous = action === 'approve' && this.approvedPlans.get(planId)
+    if (previous) return { ...previous }
+    const plan = this.state.plan
+    if (plan?.state !== 'review' || plan.assistantMessageId !== planId) {
+      throw new SessionSubmitError('invalid', '此方案已不是当前待审方案，请重新同步会话。')
+    }
+    if (action === 'discuss') {
+      if (this.submitting || this.state.running) throw new SessionSubmitError('busy', '正在接收或生成，请等待本次回答结束')
+      const planning = { state: 'planning' } as const
+      this.changePlan(planning)
+      return { plan: planning }
+    }
+    const selection = this.state.modelSelection
+    if (!selection) throw new SessionSubmitError('invalid', '请先选择执行方案使用的模型。')
+    const text = ['请执行已确认的方案。', '', 'Plan:', ...plan.steps.map((step, index) => `${index + 1}. ${step}`)].join('\n')
+    const result = await this.submitMessage({ ...selection, clientMessageId: `plan:${planId}`, text }, planId)
+    if (result.kind !== 'message') throw new Error('未接收计划执行轮')
+    return result
+  }
+
   async submit(input: SubmissionInput): Promise<SubmissionResult> {
+    if (typeof input?.clientMessageId === 'string' && input.clientMessageId.startsWith('plan:')) {
+      throw new SessionSubmitError('invalid', '提交编号无效')
+    }
+    return this.submitMessage(input)
+  }
+
+  private async submitMessage(input: SubmissionInput, approvedPlanId?: string): Promise<SubmissionResult> {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
     if (typeof input?.modelId !== 'string' || !input.provider && input.modelId !== 'deepseek-flash'
-      || typeof input.text !== 'string' || !input.text.trim()
+      || typeof input.text !== 'string' || (!input.text.trim() && !input.attachmentIds?.length)
       || typeof input.clientMessageId !== 'string' || !input.clientMessageId.trim() || input.clientMessageId.length > 128) {
       throw new SessionSubmitError('invalid', '请提交有效原文、支持的模型和临时编号')
     }
+    const planArgument = planCommandArgument(input.text)
+    const planControl = planArgument === '' || planArgument === 'off'
+    if ((planControl || input.text.trim() === '/compact') && (input.attachmentIds?.length || input.referenceSessionIds?.length)) {
+      throw new SessionSubmitError('invalid', '控制命令不能同时发送附件或会话引用')
+    }
     const selection = runSelection(input)
+    if (planArgument === 'off' && this.submitting) {
+      if (this.submitting.input.clientMessageId === input.clientMessageId) this.checkReplay(this.submitting.input, input, selection)
+      await this.submitting.settled.catch(() => undefined)
+      if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+    }
     const previous = this.replay(input, selection)
     if (previous) return previous
+    if (planControl) {
+      if (this.options.persistence?.first && !this.storedRuns.size) {
+        throw new SessionSubmitError('invalid', '请先创建会话，再开启计划模式。')
+      }
+      if (planArgument !== 'off' && (this.submitting || this.state.running)) {
+        throw new SessionSubmitError('busy', '正在接收或生成，请等待本次回答结束')
+      }
+      this.changePlan(planArgument === 'off' ? null : this.state.plan ?? { state: 'planning' }, input)
+      const result: SubmissionHandled = { kind: 'handled', clientMessageId: input.clientMessageId, notices: [] }
+      this.handled.set(input.clientMessageId, { input, result })
+      return structuredClone(result)
+    }
     const model = findModel(selection.modelId, selection.provider)
     if (!model) throw new SessionSubmitError('invalid', '当前模型不可用，请重新选择')
     if (model.reasoningEfforts
@@ -210,12 +293,17 @@ export class AgentSession {
       this.checkReplay(this.submitting.input, input, selection)
       await this.submitting.settled.catch(() => undefined)
       if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+      const approved = approvedPlanId && this.approvedPlans.get(approvedPlanId)
+      if (approved) return { ...approved }
       const accepted = this.replay(input, selection)
       if (accepted) return accepted
     }
     if (this.submitting || this.state.running) throw new SessionSubmitError('busy', '正在接收或生成，请等待本次回答结束')
+    if (this.state.plan?.state === 'review' && !approvedPlanId && input.text.trim() !== '/compact') {
+      throw new SessionSubmitError('busy', '请先确认当前方案，或选择去聊天里说。')
+    }
     const controller = this.preparing = new AbortController()
-    const promise = this.accept(input, selection, model, controller)
+    const promise = this.accept(input, selection, model, controller, approvedPlanId, planArgument)
     this.submitting = { input, settled: promise }
     try {
       return await promise
@@ -225,7 +313,7 @@ export class AgentSession {
     }
   }
 
-  private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo, controller: AbortController): Promise<SubmissionResult> {
+  private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo, controller: AbortController, approvedPlanId?: string, planArgument?: string): Promise<SubmissionResult> {
     const { signal } = controller
     const cwd = await this.options.resolveDirectory()
     const directory = await this.options.discoverModels?.()
@@ -241,8 +329,9 @@ export class AgentSession {
     const initializing = this.initialize(cwd, model)
     if (initializing) await initializing
     this.checkPreparing(signal)
-    let text = input.text
-    if (!manual && this.runtime?.has('input')) {
+    const submittedText = planArgument ?? input.text
+    let text = submittedText
+    if (!manual && !approvedPlanId && this.runtime?.has('input')) {
       const notices: ExtensionNotice[] = []
       const result = await this.runtime.input(text, this.extensionContext(cwd, model, signal, notices))
       this.checkPreparing(signal)
@@ -268,7 +357,7 @@ export class AgentSession {
       }
     }
     this.checkPreparing(signal)
-    this.configure(cwd, [...tools, ...this.runtime?.tools() ?? []], files, skills)
+    this.configure(cwd, this.availableTools([...tools, ...this.runtime?.tools() ?? []], !approvedPlanId && (planArgument !== undefined || Boolean(this.state.plan))), files, skills)
     if (manual) {
       this.checkModelSelection(input, selection, directory)
       const record = this.newCompaction('manual', input.clientMessageId)
@@ -291,32 +380,107 @@ export class AgentSession {
       })
       return { kind: 'compaction', clientMessageId: input.clientMessageId, compactionId: record.id, acceptedSeq }
     }
+    const prepared = await this.prepareSources(input, model)
     const user: ConversationMessage = {
       id: randomUUID(), clientMessageId: input.clientMessageId,
       message: { role: 'user', content: text, timestamp: Date.now() },
       ...(skillInvocation && { skillInvocation }),
+      ...(prepared.attachments.length && { attachments: prepared.attachments }),
+      ...(prepared.references.length && { references: prepared.references }),
     }
     const running = { kind: 'task' as const, runId: user.id, assistantMessageId: randomUUID(), phase: 'model' as const, activeTools: [] }
     let systemPrompt: string | undefined
     let extra: ConversationMessage[] = []
-    if (this.runtime?.has('before_agent_start')) {
-      const prompt = buildModelHistory([user])[0]?.content
-      const start = await beforeStart(this.runtime, this.extensionContext(cwd, model, signal), this.configuration.systemPrompt ?? '',
-        typeof prompt === 'string' ? prompt : text, user.id)
+    const first = !this.state.messages.some(entry => entry.message.role === 'user' && !entry.extension)
+    const title = first ? temporarySessionTitle(submittedText.trim() ? submittedText : prepared.attachments[0]?.name ?? '') : ''
+    const planChange = approvedPlanId ? null : planArgument !== undefined && !this.state.plan ? { state: 'planning' } as const : undefined
+    let run: StoredRun | undefined
+    try {
+      if (this.runtime?.has('before_agent_start')) {
+        const prompt = buildModelHistory([user], undefined, false, this.options.attachments && { path: id => this.options.attachments!.path(id) })[0]?.content
+        const start = await beforeStart(this.runtime, this.extensionContext(cwd, model, signal), this.configuration.systemPrompt ?? '',
+          typeof prompt === 'string' ? prompt : text, user.id)
+        if (start.overridden) systemPrompt = start.systemPrompt
+        extra = start.extra.map(message => this.extensionEntry(message))
+      }
       this.checkPreparing(signal)
-      if (start.overridden) systemPrompt = start.systemPrompt
-      extra = start.extra.map(message => this.extensionEntry(message))
+      this.checkModelSelection(input, selection, directory)
+      run = this.saveStart(input, selection, user.id, 'task', {
+        messages: [user, ...extra], plan: planChange,
+        ...(prepared.scope && { attachments: { ids: prepared.attachments.map(attachment => attachment.id),
+          scope: prepared.scope, cutoff: Date.now() - ATTACHMENT_TTL_MS } }),
+      }, text, approvedPlanId, title)
+    } catch (error) {
+      if (!(error instanceof SessionWriteError && error.reason === 'unconfirmed')) await removeReferenceSnapshots(prepared.references)
+      throw error
     }
-    this.checkModelSelection(input, selection, directory)
-    const run = this.saveStart(input, selection, user.id, 'task', { messages: [user, ...extra] }, text)
     const initialSelection = this.confirmInitialSelection(selection)
     this.controller = controller
     this.state.messages.push(user, ...extra)
     this.state.running = running
+    if (planChange !== undefined) this.state.plan = planChange
     this.publish({ type: 'accepted', user, running }, run && this.publicRun(run), undefined, initialSelection)
-    const acceptedSeq = this.state.seq
+    const receipt: SubmissionAccepted = { kind: 'message', clientMessageId: input.clientMessageId, userMessageId: user.id, acceptedSeq: this.state.seq }
+    if (approvedPlanId) this.approvedPlans.set(approvedPlanId, { ...receipt })
+    if (planChange !== undefined) this.publish({ type: 'plan', plan: planChange })
     this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal, user, systemPrompt))
-    return { kind: 'message', clientMessageId: input.clientMessageId, userMessageId: user.id, acceptedSeq }
+    if (run && title) this.startTitle(model, submittedText, title)
+    return receipt
+  }
+
+  private async prepareSources(input: SubmissionInput, model: ModelInfo) {
+    const storage = this.options.persistence
+    const files = this.options.attachments
+    const attachments: NonNullable<ConversationMessage['attachments']> = []
+    let scope: AttachmentScope | undefined
+    if (input.attachmentIds?.length) {
+      if (!storage || !files) throw new SessionSubmitError('invalid', '当前会话不支持附件')
+      scope = storage.first && !this.storedRuns.size
+        ? { workspaceId: storage.summary.workspaceId, draftSessionId: this.sessionId } : { sessionId: this.sessionId }
+      let bytes = 0
+      for (const id of new Set(input.attachmentIds)) {
+        const attachment = storage.store.pendingAttachment(id, scope, Date.now() - ATTACHMENT_TTL_MS)
+        if (!attachment) throw new SessionSubmitError('invalid', '附件不存在、已过期，或不属于此会话草稿。请重新上传。')
+        try { await access(files.path(id)) }
+        catch { throw new SessionSubmitError('invalid', '附件文件不可读取，请重新上传。') }
+        if (attachment.mediaType !== 'text/plain') {
+          if (!model.supportsImages) throw new SessionSubmitError('invalid', '当前模型不支持图片。请更换模型或移除图片。')
+          try { bytes += files.image(attachment.id).data.length }
+          catch { throw new SessionSubmitError('invalid', '附件图片不可读取，请重新上传。') }
+          if (bytes > IMAGE_BUDGET_BYTES) throw new SessionSubmitError('invalid', '本轮图片总量超过模型请求上限，请减少图片。')
+        }
+        attachments.push(attachment)
+      }
+    }
+    let references: NonNullable<ConversationMessage['references']> = []
+    if (input.referenceSessionIds?.length) {
+      if (!storage) throw new SessionSubmitError('invalid', '当前会话不支持引用')
+      try {
+        ({ references } = await prepareSessionReferences({
+          sessionId: this.sessionId, sourceIds: input.referenceSessionIds, contextWindow: model.contextWindow,
+          directory: this.options.referenceDirectory, read: id => storage.store.readReferenceSource(id),
+          canReference: this.options.isWorkspaceRegistered,
+        }))
+      } catch (error) {
+        if (error instanceof ReferenceInputError) throw new SessionSubmitError('invalid', error.message)
+        throw error
+      }
+    }
+    return { attachments, scope, references }
+  }
+
+  private startTitle(model: ModelInfo, text: string, fallback: string) {
+    const storage = this.options.persistence!
+    if (!storage.first) this.options.onTitleChanged?.()
+    if (!this.options.titleStream || !text.trim()) return
+    const controller = new AbortController()
+    const pending = generateSessionTitle(this.options.titleStream, model, text, controller.signal).then(title => {
+      if (!title || title === fallback || controller.signal.aborted) return
+      if (storage.store.save(storage.summary.id, { name: { value: title, expected: fallback } })) {
+        this.options.onTitleChanged?.()
+      }
+    }).catch(() => undefined)
+    this.titleRequest = { controller, pending }
   }
 
   private checkModelSelection(input: SubmissionInput, selection: ModelSelection, directory?: ModelDiscovery) {
@@ -367,26 +531,35 @@ export class AgentSession {
   }
 
   private checkReplay(previous: SubmissionInput, input: SubmissionInput, selection: ModelSelection) {
-    if (previous.text !== input.text || previous.permissionMode !== input.permissionMode || !sameSelection(runSelection(previous), selection)) {
+    if (previous.text !== input.text || previous.permissionMode !== input.permissionMode || !sameSelection(runSelection(previous), selection)
+      || !sameSubmissionSources(previous, input)) {
       throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
     }
   }
 
-  private publicRun({ text: _text, finalText: _finalText, acceptedSeq: _acceptedSeq, firstPermissionMode: _firstPermissionMode, ...run }: StoredRun): RunRecord {
+  private publicRun({ text: _text, finalText: _finalText, acceptedSeq: _acceptedSeq, firstPermissionMode: _firstPermissionMode,
+    approvedPlanId: _approvedPlanId, attachmentIds: _attachmentIds, referenceSessionIds: _referenceSessionIds, firstTitle: _firstTitle, ...run }: StoredRun): RunRecord {
     return run
   }
 
   private saveStart(input: SubmissionInput, selection: ModelSelection, id: string, kind: RunRecord['kind'],
-    data: { messages?: ConversationMessage[]; compaction?: CompactionRecord }, finalText?: string) {
+    data: Pick<Parameters<SessionPersistence['store']['save']>[1], 'messages' | 'compaction' | 'plan' | 'attachments'>,
+    finalText?: string, approvedPlanId?: string, title?: string) {
     const storage = this.options.persistence
     if (!storage) return
     const { permissionMode, ...message } = input
     const summary = this.storedRuns.size === 0 ? storage.first?.() : undefined
+    if (summary && title) summary.name = title
     const run: StoredRun = {
-      ...message, ...(finalText !== undefined && finalText !== input.text && { finalText }), ...(summary && permissionMode !== undefined && { firstPermissionMode: permissionMode }), ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
+      ...message, ...(finalText !== undefined && finalText !== input.text && { finalText }), ...(summary && permissionMode !== undefined && { firstPermissionMode: permissionMode }),
+      ...(summary && title && { firstTitle: title }),
+      ...(approvedPlanId && { approvedPlanId }), ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
     }
     this.save({ ...data, run, summary, ...(summary && { permissionMode: this.state.permissionMode }),
+      ...(!summary && title && { name: { value: title, expected: storage.summary.name } }),
       modelSelection: this.state.modelSelection ? undefined : selection })
+    if (summary) Object.assign(storage.summary, summary)
+    else if (title) storage.summary.name = title
     return run
   }
 
@@ -415,7 +588,8 @@ export class AgentSession {
 
   private context(compaction = this.latestCompaction()): ModelContext {
     return {
-      ...this.configuration, messages: buildModelHistory(this.historyMessages(), compaction, !!this.options.persistence),
+      ...this.configuration, messages: buildModelHistory(this.historyMessages(), compaction, !!this.options.persistence, this.options.attachments),
+      ...(this.state.running?.kind === 'task' && { currentUserMessageId: this.state.running.runId }),
       omittedToolImageResults: this.omittedToolImageResults,
     }
   }
@@ -480,7 +654,7 @@ export class AgentSession {
     let summaryUsage: AssistantMessage['usage']
     try {
       signal.throwIfAborted()
-      const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000, Boolean(this.configuration.tools?.length), !!this.options.persistence, model)
+      const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000, Boolean(this.configuration.tools?.length), !!this.options.persistence, model, this.options.attachments)
       if (preparation.status === 'skipped') {
         final = { ...record, status: 'skipped', finishedAt: Date.now(), reason: preparation.reason === 'already_compacted' ? '刚压缩完成，尚无新内容。' : '没有可压缩的较早内容。' }
       } else {
@@ -549,16 +723,20 @@ export class AgentSession {
   }
 
   private async finish(signal: AbortSignal, status: RunRecord['status'], entry?: ConversationMessage,
-    compaction?: Extract<CompactionRecord, { status: 'success' }>) {
+    compaction?: Extract<CompactionRecord, { status: 'success' }>, assistantMessageId?: string) {
     if (this.controller?.signal !== signal) return
     if (this.state.running?.kind === 'task' && signal.aborted) status = 'aborted'
+    const savedReply = !entry && assistantMessageId && this.savedMessages.has(assistantMessageId)
+      ? this.state.messages.find(message => message.id === assistantMessageId) : undefined
+    let plan = status === 'completed' && !this.failure && this.state.plan?.state === 'planning'
+      ? extractPlan(entry ?? savedReply) : undefined
     const current = this.state.runs?.find(run => run.id === this.state.running?.runId)
     const stored = current && this.storedRuns.get(current.clientMessageId)
     let run = stored
     if (stored?.status === 'running') {
       run = this.endedRun(stored, this.failure ? 'failed' : status)
       const followup = entry && this.followup(compaction, entry)
-      const data = { run, messages: entry && [entry], compaction: followup }
+      const data = { run, messages: entry && [entry], compaction: followup, plan }
       const plainAnswer = entry?.message.role === 'assistant' && ['stop', 'length'].includes(entry.message.stopReason)
         && entry.message.content.some(block => block.type === 'text' && block.text.length > 0)
       try {
@@ -571,6 +749,7 @@ export class AgentSession {
       } catch (error) {
         this.noteFailure(error, plainAnswer ? 'answer' : 'finish')
         run = this.endedRun(stored, 'failed')
+        plan = undefined
       }
     }
     this.settling = true
@@ -582,7 +761,11 @@ export class AgentSession {
     this.task = undefined
     this.settling = false
     this.state.running = null
+    // An explicit exit may have arrived while the settled extension ran.
+    if (this.state.plan?.state !== 'planning') plan = undefined
+    if (plan) this.state.plan = plan
     this.publish({ type: 'task', running: null }, run && this.publicRun(run), this.failure)
+    if (plan) this.publish({ type: 'plan', plan })
     this.failure = undefined
   }
 
@@ -630,14 +813,20 @@ export class AgentSession {
     const ctx = () => this.extensionContext(cwd, model, signal)
     const runId = running.runId
     let roundTools = tools
+    let roundPlanning = Boolean(this.state.plan)
+    let leftPlan = false
     const configure = (files: ProjectContextFile[]) => {
-      roundTools = [...tools, ...runtime?.tools() ?? []]
-      if (this.state.permissionMode !== 'normal') roundTools = roundTools.filter(tool => readOnlyTools.has(tool.name))
+      if (roundPlanning && !this.state.plan) leftPlan = true
+      roundPlanning = Boolean(this.state.plan)
+      roundTools = this.availableTools([...tools, ...runtime?.tools() ?? []], roundPlanning)
       this.configure(cwd, roundTools, files, skills)
       if (systemPrompt !== undefined) this.configuration.systemPrompt = systemPrompt
+      if (roundPlanning) this.configuration.systemPrompt += '\n\n' + planInstruction
+      else if (leftPlan) this.configuration.systemPrompt += '\n\n用户已退出计划模式，当前采用普通模式。退出模式本身不表示用户已批准方案。'
     }
     const modelPhase = () => this.updateTask({ ...running, assistantMessageId: messageId, phase: 'model', activeTools: [] })
     const currentTask = () => ({ ...running, assistantMessageId: messageId, phase: 'tools' as const, activeTools })
+    const withinBudget = (context: ModelContext) => this.pressure(context, model) + model.maxTokens <= model.contextWindow
     const prepareContext: AgentRunInput['prepareContext'] = async () => {
       if (advanceRound) {
         advanceRound = false
@@ -659,44 +848,47 @@ export class AgentSession {
       if (this.estimate({ ...this.configuration, messages: [] }) > inputBudget) {
         return { error: files.length ? new ProjectContextOverflow().message : '系统提示和工具定义超出当前模型容量，请切换模型。' }
       }
-      const context = this.context()
+      let context = this.context()
       const fingerprint = JSON.stringify(context.messages)
       const margin = Math.min(16_384, Math.floor(inputBudget / 8))
       const trigger = Math.min(this.options.compaction?.triggerTokens ?? Infinity, inputBudget - margin)
-      if (this.pressure(context, model) < trigger || attemptedInput === fingerprint) return context
-      attemptedInput = fingerprint
-      return this.compact(model, reasoningEffort, 'auto', { ...running, assistantMessageId: messageId }, signal).then(() => {
+      if (this.pressure(context, model) >= trigger && attemptedInput !== fingerprint) {
+        attemptedInput = fingerprint
+        await this.compact(model, reasoningEffort, 'auto', { ...running, assistantMessageId: messageId }, signal)
         signal.throwIfAborted()
         modelPhase()
-        return this.context()
-      })
+        context = this.context()
+      }
+      if (!runtime?.has('context')) return context
+      const messages = await runtime.chain('context', ctx(), context.messages, messages => ({ messages }), (_current, event, result) => {
+        const messages = result?.messages === undefined ? event.messages : result.messages
+        if (!requestMessages(messages) || !withinBudget({ ...context, messages })) throw new Error('无效的模型上下文改写')
+        return structuredClone(messages)
+      }, { runId })
+      return { ...context, messages }
     }
 
-    const finalizeContext: AgentRunInput['finalizeContext'] = () => {
+    // Snapshot mode and executable tools together after all asynchronous preparation.
+    const finalizeContext: AgentRunInput['finalizeContext'] = prepared => {
       configure(this.projectContext?.files ?? [])
-      const candidate = this.context()
-      const withinBudget = (context: ModelContext) => this.pressure(context, model) + model.maxTokens <= model.contextWindow
-      const finish = (context: ModelContext) => {
-        if (!withinBudget(context)) return { error: capacityError }
-        usedCompaction = this.latestCompaction()
-        for (const index of omittedToolImageIndexes(context)) {
-          const result = context.messages[index]
-          if (result.role === 'toolResult' && result.imageResultId !== undefined) this.omittedToolImageResults.add(result.imageResultId)
-        }
-        return context
+      const context = { ...prepared, ...this.configuration, tools: this.configuration.tools }
+      if (!withinBudget(context)) return { error: capacityError }
+      usedCompaction = this.latestCompaction()
+      for (const index of omittedToolImageIndexes(context)) {
+        const result = context.messages[index]
+        if (result.role === 'toolResult' && result.imageResultId !== undefined) this.omittedToolImageResults.add(result.imageResultId)
       }
-      if (!runtime?.has('context')) return finish(candidate)
-      return runtime.chain('context', ctx(), candidate.messages, messages => ({ messages }), (_current, event, result) => {
-        const messages = result?.messages === undefined ? event.messages : result.messages
-        if (!requestMessages(messages) || !withinBudget({ ...candidate, messages })) throw new Error('无效的模型上下文改写')
-        return structuredClone(messages)
-      }, { runId }).then(messages => finish({ ...candidate, messages }))
+      return context
     }
 
     const beforeToolCall: AgentRunInput['beforeToolCall'] = call => {
       if (this.permissionUnconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
       if (this.state.permissionMode === 'read-only' && !readOnlyTools.has(call.name)) {
         return { code: 'permission_denied', message: '只读模式下未执行此工具。' }
+      }
+      if (roundPlanning && !planReadTools.has(call.name)
+        && (call.name !== 'bash' || !roundTools.some(tool => tool.name === 'bash') || !planGitArgs(call.arguments.command))) {
+        return { code: 'permission_denied', message: '计划模式仅允许只读调查工具及获准的 Git 命令。' }
       }
     }
 
@@ -858,7 +1050,7 @@ export class AgentSession {
       terminalEntry = this.fail(model, messageId, signal.aborted ? '本次生成已取消' : '模型调用意外中断，请重新发送', signal.aborted)
     } finally {
       unsubscribe()
-      await this.finish(signal, status, terminalEntry, usedCompaction)
+      await this.finish(signal, status, terminalEntry, usedCompaction, messageId)
     }
   }
 
@@ -1036,10 +1228,11 @@ export class AgentSession {
     this.closed = true
     this.initializing?.abort()
     this.preparing?.abort()
+    this.titleRequest?.controller.abort()
     if (!this.settling) this.controller?.abort()
     const task = this.task
     return this.closing = (async () => {
-      await Promise.allSettled([this.initialization, this.submitting?.settled, ...this.selectionNotifications])
+      await Promise.allSettled([this.initialization, this.submitting?.settled, this.titleRequest?.pending, ...this.selectionNotifications])
       await task
       if (this.cwd && this.runtime?.has('session_shutdown')) {
         await this.runtime.emit('session_shutdown', { reason: 'quit' }, this.extensionContext(this.cwd, this.model))

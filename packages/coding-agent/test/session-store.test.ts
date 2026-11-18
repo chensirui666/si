@@ -110,7 +110,9 @@ it('27 读取会话各表时维持同一事务，第二连接无法在中途改�
       })
       try {
         expect(store.loadSession(summary.id)).toEqual({ summary, runs: [run], messages: [user], compactions: [], permissionMode: 'normal' })
-        expect(readSteps).toHaveLength(6)
+        expect(readSteps).toHaveLength(8)
+        expect(readSteps.at(-2)).toContain('FROM session_plan_state')
+        expect(readSteps.at(-1)).toContain('FROM session_plan_commands')
       } finally { observe.mockRestore() }
     } finally { other.close(); store.close() }
   } finally { await rm(directory, { recursive: true, force: true }) }

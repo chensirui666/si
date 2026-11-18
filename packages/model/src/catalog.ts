@@ -83,6 +83,7 @@ function info(model: Model<Api>): ModelInfo {
     provider, api, contextWindow,
     // Some catalog entries allow output as long as their entire context window.
     maxTokens: Math.min(maxTokens, 65_536, Math.max(1, Math.floor(contextWindow / 4))),
+    ...(model.input.includes('image') && { supportsImages: true }),
     ...(model.reasoning && levels.length > 1 && { reasoningEfforts: levels, defaultReasoningEffort }),
   }
 }

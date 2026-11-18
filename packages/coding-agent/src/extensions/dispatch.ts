@@ -27,7 +27,7 @@ export function requestMessages(value: unknown): value is ModelMessage[] {
     }
     if (pending.size) return false
     if (message.role === 'user') {
-      if (!(typeof message.content === 'string' || Array.isArray(message.content) && message.content.every(textContent))) return false
+      if (!(typeof message.content === 'string' || toolContent(message.content))) return false
     } else if (message.role === 'assistant') {
       if (!Array.isArray(message.content) || typeof message.api !== 'string' || typeof message.provider !== 'string'
         || typeof message.model !== 'string' || !['stop', 'length', 'toolUse'].includes(String(message.stopReason))) return false

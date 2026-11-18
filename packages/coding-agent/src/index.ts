@@ -16,11 +16,17 @@ export type {
   ActiveContent,
   ModelFrame,
   ModelRetryState,
+  PlanState,
   SessionSubscriptionEvent,
 } from './types.js'
 export { SessionStore, SessionReadError, SessionWriteError, type SessionPersistence } from './session-store.js'
+export {
+  SessionAttachments, AttachmentInputError, ATTACHMENT_TTL_MS, MAX_ATTACHMENT_UPLOAD_BYTES,
+  type AttachmentScope, type MessageAttachment,
+} from './session-attachments.js'
 export { isPermissionMode, type PermissionMode } from './permissions.js'
 export type { RunRecord, SaveFailure } from './types.js'
+export type { SubmissionSources } from './types.js'
 export { discoverSkills, type SkillSummary, type SkillInvocation, type SkillSource } from './skills.js'
 
 export { loadExtensions } from './extensions/loader.js'

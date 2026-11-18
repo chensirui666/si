@@ -4,11 +4,12 @@ import { useRef } from 'react'
 import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure, SkillInvocationView } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
+import { SentAttachments } from './MessageAttachments'
 import { SaveFailureNotice } from './SaveFailureNotice'
 import { QuoteSelection } from './QuoteSelection'
 
 type MessageRow =
-  | { type: 'user'; id: string; text: string; local?: LocalSubmission; skill?: SkillInvocationView }
+  | { type: 'user'; id: string; text: string; local?: LocalSubmission; skill?: SkillInvocationView; attachments?: ConversationMessage['attachments']; references?: ConversationMessage['references'] }
   | { type: 'assistant'; id: string; userId: string; messages: AssistantEntry[] }
 
 export function MessageList({ messages, activeContent = [], running = null, showRetry = true, runs = [], saveFailures = [], onQuote }: {
@@ -35,7 +36,8 @@ export function MessageList({ messages, activeContent = [], running = null, show
     const { id, message, toolCall } = item
     if (message.role === 'user') {
       userId = id
-      rows.push({ type: 'user', id, skill: item.skillInvocation, text: typeof message.content === 'string' ? message.content : message.content.map(block => block.text).join('') })
+      rows.push({ type: 'user', id, skill: item.skillInvocation, attachments: item.attachments, references: item.references,
+        text: typeof message.content === 'string' ? message.content : message.content.filter(block => block.type === 'text').map(block => block.text).join('') })
     } else if (message.role === 'assistant') {
       const previous = rows.at(-1)
       if (previous?.type === 'assistant') previous.messages.push({ id, message })
@@ -67,7 +69,11 @@ export function MessageList({ messages, activeContent = [], running = null, show
               ? <AssistantMessage showRetry={showRetry} messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure} run={activity}
                 running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
               : <>
-                <div className="message-text">{row.text}<br /></div>
+                {row.text && <div className="message-text">{row.text}<br /></div>}
+                {row.attachments && <SentAttachments attachments={row.attachments} />}
+                {!!row.references?.length && <div className="reference-list" role="group" aria-label={t('chat.selectedReferences')}>
+                  {row.references.map(ref => <span className="reference-draft" key={ref.sourceSessionId}>Session · {ref.label}</span>)}
+                </div>}
                 {row.skill && <div className="submission-status" data-skill-status={row.skill.status}>
                   {row.skill.status === 'loaded'
                     ? t('chat.skillLoaded', { name: row.skill.name })

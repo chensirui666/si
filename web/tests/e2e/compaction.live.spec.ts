@@ -82,7 +82,8 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
-      requests.push(JSON.parse(String(init?.body)))
+      const body = JSON.parse(String(init?.body))
+      if (!String(body.messages[0]?.content).startsWith('你是会话标题生成器。')) requests.push(body)
       return globalThis.fetch(url, init)
     } },
   })
@@ -137,7 +138,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
       const entries = snapshot.messages.slice(0, last + 1)
       const probe = { role: 'user' as const, content: '本次仅验证上下文输入。不要调用工具，只回答“对照完成”。', timestamp: 0 }
       const inputs: ModelContext[] = [previous, record].map(latest => ({
-        systemPrompt, tools, messages: [...buildModelHistory(entries.map(({ skillInvocation: _, ...entry }) => entry), latest), probe],
+        systemPrompt, tools, messages: [...buildModelHistory(entries.map(({ skillInvocation: _, references: _references, ...entry }) => entry), latest), probe],
       }))
       const actual: number[] = []
       for (const input of inputs) {
@@ -183,7 +184,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     expect(secondRecord.fileOperations).toMatchObject({
       readFiles: expect.arrayContaining([...firstReadFiles, join(workspacePath, 'progress.txt')]), modifiedFiles: [],
     })
-    const recent = buildModelHistory(secondSnapshot.messages.map(({ skillInvocation: _, ...entry }) => entry), secondRecord).slice(1)
+    const recent = buildModelHistory(secondSnapshot.messages.map(({ skillInvocation: _, references: _references, ...entry }) => entry), secondRecord).slice(1)
     expect(JSON.stringify(recent)).not.toContain(deliveryId)
     const prior = secondSnapshot.compactions.filter((record): record is Success => record.status === 'success' && record.id !== secondRecord.id && record.startedAt <= secondRecord.startedAt).at(-1)
     expect(prior?.id).toBe(firstRecord.id)
@@ -211,7 +212,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     expect(restoredB.sessionId).toBe(b)
     expect(restoredB.snapshot.messages).toEqual(otherSnapshot.messages)
     expect(restoredB.snapshot.compactions).toEqual([])
-    const restoredA = await openSession(page, observed, '会话 1')
+    const restoredA = await openSession(page, observed, a)
     expect(restoredA.sessionId).toBe(a)
     expect(restoredA.snapshot.messages).toEqual(secondSnapshot.messages)
     expect(restoredA.snapshot.compactions).toEqual(secondSnapshot.compactions)
@@ -297,7 +298,8 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
-      requests.push(JSON.parse(String(init?.body)))
+      const body = JSON.parse(String(init?.body))
+      if (!String(body.messages[0]?.content).startsWith('你是会话标题生成器。')) requests.push(body)
       return globalThis.fetch(url, init)
     } },
   })
@@ -339,15 +341,15 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
     const toolA = await verifyRead('a.txt', contentA, codeA, '先输出代号再输出文件原文')
     const b = await seedSession(page, observed, workspaceId)
     const toolB = await verifyRead('b.txt', contentB, codeB, '先输出文件原文再输出代号')
-    await openSession(page, observed, '会话 1')
+    await openSession(page, observed, a)
     const aRecalled = await verifyRecall(codeA, contentA, codeB, contentB, codeA, contentA)
     expect(aRecalled.input.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: toolA, content: contentA }))
-    await openSession(page, observed, '会话 2')
+    await openSession(page, observed, b)
     const bRecalled = await verifyRecall(codeB, contentB, codeA, contentA, contentB, codeB)
     expect(bRecalled.input.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: toolB, content: contentB }))
     const bBefore = await refresh(page, observed)
 
-    await openSession(page, observed, '会话 1')
+    await openSession(page, observed, a)
     await submit(page, observed, `以下是可省略的旧运行日志，后续摘要无需记录。只回复“收到”。\n${randomBytes(1200).toString('hex')}`)
     await submit(page, observed, `只回复“收到”。以下随机样本属于近期数据，无需记住或复述。\n${randomBytes(1600).toString('hex')}`)
     const aBefore = await refresh(page, observed)
@@ -366,7 +368,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
     expect(aResumed.input.messages[1]?.content).toContain(record.summary)
     expect(aResumed.input.messages.some(message => message.role === 'user' && message.content?.includes('以下随机样本属于近期数据'))).toBe(true)
     expect(aResumed.input.messages.some(message => message.role === 'tool' && message.tool_call_id === toolA)).toBe(false)
-    const bAfter = await openSession(page, observed, '会话 2')
+    const bAfter = await openSession(page, observed, b)
     expect(bAfter.sessionId).toBe(b)
     expect(bAfter.snapshot).toEqual(bBefore)
     const bResumed = await verifyRecall(codeB, contentB, codeA, contentA, contentB, codeB)

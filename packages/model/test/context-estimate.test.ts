@@ -123,6 +123,59 @@ describe('model-visible context estimates', () => {
     ])
     expect(sent.filter(message => message.role === 'user')).toHaveLength(1)
   })
+
+  it.each([false, true])('keeps current uploads across tool calls and spends the shared budget on the newest history (overflowing history: %s)', overflow => {
+    const image = (marker: string, bytes: number) => ({
+      type: 'image' as const, mimeType: 'image/png' as const, data: marker.repeat(bytes),
+    })
+    const uploads = {
+      old: image('O', 3_000_000),
+      newer: image('N', 11_000_000),
+      recent: image('R', 8_000_000),
+      current: image('C', 4_000_000),
+    }
+    const calls = Array.from({ length: 6 }, (_, index) => ({
+      type: 'toolCall' as const, id: `read-${index}`, name: 'read', arguments: { path: `tool-${index}.png` },
+    }))
+    const results = calls.map((call, index): ToolResultMessage => ({
+      role: 'toolResult', toolCallId: call.id, toolName: call.name, timestamp: 1, isError: false,
+      content: [{ type: 'text', text: call.arguments.path }, image(String(index), 3_000_000)],
+    }))
+    const context: ModelContext = {
+      currentUserMessageId: 'current',
+      messages: [
+        ...(overflow ? [{
+          role: 'user' as const, timestamp: 1, content: [
+            { type: 'text' as const, text: 'old.png and newer.png' }, uploads.old, uploads.newer,
+          ],
+        }] : []),
+        { role: 'user', timestamp: 2, content: [{ type: 'text', text: 'recent.png' }, uploads.recent] },
+        { role: 'user', timestamp: 3, uploadMessageId: 'current', content: [{ type: 'text', text: 'current.png' }, uploads.current] },
+        { role: 'user', timestamp: 4, content: 'An extension supplied this message.' },
+        { ...assistant, stopReason: 'toolUse', content: calls },
+        ...results,
+      ],
+    }
+    const wire = convertMessages(context)
+    const pi = toPiContext(context)
+    const wireImages = wire.flatMap(message => message.role === 'user' && Array.isArray(message.content)
+      ? message.content.flatMap(block => block.type === 'image_url' ? [block.image_url.url.at(-1)] : [])
+      : [])
+    const piImages = pi.messages.flatMap(message => (message.role === 'user' || message.role === 'toolResult') && Array.isArray(message.content)
+      ? message.content.flatMap(block => block.type === 'image' ? [block.data[0]] : []) : [])
+    expect(wireImages).toEqual(overflow ? ['N', 'R', 'C'] : ['R', 'C', '2', '3', '4', '5'])
+    expect(piImages).toEqual(wireImages)
+    expect(wire.filter(message => message.role === 'tool').map(message => message.tool_call_id)).toEqual(calls.map(call => call.id))
+    expect(wire.filter(message => message.role === 'tool').map(message => String(message.content).split('\n')[0]))
+      .toEqual(calls.map(call => call.arguments.path))
+    expect(JSON.stringify(wire)).toContain('recent.png')
+    if (overflow) expect(JSON.stringify(wire[0])).toContain('old.png and newer.png')
+  })
+
+  it('reports whether each DeepSeek route accepts images', () => {
+    expect(modelApi.findModel('deepseek-flash')?.supportsImages).toBe(true)
+    expect(modelApi.findModel('deepseek-v4-pro')?.supportsImages).toBeFalsy()
+  })
 })
 
 

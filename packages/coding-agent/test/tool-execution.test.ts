@@ -119,6 +119,31 @@ it('keeps read output within the limit without returning a partial line', async 
   expect(output).not.toContain('第三行')
 })
 
+it('resumes an oversized UTF-8 line without losing bytes or splitting characters', async () => {
+  const json = JSON.stringify({ log: '汉😀'.repeat(20_000), marker: 'EOF-981' })
+  await writeFile(join(cwd, 'note.json'), 'first\r\n' + json + '\r\nnext\r\n')
+  const read = tool('read')
+  const parts: string[] = []
+  let column = 1
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const output = await read({ path: 'note.json', offset: 2, column, limit: 1 }, context())
+    expect(typeof output).toBe('string')
+    const [content, notice = ''] = String(output).split('\n\n')
+    parts.push(content)
+    const resume = /offset=2 column=(\d+)/.exec(notice)
+    if (!resume) {
+      expect(notice).toContain('offset=3')
+      break
+    }
+    expect(Buffer.byteLength(String(output))).toBeLessThanOrEqual(50 * 1024)
+    expect(Number(resume[1])).toBe(column + Buffer.byteLength(content))
+    column = Number(resume[1])
+  }
+  expect(parts.join('')).toBe(json)
+  expect(await read({ path: 'note.json', offset: 3 }, context())).toBe('next\n')
+  await expect(read({ path: 'note.json', offset: 2, column: 10 }, context())).rejects.toThrow('column')
+})
+
 it('creates missing parent directories and accepts an empty overwrite', async () => {
   const write = tool('write')
   const path = join(cwd, 'notes', 'note.txt')

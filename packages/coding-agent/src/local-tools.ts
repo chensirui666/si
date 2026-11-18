@@ -111,8 +111,20 @@ class OutputLines {
   }
 }
 
-async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: LocalToolContext): Promise<string | ToolResultMessage['content']> {
+function utf8ContinuationByte(byte: number) {
+  return (byte & 0xc0) === 0x80
+}
+
+function readLineSegment(bytes: Buffer, from: number, offset: number) {
+  const continuation = (next: number) => `\n\n[该行尚未读完，可用 offset=${offset} column=${next + 1} 继续读取]`
+  let end = from + MAX_OUTPUT_BYTES - Buffer.byteLength(continuation(from + MAX_OUTPUT_BYTES))
+  while (utf8ContinuationByte(bytes[end])) end--
+  return bytes.toString('utf8', from, end) + continuation(end)
+}
+
+async function read({ path, offset = 1, column = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: LocalToolContext): Promise<string | ToolResultMessage['content']> {
   const start = integer(offset, 'offset') - 1
+  const from = integer(column, 'column') - 1
   const count = limit === undefined ? Infinity : integer(limit, 'limit')
   const target = pathFrom(cwd, path)
   const bytes = await readWithAbort(signal, () => readBytes(target, signal, true))
@@ -127,17 +139,24 @@ async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, reco
   const text = decodeText(target, bytes)
   const lines = linesOf(text)
   if (start >= lines.length && (lines.length || start > 0)) throw new Error(`offset 超出文件范围（共 ${lines.length} 行）`)
+  const first = lines[start] ?? ''
+  const firstBytes = from ? Buffer.from(first) : undefined
+  if (firstBytes && (from >= firstBytes.length || utf8ContinuationByte(firstBytes[from]))) {
+    throw new Error('column 必须指向起始行中一个完整 UTF-8 字符的首字节')
+  }
   recordFileOperation?.(target)
+  if (firstBytes && firstBytes.length - from > MAX_OUTPUT_BYTES) return readLineSegment(firstBytes, from, offset)
 
   const output = new OutputLines()
   const requested = Math.min(lines.length - start, count)
   for (let i = 0; i < Math.min(requested, MAX_OUTPUT_LINES); i++) {
-    if (!output.append(lines[start + i]!)) break
+    const line = i === 0 && firstBytes ? firstBytes.toString('utf8', from) : lines[start + i]
+    if (!output.append(line)) break
   }
   const content = output.text()
   const next = start + output.lines.length
   if (output.lines.length < requested) {
-    if (!output.lines.length) return `[第 ${offset} 行超过 50 KiB，无法返回完整一行。可用 Bash 查看这一行，或用 offset=${offset + 1} 读取后续内容]`
+    if (!output.lines.length) return readLineSegment(Buffer.from(first), from, offset)
     return `${content}\n\n[输出已截断，可用 offset=${next + 1} 继续读取]`
   }
   if (next < lines.length) return `${content}\n\n[剩余 ${lines.length - next} 行，可用 offset=${next + 1} 继续读取]`

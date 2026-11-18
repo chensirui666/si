@@ -12,7 +12,7 @@ export function imageMimeType(bytes: Buffer): ImageContent['mimeType'] | undefin
   if (bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP') return 'image/webp'
 }
 
-function imageContent(bytes: Buffer, mimeType: ImageContent['mimeType']): ImageContent {
+export function imageContent(bytes: Buffer, mimeType: ImageContent['mimeType']): ImageContent {
   return { type: 'image', mimeType, data: bytes.toString('base64') }
 }
 

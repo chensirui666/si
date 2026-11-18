@@ -657,6 +657,39 @@ it('replays foreign tool calls into DeepSeek with paired normalized IDs and no f
   expect(history.messages[1]).toMatchObject({ toolCallId: calls[0].id })
 })
 
+it('keeps both upload and read paths when DeepSeek Pro replays an image-bearing Flash conversation', async () => {
+  const model = modelApi.findModel('deepseek-v4-pro')!
+  const uploadPath = '/attachment-store/screenshot'
+  const readPath = '/workspace/read.png'
+  const image = { type: 'image' as const, mimeType: 'image/png' as const, data: 'AAAA' }
+  const history: modelApi.ModelContext = {
+    messages: [
+      { role: 'user', timestamp: 1, content: [{ type: 'text', text: uploadPath }, image] },
+      { role: 'assistant', api: selected.api, provider: selected.provider, model: selected.id, timestamp: 2,
+        stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'read-image', name: 'read', arguments: { path: readPath } }] },
+      { role: 'toolResult', toolCallId: 'read-image', toolName: 'read', isError: false, timestamp: 3,
+        content: [{ type: 'text', text: readPath }, image] },
+      { role: 'user', timestamp: 4, content: '继续之前的会话' },
+    ],
+    tools: [{ name: 'read', description: '', parameters: Type.Object({ path: Type.String() }) }],
+  }
+  const requests: { model: string; messages: { role: string; content: unknown; tool_call_id?: string; tool_calls?: { id: string }[] }[] }[] = []
+  const { result } = await consume(modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    requests.push(JSON.parse(String(init?.body)))
+    return response([chunk({ content: '已继续' }, 'stop')])
+  } })(model, history))
+  expect(result).toMatchObject({ model: model.id, stopReason: 'stop', content: [{ type: 'text', text: '已继续' }] })
+  expect(requests[0].model).toBe('deepseek-v4-pro')
+  const transcript = JSON.stringify(requests[0].messages)
+  expect(transcript).not.toContain('image_url')
+  expect(transcript).not.toContain(image.data)
+  expect(transcript).toContain(uploadPath)
+  const call = requests[0].messages.find(message => message.tool_calls?.length)?.tool_calls?.[0]
+  const outcome = requests[0].messages.find(message => message.role === 'tool')
+  expect(outcome?.tool_call_id).toBe(call?.id)
+  expect(outcome?.content).toContain(readPath)
+})
+
 it('keeps the advertised reply cap after an Anthropic-compatible adapter adds reasoning', async () => {
   const model = modelApi.findModel('MiniMax-M3', 'minimax-cn')!
   let outputBudget: number | undefined

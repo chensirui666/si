@@ -2,8 +2,10 @@ import { sameSelection, type ModelSelection } from '@agent-learning/model'
 import { randomUUID } from 'node:crypto'
 import { SessionSubmitError, type AgentSession } from './agent-session.js'
 import { runSelection, submissionReceipt, type SessionPersistence, type SessionStore } from './session-store.js'
+import { planCommandArgument } from './plan-mode.js'
 import type { PermissionMode } from './permissions.js'
 import type { SubmissionAccepted, SubmissionHandled } from './types.js'
+import { sameSubmissionSources } from './types.js'
 
 export type SessionSummary = {
   id: string
@@ -43,9 +45,9 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     return true
   }
 
-  async create(workspaceId: string): Promise<SessionSummary> {
+  async create(workspaceId: string, selectedPermission?: PermissionMode): Promise<SessionSummary> {
     const resolveDirectory = await this.validateWorkspace(workspaceId)
-    const permissionMode = await this.options.getDefaultPermissionMode?.() ?? 'normal'
+    const permissionMode = selectedPermission ?? await this.options.getDefaultPermissionMode?.() ?? 'normal'
     this.ensureOpen()
     let id: string
     do { id = randomUUID() } while (this.sessions.has(id) || this.starts.has(id) || this.drafts.has(id))
@@ -64,7 +66,8 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     const draftId = input.draftSessionId ?? id
     const previous = this.starts.get(id)
     if (previous) {
-      if (previous.input.workspaceId !== input.workspaceId || previous.input.draftSessionId !== input.draftSessionId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text || previous.input.permissionMode !== input.permissionMode) {
+      if (previous.input.workspaceId !== input.workspaceId || previous.input.draftSessionId !== input.draftSessionId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text || previous.input.permissionMode !== input.permissionMode
+        || !sameSubmissionSources(previous.input, input)) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
       return previous.result
@@ -73,13 +76,16 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     if (history) {
       const run = history.runs[0]
       if (run?.kind !== 'task' || run.clientMessageId !== id || history.summary.workspaceId !== input.workspaceId
-        || run.text !== input.text || run.firstPermissionMode !== input.permissionMode || !sameSelection(runSelection(run), runSelection(input))) {
+        || run.text !== input.text || run.firstPermissionMode !== input.permissionMode || !sameSelection(runSelection(run), runSelection(input))
+        || !sameSubmissionSources(run, input)) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
-      return { session: history.summary, accepted: submissionReceipt(run) }
+      return { session: run.firstTitle ? { ...history.summary, name: run.firstTitle } : history.summary, accepted: submissionReceipt(run) }
     }
     if (this.sessions.has(draftId)) throw new SessionSubmitError('busy', '此会话编号已被使用')
     if (input.text.trim() === '/compact') throw new SessionSubmitError('invalid', '新会话没有可压缩的内容')
+    const planArgument = planCommandArgument(input.text)
+    if (planArgument === '' || planArgument === 'off') throw new SessionSubmitError('invalid', '请先创建会话，再开启计划模式')
     const result = this.acceptFirst(input, submit)
     this.starts.set(id, { input, result })
     try {
@@ -110,7 +116,7 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
         this.drafts.delete(id)
         this.options.onStarted?.()
       }
-      return { session: summary, accepted }
+      return { session: { ...summary }, accepted }
     } catch (error) {
       if (!previous && !this.sessions.has(id)) {
         this.drafts.delete(id)
@@ -129,7 +135,7 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     const summary = this.newSummary(id, input.workspaceId)
     const store = this.options.store
     const session = this.options.createSession(resolveDirectory, store && {
-      summary, store, first: () => Object.assign(summary, this.newSummary(summary.id, summary.workspaceId)),
+      summary, store, first: () => this.newSummary(summary.id, summary.workspaceId),
     }, permissionMode, id)
     let closing: Promise<void> | undefined
     return { summary, session,
@@ -148,8 +154,7 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
   }
 
   private newSummary(id: string, workspaceId: string): SessionSummary {
-    const number = this.list().filter(summary => summary.workspaceId === workspaceId).length + 1
-    return { id, workspaceId, name: `会话 ${number}`, createdAt: new Date().toISOString() }
+    return { id, workspaceId, name: '新会话', createdAt: new Date().toISOString() }
   }
 
   list(): SessionSummary[] {
