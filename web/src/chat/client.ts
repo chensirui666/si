@@ -1,5 +1,5 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, ClientFrame, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, BashJobsView, ClientFrame, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, StopBashJobResult, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
 import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
 
 export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged) => {
@@ -214,6 +214,22 @@ export const getWorkspaces = () => requestView('/api/workspaces', '工作区', w
 export const pickWorkspace = () => requestView('/api/workspaces/pick', '工作区选择', workspacePick, { method: 'POST' })
 
 export const getSessions = async () => (await requestView('/api/sessions', '会话列表', sessionList)).sessions
+
+const jobsPath = (sessionId: string) => `/api/sessions/${encodeURIComponent(sessionId)}/jobs`
+
+export const getBashJobs = async (sessionId: string, signal: AbortSignal) => (await requestView(jobsPath(sessionId), '后台任务列表',
+  (value): value is BashJobsView => record(value) && value.sessionId === sessionId && Array.isArray(value.jobs)
+    && value.jobs.every(job => record(job) && typeof job.jobId === 'string' && !!job.jobId && typeof job.command === 'string' && job.status === 'running')
+    && new Set(value.jobs.map(job => job.jobId)).size === value.jobs.length,
+  { signal })).jobs
+
+export const stopBashJob = (sessionId: string, jobId: string) => requestView(`${jobsPath(sessionId)}/${encodeURIComponent(jobId)}/stop`, '停止后台任务',
+  (value): value is StopBashJobResult => record(value) && value.sessionId === sessionId && record(value.job) && value.job.jobId === jobId
+    && typeof value.job.command === 'string' && (value.job.status === 'exited' || value.job.status === 'stopped' || value.job.status === 'failed')
+    && (value.job.exitCode === null || Number.isInteger(value.job.exitCode))
+    && (value.job.signal === null || typeof value.job.signal === 'string')
+    && (value.job.reason === undefined || typeof value.job.reason === 'string'),
+  { method: 'POST', signal: AbortSignal.timeout(10_000) })
 
 export const getWebSettings = () => requestView('/api/web/settings', '网页工具设置', webSettings)
 export const saveWebSettings = (selection: Pick<WebSettingsView, 'searchProvider' | 'fetchProvider'>) =>

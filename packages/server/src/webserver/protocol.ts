@@ -1,4 +1,4 @@
-import type { ConversationSnapshot, ConversationUpdate, SessionSummary, SubmissionAccepted } from '@agent-learning/coding-agent'
+import type { ConversationSnapshot, ConversationUpdate, FinishedBashJob, RunningBashJob, SessionSummary, SubmissionAccepted } from '@agent-learning/coding-agent'
 import type { WorkspaceRegistration } from '../workspaces.js'
 
 export type {
@@ -17,6 +17,8 @@ export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { wo
 export type StartSessionAccepted = { session: SessionSummary; accepted: SubmitMessageAccepted }
 export type AbortRequest = { sessionId: string; runId: string }
 export type AbortResult = AbortRequest & { handled: boolean }
+export type BashJobsView = { sessionId: string; jobs: RunningBashJob[] }
+export type StopBashJobResult = { sessionId: string; job: FinishedBashJob }
 
 type SubscriptionTarget = { sessionId: string; subscriptionId: string }
 

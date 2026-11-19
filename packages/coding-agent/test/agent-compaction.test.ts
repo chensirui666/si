@@ -107,7 +107,7 @@ describe('AgentSession compaction', () => {
       resolveDirectory: async () => project,
       compaction: { triggerTokens: 10000, keepRecentTokens: 100 },
       tools: cwd => {
-        const write = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, cwd).find(tool => tool.name === 'write')!
+        const write = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, cwd, 'test-session').find(tool => tool.name === 'write')!
         return [{
           ...write,
           async execute(args, context) {

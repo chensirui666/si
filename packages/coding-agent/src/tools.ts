@@ -14,7 +14,15 @@ const readParameters = Type.Object({
 
 const bashParameters = Type.Object({
   command: Type.String({ description: '要运行的 Bash 命令' }),
-  timeout: Type.Optional(Type.Number({ description: '超时时间，单位为秒' })),
+  timeout: Type.Optional(Type.Number({ description: '正数秒数。省略时前台默认 240 秒，后台无时限' })),
+  background: Type.Optional(Type.Boolean({ description: '设为 true 时启动后台任务，返回任务编号' })),
+})
+
+const processParameters = Type.Object({
+  action: Type.Union([Type.Literal('list'), Type.Literal('status'), Type.Literal('log'), Type.Literal('stop')], {
+    description: '列出任务、查询状态、读取最近日志或停止任务',
+  }),
+  jobId: Type.Optional(Type.String({ description: 'Bash 启动时返回的任务编号。除 list 外必填' })),
 })
 
 const editParameters = Type.Object({
@@ -58,7 +66,8 @@ const webFetchParameters = Type.Object({
 
 const declarations = {
   read: { name: 'read', description: '读取 UTF-8 文本文件，可指定起始行和最多读取行数。', parameters: readParameters },
-  bash: { name: 'bash', description: '在工作目录运行 Bash 命令，可指定超时秒数。', parameters: bashParameters },
+  bash: { name: 'bash', description: '在工作目录运行 Bash 命令。前台默认限时 240 秒，显式后台运行时返回任务编号。', parameters: bashParameters },
+  process: { name: 'process', description: '列出当前会话的后台 Bash 任务，按编号查状态、读最近日志或停止任务。', parameters: processParameters },
   edit: { name: 'edit', description: '对同一原文件进行一处或多处文本替换，先精确匹配，未命中时忽略行尾普通空格。', parameters: editParameters },
   write: { name: 'write', description: '创建或完整覆盖文本文件。', parameters: writeParameters },
   find: { name: 'find', description: '按通配规则查找文件或目录，返回相对于搜索目录的路径。', parameters: findParameters },
@@ -70,7 +79,8 @@ const declarations = {
 export type CodingTool = ExecutableTool & { promptSnippet?: string }
 
 const promptSnippets: Record<string, string> = {
-  bash: '在当前工作目录执行 Bash 命令。',
+  bash: '在当前工作目录执行 Bash 命令，默认前台限时 240 秒。传入 background: true 可在后台运行。',
+  process: '列出当前会话的后台 Bash 任务，按编号查状态、读日志或停止。',
   edit: '通过精确匹配原文来修改文件，一次调用可修改同一文件中多处互不重叠的内容。',
   grep: '搜索文件内容，返回文件路径、行号、命中文本及可选的上下文。',
   web_search: '搜索网页，返回标题、链接和相关片段。',
@@ -81,6 +91,7 @@ export const defaultTools: Tool[] = Object.values(declarations)
 
 export type ReadParams = Static<typeof readParameters>
 export type BashParams = Static<typeof bashParameters>
+export type ProcessParams = Static<typeof processParameters>
 export type EditParams = Static<typeof editParameters>
 export type WriteParams = Static<typeof writeParameters>
 export type FindParams = Static<typeof findParameters>
@@ -114,11 +125,12 @@ function executable<Schema extends TSchema>(
   }
 }
 
-export function createTools(runtime: ToolRuntime, web: WebTools, cwd: string): CodingTool[] {
-  const local = createLocalTools(runtime)
+export function createTools(runtime: ToolRuntime, web: WebTools, cwd: string, sessionId: string): CodingTool[] {
+  const local = createLocalTools(runtime, sessionId)
   return [
     executable(declarations.read, local.read, cwd, 'read'),
     executable(declarations.bash, local.bash, cwd),
+    executable(declarations.process, local.process, cwd),
     executable(declarations.edit, local.edit, cwd, 'modified'),
     executable(declarations.write, local.write, cwd, 'modified'),
     executable(declarations.find, local.find, cwd),

@@ -67,6 +67,28 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 }
 .chat-header h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 600; }
 .connection-status { max-width: 72%; margin: 0; color: var(--secondary-text); text-align: right; font-size: 12px; line-height: 18px; }
+.chat-header-controls { display: flex; align-items: center; justify-content: flex-end; min-width: 0; gap: 12px; }
+.background-tasks { position: relative; flex: none; }
+.background-task-panel {
+  position: absolute;
+  inset: calc(100% + 8px) 0 auto auto;
+  z-index: 6;
+  width: min(384px, calc(100vw - 32px));
+  min-height: 44px;
+  max-height: min(320px, 55dvh);
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--background);
+  box-shadow: 0 5px 24px #00000012;
+}
+.background-task-list { margin: 0; padding: 0; list-style: none; }
+.background-task-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; font-size: 12px; line-height: 18px; }
+.background-task-row + .background-task-row { border-top: 1px solid var(--border); }
+.background-task-row code { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.background-task-status { flex: none; color: var(--secondary-text); }
+.background-task-error { margin: 4px; color: var(--color-destructive); font-size: 12px; line-height: 18px; }
 .chat-main { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 24px; }
 
 .message-list-frame { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; position: relative; }
@@ -254,6 +276,7 @@ code, pre { font-family: "Noto Sans Mono CJK SC", monospace; }
 @media (pointer: coarse) {
   .sidebar-workspaces-heading button, .workspace-add-session, .sidebar-toggle, .sidebar-sheet-close { width: 44px; height: 44px; }
   .sidebar-new-session, .workspace-conversation, .settings-trigger, .select-trigger { min-height: 44px; }
+  .background-tasks > button, .background-task-row button { min-width: 44px; min-height: 44px; }
 }
 @media (max-height: 500px) {
   .chat-page .message-editor { max-height: clamp(24px, calc(100dvh - 228px), 200px); }

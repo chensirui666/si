@@ -39,7 +39,7 @@ it.each(['search', 'fetch'] as const)('Tavily %s cancellation closes a real loca
     const controller = new AbortController()
     const context = { signal: controller.signal, recordDetails: () => {} }
     const runtime = new ToolRuntime()
-    const tool = createTools(runtime, tools, tmpdir()).find(tool => tool.name === `web_${capability}`)!
+    const tool = createTools(runtime, tools, tmpdir(), 'test-session').find(tool => tool.name === `web_${capability}`)!
     const output = tool.execute(capability === 'search' ? { query: 'test' } : { urls: ['https://8.8.8.8/'] }, context).finally(() => runtime.close())
     const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted' })
     await entered.promise
@@ -98,7 +98,7 @@ it.each(['search', 'fetch'] as const)('普通 %s 网络失败不被同时到达�
   const tools = createWebTools({ provider: async () => ({ id: 'test', name: 'Test', search: failure, fetch: failure }) }, { saveTemporary: vi.fn() })
   const runtime = new ToolRuntime()
   try {
-    const tool = createTools(runtime, tools, tmpdir()).find(tool => tool.name === `web_${capability}`)!
+    const tool = createTools(runtime, tools, tmpdir(), 'test-session').find(tool => tool.name === `web_${capability}`)!
     await expect(tool.execute(capability === 'search' ? { query: 'test' } : { urls: ['https://8.8.8.8/'] }, { signal: controller.signal, recordDetails: () => {} })).rejects.toMatchObject({ message: expect.stringContaining('网络原始失败') })
   } finally { await runtime.close() }
 })

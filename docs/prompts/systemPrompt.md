@@ -8,7 +8,7 @@
 
 [AgentSession](../../packages/coding-agent/src/agent-session.ts) 在每轮普通模型请求前读取适用的项目说明，再调用 [buildSystemPrompt](../../packages/coding-agent/src/system-prompt.ts) 组装提示词。[convertMessages](../../packages/model/src/context.ts) 将结果放入 DeepSeek 请求的第一条 `system` 消息。工具定义和本轮聊天历史各自加入请求。
 
-说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。下面是使用八种工具且没有项目说明时的原文。摘要请求使用独立的摘要提示词。
+说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。下面是使用九种工具且没有项目说明时的原文。摘要请求使用独立的摘要提示词。
 
 展开 `this.configuration` 后，请求数据如下。
 
@@ -27,7 +27,8 @@ const context: ModelContext = {
 
 <tools>
 - read：读取 UTF-8 文本文件，可指定起始行和最多读取行数。
-- bash：在当前工作目录执行 Bash 命令。
+- bash：在当前工作目录执行 Bash 命令，默认前台限时 240 秒。传入 background: true 可在后台运行。
+- process：列出当前会话的后台 Bash 任务，按编号查状态、读日志或停止。
 - edit：通过精确匹配原文来修改文件，一次调用可修改同一文件中多处互不重叠的内容。
 - write：创建或完整覆盖文本文件。
 - find：按通配规则查找文件或目录，返回相对于搜索目录的路径。

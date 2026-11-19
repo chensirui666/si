@@ -164,9 +164,9 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
       const result = await complete(page, observed, '本条消息只调用一次 read 读取工作区当前的 note.txt。收到这次工具结果后，直接回答其中的项目名称。')
       expect(textOf(result.message)).toContain(name)
       expect(modelRequests).toHaveLength(before + 2)
-      expect(modelRequests[before]?.tools).toHaveLength(8)
+      expect(modelRequests[before]?.tools).toHaveLength(9)
       const followup = modelRequests[before + 1]!
-      expect(followup.tools).toHaveLength(8)
+      expect(followup.tools).toHaveLength(9)
       const call = followup.messages.at(-2)?.tool_calls?.[0]
       expect(call?.id).toBeTruthy()
       expect(followup.messages.at(-1)).toMatchObject({
@@ -186,7 +186,7 @@ test('T1 live: 网页两次读取真实文件，显示工具结果且回答随�
   }
 })
 
-for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${scenario}: 实际工具结果进入后续请求，每轮保留八种工具`, async ({ page, context }) => {
+for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${scenario}: 实际工具结果进入后续请求，每轮保留九种工具`, async ({ page, context }) => {
   test.setTimeout(450_000)
   const keyFile = process.env.DEEPSEEK_LIVE_KEY_FILE
   test.skip(!keyFile, '未提供 DEEPSEEK_LIVE_KEY_FILE')
@@ -213,7 +213,7 @@ for (const scenario of ['loop', 'write-once'] as const) test(`Feature6 live ${sc
     const result = await complete(page, observed, scenario === 'loop'
       ? '请根据 index.txt 的线索找到项目名称。请先用 read 读取 index.txt，再根据真实结果继续使用 read，最后只回答项目名称。'
       : '已确认这是新建的空测试工作区，note.txt 不存在。请直接用 write 把“项目名称：青禾”写入 note.txt。本次只允许一次 write 调用，不使用其他工具，不检查目录或读取验证，收到写入结果后直接回答“已保存”。')
-    expect(requests.every(request => request.tools?.length === 8)).toBe(true)
+    expect(requests.every(request => request.tools?.length === 9)).toBe(true)
     const actualResults = observed.updates.flatMap(({ update }) => update.change.type === 'task' && update.change.message?.message.role === 'toolResult' ? [update.change.message] : [])
     expect(actualResults.every(entry => entry.message.role === 'toolResult' && !entry.message.isError)).toBe(true)
     if (scenario === 'loop') {

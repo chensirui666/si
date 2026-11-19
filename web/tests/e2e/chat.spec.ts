@@ -42,7 +42,7 @@ for (const mode of ['node', 'vite'] as const) {
       expect(first.path).toBe('/v1/chat/completions')
       expect(first.authorized).toBe(true)
       expect(first.body).toMatchObject({ model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'high' })
-      expect(first.body.tools).toHaveLength(8)
+      expect(first.body.tools).toHaveLength(9)
       expect(first.body.messages).toEqual([
         expect.objectContaining({ role: 'system', content: expect.stringContaining(`<cwd>\n${await realpath(temporary)}\n</cwd>`) }),
         { role: 'user', content: original },

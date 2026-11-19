@@ -942,6 +942,94 @@ async function pickSession(url: string, auth: string) {
   return (await createSession(url, auth, await pickWorkspace(url, auth))).id
 }
 
+it('后台任务跨轮管理，线程隔离，正常关闭时收尾且重启后编号失效', async () => {
+  const app = await setup({ modelOptions: { fetch: async (_url, init) => {
+    const message = JSON.parse(String(init?.body)).messages.at(-1)
+    const call = message.role === 'user' ? JSON.parse(message.content) : undefined
+    const delta = call ? { tool_calls: [{ index: 0, id: call.id, type: 'function', function: {
+      name: call.name, arguments: JSON.stringify(call.args),
+    } }] } : { content: '完成' }
+    return new Response(`data: ${JSON.stringify({ id: 'background-test', choices: [{ index: 0, delta, finish_reason: call ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } })
+  } } })
+  const auth = await cookie(app.authUrl)
+  const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+  const workspaceId = await pickWorkspace(app.url, auth)
+  const a = (await createSession(app.url, auth, workspaceId)).id
+  const b = (await createSession(app.url, auth, workspaceId)).id
+  const runTool = async (sessionId: string, name: string, args: object) => {
+    const id = randomUUID()
+    const result = await http(app.url + '/api/messages', headers, 'POST', JSON.stringify({
+      sessionId, modelId: 'deepseek-flash', clientMessageId: id, text: JSON.stringify({ id, name, args }),
+    }))
+    expect(result.status).toBe(202)
+    let toolResult: Extract<ConversationSnapshot['messages'][number]['message'], { role: 'toolResult' }> | undefined
+    await vi.waitFor(async () => {
+      const snapshot = await serverSnapshot(app.url, auth, sessionId)
+      expect(snapshot.running).toBeNull()
+      toolResult = snapshot.messages.map(({ message }) => message).find(message => message.role === 'toolResult' && message.toolCallId === id)
+      expect(toolResult).toBeDefined()
+    })
+    return toolResult!
+  }
+  const jobsUrl = (sessionId: string) => app.url + '/api/sessions/' + sessionId + '/jobs'
+  const list = async (sessionId: string) => {
+    const result = await http(jobsUrl(sessionId), headers)
+    expect(result.status).toBe(200)
+    return JSON.parse(result.text).jobs
+  }
+  const launch = async (command: string) => {
+    const result = await runTool(a, 'bash', { command, background: true, timeout: 30 })
+    expect(result.isError).toBeFalsy()
+    return JSON.parse(result.content[0]!.text).jobId as string
+  }
+  await http(app.url + '/api/providers/deepseek', headers, 'PUT', '{"apiKey":"test-key"}')
+  expect(await list(a)).toEqual([])
+  expect((await http(jobsUrl(a))).status).toBe(401)
+  expect((await http(jobsUrl('%ff'), headers)).status).toBe(400)
+  expect((await http(jobsUrl('unknown'), headers)).status).toBe(404)
+
+  const command = 'echo "$$" > leader; printf "ready\\n"; sleep 30'
+  const jobId = await launch(command)
+  const pid = Number(await readFile(join(app.workspace, 'leader'), 'utf8'))
+  expect(await list(a)).toEqual([{ jobId, command, status: 'running' }])
+  expect(await list(b)).toEqual([])
+  const manage = (sessionId: string, action: string) => runTool(sessionId, 'process', { action, jobId })
+  for (const action of ['status', 'log', 'stop']) {
+    expect(await manage(b, action)).toMatchObject({ isError: true, content: [{ type: 'text', text: '后台任务记录不可用' }] })
+  }
+  const stopPath = (sessionId: string) => jobsUrl(sessionId) + '/' + jobId + '/stop'
+  expect((await http(stopPath(b), headers, 'POST')).status).toBe(404)
+  expect((await http(stopPath(a), { ...headers, Origin: 'https://untrusted.example' }, 'POST')).status).toBe(403)
+  expect(() => process.kill(pid, 0)).not.toThrow()
+  expect(JSON.parse((await manage(a, 'status')).content[0]!.text)).toMatchObject({ jobId, status: 'running' })
+  expect((await manage(a, 'log')).content[0]!.text).toContain('ready')
+  const stopped = JSON.parse((await manage(a, 'stop')).content[0]!.text)
+  expect(stopped).toMatchObject({ jobId, status: 'stopped' })
+  const repeated = await http(stopPath(a), headers, 'POST')
+  expect(repeated.status).toBe(200)
+  expect(JSON.parse(repeated.text)).toEqual({ sessionId: a, job: stopped })
+  expect(await list(a)).toEqual([])
+  expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
+
+  const shutdownJob = await launch('sleep 30 & echo "$!" > child; echo "$$" > parent; echo ready > ready; wait')
+  await vi.waitFor(async () => expect(await readFile(join(app.workspace, 'ready'), 'utf8')).toBe('ready\n'))
+  const pids = await Promise.all(['parent', 'child'].map(async name => Number(await readFile(join(app.workspace, name), 'utf8'))))
+  await app.server.close()
+  await vi.waitFor(() => {
+    for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
+  })
+  const restarted = new WebServer(app.config)
+  cleanups.push(() => restarted.close())
+  const next = await restarted.start()
+  const nextHeaders = { Cookie: await cookie(next.authUrl) }
+  const path = next.url + '/api/sessions/' + a + '/jobs'
+  expect(JSON.parse((await http(path, nextHeaders)).text)).toEqual({ sessionId: a, jobs: [] })
+  expect(await http(path + '/' + shutdownJob + '/stop', nextHeaders, 'POST')).toMatchObject({
+    status: 404, text: '{"error":"后台任务记录不可用"}',
+  })
+})
+
 it('取消不写入登记，旧登记兼容，符号链接复用目录，目录不可用时保留历史，重启恢复会话', async () => {
   let selected: string | null = null
   const requests: any[] = []
@@ -998,8 +1086,8 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
     .replace('{{workspacePath}}', () => app.workspace)
   expect(requests[0].messages[0]).toEqual({ role: 'system', content: expectedPrompt })
   expect(requests[1].messages[0]).toEqual(requests[0].messages[0])
-  expect(requests[0].tools).toHaveLength(8)
-  expect(requests[1].tools).toHaveLength(8)
+  expect(requests[0].tools).toHaveLength(9)
+  expect(requests[1].tools).toHaveLength(9)
   expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })
   expect(await readFile(join(app.workspace, 'written.txt'), 'utf8')).toBe('working-directory')
   let history!: ConversationSnapshot

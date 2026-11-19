@@ -7,6 +7,7 @@ import { MessageInput } from '../components/MessageInput'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
+import { BackgroundTasks } from '../components/BackgroundTasks'
 import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
@@ -482,7 +483,10 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert">{saveNotice.text}</p>}
       {!isNew && <header className="chat-header">
         <h1>聊天</h1>
-        <p className="connection-status" role="status">{status}</p>
+        <div className="chat-header-controls">
+          <p className="connection-status" role="status">{status}</p>
+          {sessionId && <BackgroundTasks sessionId={sessionId} />}
+        </div>
       </header>}
       <main className="chat-main">
         {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures} />}

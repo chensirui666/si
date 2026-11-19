@@ -1,10 +1,10 @@
 import { expect, it } from 'vitest'
 import { Check } from 'typebox/value'
 
-it('提供八种具备用途说明的工具声明', async () => {
+it('提供九种具备用途说明的工具声明', async () => {
   const { defaultTools } = await import('../src/tools.js')
 
-  expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'edit', 'write', 'find', 'grep', 'web_search', 'web_fetch'])
+  expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'process', 'edit', 'write', 'find', 'grep', 'web_search', 'web_fetch'])
   for (const tool of defaultTools) {
     expect(tool.description.trim()).not.toBe('')
     expect(tool.parameters).toHaveProperty('type', 'object')
@@ -31,10 +31,11 @@ it.each([
   },
   {
     name: 'bash',
-    fields: ['command', 'timeout'],
+    fields: ['command', 'timeout', 'background'],
     valid: [
       { command: 'pwd' },
       { command: 'pwd', timeout: 5 },
+      { command: 'pwd', background: true },
       { command: 'pwd', timeout: -0.5 },
       { command: 'pwd', timeout: 0 },
       { command: 'pwd', timeout: 1e12 },
@@ -43,7 +44,14 @@ it.each([
       {},
       { command: 1 },
       { command: 'pwd', timeout: '5' },
+      { command: 'pwd', background: 'true' },
     ],
+  },
+  {
+    name: 'process',
+    fields: ['action', 'jobId'],
+    valid: [{ action: 'list' }, { action: 'status', jobId: 'job-1' }],
+    invalid: [{}, { action: 'restart' }, { action: 'stop', jobId: 1 }],
   },
   {
     name: 'edit',

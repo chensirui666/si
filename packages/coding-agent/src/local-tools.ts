@@ -4,7 +4,7 @@ import { homedir } from 'node:os'
 import { basename, dirname, relative, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type ToolRuntime } from './tool-runtime.js'
-import type { BashParams, EditParams, FindParams, GrepParams, ReadParams, WriteParams } from './tools.js'
+import type { BashParams, EditParams, FindParams, GrepParams, ProcessParams, ReadParams, WriteParams } from './tools.js'
 
 export type LocalToolContext = { cwd: string; signal: AbortSignal; recordFileOperation?: (path: string) => void }
 
@@ -189,10 +189,23 @@ async function edit({ path, edits }: EditParams, { cwd, signal, recordFileOperat
   return `已在 ${target} 完成 ${edits.length} 处替换`
 }
 
-function bash(runtime: ToolRuntime, { command, timeout }: BashParams, { cwd, signal }: LocalToolContext) {
+async function bash(runtime: ToolRuntime, sessionId: string, { command, timeout, background }: BashParams, { cwd, signal }: LocalToolContext) {
   nonEmpty(command, 'command')
   if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) throw new Error('timeout 必须是正数')
+  if (background) {
+    const job = await runtime.startBashJob(sessionId, command, cwd, signal, timeout)
+    return JSON.stringify({ ...job, message: '后台进程已启动。可用 process 查询状态或日志。' })
+  }
   return runtime.bash(command, cwd, signal, timeout)
+}
+
+async function manageProcess(runtime: ToolRuntime, sessionId: string, { action, jobId }: ProcessParams) {
+  if (action === 'list') return JSON.stringify(runtime.listJobs(sessionId))
+  const id = nonEmpty(jobId ?? '', 'jobId')
+  const result = action === 'log' ? runtime.jobLog(sessionId, id)
+    : action === 'stop' ? await runtime.stopJob(sessionId, id) : runtime.jobStatus(sessionId, id)
+  if (result === undefined) throw new Error('后台任务记录不可用')
+  return typeof result === 'string' ? result : JSON.stringify(result)
 }
 
 function splitOutput(separator: string, receive: (entry: string) => boolean | void) {
@@ -358,12 +371,13 @@ async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: L
   ].filter(Boolean).join('\n')
 }
 
-export function createLocalTools(runtime: ToolRuntime) {
+export function createLocalTools(runtime: ToolRuntime, sessionId: string) {
   return {
     read,
     write,
     edit,
-    bash: (params: BashParams, context: LocalToolContext) => bash(runtime, params, context),
+    bash: (params: BashParams, context: LocalToolContext) => bash(runtime, sessionId, params, context),
+    process: (params: ProcessParams) => manageProcess(runtime, sessionId, params),
     find: (params: FindParams, context: LocalToolContext) => find(runtime, params, context),
     grep: (params: GrepParams, context: LocalToolContext) => grep(runtime, params, context),
   }

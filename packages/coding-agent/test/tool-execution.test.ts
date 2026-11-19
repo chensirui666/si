@@ -23,8 +23,8 @@ afterEach(async () => {
   await rm(cwd, { recursive: true, force: true })
 })
 
-function tool(name: string) {
-  const tools = createTools(runtime, { web_search: async () => 'search', web_fetch: async () => 'fetch' }, cwd)
+function tool(name: string, sessionId = 'thread-a') {
+  const tools = createTools(runtime, { web_search: async () => 'search', web_fetch: async () => 'fetch' }, cwd, sessionId)
   return tools.find(tool => tool.name === name)!.execute
 }
 
@@ -127,6 +127,97 @@ it('ends the Bash process group on timeout and reports existing output', async (
   await expect(tool('bash')({ command, timeout: 0.1 }, context())).rejects.toThrow(/partial[\s\S]*超时/)
   await new Promise(resolve => setTimeout(resolve, 650))
   await expect(readFile(join(cwd, 'survived'))).rejects.toHaveProperty('code', 'ENOENT')
+})
+
+it('默认前台时限为 240 秒，终止真实进程组并保留输出', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+  const controller = new AbortController()
+  const ready = Promise.withResolvers<void>()
+  const watcher = watch(cwd, (_event, filename) => { if (filename === 'ready') ready.resolve() })
+  const output = tool('bash')({
+    command: 'printf partial; (while [[ ! -f go ]]; do sleep 0.01; done; touch survived) & echo "$!" > child; touch ready; wait',
+  }, context(controller.signal))
+  const result = output.catch(error => error)
+  try {
+    await Promise.race([ready.promise, result.then(() => { throw new Error('命令在就绪前退出') })])
+    const pid = Number(await readFile(join(cwd, 'child'), 'utf8'))
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(239_999)
+    expect(() => process.kill(pid, 0)).not.toThrow()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await result).toMatchObject({ message: expect.stringMatching(/partial[\s\S]*超时（240 秒）/) })
+    await writeFile(join(cwd, 'go'), '')
+    await expect(readFile(join(cwd, 'survived'))).rejects.toHaveProperty('code', 'ENOENT')
+  } finally {
+    controller.abort()
+    await result
+    watcher.close()
+    vi.useRealTimers()
+  }
+  await vi.waitFor(async () => {
+    const pid = Number(await readFile(join(cwd, 'child'), 'utf8'))
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
+  })
+})
+
+it('后台 Bash 启动后脱离原轮次，同会话可读日志及重复停止', async () => {
+  const controller = new AbortController()
+  const command = 'echo "$$" > pid; printf "ready\\n" >&2; sleep 60'
+  const started = await tool('bash')({ command, background: true, timeout: 2 }, context(controller.signal))
+  const { jobId } = JSON.parse(started)
+  expect(started).toContain('已启动')
+  controller.abort()
+  const manage = (action: string, sessionId = 'thread-a') => tool('process', sessionId)({ action, jobId }, context())
+  await vi.waitFor(async () => expect(await manage('log')).toContain('ready'))
+  const pid = Number(await readFile(join(cwd, 'pid'), 'utf8'))
+  expect(JSON.parse(await manage('status'))).toMatchObject({ jobId, command, status: 'running' })
+  expect(JSON.parse(await tool('process')({ action: 'list' }, context()))).toMatchObject([{ jobId }])
+  await expect(manage('stop', 'thread-b')).rejects.toThrow('任务记录不可用')
+  expect(() => process.kill(pid, 0)).not.toThrow()
+  const results = await Promise.all([manage('stop'), manage('stop')])
+  expect(results[0]).toBe(results[1])
+  expect(JSON.parse(results[0]!)).toMatchObject({ jobId, status: 'stopped', signal: 'SIGKILL' })
+  expect(await manage('stop')).toBe(results[0])
+  expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
+  expect(await manage('log')).toContain('ready')
+})
+
+it('后台 Bash 启动失败和启动中取消时不登记任务', async () => {
+  const controller = new AbortController()
+  const starting = tool('bash')({ command: 'sleep 60', background: true, timeout: 1 }, context(controller.signal))
+  controller.abort()
+  await expect(starting).rejects.toHaveProperty('code', 'interrupted')
+  const tools = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, join(cwd, 'missing'), 'thread-a')
+  await expect(tools.find(tool => tool.name === 'bash')!.execute({ command: 'pwd', background: true }, context())).rejects.toThrow('ENOENT')
+  expect(await tool('process')({ action: 'list' }, context())).toBe('[]')
+})
+
+it('后台时限与退出码可查询，日志仅保留最近 50 KiB', async () => {
+  const bash = tool('bash')
+  const status = async (jobId: string) => JSON.parse(await tool('process')({ action: 'status', jobId }, context()))
+  const { jobId: timed } = JSON.parse(await bash({ command: 'sleep 30', background: true, timeout: 0.05 }, context()))
+  const { jobId: exited } = JSON.parse(await bash({
+    command: 'echo first; yes 汉 | head -n 15000; echo last; exit 7', background: true,
+  }, context()))
+  await vi.waitFor(async () => {
+    expect(await status(timed)).toMatchObject({ status: 'stopped', reason: '执行超时（0.05 秒）' })
+    expect(await status(exited)).toMatchObject({ status: 'exited', exitCode: 7 })
+  })
+  const log = await tool('process')({ action: 'log', jobId: exited }, context())
+  expect(Buffer.byteLength(log)).toBeLessThanOrEqual(50 * 1024)
+  expect(log).toContain('last')
+  expect(log).not.toMatch(/first|�/)
+})
+
+it('后台日志正确保留交错输出中跨数据块的 UTF-8 字符', async () => {
+  const command = "printf '\\xe6'; sleep 0.05; printf X >&2; sleep 0.05; printf '\\xb1\\x89'"
+  const { jobId } = JSON.parse(await tool('bash')({ command, background: true }, context()))
+  const manage = (action: string) => tool('process')({ action, jobId }, context())
+  await vi.waitFor(async () => expect(JSON.parse(await manage('status'))).toMatchObject({ status: 'exited', exitCode: 0 }))
+  const log = await manage('log')
+  expect(log).toContain('汉')
+  expect(log).toContain('X')
+  expect(log).not.toContain('�')
 })
 
 it('stops a running Bash process group when the service closes', async () => {

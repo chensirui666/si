@@ -272,6 +272,8 @@ test('消息区键盘焦点使用固定局部标记，滚动和高对比度下�
   await expect(frame).toHaveCount(1)
   expect(await frame.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
   await page.keyboard.press('Tab')
+  await expect(page.getByRole('button', { name: '后台任务', exact: true })).toBeFocused()
+  await page.keyboard.press('Tab')
   await expect(list).toBeFocused()
   await expect(list).toHaveCSS('border-width', '0px')
   await expect(list).toHaveCSS('outline-style', 'none')

@@ -7,6 +7,20 @@ import { StringDecoder } from 'node:string_decoder'
 
 export const MAX_OUTPUT_BYTES = 50 * 1024
 export const MAX_OUTPUT_LINES = 2000
+const MAX_FINISHED_JOBS = 100
+
+export type RunningBashJob = { jobId: string; command: string; status: 'running' }
+export type FinishedBashJob = {
+  jobId: string
+  command: string
+  status: 'exited' | 'stopped' | 'failed'
+  exitCode: number | null
+  signal: NodeJS.Signals | null
+  reason?: string
+}
+type BashJob = RunningBashJob | FinishedBashJob
+type JobRecord<T extends BashJob> = { sessionId: string; view: T; output: Buffer }
+type RunningJobRecord = JobRecord<RunningBashJob> & { stop: AbortController; done: Promise<FinishedBashJob> }
 
 type SearchBinary = 'fd' | 'rg'
 type ChildResult = { code: number | null; signal: NodeJS.Signals | null; stderr: string; stopped?: string; aborted?: boolean }
@@ -17,6 +31,9 @@ type RunOptions = {
   outputFd?: number
   processGroup?: boolean
   timeout?: number
+  onSpawn?: () => void
+  output?: (chunk: Buffer, stream: 'stdout' | 'stderr') => void
+  abortMessage?: string
 }
 
 // GitHub's official release assets and published SHA-256 digests.
@@ -77,10 +94,18 @@ function stopGroup(child: ChildProcess) {
   }
 }
 
+function decodeTail(bytes: Buffer) {
+  let start = 0
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++
+  return bytes.subarray(start).toString('utf8')
+}
+
 export class ToolRuntime {
   private readonly shutdown = new AbortController()
   private readonly tasks = new Set<Promise<unknown>>()
   private readonly binaries = new Map<SearchBinary, string>()
+  private readonly runningJobs = new Map<string, RunningJobRecord>()
+  private readonly finishedJobs = new Map<string, JobRecord<FinishedBashJob>>()
   private directory?: Promise<string>
   private closing?: Promise<void>
 
@@ -175,7 +200,7 @@ export class ToolRuntime {
 
   run(command: string, args: string[], options: RunOptions): Promise<ChildResult> {
     return this.active(options.signal, signal => new Promise((resolve, reject) => {
-      const { cwd, stdout, outputFd, processGroup = false, timeout } = options
+      const { cwd, stdout, outputFd, processGroup = false, timeout, onSpawn, output, abortMessage = '任务已取消' } = options
       const child = spawn(command, args, {
         cwd, detached: processGroup,
         stdio: ['ignore', outputFd ?? 'pipe', processGroup ? outputFd ?? 'pipe' : 'pipe'],
@@ -194,8 +219,10 @@ export class ToolRuntime {
         if (processGroup) stopGroup(child)
         else child.kill('SIGKILL')
       }
-      const onAbort = () => stop(this.shutdown.signal.aborted ? '服务关闭' : '任务已取消', true)
-      signal.addEventListener('abort', onAbort, { once: true })
+      const onAbort = () => stop(this.shutdown.signal.aborted ? '服务关闭' : abortMessage, true)
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+      if (onSpawn) child.once('spawn', () => { if (!signal.aborted) onSpawn() })
 
       if (timeout !== undefined) {
         const deadline = performance.now() + timeout * 1000
@@ -208,6 +235,7 @@ export class ToolRuntime {
       }
 
       child.stdout?.on('data', (chunk: Buffer) => {
+        if (output) { output(chunk, 'stdout'); return }
         if (stopped) return
         try {
           if (stdout?.(chunk) === false) stop('达到结果上限')
@@ -216,7 +244,10 @@ export class ToolRuntime {
           error = cause instanceof Error ? cause : new Error(String(cause))
         }
       })
-      child.stderr?.on('data', (chunk: Buffer) => { stderr = (stderr + decoder.write(chunk)).slice(-4096) })
+      child.stderr?.on('data', (chunk: Buffer) => {
+        if (output) output(chunk, 'stderr')
+        else stderr = (stderr + decoder.write(chunk)).slice(-4096)
+      })
       child.once('error', cause => { error = cause })
       // The tool has ended when its foreground command exits. Reap background jobs in its group.
       if (processGroup) child.once('exit', () => stopGroup(child))
@@ -229,7 +260,7 @@ export class ToolRuntime {
     }))
   }
 
-  bash(command: string, cwd: string, signal: AbortSignal, timeout?: number): Promise<string> {
+  bash(command: string, cwd: string, signal: AbortSignal, timeout = 240): Promise<string> {
     return this.active(signal, async activeSignal => {
       const path = join(await this.temporaryDirectory(), `bash-${randomUUID()}.txt`)
       const file = await open(path, 'wx+', 0o600)
@@ -241,9 +272,7 @@ export class ToolRuntime {
         const size = (await file.stat()).size
         const bytes = Buffer.alloc(Math.min(size, MAX_OUTPUT_BYTES))
         await file.read({ buffer: bytes, position: size - bytes.length })
-        let start = 0
-        while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++
-        let output = bytes.subarray(start).toString('utf8')
+        let output = decodeTail(bytes)
         const lines = output.split('\n')
         const trailingNewline = lines.at(-1) === '' ? 1 : 0
         if (size > bytes.length || lines.length - trailingNewline > MAX_OUTPUT_LINES) {
@@ -261,5 +290,89 @@ export class ToolRuntime {
         if (!keep) await rm(path, { force: true })
       }
     })
+  }
+
+  startBashJob(sessionId: string, command: string, cwd: string, signal: AbortSignal, timeout?: number): Promise<RunningBashJob> {
+    return new Promise((resolve, reject) => {
+      const jobId = randomUUID()
+      const view: RunningBashJob = { jobId, command, status: 'running' }
+      const stop = new AbortController()
+      const cancelStartup = () => stop.abort(signal.reason)
+      if (signal.aborted) cancelStartup()
+      else signal.addEventListener('abort', cancelStartup, { once: true })
+
+      const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }
+      const append = (text: string) => {
+        if (!text) return
+        const chunk = Buffer.from(text)
+        const keep = Math.max(0, job.output.length + chunk.length - MAX_OUTPUT_BYTES)
+        job.output = Buffer.concat([job.output.subarray(keep), chunk.subarray(-MAX_OUTPUT_BYTES)])
+      }
+      const finish = (result: FinishedBashJob) => {
+        signal.removeEventListener('abort', cancelStartup)
+        if (this.runningJobs.delete(jobId)) {
+          append(decoders.stdout.end())
+          append(decoders.stderr.end())
+          this.finishedJobs.set(jobId, { sessionId, view: result, output: job.output })
+          if (this.finishedJobs.size > MAX_FINISHED_JOBS) this.finishedJobs.delete(this.finishedJobs.keys().next().value!)
+        }
+        return result
+      }
+      const job: RunningJobRecord = {
+        sessionId, view, stop, output: Buffer.alloc(0),
+        done: this.run('/bin/bash', ['-c', command], {
+          cwd, signal: stop.signal, processGroup: true, timeout, abortMessage: '已停止',
+          onSpawn: () => {
+            signal.removeEventListener('abort', cancelStartup)
+            this.runningJobs.set(jobId, job)
+            resolve(view)
+          },
+          output: (chunk, stream) => append(decoders[stream].write(chunk)),
+        }).then(result => {
+          if (!this.runningJobs.has(jobId)) reject(signal.aborted ? signal.reason : new Error(result.stopped ?? '后台任务启动失败'))
+          return finish({
+            jobId, command, status: result.stopped ? 'stopped' : 'exited',
+            exitCode: result.code, signal: result.signal, ...(result.stopped && { reason: result.stopped }),
+          })
+        }, error => {
+          reject(error)
+          return finish({ jobId, command, status: 'failed', exitCode: null, signal: null, reason: String(error) })
+        }),
+      }
+    })
+  }
+
+  listRunningJobs(sessionId: string): RunningBashJob[] {
+    return [...this.runningJobs.values()].filter(job => job.sessionId === sessionId).map(job => job.view)
+  }
+
+  listJobs(sessionId: string): BashJob[] {
+    return [...this.listRunningJobs(sessionId),
+      ...[...this.finishedJobs.values()].filter(job => job.sessionId === sessionId).map(job => job.view),
+    ]
+  }
+
+  private ownedJob(sessionId: string, jobId: string) {
+    const job = this.runningJobs.get(jobId) ?? this.finishedJobs.get(jobId)
+    return job?.sessionId === sessionId ? job : undefined
+  }
+
+  jobStatus(sessionId: string, jobId: string) {
+    return this.ownedJob(sessionId, jobId)?.view
+  }
+
+  jobLog(sessionId: string, jobId: string) {
+    const job = this.ownedJob(sessionId, jobId)
+    return job && decodeTail(job.output)
+  }
+
+  async stopJob(sessionId: string, jobId: string): Promise<FinishedBashJob | undefined> {
+    const job = this.ownedJob(sessionId, jobId)
+    if (!job) return undefined
+    if ('stop' in job) {
+      job.stop.abort()
+      return job.done
+    }
+    return job.view
   }
 }

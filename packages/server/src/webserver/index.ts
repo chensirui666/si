@@ -17,7 +17,7 @@ import { Workspaces, WorkspaceBindingError } from '../workspaces.js'
 import { WebSettings } from '../web-settings.js'
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
-import type { ClientFrame, ServerFrame, StartSessionAccepted, StartSessionRequest } from './protocol.js'
+import type { BashJobsView, ClientFrame, ServerFrame, StartSessionAccepted, StartSessionRequest, StopBashJobResult } from './protocol.js'
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
@@ -73,6 +73,13 @@ async function providerKey(req: IncomingMessage): Promise<string> {
 function validId(value: unknown): value is string {
   return typeof value === 'string' && value.length <= 128 && !!value.trim()
 }
+function pathId(segment: string) {
+  let id: string
+  try { id = decodeURIComponent(segment) }
+  catch { throw new InputError(400, '编号无效') }
+  if (!validId(id)) throw new InputError(400, '编号无效')
+  return id
+}
 async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspaceId') {
   const value = await readJson(req)
   const targetLabel = target === 'sessionId' ? '会话' : '工作区'
@@ -94,6 +101,7 @@ function validFrame(value: unknown): value is ClientFrame {
 
 export class WebServer {
   private sessions!: Sessions<SessionTarget>
+  private runtime!: ToolRuntime
   private store?: SessionStore
   private server?: Server
   private ws?: WebSocketServer
@@ -114,14 +122,14 @@ export class WebServer {
     this.webSettings = new WebSettings(options.webProviders ?? [createTavilyProvider(this.credentials)], this.credentials, options.webSettingsPath)
   }
   private createSessions() {
-    const runtime = new ToolRuntime()
+    const runtime = this.runtime = new ToolRuntime()
     const webTools = createWebTools(this.webSettings, runtime)
     const stream = createModelStream(this.credentials, this.options.modelOptions)
     return new Sessions<SessionTarget>({
       resolveDirectory: id => this.workspaces.resolveDirectory(id),
       store: this.store,
-      createSession: this.options.createSession ?? ((resolveDirectory, persistence) => new AgentSession({
-        resolveDirectory, persistence, stream, tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+      createSession: this.options.createSession ?? ((resolveDirectory, persistence, sessionId) => new AgentSession({
+        resolveDirectory, persistence, stream, tools: cwd => createTools(runtime, webTools, cwd, sessionId), compaction: this.options.compaction,
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
       })),
@@ -249,6 +257,20 @@ export class WebServer {
       } catch (error) {
         this.sessionError(res, error, '暂时无法发送首条消息')
       }
+      return
+    }
+    const jobsRoute = /^\/api\/sessions\/([^/]+)\/jobs(?:\/([^/]+)\/stop)?$/.exec(url.pathname)
+    if (jobsRoute && req.method === (jobsRoute[2] ? 'POST' : 'GET')) {
+      try {
+        const sessionId = pathId(jobsRoute[1]!)
+        const jobId = jobsRoute[2] && pathId(jobsRoute[2])
+        this.target(sessionId)
+        if (jobId) {
+          const job = await this.runtime.stopJob(sessionId, jobId)
+          if (!job) throw new InputError(404, '后台任务记录不可用')
+          this.json(res, 200, { sessionId, job } satisfies StopBashJobResult)
+        } else this.json(res, 200, { sessionId, jobs: this.runtime.listRunningJobs(sessionId) } satisfies BashJobsView)
+      } catch (error) { this.sessionError(res, error, '后台任务请求失败，请重试') }
       return
     }
     const webProvider = /^\/api\/web\/providers\/([a-z][a-z0-9-]*)$/.exec(url.pathname)?.[1]

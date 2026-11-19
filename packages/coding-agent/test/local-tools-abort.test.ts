@@ -28,7 +28,7 @@ it.each(['stat', 'readFile'] as const)('read stops waiting during %s and discard
   const paths: string[] = []
   if (stage === 'stat') vi.mocked(fs.stat).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return real.stat(join(cwd, 'note.txt')) })
   else vi.mocked(fs.readFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return Buffer.from('late text') })
-  const output = createLocalTools(runtime).read({ path: 'note.txt' }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
+  const output = createLocalTools(runtime, 'test-session').read({ path: 'note.txt' }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
   let settled = false
   void output.then(() => { settled = true }, () => { settled = true })
   const rejected = expect(output).rejects.toThrow()
@@ -50,7 +50,7 @@ it.each(['mkdir', 'writeFile'] as const)('write waits for %s to settle and then 
   if (stage === 'mkdir') vi.mocked(fs.mkdir).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return undefined })
   else vi.mocked(fs.writeFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; await real.writeFile(join(cwd, 'note.txt'), 'after') })
   let settled = false
-  const output = createLocalTools(runtime).write({ path: 'note.txt', content: 'after' }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
+  const output = createLocalTools(runtime, 'test-session').write({ path: 'note.txt', content: 'after' }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
   void output.then(() => { settled = true }, () => { settled = true })
   const rejected = expect(output).rejects.toThrow()
   await entered.promise
@@ -70,7 +70,7 @@ it.each(['readFile', 'writeFile'] as const)('edit waits for %s and never reports
   if (stage === 'readFile') vi.mocked(fs.readFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return Buffer.from('before') })
   else vi.mocked(fs.writeFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; await real.writeFile(join(cwd, 'note.txt'), 'after') })
   let settled = false
-  const output = createLocalTools(runtime).edit({ path: 'note.txt', edits: [{ oldText: 'before', newText: 'after' }] }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
+  const output = createLocalTools(runtime, 'test-session').edit({ path: 'note.txt', edits: [{ oldText: 'before', newText: 'after' }] }, { cwd, signal: controller.signal, recordFileOperation: path => paths.push(path) })
   void output.then(() => { settled = true }, () => { settled = true })
   const rejected = expect(output).rejects.toThrow()
   await entered.promise
@@ -88,7 +88,7 @@ it('T1.1 正式 read 工具返回明确的中止码，晚到文件结果不会�
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   vi.mocked(fs.readFile).mockImplementationOnce(async () => { entered.resolve(); await release.promise; return Buffer.from('项目名称：青禾') })
   const controller = new AbortController()
-  const read = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, cwd).find(tool => tool.name === 'read')!
+  const read = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, cwd, 'test-session').find(tool => tool.name === 'read')!
   const output = read.execute({ path: 'note.txt' }, { signal: controller.signal, recordDetails: () => {} })
   const rejected = expect(output).rejects.toMatchObject({ code: 'interrupted' })
   await entered.promise

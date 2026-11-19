@@ -21,7 +21,7 @@ export class Sessions<T extends { close?: () => Promise<void> }> {
 
   constructor(private readonly options: {
     resolveDirectory(workspaceId: string): Promise<string>
-    createSession(resolveDirectory: () => Promise<string>, persistence?: SessionPersistence): T
+    createSession(resolveDirectory: () => Promise<string>, persistence: SessionPersistence | undefined, sessionId: string): T
     store?: SessionStore
     closeTools?(): Promise<void>
     onStarted?(): void
@@ -34,7 +34,7 @@ export class Sessions<T extends { close?: () => Promise<void> }> {
     do { id = randomUUID() } while (this.sessions.has(id) || this.starts.has(id))
     const summary = this.newSummary(id, workspaceId)
     const store = this.options.store
-    const session = this.options.createSession(resolveDirectory, store && { summary, store })
+    const session = this.options.createSession(resolveDirectory, store && { summary, store }, id)
     store?.save(id, { summary })
     this.sessions.set(id, { summary, session })
     return summary
@@ -75,7 +75,7 @@ export class Sessions<T extends { close?: () => Promise<void> }> {
     const store = this.options.store
     const session = this.options.createSession(resolveDirectory, store && {
       summary, store, first: () => Object.assign(summary, this.newSummary(summary.id, summary.workspaceId)),
-    })
+    }, summary.id)
     let closing: Promise<void> | undefined
     const close = () => closing ??= Promise.resolve().then(() => session.close?.())
     this.provisional.add(close)
@@ -117,7 +117,7 @@ export class Sessions<T extends { close?: () => Promise<void> }> {
     const history = store?.loadSession(sessionId)
     if (!store || !history) return undefined
     const { summary } = history
-    const session = this.options.createSession(() => this.options.resolveDirectory(summary.workspaceId), { store, summary, history })
+    const session = this.options.createSession(() => this.options.resolveDirectory(summary.workspaceId), { store, summary, history }, summary.id)
     this.sessions.set(sessionId, { summary, session })
     return session
   }
