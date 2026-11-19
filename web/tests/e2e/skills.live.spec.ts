@@ -87,7 +87,7 @@ test('Skill 23/26/29：先确认范围与同名冲突，新建后在真实任务
 
     const conflict = await turn('/skill:skill-creator 请新建一个叫 delivery-check 的 Skill，用来交叉核对清单。')
     expect(conflict.text).toContain(`/.si/skills/${name}/SKILL.md`)
-    expect(conflict.text).toMatch(/修改|更新/)
+    expect(conflict.text).toMatch(/修改|更新|改已有|改现有/)
     expect(conflict.text).toMatch(/另[一]?个[名]?|换名|改名|新名称|不同.*名/)
     expect(conflict.effects).toEqual([])
     expect(await readFile(projectSkill, 'utf8')).toBe(body)
