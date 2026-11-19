@@ -154,7 +154,7 @@ it('附件首发回执丢失后，用恢复的同一条消息确认并清理草�
   render(<ChatPage getDefaultPermission={getDefaultPermission} subscribe={subscription} getModels={getModels} getWorkspaces={getWorkspaces}
     getSessions={async () => sessions} startSession={startSession} />)
   await screen.findByRole('button', { name: '重试首次发送' })
-  fireEvent.click(screen.getByRole('button', { name: session.name }))
+  fireEvent.click(await screen.findByRole('button', { name: session.name }))
   const update = (clientMessageId: string) => {
     const snapshot: ConversationSnapshot = { ...empty, seq: 1, messages: [
       { id: 'stored-first', clientMessageId, message: { role: 'user', content: firstText, timestamp: 1 } },
