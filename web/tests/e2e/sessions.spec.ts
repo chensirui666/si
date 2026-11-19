@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebServer } from '@agent-learning/server'
 import type { SessionList, StartSessionAccepted, StartSessionRequest, WorkspacePick } from '@agent-learning/server/protocol'
-import { expect, test } from '@playwright/test'
+import { expect, test } from './chinese-fixture'
 import { startModelServer } from './model-server'
 import { addWorkspace, authorize, expectBrowserStorage, observe, openSession, ready, saveKey, startBackend, stop } from './test-utils'
 
@@ -13,7 +13,7 @@ test('未发送的新会话共用一份草稿，首次发送使用最后选中�
   const folders = ['workspace-a', 'workspace-b'].map(name => join(temporary, name))
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'),
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'),
     modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'),
@@ -79,11 +79,11 @@ test('未发送的新会话共用一份草稿，首次发送使用最后选中�
     const response = await receipt
     expect(response.status()).toBe(202)
     const request: StartSessionRequest = response.request().postDataJSON()
-    expect(request).toEqual({ workspaceId: workspaceB, clientMessageId: expect.any(String), modelId: 'deepseek-flash', text: draft })
+    expect(request).toEqual({ permissionMode: 'normal', workspaceId: workspaceB, clientMessageId: expect.any(String), provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high', text: draft })
     const { session }: StartSessionAccepted = await response.json()
-    expect(session).toMatchObject({ id: request.clientMessageId, workspaceId: workspaceB, name: '会话 1' })
+    expect(session).toMatchObject({ id: request.clientMessageId, workspaceId: workspaceB, name: '读取 answer.txt 保留原文' })
     expect(await listSessions()).toEqual([session])
-    await expect(page.getByRole('group', { name: 'workspace-b', exact: true }).getByRole('button', { name: '会话 1', exact: true })).toBeVisible()
+    await expect(page.getByRole('group', { name: 'workspace-b', exact: true }).getByRole('button', { name: '读取 answer.txt 保留原文', exact: true })).toBeVisible()
     await expect(heading).toHaveCount(0)
     await expect(draftRow).toHaveCount(0)
     await expect(editor).toHaveText('')
@@ -195,7 +195,7 @@ test('Feature8 运行中的会话可切换、并行与独立中止，重开页�
     second.delta({ role: 'assistant', content: 'B 已输出。' })
     await expect(messages).toContainText('B 已输出。')
     await editor.fill('B 的下一条')
-    await expect(otherPage.locator('[data-session-id]')).toHaveAttribute('data-session-id', a)
+    await expect(otherPage.locator('.chat-page[data-session-id]')).toHaveAttribute('data-session-id', a)
     const beforeOtherReload = other.snapshots.length
     await otherPage.reload()
     await ready(otherPage, other, beforeOtherReload, false)
@@ -206,7 +206,7 @@ test('Feature8 运行中的会话可切换、并行与独立中止，重开页�
     expect(second.closed).toBe(false)
     expect(first.body.messages.filter(message => message.role === 'user').map(message => message.content)).toEqual(['A 任务'])
     expect(second.body.messages.filter(message => message.role === 'user').map(message => message.content)).toEqual(['B 任务'])
-    const snapshot = await openSession(page, observed, '会话 1')
+    const snapshot = await openSession(page, observed, a)
     expect(snapshot.sessionId).toBe(a)
     const runA = snapshot.snapshot.running?.runId
     expect(runA).toBeDefined()
@@ -221,7 +221,7 @@ test('Feature8 运行中的会话可切换、并行与独立中止，重开页�
     expect(second.closed).toBe(false)
     await expect(messages).toContainText('A 已输出。')
     await expect(send).toBeEnabled()
-    const bRunning = await openSession(page, observed, '会话 2')
+    const bRunning = await openSession(page, observed, b)
     expect(bRunning.sessionId).toBe(b)
     const runB = bRunning.snapshot.running?.runId
     expect(runB).toBeDefined()
@@ -238,7 +238,7 @@ test('Feature8 运行中的会话可切换、并行与独立中止，重开页�
     second.finish()
     await expect(reopened.getByRole('region', { name: '消息列表' })).toContainText('B 已输出。切换后继续。')
     await expect(reopened.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
-    const aRestored = await openSession(reopened, restored, '会话 1')
+    const aRestored = await openSession(reopened, restored, a)
     expect(aRestored.snapshot.running).toBeNull()
     const aDraft = reopened.getByRole('textbox', { name: '消息', exact: true })
     await expect.poll(() => aDraft.evaluate(el => Array.from(el.children, node => node.textContent).join('\n'))).toBe('  A 的下一条\n保留原文  ')
@@ -286,7 +286,7 @@ test('Feature10 22/23/25：服务正常重启后从侧栏回看，由用户主�
     await page.reload()
     await ready(page, observed, before, false)
     await page.getByRole('button', { name: '新会话', exact: true }).click()
-    const restored = await openSession(page, observed, '会话 1')
+    const restored = await openSession(page, observed, sessionId)
     expect(restored.sessionId).toBe(sessionId)
     expect(restored.snapshot.runs).toMatchObject([{ status: 'completed' }])
     await expect(list.locator('.message-text, .markdown-text')).toHaveText(['记住代号青禾', '已记住青禾'])

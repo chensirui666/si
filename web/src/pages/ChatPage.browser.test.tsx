@@ -6,6 +6,7 @@ import { draftKey, newSessionDraft, recentSessionKey } from '../chat/drafts'
 import { Button } from '../components/ui/button'
 
 test.beforeEach(async ({ page }) => {
+  await page.route('**/api/settings/permission', route => route.fulfill({ json: { defaultPermissionMode: 'normal' } }))
   await page.route('**/api/web/settings', route => route.fulfill({
     json: {
       searchProvider: 'tavily', fetchProvider: 'tavily',
@@ -19,18 +20,19 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
   await mount(<ChatPageHarness messages={history} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const list = page.getByRole('region', { name: '消息列表' })
+  const scroll = page.locator('.chat-main')
   const items = list.getByRole('listitem')
   await expect(items).toHaveCount(26)
-  expect(await list.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true)
-  await list.evaluate(el => { el.scrollTop = 350 })
+  expect(await scroll.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true)
+  await scroll.evaluate(el => { el.scrollTop = 350 })
   const oldItem = items.nth(5)
   const oldTop = (await oldItem.boundingBox())!.y
-  const readingPosition = await list.evaluate(el => el.scrollTop)
+  const readingPosition = await scroll.evaluate(el => el.scrollTop)
   const multiline = '多行草稿\n第二行\n\n第四行\n第五行\n最后一行'
   const before = await editor.boundingBox()
   await editor.fill(multiline)
   expect((await editor.boundingBox())!.height).toBeGreaterThan(before!.height + 90)
-  expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
+  expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
   expect((await oldItem.boundingBox())!.y).toBeCloseTo(oldTop, 0)
   for (const connection of ['disconnected', 'connecting', 'awaitingSnapshot', 'ready'] as const) {
     await page.evaluate(({ connection, history }) => {
@@ -44,7 +46,7 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
     await editor.press('Enter')
     expect(await editor.textContent()).toBe(multiline)
     await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled()
-    expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
+    expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
     expect((await oldItem.boundingBox())!.y).toBeCloseTo(oldTop, 0)
   }
   // fill('') 直接设置 DOM 选区后立刻 Delete，可能早于 Lexical 的选区同步。
@@ -52,14 +54,14 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
   await editor.press('Backspace')
   await expect(editor).toHaveText('')
   await expect.poll(async () => (await editor.boundingBox())!.height).toBeCloseTo(before!.height, 0)
-  expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
+  expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(readingPosition, 0)
   await list.focus()
-  const keyboardBefore = await list.evaluate(el => el.scrollTop)
+  const keyboardBefore = await scroll.evaluate(el => el.scrollTop)
   await list.press('PageDown')
-  await expect.poll(() => list.evaluate(el => el.scrollTop)).toBeGreaterThan(keyboardBefore)
-  await list.evaluate(el => { el.scrollTop = el.scrollHeight })
+  await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBeGreaterThan(keyboardBefore)
+  await scroll.evaluate(el => { el.scrollTop = el.scrollHeight })
   await expect(items.last()).toBeInViewport()
-  const bottom = await list.evaluate(el => el.scrollTop)
+  const bottom = await scroll.evaluate(el => el.scrollTop)
   await page.evaluate(history => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,
@@ -67,9 +69,85 @@ test('连接切换、快照恢复和输入区增高时保留草稿、焦点与�
     } }))
   }, history)
   await expect(items).toHaveCount(27)
-  expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(bottom, 0)
-  expect(await list.evaluate(el => el.scrollTop + el.clientHeight < el.scrollHeight)).toBe(true)
+  expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(bottom, 0)
+  expect(await scroll.evaluate(el => el.scrollTop + el.clientHeight < el.scrollHeight)).toBe(true)
   expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(true)
+})
+
+test('正文外的留白能滚动，消息到输入框上沿才被遮住', async ({ mount, page }) => {
+  const messages = Array.from({ length: 30 }, (_, i) => `消息 ${i}\n第二行\n第三行`)
+  await mount(<ChatPageHarness messages={messages} />)
+  const workspace = (await page.locator('.chat-workspace').boundingBox())!
+  const scroll = page.locator('.chat-main')
+  const header = page.getByRole('heading', { name: '会话 1' })
+  const headerBefore = await header.boundingBox()
+  const composer = page.locator('.message-input')
+  const input = (await composer.boundingBox())!
+  const list = page.getByRole('region', { name: '消息列表' })
+  const rows = list.getByRole('listitem')
+  await expect(rows).toHaveCount(messages.length)
+  const scrollBox = (await scroll.boundingBox())!
+  expect(scrollBox.x).toBeCloseTo(workspace.x, 0)
+  expect(scrollBox.x + scrollBox.width).toBeCloseTo(workspace.x + workspace.width, 0)
+  const gutterX = (input.x + workspace.x) / 2
+  await page.mouse.move(gutterX, input.y - 60)
+  await page.mouse.wheel(0, 310)
+  await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBeGreaterThan(100)
+  expect(await header.boundingBox()).toEqual(headerBefore)
+  expect(await composer.boundingBox()).toEqual(input)
+
+  const row = rows.nth(10)
+  const box = (await row.boundingBox())!
+  await scroll.evaluate((el, delta) => { el.scrollTop += delta }, box.y + box.height / 2 - input.y)
+  const edge = await row.evaluate((el, { x, y }) => ({
+    above: el.contains(document.elementFromPoint(x, y - 2)),
+    below: Boolean(document.elementFromPoint(x, y + 2)?.closest('.message-input')),
+  }), { x: box.x + box.width / 2, y: input.y })
+  expect(edge).toEqual({ above: true, below: true })
+  const toBottom = page.getByRole('button', { name: '回到底部' })
+  await expect(toBottom).toBeVisible()
+  const jump = (await toBottom.boundingBox())!
+  expect(jump.y + jump.height).toBeLessThan(input.y)
+  expect(jump.x).toBeGreaterThan(input.x + input.width / 2)
+  await toBottom.click()
+  await expect(toBottom).toBeHidden()
+  const last = (await rows.last().boundingBox())!
+  expect(last.y + last.height).toBeLessThanOrEqual(input.y)
+  expect(last.y).toBeGreaterThanOrEqual(scrollBox.y)
+})
+
+test('含代码块的长会话滚到底后不会带动整页', async ({ mount, page }) => {
+  await mount(<ChatPageHarness />)
+  await expect(page.locator('.chat-page')).toHaveAttribute('data-session-id', 'session-a')
+  const text = `${'较早的回答内容。\n\n'.repeat(36)}\`\`\`js\nconsole.log('最后的代码块')\n\`\`\``
+  await page.evaluate(text => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null,
+      snapshot: { seq: 1, messages: [{ id: 'answer', message: {
+        role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+        timestamp: 1, stopReason: 'stop', content: [{ type: 'text', text }],
+      } }], running: null, compactions: [], contextUsage: null, activeContent: [] },
+    } }))
+  }, text)
+  const scroll = page.locator('.chat-main')
+  const code = scroll.locator('.markdown-code pre')
+  await expect(code).toHaveText("console.log('最后的代码块')")
+  const composer = page.locator('.message-input')
+  const sidebar = page.locator('.chat-sidebar')
+  const input = (await composer.boundingBox())!
+  const rail = await sidebar.boundingBox()
+  const box = (await scroll.boundingBox())!
+  await page.mouse.move(box.x + 20, box.y + 100)
+  await page.mouse.wheel(0, 10_000)
+  await expect.poll(() => scroll.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThanOrEqual(1)
+  await page.mouse.wheel(0, 500)
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  expect(await page.evaluate(() => ({ scrollY, extraHeight: document.documentElement.scrollHeight - innerHeight })))
+    .toEqual({ scrollY: 0, extraHeight: 0 })
+  expect(await sidebar.boundingBox()).toEqual(rail)
+  expect(await composer.boundingBox()).toEqual(input)
+  const lastCode = (await code.boundingBox())!
+  expect(lastCode.y + lastCode.height).toBeLessThanOrEqual(input.y)
 })
 
 test('输入组件发送按钮随空白和有效草稿切换颜色，发送后恢复空白状态', async ({ mount, page }) => {
@@ -98,15 +176,15 @@ test('输入组件发送按钮随空白和有效草稿切换颜色，发送后�
   await expectEmptyButton()
 })
 
-test('白色页面与消息输入区同轴，正文和标题遵守已确认尺寸', async ({ mount, page }) => {
+test('白色页面的正文与输入框同轴，输入框两侧各宽出 16px', async ({ mount, page }) => {
   await mount(<ChatPageHarness messages={['正文消息']} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const list = page.getByRole('region', { name: '消息列表' })
   const composer = page.locator('.message-input')
   await expect(page.locator('html')).toHaveCSS('background-color', 'rgb(255, 255, 255)')
-  await expect(page.getByRole('heading', { name: '聊天' })).toHaveCSS('font-size', '20px')
-  await expect(page.getByRole('heading', { name: '聊天' })).toHaveCSS('line-height', '28px')
-  await expect(page.getByRole('heading', { name: '聊天' })).toHaveCSS('font-weight', '600')
+  await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('font-size', '20px')
+  await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('line-height', '28px')
+  await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('font-weight', '600')
   await expect(editor).toHaveCSS('font-size', '14px')
   await expect(editor).toHaveCSS('line-height', '24px')
   await expect(editor).toHaveCSS('font-weight', '400')
@@ -115,10 +193,23 @@ test('白色页面与消息输入区同轴，正文和标题遵守已确认尺�
   const composerBox = (await composer.boundingBox())!
   expect(composerBox.width).toBeLessThanOrEqual(760)
   const workspaceBox = (await page.locator('.chat-workspace').boundingBox())!
+  const header = page.locator('.chat-header')
+  await expect(header).toHaveCSS('border-bottom-width', '1px')
+  const headerBox = (await header.boundingBox())!
+  expect(headerBox.x).toBe(workspaceBox.x)
+  expect(headerBox.width).toBe(workspaceBox.width)
+  const title = header.getByRole('heading')
+  expect((await title.boundingBox())!.x - workspaceBox.x).toBe(24)
   expect(composerBox.x + composerBox.width / 2).toBeCloseTo(workspaceBox.x + workspaceBox.width / 2, 0)
-  expect(listBox.x).toBeCloseTo(composerBox.x, 0)
-  expect(listBox.width).toBeCloseTo(composerBox.width, 0)
+  expect(listBox.x - composerBox.x).toBeCloseTo(16, 0)
+  expect(composerBox.x + composerBox.width - (listBox.x + listBox.width)).toBeCloseTo(16, 0)
   await expect(list.getByRole('listitem')).toHaveCSS('background-color', 'rgb(247, 247, 245)')
+  await expect(list.getByRole('listitem')).toHaveCSS('max-width', '72%')
+  await expect(list.getByRole('listitem')).toHaveCSS('padding', '10px 16px')
+  await page.setViewportSize({ width: 390, height: 700 })
+  const mobileToggleBox = (await page.getByRole('button', { name: '展开侧边栏' }).boundingBox())!
+  expect((await title.boundingBox())!.x).toBeGreaterThanOrEqual(mobileToggleBox.x + mobileToggleBox.width)
+  await expect(list.getByRole('listitem')).toHaveCSS('max-width', '88%')
   const text = list.locator('.message-text')
   await expect(text).toHaveCSS('font-size', '14px')
   await expect(text).toHaveCSS('line-height', '24px')
@@ -142,6 +233,9 @@ test('窄屏长草稿到上限后内部滚动，输入和发送操作始终可�
   const composerBox = (await page.locator('.message-input').boundingBox())!
   expect(composerBox.x).toBeGreaterThanOrEqual(16)
   expect(composerBox.x + composerBox.width).toBeLessThanOrEqual(374)
+  const listBox = (await page.getByRole('region', { name: '消息列表' }).boundingBox())!
+  expect(listBox.x - composerBox.x).toBeCloseTo(16, 0)
+  expect(composerBox.x + composerBox.width - (listBox.x + listBox.width)).toBeCloseTo(16, 0)
   await expect(send).toBeDisabled()
   await editor.press('Enter')
   await expect(editor).not.toHaveText('')
@@ -190,17 +284,13 @@ test.describe('触屏操作', () => {
   })
 })
 
-test('正文使用随应用加载的 Noto Sans CJK SC 字体', async ({ mount, page, context }) => {
+test('中英混排正文和输入框优先使用系统字体', async ({ mount, page, context }) => {
   await mount(<ChatPageHarness messages={['中文正文 English']} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   await editor.fill('中文正文 English')
-  await editor.press('Enter')
-  const faces = await page.evaluate(async () => {
-    const loaded = await document.fonts.load('400 14px "Noto Sans CJK SC"', '中文正文 English')
-    return loaded.map(face => ({ family: face.family, status: face.status }))
-  })
-  expect(faces).toContainEqual({ family: 'Noto Sans CJK SC', status: 'loaded' })
-  await expect(page.locator('.message-text')).toHaveCSS('font-family', /Noto Sans CJK SC/)
+  await expect(editor).toHaveCSS('font-family', /^system-ui,.*Noto Sans CJK SC/)
+  await expect(page.locator('.message-text')).toHaveCSS('font-family', /^system-ui,.*Noto Sans CJK SC/)
+  await page.evaluate(() => document.fonts.ready.then(() => undefined))
 
   const session = await context.newCDPSession(page)
   await session.send('DOM.enable')
@@ -208,7 +298,10 @@ test('正文使用随应用加载的 Noto Sans CJK SC 字体', async ({ mount, p
   const { root } = await session.send('DOM.getDocument')
   const { nodeId } = await session.send('DOM.querySelector', { nodeId: root.nodeId, selector: '.message-text' })
   const { fonts } = await session.send('CSS.getPlatformFontsForNode', { nodeId })
-  expect(fonts.some(font => font.familyName === 'Noto Sans CJK SC' && font.isCustomFont && font.glyphCount > 0)).toBe(true)
+  expect(fonts.some(font => !font.isCustomFont && font.glyphCount >= 'English'.length)).toBe(true)
+  if (process.platform === 'darwin') {
+    expect(fonts.some(font => font.familyName === 'PingFang SC' && font.glyphCount > 0)).toBe(true)
+  }
   await session.detach()
 })
 
@@ -267,8 +360,9 @@ test('输入区聚焦、切换和发送后保持弱边界，按钮焦点使用�
 test('消息区键盘焦点使用固定局部标记，滚动和高对比度下仍可辨认', async ({ mount, page }) => {
   await mount(<ChatPageHarness messages={Array.from({ length: 12 }, (_, i) => `消息 ${i}：${'用于验证滚动。'.repeat(24)}`)} />)
   const list = page.getByRole('region', { name: '消息列表' })
-  const frame = page.locator('.message-list-frame')
-  await page.getByRole('heading', { name: '聊天' }).click()
+  const frame = page.locator('.chat-main-frame')
+  const scroll = page.locator('.chat-main')
+  await page.getByRole('heading', { name: '会话 1' }).click()
   await expect(frame).toHaveCount(1)
   expect(await frame.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
   await page.keyboard.press('Tab')
@@ -284,9 +378,9 @@ test('消息区键盘焦点使用固定局部标记，滚动和高对比度下�
   })
   expect(markerBefore).toMatchObject({ opacity: '1', width: '6px', height: '6px' })
   const frameBefore = await frame.boundingBox()
-  const scrollBefore = await list.evaluate(el => el.scrollTop)
+  const scrollBefore = await scroll.evaluate(el => el.scrollTop)
   await page.keyboard.press('PageDown')
-  await expect.poll(() => list.evaluate(el => el.scrollTop)).toBeGreaterThan(scrollBefore)
+  await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBeGreaterThan(scrollBefore)
   expect(await frame.boundingBox()).toEqual(frameBefore)
   expect(await frame.evaluate(el => {
     const marker = getComputedStyle(el, '::after')
@@ -322,6 +416,53 @@ test('浅色按钮以背景反馈悬停和按下，键盘焦点不叠加外圈',
     await expect(button).toHaveCSS('box-shadow', 'none')
     expect(await button.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
   }
+})
+
+test('选中回复可引用追问，保留草稿并通过现有消息接口发送', async ({ mount, page }) => {
+  let sentText: string | undefined
+  await page.route('**/api/messages', async route => {
+    const input = route.request().postDataJSON()
+    sentText = input.text
+    await route.fulfill({ status: 409, json: { code: 'save_rejected', error: '磁盘错误' } })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  await expect(page.getByRole('heading', { name: '会话 1' })).toBeVisible()
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null,
+      snapshot: { seq: 1, messages: [
+        { id: 'user', message: { role: 'user', content: '说明方案', timestamp: 1 } },
+        { id: 'answer', message: { role: 'assistant', content: [{ type: 'text', text: '从 **服务端确认开始** 后记录耗时。' }], api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 2, stopReason: 'stop' } },
+      ], running: null, compactions: [], contextUsage: null, activeContent: [] },
+    } }))
+  })
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.fill('  为什么？  ')
+  const quote = page.getByRole('button', { name: '引用追问' })
+  const select = async () => {
+    await page.locator('.assistant-message strong').evaluate(element => {
+      const range = document.createRange()
+      range.selectNodeContents(element)
+      const selection = window.getSelection()!
+      selection.removeAllRanges()
+      selection.addRange(range)
+    })
+    await quote.click()
+  }
+  await select()
+  const remove = page.getByRole('button', { name: '移除引用' })
+  await expect(remove).toBeVisible()
+  await expect(editor).toBeFocused()
+  expect(await editor.textContent()).toBe('  为什么？  ')
+  expect(sentText).toBeUndefined()
+  await remove.click()
+  await expect(remove).toHaveCount(0)
+  expect(await editor.textContent()).toBe('  为什么？  ')
+  await select()
+  await page.getByRole('button', { name: '发送', exact: true }).click()
+  await expect.poll(() => sentText).toBe('> 服务端确认开始\n\n  为什么？  ')
+  await expect(editor).toHaveText('为什么？')
+  await expect(remove).toBeVisible()
 })
 
 test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到与迟到拒绝不覆盖新草稿', async ({ mount, page }) => {
@@ -404,10 +545,11 @@ test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动�
   const history = Array.from({ length: 26 }, (_, i) => `历史 ${i}：${'独立阅读位置。'.repeat(20)}`)
   await mount(<ChatPageHarness messages={history} modelConfigured />)
   const list = page.getByRole('region', { name: '消息列表' })
+  const scroll = page.locator('.chat-main')
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
-  await list.evaluate(el => { el.scrollTop = 350 })
+  await scroll.evaluate(el => { el.scrollTop = 350 })
   const oldTop = (await list.getByRole('listitem').nth(5).boundingBox())!.y
-  const scrollTop = await list.evaluate(el => el.scrollTop)
+  const scrollTop = await scroll.evaluate(el => el.scrollTop)
   await editor.fill('生成时继续编辑')
   for (const seq of [1, 2, 3]) {
     await page.evaluate(({ history, seq }) => {
@@ -417,7 +559,7 @@ test('回复逐块增长和最终校准保留旧消息阅读位置，不滚动�
       } }))
     }, { history, seq })
     await expect(list.getByRole('listitem')).toHaveCount(27)
-    expect(await list.evaluate(el => el.scrollTop)).toBeCloseTo(scrollTop, 0)
+    expect(await scroll.evaluate(el => el.scrollTop)).toBeCloseTo(scrollTop, 0)
     expect((await list.getByRole('listitem').nth(5).boundingBox())!.y).toBeCloseTo(oldTop, 0)
     await expect(editor).toBeFocused()
     await expect(editor).toHaveText('生成时继续编辑')
@@ -494,11 +636,14 @@ test('侧栏不横滚，收起后保留草稿和容量，展开后可以继续�
   const reopen = page.getByRole('button', { name: '展开侧边栏' })
   await expect(reopen).toBeFocused()
   await expect(sidebar).toBeHidden()
+  const reopenBox = (await reopen.boundingBox())!
+  expect((await page.getByRole('heading', { name: longName, exact: true }).boundingBox())!.x).toBeGreaterThanOrEqual(reopenBox.x + reopenBox.width)
   await expect(editor).toHaveText('侧栏收起前的草稿')
   await expect(meter).toBeVisible()
   await reopen.press('Enter')
   await expect(sidebar.getByRole('button', { name: longName })).toHaveAttribute('aria-current', 'page')
   await sidebar.getByRole('button', { name: '会话 2' }).click()
+  await expect(page.getByRole('heading', { name: '会话 2' })).toBeVisible()
   await expect(editor).toHaveText('')
 })
 
@@ -543,6 +688,11 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   const groupB = page.getByRole('group', { name: '白榆', exact: true })
   const model = page.getByRole('combobox', { name: '模型', exact: true })
   await expect(heading).toBeVisible()
+  await expect(heading).toHaveCSS('font-family', /^"?EB Garamond/)
+  await expect(heading).toHaveCSS('font-size', '32px')
+  await expect(heading).toHaveCSS('line-height', '40px')
+  await expect(heading).toHaveCSS('font-weight', '400')
+  await expect(workspaceSelect).toHaveCSS('font-size', '14px')
   const headingBox = (await heading.boundingBox())!
   const editorBox = (await editor.boundingBox())!
   const workspaceBox = (await workspaceSelect.boundingBox())!
@@ -590,7 +740,7 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   await editor.press('Enter')
   const history = groupB.getByRole('button', { name: '会话 1', exact: true })
   await expect(history).toHaveAttribute('aria-current', 'page')
-  expect(starts).toEqual([{ workspaceId: otherWorkspace.id, modelId: 'deepseek-flash', clientMessageId: expect.any(String), text: original }])
+  expect(starts).toEqual([{ permissionMode: 'normal', workspaceId: otherWorkspace.id, provider: 'deepseek', modelId: 'deepseek-flash', clientMessageId: expect.any(String), text: original }])
   await expect(draftRow).toHaveCount(0)
   await expect(heading).toHaveCount(0)
   await expect.poll(readDraft).toBeNull()
@@ -640,6 +790,7 @@ test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', as
   await expect(sidebarToggle).toBeFocused()
   await sidebarToggle.click()
   await settings.click()
+  await settingsDialog.getByRole('button', { name: '模型', exact: true }).click()
   await settingsDialog.getByRole('button', { name: '编辑', exact: true }).click()
   const key = settingsDialog.getByLabel('API Key')
   await key.fill('unsaved-test-key')
@@ -664,9 +815,11 @@ test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', as
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && document.documentElement.scrollHeight <= innerHeight)).toBe(true)
 })
 
-test('切换两段会话后恢复草稿的空格和换行', async ({ mount, page }) => {
-  await mount(<ChatPageHarness modelConfigured sessions={[sessionA, sessionB]} />)
+test('切换会话时从顶部阅读，并恢复草稿的空格和换行', async ({ mount, page }) => {
+  const messages = Array.from({ length: 20 }, (_, i) => `历史消息 ${i}`)
+  await mount(<ChatPageHarness messages={messages} modelConfigured sessions={[sessionA, sessionB]} />)
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const scroll = page.locator('.chat-main')
   const a = page.getByRole('button', { name: '会话 1', exact: true })
   const b = page.getByRole('button', { name: '会话 2', exact: true })
   const text = '  先跑测试\n再整理结果  '
@@ -674,8 +827,10 @@ test('切换两段会话后恢复草稿的空格和换行', async ({ mount, page
   await a.click()
   await editor.fill(text)
   await expect.poll(() => page.evaluate(key => localStorage.getItem(key), draftKey(sessionA.id))).toBe(text)
+  expect(await scroll.evaluate(el => (el.scrollTop = 350, el.scrollTop))).toBeGreaterThan(0)
   await b.click()
   await expect(editor).toHaveText('')
+  expect(await scroll.evaluate(el => el.scrollTop)).toBe(0)
   await editor.fill('检查 README')
   await a.click()
   await expect.poll(readDraft).toBe(text)
@@ -714,17 +869,22 @@ test('02 首发保存被拒绝时保留草稿，顶部提示三秒后消失', as
   await mount(<ChatPageHarness useWorkspaceApi modelConfigured />)
   await page.getByRole('combobox', { name: '工作区', exact: true }).click()
   await page.getByRole('option', { name: workspace.name, exact: true }).click()
+  const permission = page.locator('.composer-actions').getByRole('combobox', { name: '权限', exact: true })
+  await permission.click()
+  await page.getByRole('option', { name: '只读', exact: true }).click()
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   await editor.fill('读取 README.md')
   await page.getByRole('button', { name: '发送', exact: true }).click()
   const notice = page.locator('.save-notice')
-  await expect(notice).toHaveText('磁盘空间不足，未保存')
+  await expect(notice).toHaveText('会话保存失败 · 磁盘空间不足，未保存')
   expect((await notice.boundingBox())?.y).toBeLessThan(24)
   await expect(editor).toHaveText('读取 README.md')
+  await expect(permission).toHaveText('只读')
   await expect(page.getByRole('button', { name: '会话 1', exact: true })).toHaveCount(0)
   await page.clock.runFor(3000)
   await expect(notice).toHaveCount(0)
   await expect(editor).toHaveText('读取 README.md')
+  await expect(permission).toHaveText('只读')
 })
 
 test('28 历史读取失败时不能发送，收到完整快照后恢复', async ({ mount, page }) => {
@@ -750,4 +910,227 @@ test('28 历史读取失败时不能发送，收到完整快照后恢复', async
   })
   await expect(page.getByRole('region', { name: '消息列表' })).toContainText('完整原文')
   await expect(send).toBeEnabled()
+})
+
+test('超限压缩由页面状态显示，本轮详情在压缩和恢复时隐藏', async ({ mount, page }) => {
+  await mount(<ChatPageHarness messages={['任务']} />)
+  for (const phase of ['compaction', 'model'] as const) {
+    await page.evaluate(phase => {
+      window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null,
+        snapshot: { seq: 1, messages: [{ id: 'u', message: { role: 'user', content: '任务', timestamp: 1 } },
+          { id: 'a', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+            timestamp: 2, stopReason: 'error', errorCode: 'context_overflow', content: [] } }],
+        running: { kind: 'task', runId: 'u', assistantMessageId: 'a', phase, activeTools: [] }, compactions: [], contextUsage: null, activeContent: [] },
+      } }))
+    }, phase)
+    const status = page.locator('header').getByRole('status')
+    if (phase === 'compaction') await expect(status).toHaveText('正在压缩对话…')
+    else await expect(status).not.toHaveText('正在压缩对话…')
+    await expect(page.locator('[data-run-detail]')).toHaveCount(0)
+    await expect(page.getByRole('region', { name: '消息列表' })).not.toContainText('回答生成失败')
+  }
+})
+
+test('截图或文件粘贴不接管普通文字，PDF 显示支持格式', async ({ mount, page }) => {
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.focus()
+
+  await editor.evaluate(root => {
+    const data = new DataTransfer()
+    data.setData('text/plain', '保留正文\n第二行')
+    root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }))
+  })
+  await expect(editor).toHaveText('保留正文第二行')
+  await editor.evaluate(root => {
+    const data = new DataTransfer()
+    data.items.add(new File(['%PDF'], 'report.pdf', { type: 'application/pdf' }))
+    root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }))
+  })
+  await expect(page.getByRole('alert')).toContainText('支持 PNG、JPG、WebP 图片，以及 TXT、Markdown、CSV、JSON 和 UTF-8 源代码。')
+  await expect(editor).toHaveText('保留正文第二行')
+  await expect(page.getByText('report.pdf')).toHaveCount(0)
+})
+
+test('@ 候选优先显示同工作区，最多选择三个不同的会话', async ({ mount, page }) => {
+  const session = (id: string, name: string, workspaceId = 'workspace-1') => ({ id, name, workspaceId, createdAt: '2026-11-18T08:00:00Z' })
+  await page.evaluate(key => localStorage.setItem(key, 'session-a'), recentSessionKey)
+  await mount(<ChatPageHarness modelConfigured sessions={[
+    session('session-a', '当前会话'), session('session-e', '另一工作区', 'workspace-2'),
+    session('session-b', '服务启动'), session('session-c', '测试结果'), session('session-d', '上线过程'),
+  ]} />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const menu = page.getByRole('listbox', { name: '引用会话' })
+  const choose = async (name: string) => {
+    await editor.pressSequentially('@')
+    await menu.getByRole('option', { name: `Session · ${name}`, exact: true }).click()
+  }
+  await editor.pressSequentially('@')
+  await expect(menu.getByRole('option').first()).toHaveText('Session · 服务启动')
+  await expect(menu.getByRole('option', { name: 'Session · 当前会话' })).toHaveCount(0)
+  await menu.getByRole('option', { name: 'Session · 服务启动', exact: true }).click()
+  await choose('服务启动')
+  await choose('测试结果')
+  await choose('上线过程')
+  await choose('另一工作区')
+  await expect(page.getByRole('alert')).toContainText('一条消息最多引用 3 个会话')
+  const references = page.getByRole('group', { name: '已引用会话' })
+  await expect(references.getByRole('button')).toHaveCount(3)
+  await expect(references).not.toContainText('另一工作区')
+  await editor.pressSequentially('/')
+  await expect(page.getByRole('option', { name: /compact/ })).toBeVisible()
+})
+
+test('待审计划来自服务端状态，继续讨论后聚焦输入框', async ({ mount, page }) => {
+  await page.route('**/api/sessions/session-a/plan/review', async route => {
+    expect(route.request().postDataJSON()).toEqual({ planId: 'assistant-plan', action: 'discuss' })
+    await route.fulfill({ status: 200, json: {} })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const update = (state: 'review' | 'planning') => page.evaluate(state => {
+    const plan = state === 'review' ? { state, assistantMessageId: 'assistant-plan', steps: ['查看日志', '复查错误'] } : { state }
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null, snapshot: {
+        seq: state === 'review' ? 1 : 2, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [], permissionMode: 'normal', plan,
+      },
+    } }))
+  }, state)
+  await expect(page.getByRole('button', { name: '确认执行' })).toHaveCount(0)
+  await update('review')
+  const card = page.getByRole('region', { name: '待确认计划' })
+  await expect(card.getByRole('listitem')).toHaveText(['查看日志', '复查错误'])
+  await expect(card.getByRole('button')).toHaveCount(2)
+  const discussed = page.waitForResponse('**/api/sessions/session-a/plan/review')
+  await card.getByRole('button', { name: '去聊天里说' }).click()
+  await discussed
+  await update('planning')
+  await expect(card).toBeHidden()
+  await expect(editor).toBeFocused()
+  await expect(page.getByRole('button', { name: '退出计划模式', exact: true })).toBeVisible()
+})
+
+test('移除上传中的文件后忽略晚到回执，失败附件重试成功后按有效 ID 发送', async ({ mount, page }) => {
+  let releaseUpload!: () => void
+  const delayedUpload = new Promise<void>(resolve => { releaseUpload = resolve })
+  let attempts = 0
+  await page.route('**/api/attachments?*', async route => {
+    const name = route.request().headers()['x-attachment-name']
+    expect(new URL(route.request().url()).searchParams.get('sessionId')).toBe('session-a')
+    if (name === 'removed.png') {
+      await delayedUpload
+      await route.fulfill({ json: { id: 'removed', name, size: 9, mediaType: 'image/png' } }).catch(() => undefined)
+      return
+    }
+    if (++attempts === 1) {
+      await route.fulfill({ status: 500, json: { error: '上传暂时不可用' } })
+      return
+    }
+    await route.fulfill({ json: { id: 'current', name, size: 24, mediaType: 'text/plain' } })
+  })
+  let sent: { clientMessageId: string; text: string; attachmentIds: string[] } | undefined
+  let acceptSend!: () => void
+  const delayedSend = new Promise<void>(resolve => { acceptSend = resolve })
+  await page.route('**/api/messages', async route => {
+    sent = route.request().postDataJSON()
+    await delayedSend
+    await route.fulfill({ status: 202, json: { sessionId: 'session-a', userMessageId: 'accepted', clientMessageId: sent!.clientMessageId, acceptedSeq: 1, kind: 'message' } })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  const drafts = page.getByRole('group', { name: '待发送附件' })
+  await editor.fill('分析正文')
+  await page.locator('input[type=file]').setInputFiles([
+    { name: 'removed.png', mimeType: 'image/png', buffer: Buffer.from('mock-png') },
+    { name: 'log.txt', mimeType: 'text/plain', buffer: Buffer.from('mock-log') },
+  ])
+  await expect(drafts.getByRole('img', { name: 'removed.png' })).toBeVisible()
+  await drafts.getByRole('button', { name: '移除 removed.png' }).click()
+  releaseUpload()
+  await expect(drafts.getByRole('button', { name: '重试 log.txt' })).toBeVisible()
+  await expect(send).toBeDisabled()
+  await expect(editor).toHaveText('分析正文')
+  await drafts.getByRole('button', { name: '重试 log.txt' }).click()
+  await expect(send).toBeEnabled()
+  await expect(drafts.getByRole('img', { name: 'removed.png' })).toHaveCount(0)
+  await send.click()
+  await expect.poll(() => sent?.attachmentIds).toEqual(['current'])
+  await expect(editor).toHaveText('分析正文')
+  await expect(drafts).toBeVisible()
+  acceptSend()
+  await expect(editor).toBeEmpty()
+  await expect(drafts).toHaveCount(0)
+})
+
+test('引用读取失败时保留原草稿，未收到回执时用同一编号和引用重试', async ({ mount, page }) => {
+  const sessions = [
+    { id: 'session-a', name: '当前会话', workspaceId: 'workspace-1', createdAt: '2026-11-18T08:00:00Z' },
+    { id: 'source', name: '源会话', workspaceId: 'workspace-1', createdAt: '2026-11-18T08:00:00Z' },
+  ]
+  const submissions: { clientMessageId: string; text: string; referenceSessionIds: string[] }[] = []
+  await page.route('**/api/messages', async route => {
+    const input = route.request().postDataJSON()
+    submissions.push(input)
+    if (submissions.length === 1) {
+      await route.fulfill({ status: 400, json: { error: '无法读取引用会话，请重试或移除此引用' } })
+    } else if (submissions.length === 2) {
+      await route.abort('failed')
+    } else {
+      await route.fulfill({ status: 202, json: { kind: 'message', sessionId: 'session-a', userMessageId: 'accepted', clientMessageId: input.clientMessageId, acceptedSeq: 1 } })
+    }
+  })
+  await page.evaluate(key => localStorage.setItem(key, 'session-a'), recentSessionKey)
+  await mount(<ChatPageHarness modelConfigured sessions={sessions} />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.pressSequentially('@')
+  await page.getByRole('option', { name: 'Session · 源会话' }).click()
+  await editor.fill('服务是如何启动的？')
+  await editor.press('Enter')
+  await expect(page.getByRole('alert')).toContainText('无法读取引用会话')
+  await expect(editor).toHaveText('服务是如何启动的？')
+  await expect(page.getByRole('group', { name: '已引用会话' })).toContainText('源会话')
+
+  await editor.press('Enter')
+  await page.getByRole('button', { name: '重试发送', exact: true }).click()
+  await expect(editor).toBeEmpty()
+  await expect(page.getByRole('group', { name: '已引用会话' })).toHaveCount(0)
+  expect(submissions).toHaveLength(3)
+  expect(submissions[1]).toEqual(submissions[2])
+  expect(submissions[2]).toMatchObject({ text: '服务是如何启动的？', referenceSessionIds: ['source'] })
+})
+
+test('草稿进入计划时复用已创建的会话，失败保留命令可重试', async ({ mount, page }) => {
+  let creates = 0
+  let submissions = 0
+  await page.route('**/api/sessions', async route => {
+    creates++
+    await route.fulfill({ status: 201, json: {
+      id: 'created-after-plan', name: '新会话', workspaceId: 'workspace-1', createdAt: '2026-11-18T08:00:00Z',
+    } })
+  })
+  await page.route('**/api/model-selection', route => route.fulfill({ status: 200, json: { modelId: 'deepseek-flash', provider: 'deepseek' } }))
+  await page.route('**/api/messages', route => {
+    const input = route.request().postDataJSON()
+    expect(input).toMatchObject({ text: '/plan', sessionId: 'created-after-plan' })
+    submissions++
+    return submissions === 1
+      ? route.fulfill({ status: 500, json: { error: '请求失败，请重试' } })
+      : route.fulfill({ status: 202, json: { kind: 'handled', sessionId: input.sessionId, clientMessageId: input.clientMessageId, notices: [] } })
+  })
+  await mount(<ChatPageHarness modelConfigured />)
+  const workspace = page.getByRole('group', { name: 'workspace', exact: true })
+  await workspace.getByRole('button', { name: '新建会话', exact: true }).click()
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  const send = page.getByRole('button', { name: '发送', exact: true })
+  await editor.fill('/plan')
+  await expect(send).toBeEnabled()
+  await editor.press('Enter')
+  await expect(page.getByRole('alert')).toBeVisible()
+  await expect(editor).toHaveText('/plan')
+  await expect(send).toBeEnabled()
+  await editor.press('Enter')
+  await expect(page.locator('.chat-page')).toHaveAttribute('data-session-id', 'created-after-plan')
+  expect(creates).toBe(1)
+  expect(submissions).toBe(2)
 })

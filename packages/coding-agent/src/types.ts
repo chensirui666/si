@@ -1,8 +1,25 @@
-import type { AssistantMessage, ModelMessage, ModelUsage, ContextEstimate, ToolCall } from '@agent-learning/model'
+import type { AssistantMessage, JsonObject, ModelMessage, ModelUsage, ModelFailureKind, ContextEstimate, ModelSelection, ToolCall } from '@agent-learning/model'
+
+import type { ExtensionMessage } from './extensions/runtime.js'
+import type { SkillInvocation } from './skills.js'
+import type { PermissionMode } from './permissions.js'
+import type { MessageAttachment } from './session-attachments.js'
+import type { SessionReference } from './session-references.js'
+
+export type SubmissionSources = { attachmentIds?: string[]; referenceSessionIds?: string[] }
+
+export type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & SubmissionSources
+  & { clientMessageId: string; text: string; permissionMode?: PermissionMode }
+
+export function sameSubmissionSources(before: SubmissionSources, after: SubmissionSources): boolean {
+  return JSON.stringify(before.attachmentIds ?? []) === JSON.stringify(after.attachmentIds ?? [])
+    && JSON.stringify([...new Set(before.referenceSessionIds)]) === JSON.stringify([...new Set(after.referenceSessionIds)])
+}
 
 type ToolLocation = {
   assistantMessageId: string
   contentIndex: number
+  actualArguments?: JsonObject
 }
 
 export type ConversationMessage = {
@@ -10,13 +27,28 @@ export type ConversationMessage = {
   clientMessageId?: string
   toolCall?: ToolLocation
   toolErrorCode?: string
+  imageOmitted?: true
+  skillInvocation?: SkillInvocation
+  attachments?: MessageAttachment[]
+  references?: SessionReference[]
+  extension?: Omit<ExtensionMessage, 'content'>
   fileOperation?: { kind: 'read' | 'modified'; path: string }
   message: ModelMessage
 }
 
+export type SubmissionHandled = { kind: 'handled'; clientMessageId: string; notices: ExtensionNotice[] }
 export type SubmissionAccepted = { clientMessageId: string; acceptedSeq: number } & (
   | { kind: 'message'; userMessageId: string }
   | { kind: 'compaction'; compactionId: string }
+)
+
+export type ModelRetryState = {
+  phase: 'waiting' | 'retrying'
+  retryAt?: number
+  incomplete?: true
+} & (
+  | { mode: 'connection'; reason: 'connection' }
+  | { mode: 'limited'; reason: ModelFailureKind; attempt: number; maxAttempts: 5; status?: number }
 )
 
 export type RunningState = null | {
@@ -25,6 +57,7 @@ export type RunningState = null | {
   assistantMessageId: string
   phase: 'model' | 'tools' | 'compaction'
   activeTools: ToolLocation[]
+  retry?: ModelRetryState
 } | { kind: 'compaction'; runId: string; phase: 'compaction' }
 
 export type CompactionRecord = {
@@ -51,10 +84,15 @@ export type ContextUsage = {
   breakdown: ContextEstimate
 }
 
+export type PlanState = { state: 'planning' } | { state: 'review'; assistantMessageId: string; steps: string[] }
+
 export type ConversationSnapshot = {
   seq: number
+  permissionMode: PermissionMode
+  plan?: PlanState | null
   messages: ConversationMessage[]
   running: RunningState
+  modelSelection?: ModelSelection
   activeContent: ActiveContent[]
   compactions: CompactionRecord[]
   contextUsage: ContextUsage | null
@@ -65,9 +103,14 @@ export type ConversationSnapshot = {
 export type ConversationUpdate = {
   seq: number
   contextUsage?: ContextUsage | null
+  modelSelection?: ModelSelection
   run?: RunRecord
   saveFailure?: SaveFailure
   change:
+    | { type: 'notice'; notice: ExtensionNotice }
+    | { type: 'permission'; permissionMode: PermissionMode }
+    | { type: 'plan'; plan: PlanState | null }
+    | { type: 'selection'; selection: ModelSelection }
     | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }
     | { type: 'compaction'; record: CompactionRecord; running: RunningState }
@@ -83,6 +126,7 @@ export type ActiveContent = {
 )
 
 export type ModelFrame =
+  | { type: 'replace'; runId: string; message: AssistantMessage; activeContent: ActiveContent[] }
   | { type: 'start'; initial: Pick<AssistantMessage, 'role' | 'api' | 'provider' | 'model' | 'timestamp'> }
   | { type: 'text_start' | 'thinking_start' | 'toolcall_start'; contentIndex: number }
   | { type: 'text_delta' | 'thinking_delta' | 'toolcall_delta'; contentIndex: number; delta: string }
@@ -100,6 +144,8 @@ export type RunRecord = {
   sessionId: string
   clientMessageId: string
   modelId: string
+  provider?: string
+  reasoningEffort?: ModelSelection['reasoningEffort']
   kind: 'task' | 'compaction'
   status: 'running' | 'completed' | 'failed' | 'aborted' | 'interrupted'
   startedAt: number
@@ -113,3 +159,5 @@ export type SaveFailure = {
   reason: 'storage-full' | 'write-failed' | 'unconfirmed'
   toolCall?: ToolLocation
 }
+
+export type ExtensionNotice = { message: string; level: 'info' | 'warning' | 'error' }

@@ -69,4 +69,8 @@ export class Workspaces {
     if (path !== workspace.path) throw new WorkspaceBindingError('工作区文件夹当前不可用。')
     return path
   }
+
+  async isRegistered(id: string): Promise<boolean> {
+    return (await this.read()).workspaces.some(workspace => workspace.id === id)
+  }
 }

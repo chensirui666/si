@@ -8,7 +8,7 @@
 
 [AgentSession](../../packages/coding-agent/src/agent-session.ts) 在每轮普通模型请求前读取适用的项目说明，再调用 [buildSystemPrompt](../../packages/coding-agent/src/system-prompt.ts) 组装提示词。[convertMessages](../../packages/model/src/context.ts) 将结果放入 DeepSeek 请求的第一条 `system` 消息。工具定义和本轮聊天历史各自加入请求。
 
-说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。下面是使用九种工具且没有项目说明时的原文。摘要请求使用独立的摘要提示词。
+说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。有 read 工具时，模型可自动调用的 Skill 摘要放在 <available_skills> 中，正文按需读取。下面是使用全部工具且没有项目说明或 Skill 摘要时的原文。摘要请求使用独立的摘要提示词。
 
 展开 `this.configuration` 后，请求数据如下。
 
@@ -26,13 +26,14 @@ const context: ModelContext = {
 你是一名专业的编程助手，运行在编程智能体框架 si 中。你通过读取文件、执行命令、编辑代码、新建文件和查阅网页资料来帮助用户。
 
 <tools>
-- read：读取 UTF-8 文本文件，可指定起始行和最多读取行数。
+- read：读取本地 UTF-8 文本或 PNG、JPEG、WebP 图片。文本可按行读取，图片超出发送大小时尝试等比缩小。
 - bash：在当前工作目录执行 Bash 命令，默认前台限时 240 秒。传入 background: true 可在后台运行。
 - process：列出当前会话的后台 Bash 任务，按编号查状态、读日志或停止。
 - edit：通过精确匹配原文来修改文件，一次调用可修改同一文件中多处互不重叠的内容。
 - write：创建或完整覆盖文本文件。
 - find：按通配规则查找文件或目录，返回相对于搜索目录的路径。
 - grep：搜索文件内容，返回文件路径、行号、命中文本及可选的上下文。
+- ls：列出目录的直接子项，包括隐藏项。目录名以 / 结尾。
 - web_search：搜索网页，返回标题、链接和相关片段。
 - web_fetch：获取指定公网网页的正文。
 </tools>
@@ -52,10 +53,12 @@ const context: ModelContext = {
 </rules>
 
 <docs>
-si 文档（仅当用户询问 si 本身时阅读）
+SI 文档（用户询问 SI 本身，或要求创建、修改 Skill 时查阅）
 - 主文档：{{siRoot}}/README.md
-- 查阅 si 文档时，从 si 自身的目录定位文档。文档里的相对链接以该文档所在目录为起点。
-- 用户询问启动、模型配置、工作区、网页工具、中止或对话压缩时，查阅主文档。询问页面操作或开发校验时，查阅 {{siRoot}}/web/README.md。
+- 补充文档位于 {{siRoot}}/docs。
+- 从 SI 应用目录定位文档。文档里的相对链接以该文档所在目录为起点。
+- 启动、模型配置、工作区、网页工具、中止和对话压缩见主文档。页面操作和开发校验见 {{siRoot}}/web/README.md。Skill 规则见 {{siRoot}}/docs/skills.md。
+- 创建或修改 Skill 前，先用 read 完整阅读 Skill 规则文档，并查阅其中与本次任务有关的引用。个人 Skill 目录是 "{{home}}/.si/skills"。
 </docs>
 
 <cwd>

@@ -1,10 +1,10 @@
 import { expect, it } from 'vitest'
 import { Check } from 'typebox/value'
 
-it('提供九种具备用途说明的工具声明', async () => {
+it('提供十种具备用途说明的工具声明', async () => {
   const { defaultTools } = await import('../src/tools.js')
 
-  expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'process', 'edit', 'write', 'find', 'grep', 'web_search', 'web_fetch'])
+  expect(defaultTools.map(tool => tool.name)).toEqual(['read', 'bash', 'process', 'edit', 'write', 'find', 'grep', 'ls', 'web_search', 'web_fetch'])
   for (const tool of defaultTools) {
     expect(tool.description.trim()).not.toBe('')
     expect(tool.parameters).toHaveProperty('type', 'object')
@@ -14,10 +14,11 @@ it('提供九种具备用途说明的工具声明', async () => {
 it.each([
   {
     name: 'read',
-    fields: ['path', 'offset', 'limit'],
+    fields: ['path', 'offset', 'column', 'limit'],
     valid: [
       { path: 'note.txt' },
       { path: 'note.txt', offset: 1, limit: 5 },
+      { path: 'note.txt', offset: 1, column: 10 },
       { path: 'note.txt', offset: -0.5, limit: 0 },
       { path: 'note.txt', offset: 0, limit: 1.5 },
       { path: 'note.txt', offset: 1e12, limit: 1e12 },
@@ -26,6 +27,7 @@ it.each([
       {},
       { path: 1 },
       { path: 'note.txt', offset: '1' },
+      { path: 'note.txt', column: '10' },
       { path: 'note.txt', limit: '5' },
     ],
   },

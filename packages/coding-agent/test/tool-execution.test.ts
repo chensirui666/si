@@ -1,10 +1,12 @@
 import { execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { watch } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import sharp from 'sharp'
 import { createTools } from '../src/tools.js'
 import { ToolRuntime } from '../src/tool-runtime.js'
 
@@ -41,6 +43,55 @@ it('reads UTF-8 lines from task cwd and from an absolute path', async () => {
   await expect(read({ path: 'note.txt', offset: 5 }, context())).rejects.toThrow('offset')
 })
 
+it.each(['png', 'jpeg', 'webp'] as const)('returns original %s bytes even when the file has no extension', async format => {
+  const path = join(cwd, 'capture')
+  const source = await sharp({ create: { width: 16, height: 16, channels: 3, background: 'red' } }).toFormat(format).toBuffer()
+  await writeFile(path, source)
+  await expect(tool('read')({ path: 'capture' }, context())).resolves.toEqual([
+    { type: 'text', text: expect.stringContaining(path) },
+    { type: 'image', mimeType: `image/${format}`, data: source.toString('base64') },
+  ])
+})
+
+it.each(['dimensions', 'encoded size'] as const)('resizes an image that exceeds the %s budget', async condition => {
+  const path = join(cwd, 'large.png')
+  const source = condition === 'dimensions'
+    ? await sharp({ create: { width: 2400, height: 1200, channels: 3, background: 'white' } }).png().toBuffer()
+    : await sharp(randomBytes(1400 * 1400 * 3), { raw: { width: 1400, height: 1400, channels: 3 } }).png().toBuffer()
+  if (condition === 'encoded size') expect(source.length).toBeGreaterThan(4 * 1024 * 1024)
+  await writeFile(path, source)
+  const output = await tool('read')({ path }, context())
+  const image = typeof output === 'string' ? undefined : output.find(block => block.type === 'image')
+  expect(image?.type).toBe('image')
+  if (image?.type !== 'image') throw new Error('missing Read image')
+  expect(image.data.length).toBeLessThanOrEqual(512 * 1024)
+  const resized = sharp(Buffer.from(image.data, 'base64'))
+  const { width, height, format } = await resized.metadata()
+  expect(image.mimeType).toBe(`image/${format}`)
+  expect(Math.max(width!, height!)).toBeLessThanOrEqual(2000)
+  expect(width).toBe(condition === 'dimensions' ? 2 * height! : height)
+  await resized.stats()
+  expect((await readFile(path)).equals(source)).toBe(true)
+})
+
+it('returns a decoding error and records no successful read for a truncated image', async () => {
+  const path = join(cwd, 'broken.png')
+  const source = await sharp({ create: { width: 16, height: 16, channels: 3, background: 'red' } }).png().toBuffer()
+  await writeFile(path, source.subarray(0, 40))
+  const recordDetails = vi.fn()
+  await expect(tool('read')({ path }, { ...context(), recordDetails })).rejects.toThrow(/图片.*解码.*broken\.png/)
+  expect(recordDetails).not.toHaveBeenCalled()
+})
+
+it('bounds the source file read for an oversized image', async () => {
+  const path = join(cwd, 'huge.png')
+  await writeFile(path, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  await truncate(path, 50 * 1024 * 1024 + 1)
+  const recordDetails = vi.fn()
+  await expect(tool('read')({ path }, { ...context(), recordDetails })).rejects.toThrow(/图片.*50 MiB/)
+  expect(recordDetails).not.toHaveBeenCalled()
+})
+
 it('records the resolved path of an empty read and omits a failed read', async () => {
   const path = join(cwd, 'empty.txt')
   await writeFile(path, '')
@@ -66,6 +117,31 @@ it('keeps read output within the limit without returning a partial line', async 
   expect(output).toContain('offset=2')
   expect(output).not.toContain('汉')
   expect(output).not.toContain('第三行')
+})
+
+it('resumes an oversized UTF-8 line without losing bytes or splitting characters', async () => {
+  const json = JSON.stringify({ log: '汉😀'.repeat(20_000), marker: 'EOF-981' })
+  await writeFile(join(cwd, 'note.json'), 'first\r\n' + json + '\r\nnext\r\n')
+  const read = tool('read')
+  const parts: string[] = []
+  let column = 1
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const output = await read({ path: 'note.json', offset: 2, column, limit: 1 }, context())
+    expect(typeof output).toBe('string')
+    const [content, notice = ''] = String(output).split('\n\n')
+    parts.push(content)
+    const resume = /offset=2 column=(\d+)/.exec(notice)
+    if (!resume) {
+      expect(notice).toContain('offset=3')
+      break
+    }
+    expect(Buffer.byteLength(String(output))).toBeLessThanOrEqual(50 * 1024)
+    expect(Number(resume[1])).toBe(column + Buffer.byteLength(content))
+    column = Number(resume[1])
+  }
+  expect(parts.join('')).toBe(json)
+  expect(await read({ path: 'note.json', offset: 3 }, context())).toBe('next\n')
+  await expect(read({ path: 'note.json', offset: 2, column: 10 }, context())).rejects.toThrow('column')
 })
 
 it('creates missing parent directories and accepts an empty overwrite', async () => {
@@ -404,4 +480,58 @@ it('处理工具输出抛错时仍杀死进程，不能让后续取消失效', a
     if (pid) { try { process.kill(pid, 'SIGKILL') } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error } }
     await outcome
   }
+})
+
+it.each([
+  [{ path: '', limit: 2 }, 'a.txt\nB.txt', 'limit=4'],
+  [{ limit: 2.9 }, 'a.txt\nB.txt', 'limit=4'],
+  [{ limit: 0 }, 'a.txt', 'limit=2'],
+  [{ limit: 3 }, 'a.txt\nB.txt\nc.txt', undefined],
+])('lists directory entries with limits %j', async (params, expected, notice) => {
+  await Promise.all(['c.txt', 'B.txt', 'a.txt'].map(name => writeFile(join(cwd, name), '')))
+  const result = await tool('ls')(params, context())
+  expect(typeof result).toBe('string')
+  const [body, details] = (result as string).split('\n\n')
+  expect(body).toBe(expected)
+  if (notice) expect(details).toContain(notice)
+  else expect(details).toBeUndefined()
+})
+
+it('lists only the first 500 entries by default', async () => {
+  for (let i = 0; i <= 500; i++) await writeFile(join(cwd, String(i).padStart(3, '0')), '')
+  const [body, notice] = String(await tool('ls')({}, context())).split('\n\n')
+  expect(body.split('\n')).toHaveLength(500)
+  expect(body.split('\n').at(-1)).toBe('499')
+  expect(notice).toContain('limit=1000')
+})
+
+it('limits a multibyte directory listing to complete lines within 50 KiB', async () => {
+  const names = Array.from({ length: 300 }, (_, i) => String(i).padStart(3, '0') + '青禾'.repeat(30))
+  for (const name of names) await writeFile(join(cwd, name), '')
+  const [body, notice] = String(await tool('ls')({}, context())).split('\n\n')
+  const lines = body.split('\n')
+  expect(lines.length).toBeLessThan(names.length)
+  expect(lines).toEqual(names.slice(0, lines.length))
+  expect(Buffer.byteLength(body)).toBeLessThanOrEqual(50 * 1024)
+  expect(Buffer.byteLength(body + '\n' + names[lines.length])).toBeGreaterThan(50 * 1024)
+  expect(notice).toContain('50 KiB')
+})
+
+it('lists hidden files, directory symlinks and empty directories', async () => {
+  await mkdir(join(cwd, 'src'))
+  await symlink('src', join(cwd, 'link'))
+  await symlink('missing', join(cwd, 'broken'))
+  await writeFile(join(cwd, '.gitignore'), '')
+  expect(await tool('ls')({}, context())).toBe('.gitignore\nlink/\nsrc/')
+  expect(await tool('ls')({ path: 'src' }, context())).toContain('空目录')
+})
+
+it('reports missing, unreadable and non-directory targets', async () => {
+  await expect(tool('ls')({ path: 'missing' }, context())).rejects.toThrow('路径不存在')
+  await writeFile(join(cwd, 'file.txt'), '')
+  await expect(tool('ls')({ path: 'file.txt' }, context())).rejects.toThrow('不是目录')
+  const locked = join(cwd, 'locked')
+  await mkdir(locked, { mode: 0o000 })
+  try { await expect(tool('ls')({ path: 'locked' }, context())).rejects.toThrow('无法读取目录') }
+  finally { await chmod(locked, 0o700) }
 })

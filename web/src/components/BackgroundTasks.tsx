@@ -1,12 +1,15 @@
 import { useEffect, useId, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import type { BashJobsView } from '@agent-learning/server/protocol'
 import { getBashJobs, stopBashJob } from '../chat/client'
 import { Button } from './ui/button'
+import { errorNotice, NoticeText, type Notice } from '../i18n/messages'
 
 type Job = BashJobsView['jobs'][number]
 type StopAttempt = { job: Job; checking: boolean }
 
 export function BackgroundTasks({ sessionId }: { sessionId: string }) {
+  const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const panelId = useId()
   const trigger = useRef<HTMLButtonElement>(null)
@@ -17,16 +20,17 @@ export function BackgroundTasks({ sessionId }: { sessionId: string }) {
     }
   }}>
     <Button ref={trigger} type="button" variant="outline" size="sm" aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => setOpen(value => !value)}>
-      后台任务
+      {t('background.title')}
     </Button>
     {open && <BackgroundTaskList key={sessionId} sessionId={sessionId} panelId={panelId} />}
   </div>
 }
 
 function BackgroundTaskList({ sessionId, panelId }: { sessionId: string; panelId: string }) {
+  const { t } = useTranslation()
   const [jobs, setJobs] = useState<Job[]>([])
   const [stops, setStops] = useState<StopAttempt[]>([])
-  const [readError, setReadError] = useState<string | null>(null)
+  const [readError, setReadError] = useState<Notice | null>(null)
   const [refresh, setRefresh] = useState(0)
   const readVersion = useRef(0)
 
@@ -43,7 +47,7 @@ function BackgroundTaskList({ sessionId, panelId }: { sessionId: string; panelId
         setStops(previous => previous.some(stop => stop.checking) ? previous.filter(stop => !stop.checking) : previous)
         setReadError(null)
       } catch (error) {
-        if (current()) setReadError(error instanceof Error ? error.message : '后台任务列表读取失败')
+        if (current()) setReadError(errorNotice('background.readFailed', error))
       } finally {
         if (!lifetime.signal.aborted) timer = setTimeout(read, 1000)
       }
@@ -72,16 +76,16 @@ function BackgroundTaskList({ sessionId, panelId }: { sessionId: string; panelId
   }
 
   const visible = [...jobs, ...stops.map(({ job }) => job).filter(job => !jobs.some(row => row.jobId === job.jobId))]
-  return <section id={panelId} className="background-task-panel" aria-label="后台任务">
-    {readError && <p className="background-task-error" role="alert">{readError}</p>}
+  return <section id={panelId} className="background-task-panel" aria-label={t('background.title')}>
+    {readError && <p className="background-task-error" role="alert"><NoticeText notice={readError} /></p>}
     {visible.length > 0 && <ul className="background-task-list" role="list">
       {visible.map(job => {
         const attempt = stops.find(stop => stop.job.jobId === job.jobId)
         return <li className="background-task-row" key={job.jobId}>
           <code>{job.command}</code>
-          {!attempt && <span className="background-task-status">运行中</span>}
+          {!attempt && <span className="background-task-status">{t('background.running')}</span>}
           <Button type="button" variant="outline" size="xs" disabled={!!attempt} onClick={() => { void stop(job) }}>
-            {attempt ? attempt.checking ? '正在核对' : '正在停止' : '停止'}
+            {t(attempt ? attempt.checking ? 'background.checking' : 'background.stopping' : 'background.stop')}
           </Button>
         </li>
       })}

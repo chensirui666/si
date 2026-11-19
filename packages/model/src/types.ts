@@ -1,3 +1,4 @@
+import type { ModelThinkingLevel } from '@earendil-works/pi-ai'
 import type { CredentialStatus } from '@agent-learning/credentials'
 import type { TSchema } from 'typebox'
 
@@ -11,7 +12,8 @@ export type SystemMessage = {
 
 export type UserMessage = {
   role: 'user'
-  content: string | TextContent[]
+  content: string | (TextContent | ImageContent)[]
+  uploadMessageId?: string
   timestamp: number
 }
 
@@ -23,9 +25,11 @@ export type AssistantMessage = {
   model: string
   responseId?: string
   responseModel?: string
+  providerThinkingLevel?: string
   stopReason: 'pending' | ModelStopReason
   errorMessage?: string
   errorCode?: 'context_overflow'
+  failure?: ModelFailureInfo & { attempts?: 5 }
   usage?: ModelUsage
   timestamp: number
   durationMs?: number
@@ -35,7 +39,8 @@ export type ToolResultMessage = {
   role: 'toolResult'
   toolCallId: string
   toolName: string
-  content: TextContent[]
+  imageResultId?: string
+  content: (TextContent | ImageContent)[]
   isError: boolean
   timestamp: number
 }
@@ -43,12 +48,20 @@ export type ToolResultMessage = {
 export type TextContent = {
   type: 'text'
   text: string
+  textSignature?: string
+}
+
+export type ImageContent = {
+  type: 'image'
+  mimeType: 'image/png' | 'image/jpeg' | 'image/webp'
+  data: string
 }
 
 export type ThinkingContent = {
   type: 'thinking'
   thinking: string
   thinkingSignature?: string
+  redacted?: boolean
 }
 
 export type ToolCall = {
@@ -57,6 +70,8 @@ export type ToolCall = {
   name: string
   arguments: JsonObject
   argumentsError?: string
+  thoughtSignature?: string
+  namespace?: string
 }
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject
@@ -71,6 +86,14 @@ export type ModelUsage = {
   total?: number
 }
 
+export type ModelFailureKind =
+  | 'connection' | 'connection-reset' | 'stream-read' | 'stream-ended' | 'timeout'
+  | 'temporary-rate-limit' | 'rate-limit' | 'internal' | 'bad-gateway' | 'unavailable' | 'gateway-timeout'
+  | 'overloaded' | 'capacity' | 'balance' | 'quota' | 'authentication' | 'permission'
+  | 'invalid-request' | 'configuration' | 'context-capacity' | 'unknown' | 'request-error' | 'response-error' | 'http-error'
+
+export type ModelFailureInfo = { kind: ModelFailureKind; status?: number; retryAt?: number }
+
 export type ModelStopReason = 'stop' | 'length' | 'toolUse' | 'error' | 'aborted'
 
 
@@ -81,11 +104,31 @@ export type ModelInfo = {
   api: string
   contextWindow: number
   maxTokens: number
+  supportsImages?: boolean
+  reasoningEfforts?: ReasoningEffort[]
+  defaultReasoningEffort?: ReasoningEffort
+}
+
+export type ReasoningEffort = ModelThinkingLevel
+
+export type ModelSelection = {
+  provider: string
+  modelId: string
+  reasoningEffort?: ReasoningEffort
+}
+
+export type ModelStreamOptions = {
+  signal?: AbortSignal
+  reasoningEffort?: ReasoningEffort
+  snapshotPartials?: boolean
+  onProviderStreamEvent?(data: unknown): void | Promise<void>
+  onProviderResponse?(response: { status: number; headers: Record<string, string> }): void | Promise<void>
 }
 
 export type ModelDiscovery = {
   models: ModelInfo[]
-  deepseek: CredentialStatus
+  providers: { id: string; name: string; status: CredentialStatus }[]
+  defaultSelection?: ModelSelection
 }
 
 export type ContextEstimate = {
@@ -98,6 +141,8 @@ export type ModelContext = {
   systemPrompt?: string
   messages: ModelMessage[]
   tools?: Tool[]
+  omittedToolImageResults?: ReadonlySet<string>
+  currentUserMessageId?: string
 }
 
 export type Tool<TParameters extends TSchema = TSchema> = {

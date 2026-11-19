@@ -1,47 +1,16 @@
-import { constants } from 'node:fs'
-import { open, realpath, stat } from 'node:fs/promises'
+import { realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
+import { errorCode, readRegularFile, tooLarge } from './regular-file.js'
+
 const candidates = ['AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD']
-const tooLarge = Symbol('project context exceeds read budget')
 
 export type ProjectContextFile = { path: string; content: string }
 export class ProjectContextOverflow extends Error {
   constructor() { super('项目说明预计超出模型容量，请精简项目说明。') }
 }
 
-function errorCode(error: unknown) {
-  return (error as NodeJS.ErrnoException | undefined)?.code
-}
-
-async function readRegularFile(path: string, maxBytes: number, signal: AbortSignal): Promise<Buffer | typeof tooLarge | null> {
-  signal.throwIfAborted()
-  if (!(await stat(path)).isFile()) return null
-  signal.throwIfAborted()
-  // The path can change between stat and open. A FIFO must not block open.
-  const handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK)
-  try {
-    const info = await handle.stat()
-    if (!info.isFile()) return null
-    if (info.size > maxBytes) return tooLarge
-    const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1))
-    const chunks: Buffer[] = []
-    let size = 0
-    for (;;) {
-      signal.throwIfAborted()
-      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, maxBytes + 1 - size), null)
-      signal.throwIfAborted()
-      if (bytesRead === 0) return Buffer.concat(chunks, size)
-      size += bytesRead
-      if (size > maxBytes) return tooLarge
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)))
-    }
-  } finally {
-    await handle.close()
-  }
-}
-
-async function gitBoundary(directory: string, signal: AbortSignal) {
+export async function gitBoundary(directory: string, signal?: AbortSignal) {
   const path = join(directory, '.git')
   const marker = await stat(path).catch(() => undefined)
   if (marker?.isDirectory()) return true
@@ -52,7 +21,7 @@ async function gitBoundary(directory: string, signal: AbortSignal) {
     const text = Buffer.isBuffer(pointer) ? pointer.toString('utf8').trim() : ''
     if (text.startsWith('gitdir: ')) return resolve(directory, text.slice(8).trim())
   } catch (error) {
-    signal.throwIfAborted()
+    signal?.throwIfAborted()
     if (errorCode(error) !== 'ENOENT') return true
   }
 }

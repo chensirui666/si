@@ -1,12 +1,14 @@
 import { getEventListeners } from 'node:events'
 import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
 import { buildSystemPrompt } from '../src/system-prompt.js'
+import type { McpToolCatalog } from '../src/mcp/manager.js'
 import type { ExecutableTool } from '@agent-learning/agent'
+import { omittedToolImageIndexes } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelEvent, ModelEventStream, ToolCall } from '@agent-learning/model'
 
 vi.mock('node:fs/promises', { spy: true })
@@ -15,7 +17,7 @@ const workspaceDirectory = '/workspace-with-spaces /project'
 
 function createSession({ tools, ...options }: Omit<ConstructorParameters<typeof AgentSession>[0], 'resolveDirectory' | 'tools'>
   & { tools?: ExecutableTool[] } = {}) {
-  return new AgentSession({ ...options, resolveDirectory: async () => workspaceDirectory, tools: () => tools ?? [] })
+  return new AgentSession({ skillHome: workspaceDirectory, ...options, resolveDirectory: async () => workspaceDirectory, tools: () => tools ?? [] })
 }
 
 describe('AgentSession 初始订阅', () => {
@@ -27,7 +29,7 @@ describe('AgentSession 初始订阅', () => {
       done: false,
       value: {
         type: 'snapshot',
-        snapshot: { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
+        snapshot: { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
       },
     })
 
@@ -55,7 +57,7 @@ describe('AgentSession 初始订阅', () => {
     const second = agent.subscribe(controller.signal)[Symbol.asyncIterator]()
     expect((await second.next()).value).toEqual({
       type: 'snapshot',
-      snapshot: { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
+      snapshot: { seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null },
     })
     controller.abort()
   })
@@ -177,7 +179,7 @@ describe('AgentSession 提交与运行', () => {
   it.each([{ ...input, text: ' \n ' }, { ...input, modelId: 'unknown' }, { ...input, clientMessageId: '' }])('无效提交不改变正式状态', async value => {
     const agent = createSession({ stream: () => { throw new Error('must not call') } })
     await expect(agent.submit(value)).rejects.toMatchObject({ code: 'invalid' })
-    expect(await snapshot(agent)).toEqual({ seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null })
+    expect(await snapshot(agent)).toEqual({ seq: 0, permissionMode: 'normal', messages: [], running: null, activeContent: [], compactions: [], contextUsage: null })
   })
 
   it('事件独立累积，不读取已领先的 shared partial；切点后更新连续且副本独立', async () => {
@@ -326,6 +328,24 @@ const toolCall = (id: string, overrides: Partial<ToolCall> = {}): ToolCall => ({
   type: 'toolCall', id, name: 'read', arguments: { path: id }, ...overrides,
 })
 
+const searchMcp = toolCall('search-issue', { name: 'tool_search', arguments: { query: 'issue_read' } })
+
+function mcpDiscovery() {
+  const listeners = new Set<(catalog: McpToolCatalog) => void>()
+  return {
+    listDiscoveryServers: () => [{ id: 'github', name: 'GitHub', instructions: 'Repository issues\nDo not include this line' }],
+    waitForToolDiscovery: async () => {},
+    isCurrentTool: () => true,
+    subscribeToolCatalog(listener: (catalog: McpToolCatalog) => void) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    publish(catalog: McpToolCatalog) {
+      for (const listener of listeners) listener(catalog)
+    },
+  }
+}
+
 function withTools(execute: ExecutableTool['execute'], executionMode?: ExecutableTool['executionMode']) {
   const first = controlled(), answer = controlled()
   const queues = [first, answer]
@@ -339,6 +359,96 @@ function withTools(execute: ExecutableTool['execute'], executionMode?: Executabl
 }
 
 describe('AgentSession 一批工具与最终回答', () => {
+  it('MCP 搜索命中后下一轮才可调用，撤下后移出声明并保留远端失败', async () => {
+    const queues = [controlled(), controlled(), controlled()], contexts: ModelContext[] = []
+    const name = 'mcp__github__issue_read'
+    const binding = { name, serverId: 'github', credentialRef: 'test', revision: 1, tool: {
+      name: 'issue_read', description: 'Read issue', inputSchema: { type: 'object', properties: { issue_number: { type: 'integer' } }, required: ['issue_number'] },
+    } }
+    let directory = [binding]
+    const callTool = vi.fn(async (_binding: typeof binding, _args: Record<string, unknown>) => {
+      directory = []
+      return { isError: true, content: [{ type: 'text' as const, text: '远端拒绝' }] }
+    })
+    const agent = createSession({
+      mcp: { ...mcpDiscovery(), listToolsForAgent: () => directory, callTool },
+      extensions: [{ path: 'test', entry(api) {
+        api.on('tool_call', event => { if (event.toolName === name) event.input.issue_number = 42 })
+        api.on('tool_result', event => event.toolName === name ? { isError: false, content: [{ type: 'text', text: '补充说明' }] } : undefined)
+      } }],
+      stream: (_model, context) => { contexts.push(context); return queues[contexts.length - 1]!.output },
+    })
+    await agent.submit(input)
+    await until(async () => contexts.length === 1)
+    expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    expect(contexts[0].systemPrompt).toContain('GitHub')
+    expect(contexts[0].systemPrompt).toContain('Repository issues')
+    expect(contexts[0].systemPrompt).not.toContain('Do not include this line')
+    expect(contexts[0].systemPrompt).not.toContain(name)
+    const undisclosed = toolCall('undisclosed-issue', { name, arguments: { issue_number: 1 } })
+    queues[0].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [searchMcp, undisclosed] } })
+    await until(async () => contexts.length === 2)
+    expect(callTool).not.toHaveBeenCalled()
+    expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+    expect(contexts[1].systemPrompt).not.toContain(name)
+    expect(contexts[1].messages).toContainEqual(expect.objectContaining({ toolCallId: undisclosed.id, isError: true }))
+    const call = toolCall('issue-call-1', { name, arguments: { issue_number: 1 } })
+    queues[1].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [call] } })
+    await until(async () => contexts.length === 3)
+    expect(callTool).toHaveBeenCalledOnce()
+    expect(callTool.mock.calls[0]?.[1]).toEqual({ issue_number: 42 })
+    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    const result = { role: 'toolResult', toolCallId: call.id, isError: true,
+      content: expect.arrayContaining([{ type: 'text', text: '远端拒绝' }, { type: 'text', text: '补充说明' }]) }
+    expect(contexts[2].messages).toContainEqual(expect.objectContaining(result))
+    expect((await snapshot(agent)).messages).toContainEqual(expect.objectContaining({ message: expect.objectContaining(result) }))
+    queues[2].push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    await until(async () => (await snapshot(agent)).running === null)
+    await agent.close()
+  })
+
+  it('等待 MCP 发送期间切换只读，按原编号回填权限拦截，下一轮只声明本地只读工具', async () => {
+    const queues = [controlled(), controlled(), controlled()], contexts: ModelContext[] = []
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const name = 'mcp__github__issue_read'
+    const binding = { name, serverId: 'github', credentialRef: 'test', revision: 1, tool: {
+      name: 'issue_read', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true },
+    } }
+    const sent = vi.fn()
+    const local = ['read', 'grep', 'find', 'ls', 'write'].map(name => ({ name, description: name,
+      parameters: Type.Object({}), execute: async () => '' }))
+    const agent = createSession({
+      tools: local,
+      mcp: { ...mcpDiscovery(), listToolsForAgent: () => [binding], async callTool(_binding, _args, _signal, checkPermission) {
+        entered.resolve()
+        await release.promise
+        checkPermission()
+        sent()
+        return { content: [] }
+      } },
+      stream: (_model, context) => { contexts.push(context); return queues[contexts.length - 1]!.output },
+    })
+    await agent.submit(input)
+    await until(async () => contexts.length === 1)
+    expect(contexts[0].tools?.map(tool => tool.name)).not.toContain(name)
+    queues[0].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [searchMcp] } })
+    await until(async () => contexts.length === 2)
+    const call = toolCall('mcp-read-only', { name, arguments: {} })
+    queues[1].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [call] } })
+    await entered.promise
+    try { agent.selectPermissionMode('read-only') }
+    finally { release.resolve() }
+    await until(async () => contexts.length === 3)
+    expect(sent).not.toHaveBeenCalled()
+    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['read', 'grep', 'find', 'ls'])
+    expect(contexts[2].systemPrompt).not.toContain('GitHub')
+    expect((await snapshot(agent)).messages).toContainEqual(expect.objectContaining({ toolErrorCode: 'permission_denied',
+      message: expect.objectContaining({ role: 'toolResult', toolCallId: call.id, isError: true }) }))
+    queues[2].push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    await until(async () => (await snapshot(agent)).running === null)
+    await agent.close()
+  })
+
   it('完整首轮结束后才执行，回填并保持忙碌直到最终回答结束', async () => {
     const executions: string[] = []
     let release!: () => void
@@ -734,6 +844,46 @@ describe('Feature6 连续决策与同批调度', () => {
   })
 })
 
+it('续聊只在用完图片预算余量时推进已省略的消息', async () => {
+  const data = 'A'.repeat(500_000)
+  const requests: { paths: string[]; omitted: number[]; recorded: number }[] = []
+  let total = 0
+  const agent = createSession({
+    tools: [{ name: 'read', description: '读取', parameters: Type.Object({ path: Type.String() }),
+      execute: async ({ path }) => [{ type: 'text', text: String(path) }, { type: 'image', mimeType: 'image/png', data }] }],
+    stream: (_model, context) => {
+      const queue = controlled()
+      if (context.messages.at(-1)?.role === 'user') {
+        const content = Array.from({ length: total === 0 ? 49 : 1 }, (_, index) =>
+          toolCall(`read-${index}`, { arguments: { path: `${++total}.png` } }))
+        queue.push({ type: 'done', reason: 'toolUse', message: { ...assistant(), content, stopReason: 'toolUse' } })
+      } else {
+        const omitted = omittedToolImageIndexes(context)
+        requests.push({
+          paths: context.messages.flatMap(message => message.role === 'toolResult'
+            ? message.content.flatMap(block => block.type === 'text' ? [block.text] : []) : []),
+          omitted: [...omitted],
+          recorded: context.omittedToolImageResults?.size ?? 0,
+        })
+        queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+      }
+      return queue.output
+    },
+  })
+  try {
+    for (let count = 49; count <= 57; count++) {
+      await agent.submit({ ...input, clientMessageId: `read-${count}` })
+      await until(async () => (await snapshot(agent)).running === null)
+      const omitted = count === 57 ? 16 : 8
+      expect(requests.at(-1)).toEqual({
+        paths: Array.from({ length: count }, (_, index) => `${index + 1}.png`),
+        omitted: Array.from({ length: omitted }, (_, index) => index + 2),
+        recorded: omitted,
+      })
+    }
+  } finally { await agent.close() }
+})
+
 describe('每轮项目说明', () => {
   const done = () => {
     const queue = controlled()
@@ -745,7 +895,7 @@ describe('每轮项目说明', () => {
     const cwd = await fs.mkdtemp(join(tmpdir(), 'agent-context-refresh-'))
     const current = join(cwd, 'AGENTS.md'), preferred = join(cwd, 'AGENTS.override.md')
     const contexts: ModelContext[] = []
-    const agent = new AgentSession({ resolveDirectory: async () => cwd, stream: (_model, context) => {
+    const agent = new AgentSession({ resolveDirectory: async () => cwd, skillHome: cwd, stream: (_model, context) => {
       contexts.push(context)
       return done()
     } })
@@ -791,7 +941,7 @@ describe('每轮项目说明', () => {
       return handle
     })
     const stream = vi.fn(done)
-    const agent = new AgentSession({ stream, resolveDirectory: async () => cwd })
+    const agent = new AgentSession({ stream, resolveDirectory: async () => cwd, skillHome: cwd })
     try {
       const receipt = await agent.submit(input)
       if (receipt.kind !== 'message') throw new Error('missing message receipt')
@@ -826,4 +976,74 @@ it('系统提示词中的目录与来源路径保留边界', () => {
   expect(prompt.match(/<\/cwd>/g)).toHaveLength(1)
   expect(prompt).toContain('<project_instructions path="/project&lt;/cwd&gt;&#10;&quot;folder&quot;/AGENTS.md">')
   expect(prompt).toContain('<cwd>\n/project&lt;/cwd&gt;&#10;&quot;folder&quot;\n</cwd>')
+})
+
+it('loads explicit Skill snapshots on submission and discovers updates only on the next task', async () => {
+  const cwd = await fs.mkdtemp(join(tmpdir(), 'agent-skill-refresh-'))
+  const folder = join(cwd, '.si/skills/review')
+  const path = join(folder, 'SKILL.md')
+  const contexts: ModelContext[] = []
+  const agent = new AgentSession({
+    resolveDirectory: async () => cwd, skillHome: cwd,
+    stream: (_model, context) => {
+      contexts.push(context)
+      const queue = controlled()
+      queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+      return queue.output
+    },
+  })
+  try {
+    await fs.mkdir(folder, { recursive: true })
+    for (const body of ['first-version', 'second-version']) {
+      await fs.writeFile(path, `---\nname: review\ndescription: Check changes\ndisable-model-invocation: true\n---\n${body}\n`)
+      await agent.submit({ ...input, clientMessageId: body, text: '/skill:review inspect files' })
+      await until(async () => (await snapshot(agent)).running === null)
+      expect(contexts.at(-1)?.messages.filter(message => message.role === 'user').at(-1)?.content).toContain(body)
+    }
+    expect(contexts.at(-1)?.messages[0].content).toContain('first-version')
+    expect((await snapshot(agent)).messages[0]).toMatchObject({
+      message: { content: '/skill:review inspect files' },
+      skillInvocation: { status: 'loaded', name: 'review', body: 'first-version' },
+    })
+    await agent.submit({ ...input, text: '/skill:unlisted 请继续' })
+    await until(async () => (await snapshot(agent)).running === null)
+    expect(contexts.at(-1)?.messages.filter(message => message.role === 'user').at(-1)?.content).toBe('/skill:unlisted 请继续')
+  } finally {
+    await agent.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+it('keeps original user text when a discovered Skill disappears before loading', async () => {
+  const cwd = await fs.mkdtemp(join(tmpdir(), 'si-skill-disappears-'))
+  const path = join(cwd, '.si/skills/review/SKILL.md')
+  const text = '/skill:review inspect files'
+  const captured: ModelContext[] = []
+  const agent = new AgentSession({ resolveDirectory: async () => cwd, skillHome: cwd, stream: (_model, context) => {
+    captured.push(context)
+    const queue = controlled()
+    queue.push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    return queue.output
+  } })
+  const { open } = await vi.importActual<typeof fs>('node:fs/promises')
+  let skillReads = 0
+  vi.mocked(fs.open).mockImplementation(async (candidate, ...args) => {
+    if (candidate === path && ++skillReads === 2) await fs.unlink(path)
+    return open(candidate, ...args)
+  })
+  try {
+    await fs.mkdir(dirname(path), { recursive: true })
+    await fs.writeFile(path, '---\nname: review\ndescription: Review changes\n---\nOriginal body\n')
+    await agent.submit({ ...input, text })
+    await until(async () => (await snapshot(agent)).running === null)
+    expect(captured[0].messages.at(-1)?.content).toBe(text)
+    expect((await snapshot(agent)).messages[0]).toMatchObject({
+      message: { content: text },
+      skillInvocation: { status: 'failed', reason: '说明文件已移走或删除。' },
+    })
+  } finally {
+    vi.mocked(fs.open).mockRestore()
+    await agent.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
 })

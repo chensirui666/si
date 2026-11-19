@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebServer } from '@agent-learning/server'
-import { expect, test } from '@playwright/test'
+import { expect, test } from './chinese-fixture'
 import { readLiveKey } from './live-key'
 import { addWorkspace, authorize, saveKey } from './test-utils'
 
@@ -25,11 +25,12 @@ test('Feature9 live 20：网页首发使用项目说明里的随机标记', asyn
   let correctContext = false
   const requests: { model: string; messages: { role: string; content: string }[] }[] = []
   const server = new WebServer({
-    port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, globalContextDirectory: join(temporary, 'global'),
+    port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
       const request = JSON.parse(String(init?.body)) as typeof requests[number]
+      if (String(request.messages[0]?.content).startsWith('你是会话标题生成器。')) return globalThis.fetch(url, init)
       requests.push(request)
       const system = request.messages[0]
       const sections = system?.role === 'system' ? system.content.match(/<project_context>[\s\S]*?<\/project_context>/g) : null

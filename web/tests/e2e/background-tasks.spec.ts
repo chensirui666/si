@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { expect, test } from '@playwright/test'
+import { expect, test } from './chinese-fixture'
 import type { BashJobsView, StartSessionAccepted } from '@agent-learning/server/protocol'
 import { startModelServer } from './model-server'
 import { addWorkspace, authorize, freeVitePort, saveKey, startBackend, startVite, stop } from './test-utils'
@@ -32,7 +32,7 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
     await saveKey(page, 'controlled-stage3-key')
     const start = async (label: string, commands: string[]) => {
       const index = provider.exchanges.length
-      await page.getByRole('button', { name: '新会话', exact: true }).click()
+      await page.locator('.sidebar-new-session').click()
       await page.getByRole('textbox', { name: '消息', exact: true }).fill(label)
       const accepted = page.waitForResponse(response => new URL(response.url()).pathname === '/api/sessions/start')
       await page.getByRole('button', { name: '发送', exact: true }).click()
@@ -44,7 +44,7 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
       provider.exchanges[index]!.finish('tool_calls')
       await expect.poll(() => provider.exchanges.length).toBe(index + 2)
       const receipts = provider.exchanges[index + 1]!.body.messages.filter(message => message.role === 'tool')
-      expect(receipts.map(message => JSON.parse(message.content).command).sort()).toEqual([...commands].sort())
+      expect(receipts.map(message => JSON.parse(String(message.content)).command).sort()).toEqual([...commands].sort())
       provider.exchanges[index + 1]!.delta({ content: label + ' 已启动' })
       provider.exchanges[index + 1]!.finish()
       await expect(page.getByRole('region', { name: '消息列表' })).toContainText(label + ' 已启动')
@@ -52,7 +52,12 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
     }
     const a = await start('A', [natural, manual])
     const b = await start('B', [other])
-    const switchTo = (name: string) => page.getByRole('button', { name, exact: true }).click()
+    const switchTo = async (sessionId: string) => {
+      const { sessions } = await (await page.request.get(new URL('/api/sessions', page.url()).href)).json()
+      const index = sessions.findIndex((session: { id: string }) => session.id === sessionId)
+      expect(index).toBeGreaterThanOrEqual(0)
+      await page.locator('.workspace-conversation').nth(index).click()
+    }
     const jobsPath = (id: string) => '/api/sessions/' + id + '/jobs'
     let holdA = false
     let requested = 0
@@ -67,14 +72,14 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
       listReturned.resolve()
     })
 
-    await switchTo(a.name)
+    await switchTo(a.id)
     const trigger = page.getByRole('button', { name: '后台任务', exact: true })
     const panel = page.getByRole('region', { name: '后台任务', exact: true })
     await trigger.click()
     await expect(panel.getByRole('listitem')).toHaveCount(2)
     holdA = true
     await lateList.promise
-    await switchTo(b.name)
+    await switchTo(b.id)
     await expect(panel).toContainText('KEEP_B')
     await expect(panel.getByRole('listitem')).toHaveCount(1)
     await expect(panel).not.toContainText('STOP_A')
@@ -83,7 +88,7 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
     await expect(panel).toContainText('KEEP_B')
     await expect(panel).not.toContainText('STOP_A')
 
-    await switchTo(a.name)
+    await switchTo(a.id)
     await expect(panel.getByRole('listitem')).toHaveCount(2)
     await trigger.click()
     await expect(panel).toHaveCount(0)
@@ -101,7 +106,7 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
     await page.getByRole('textbox', { name: '消息', exact: true }).fill('继续工作')
     await page.getByRole('button', { name: '发送', exact: true }).click()
     await expect.poll(() => provider.exchanges.length).toBe(nextModel + 1)
-    await expect(page.locator('.chat-header').getByRole('status')).toHaveText('正在生成回答…')
+    await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
 
     let stopAttempts = 0
     await page.route('**/api/sessions/*/jobs/*/stop', async route => {
@@ -129,12 +134,12 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
     await expect(panel.getByRole('listitem')).toHaveCount(0)
     await expect(panel).toBeEmpty()
     await expect(trigger).toHaveAttribute('aria-expanded', 'true')
-    await expect(page.locator('.chat-header').getByRole('status')).toHaveText('正在生成回答…')
+    await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
     provider.exchanges[nextModel]!.finish()
     const survivingPid = Number(await readFile(join(temporary, 'keep-b.pid'), 'utf8'))
     expect(() => process.kill(survivingPid, 0)).not.toThrow()
 
-    await switchTo(b.name)
+    await switchTo(b.id)
     await expect(panel).toContainText('KEEP_B')
     await page.reload()
     await expect(panel).toHaveCount(0)

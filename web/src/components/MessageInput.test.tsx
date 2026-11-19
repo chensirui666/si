@@ -240,17 +240,15 @@ it('移焦到发送按钮后，迟到的选区格式同步不抢回输入焦点'
 })
 
 
-it('命令候选的 Enter 只补全，第二次 Enter 才发送', async () => {
+it('Enter 确认压缩命令时直接提交', async () => {
   const onSend = vi.fn(() => true)
   render(<MessageInput onSend={onSend} sendDisabled={false} />)
   const textbox = await paste('/co')
   expect(screen.getByRole('option', { name: /compact/ })).toBeVisible()
   await act(async () => { fireEvent.keyDown(textbox, { key: 'Enter' }) })
-  expect(textbox.textContent).toBe('/compact')
-  expect(onSend).not.toHaveBeenCalled()
-  expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
-  await act(async () => { fireEvent.keyDown(textbox, { key: 'Enter' }) })
   expect(onSend).toHaveBeenCalledExactlyOnceWith('/compact', expect.any(Function))
+  expect(textbox.textContent).toBe('')
+  expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
 })
 
 it('命令菜单遵守选字及刚结束选字的保护，Tab 和 Enter 都不补全或发送', async () => {

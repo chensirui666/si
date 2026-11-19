@@ -20,7 +20,7 @@ export async function freeVitePort() {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   return address.port
 }
-export const emptySnapshot = { seq: 0, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null } satisfies ConversationSnapshot
+export const emptySnapshot = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null } satisfies ConversationSnapshot
 
 type Started = { url: string; authUrl: string; devAuthUrl: string }
 
@@ -53,9 +53,9 @@ function waitForStart(child: ChildProcess): Promise<Started> {
   })
 }
 
-export async function startBackend(secretPath: string, port = 0, modelBaseURL = '', vitePort?: number) {
+export async function startBackend(secretPath: string, port = 0, modelBaseURL = '', vitePort?: number, modelClock = false) {
   const child = fork(fixturePath, [String(port), secretPath, vitePort ? String(vitePort) : ''], {
-    env: { ...process.env, TMPDIR: dirname(secretPath), AGENT_LEARNING_E2E_MODEL_BASE_URL: modelBaseURL },
+    env: { ...process.env, TMPDIR: dirname(secretPath), AGENT_LEARNING_E2E_MODEL_BASE_URL: modelBaseURL, AGENT_LEARNING_E2E_MODEL_CLOCK: modelClock ? '1' : '' },
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
   })
   try { return { child, result: await waitForStart(child) } }
@@ -133,17 +133,19 @@ export async function ready(page: Page, observed: ReturnType<typeof observe>, af
 export async function saveKey(page: Page, key: string) {
   await page.getByRole('button', { name: '设置', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: '设置', exact: true })
+  await dialog.getByRole('button', { name: '模型', exact: true }).click()
   if (await dialog.getByRole('button', { name: '编辑', exact: true }).count()) {
     await dialog.getByRole('button', { name: '编辑', exact: true }).click()
   } else {
     await dialog.getByRole('button', { name: '添加提供方', exact: true }).click()
-    await dialog.getByRole('button', { name: 'DeepSeek', exact: true }).click()
+    await dialog.getByRole('combobox', { name: '提供方', exact: true }).click()
+    await page.getByRole('option', { name: 'DeepSeek', exact: true }).click()
   }
   try { await dialog.getByLabel('API Key', { exact: true }).fill(key) }
   catch { throw new Error('API Key 输入失败，内容已省略') }
   await dialog.getByRole('button', { name: '保存', exact: true }).click()
   await expect(dialog).toContainText('已保存在本机')
-  await expect(dialog.getByLabel('API Key', { exact: true })).toHaveValue('')
+  await expect(dialog.getByLabel('API Key', { exact: true })).toHaveCount(0)
   await page.keyboard.press('Escape')
   await expect(dialog).not.toBeVisible()
   await expect(page.getByRole('combobox', { name: '模型', exact: true })).toHaveText('DeepSeek Flash')
@@ -167,15 +169,15 @@ export async function seedSession(page: Page, observed: ReturnType<typeof observ
   const response = await page.request.post(url.href, { data: { workspaceId }, headers: { Origin: url.origin } })
   expect(response.status()).toBe(201)
   const session: SessionSummary = await response.json()
-  const opened = await openSession(page, observed, session.name)
+  const opened = await openSession(page, observed, session.id)
   expect(opened.sessionId).toBe(session.id)
   expect(opened.snapshot).toEqual(emptySnapshot)
   return session.id
 }
 
-export async function openSession(page: Page, observed: ReturnType<typeof observe>, name: string) {
+export async function openSession(page: Page, observed: ReturnType<typeof observe>, sessionId: string) {
   const before = observed.snapshots.length
-  await page.getByRole('button', { name, exact: true }).click()
+  await page.locator('.workspace-conversation[data-session-id="' + sessionId + '"]').click()
   await ready(page, observed, before, false)
   return observed.snapshots.at(-1)!
 }
@@ -186,8 +188,10 @@ export async function expectBrowserStorage(page: Page, recent: string, workspace
   expected['agent-learning:recent-workspace'] = workspaceId
   await expect.poll(() => page.evaluate(expected => {
     const keys = Object.keys(localStorage)
+    const tabKeys = Object.keys(sessionStorage)
     return keys.length === Object.keys(expected).length
       && keys.every(key => localStorage.getItem(key) === expected[key])
-      && sessionStorage.length === 0
+      && tabKeys.every(key => key === 'agent-learning:draft-permission'
+        && ['normal', 'read-only'].includes(sessionStorage.getItem(key) ?? ''))
   }, expected), { message: '浏览器仅保存会话选择和草稿' }).toBe(true)
 }

@@ -1,9 +1,11 @@
 import { WebServer } from '@agent-learning/server'
+import { mock } from 'node:test'
 import { dirname, join } from 'node:path'
 
 const options = {
   port: Number(process.argv[2]),
   browserSecretPath: process.argv[3],
+  skillHome: join(dirname(process.argv[3]), 'skill-home'),
   globalContextDirectory: join(dirname(process.argv[3]), 'global-context'),
   sessionPath: join(dirname(process.argv[3]), 'sessions.sqlite'),
   modelAuthPath: join(dirname(process.argv[3]), 'auth.json'),
@@ -14,6 +16,15 @@ const options = {
   ...(process.env.AGENT_LEARNING_E2E_MODEL_BASE_URL
     ? { modelOptions: { baseURL: process.env.AGENT_LEARNING_E2E_MODEL_BASE_URL } }
     : {}),
+}
+if (process.env.AGENT_LEARNING_E2E_MODEL_CLOCK === '1') {
+  mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  Math.random = () => 0.5
+  process.on('message', message => {
+    if (message.type !== 'advanceModelClock') return
+    mock.timers.tick(message.ms)
+    process.send?.({ type: 'modelClockAdvanced' })
+  })
 }
 const server = new WebServer(options)
 let closing = false

@@ -4,8 +4,8 @@ import type { ChatState, Subscribe } from '../chat/state'
 import { recentSessionKey } from '../chat/drafts'
 import { ChatPage } from '../pages/ChatPage'
 
-const getModels = async () => ({ models: [], deepseek: { state: 'missing' as const } })
-const getConfiguredModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], deepseek: { state: 'configured' as const } })
+const getModels = async () => ({ models: [], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'missing' as const } }] })
+const getConfiguredModels = async () => ({ models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'configured' as const } }], defaultSelection: { provider: 'deepseek', modelId: 'deepseek-flash' } })
 
 const workspace = { id: 'workspace-1', path: '/tmp/workspace', name: 'workspace', available: true }
 const getEmptyWorkspaces = async () => ({ workspaces: [] })
@@ -27,6 +27,7 @@ export function ChatPageHarness({ messages = [], modelConfigured = false, useWor
     let sessionId: string | null = null
     const snapshot: ConversationSnapshot = {
       seq: 0,
+      permissionMode: 'normal',
       messages: messages.map((content, index) => ({ id: `history-${index}`, message: { role: 'user', content, timestamp: index } })),
       running: null,
       compactions: [], contextUsage: null, activeContent: [],

@@ -1,35 +1,18 @@
-import { Credentials } from '@agent-learning/credentials'
+import type { Credentials } from '@agent-learning/credentials'
 import OpenAI from 'openai'
+import { findModel } from './catalog.js'
 import { AssistantEventStream } from './event-stream.js'
+import { classifyModelFailure, observeModelFetch, providerCodes, record } from './model-failure.js'
 import { parseToolArguments } from './tool-arguments.js'
 import { convertMessages, convertTools } from './context.js'
 import type {
-  AssistantMessage, ModelContext, ModelDiscovery, ModelEventStream, ModelInfo,
+  AssistantMessage, ModelContext, ModelEventStream, ModelInfo, ModelStreamOptions,
   ModelStopReason, TextContent, ThinkingContent, ToolCall,
 } from './types.js'
 
-const deepseek: ModelInfo = {
-  id: 'deepseek-flash',
-  name: 'DeepSeek Flash',
-  provider: 'deepseek',
-  api: 'openai-completions',
-  contextWindow: 1_048_576,
-  maxTokens: 65_536,
+class ModelFailure extends Error {
+  constructor(message: string, readonly kind?: import('./types.js').ModelFailureKind) { super(message) }
 }
-
-export function findModel(modelId: string): ModelInfo | undefined {
-  return modelId === deepseek.id ? { ...deepseek } : undefined
-}
-
-export async function discoverModels(
-  credentials: Pick<Credentials, 'readStatus'> = new Credentials(),
-): Promise<ModelDiscovery> {
-  const status = await credentials.readStatus('deepseek')
-  return { models: status.state === 'configured' ? [{ ...deepseek }] : [], deepseek: status }
-}
-
-
-class ModelFailure extends Error {}
 
 function safeError(error: unknown): string {
   if (error instanceof ModelFailure) return error.message
@@ -53,12 +36,12 @@ function isContextOverflow(error: unknown): boolean {
 
 type ToolState = { block: ToolCall; contentIndex: number; argumentsText: string; index?: number }
 
-export function createModelStream(
+export function createDeepSeekStream(
   credentials: Pick<Credentials, 'readApiKey'>,
   configuration: { fetch?: typeof fetch; baseURL?: string } = {},
-): typeof stream {
+): (model: ModelInfo, context: ModelContext, options?: ModelStreamOptions) => ModelEventStream {
   return (model, context, options) => {
-    const events = new AssistantEventStream()
+    const events = new AssistantEventStream(options?.snapshotPartials)
     const started = performance.now()
     const output: AssistantMessage = {
       role: 'assistant', content: [], api: model.api, provider: model.provider, model: model.id,
@@ -90,6 +73,9 @@ export function createModelStream(
       const toolsById = new Map<string, ToolState>()
       let text: { block: TextContent; contentIndex: number } | undefined
       let thinking: { block: ThinkingContent; contentIndex: number } | undefined
+      const transport: Parameters<typeof observeModelFetch>[1] = {}
+      let reading = false
+      let observingResponse: Promise<void> | undefined
       let finalReason: Exclude<ModelStopReason, 'error' | 'aborted'> | undefined
       const endCurrentContent = () => {
         if (text) {
@@ -106,34 +92,43 @@ export function createModelStream(
         options?.signal?.addEventListener('abort', cancel, { once: true })
         if (options?.signal?.aborted) cancel()
         if (interruption) throw new ModelFailure('本次模型调用已取消。')
-        const supported = findModel(model.id)
+        const supported = findModel(model.id, model.provider)
         if (!supported || supported.provider !== model.provider || supported.api !== model.api) {
-          throw new ModelFailure('不支持所选模型。')
+          throw new ModelFailure('不支持所选模型。', 'configuration')
         }
         resetTimeout()
         const apiKey = await Promise.race([credentials.readApiKey('deepseek'), interrupted])
         if (interruption) throw new ModelFailure('本次模型调用已取消。')
+        if (!apiKey) throw new ModelFailure('请为所选提供方配置 API Key。', 'configuration')
         const client = new OpenAI({
-          apiKey, baseURL: configuration.baseURL ?? 'https://api.deepseek.com', fetch: configuration.fetch,
+          apiKey, baseURL: configuration.baseURL ?? 'https://api.deepseek.com', fetch: observeModelFetch(configuration.fetch, transport, false, options?.onProviderResponse && (response => {
+            observingResponse = Promise.resolve(options.onProviderResponse!(response))
+            return observingResponse
+          })),
           maxRetries: 0, logLevel: 'off',
           // The rolling timer owns inactivity; 0 means immediate timeout in the SDK.
           timeout: 2_147_483_647,
         })
+        const effort = options?.reasoningEffort ?? 'high'
         const upstream = await Promise.race([
           client.chat.completions.create({
-            model: model.id, messages: convertMessages(context), max_tokens: model.maxTokens, stream: true,
-            stream_options: { include_usage: true }, reasoning_effort: 'high',
+            model: model.id, messages: convertMessages(context, effort !== 'off' && Boolean(context.tools?.length), true, model), max_tokens: model.maxTokens, stream: true,
+            stream_options: { include_usage: true },
+            ...(effort !== 'off' && { reasoning_effort: effort }),
             ...(context.tools?.length ? { tools: convertTools(context.tools) } : {}),
-            ...{ thinking: { type: 'enabled' } },
+            ...{ thinking: { type: effort === 'off' ? 'disabled' : 'enabled' } },
           }, { signal: controller.signal, maxRetries: 0 }),
           interrupted,
         ])
+        reading = true
         events.push({ type: 'start', partial: output })
         const iterator = upstream[Symbol.asyncIterator]()
         while (true) {
           const item = await Promise.race([iterator.next(), interrupted])
           if (item.done) break
           const data = item.value
+          if (options?.onProviderStreamEvent) await options.onProviderStreamEvent(data)
+          options?.signal?.throwIfAborted()
           if (!data || typeof data !== 'object' || !Array.isArray(data.choices)) {
             throw new ModelFailure('模型响应格式无效。')
           }
@@ -225,13 +220,23 @@ export function createModelStream(
         if (interruption) throw new ModelFailure('本次模型调用已停止。')
         // SDK can swallow a transport AbortError and end iteration without throwing.
         if (upstream.controller.signal.aborted) throw new ModelFailure('模型响应读取中断。')
-        if (!finalReason) throw new ModelFailure('模型响应中断，未收到有效结束原因。')
+        if (!finalReason) throw new ModelFailure('模型响应中断，未收到有效结束原因。', 'stream-ended')
         output.stopReason = finalReason
       } catch (error) {
+        await observingResponse?.catch(() => undefined)
         controller.abort()
         output.stopReason = interruption ?? 'error'
         output.errorMessage = interruptionMessage ?? safeError(error)
         if (!interruption && isContextOverflow(error)) output.errorCode = 'context_overflow'
+        if (output.stopReason === 'error' && !output.errorCode) {
+          const apiError = error instanceof OpenAI.APIError ? error : undefined
+          output.failure = classifyModelFailure({
+            phase: reading || transport.responded && (transport.status ?? 0) < 400 ? 'stream' : transport.sent ? 'request' : 'setup',
+            raw: transport.error ?? error, status: transport.status, retryAt: transport.retryAt,
+            codes: providerCodes(apiError?.error), message: apiError?.message, streamFailure: reading && !!apiError && !!record(apiError.error).message,
+            timedOut: interruption === 'error', fallback: error instanceof ModelFailure ? error.kind : undefined,
+          })
+        }
       } finally {
         clearTimeout(timer)
         options?.signal?.removeEventListener('abort', cancel)
@@ -251,9 +256,3 @@ export function createModelStream(
     return events
   }
 }
-
-export function stream(model: ModelInfo, context: ModelContext, options?: { signal?: AbortSignal }): ModelEventStream {
-  return defaultStream(model, context, options)
-}
-
-const defaultStream = createModelStream(new Credentials())

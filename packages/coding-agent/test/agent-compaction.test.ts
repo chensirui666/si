@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
+import { SessionStore } from '../src/session-store.js'
 import type { ExecutableTool } from '@agent-learning/agent'
 import type { ConversationSnapshot } from '../src/types.js'
 import { createTools } from '../src/tools.js'
@@ -16,7 +17,7 @@ const directory = '/tmp/project'
 const input = { clientMessageId: 'draft', modelId: 'deepseek-flash', text: 'u'.repeat(1600) }
 function createSession({ tools, ...options }: Omit<ConstructorParameters<typeof AgentSession>[0], 'resolveDirectory' | 'tools'>
   & { tools?: ExecutableTool[] }) {
-  return new AgentSession({ ...options, resolveDirectory: async () => directory, tools: () => tools ?? [] })
+  return new AgentSession({ skillHome: directory, ...options, resolveDirectory: async () => directory, tools: () => tools ?? [] })
 }
 const reply = (text = 'a'.repeat(1600), extra: Partial<AssistantMessage> = {}): AssistantMessage => ({
   role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1,
@@ -38,9 +39,10 @@ async function state(agent: AgentSession): Promise<ConversationSnapshot> {
 async function idle(agent: AgentSession) {
   await vi.waitFor(async () => expect((await state(agent)).running).toBeNull(), { interval: 5 })
 }
-function setup(summary = reply('目标：继续任务；事实：项目青禾。', { usage: { input: 900, output: 30 } }), triggerTokens = 5000) {
+function setup(summary = reply('目标：继续任务；事实：项目青禾。', { usage: { input: 900, output: 30 } }), triggerTokens = 5000,
+  extensions?: ConstructorParameters<typeof AgentSession>[0]['extensions']) {
   const contexts: ModelContext[] = []
-  const agent = createSession({ compaction: { triggerTokens, keepRecentTokens: 100 }, tools: [tool], stream: (_model, context) => {
+  const agent = createSession({ extensions, compaction: { triggerTokens, keepRecentTokens: 100 }, tools: [tool], stream: (_model, context) => {
     contexts.push(structuredClone(context))
     return output(context.tools ? reply() : summary)
   } })
@@ -52,8 +54,75 @@ async function seed(agent: AgentSession) {
 }
 
 describe('AgentSession compaction', () => {
+  it('压缩与重开会话都保留搜索加载，完整目录确认撤下后需重新搜索', async () => {
+    const folder = await mkdtemp(join(tmpdir(), 'agent-mcp-loads-'))
+    const path = join(folder, 'sessions.sqlite')
+    const summary = { id: 'mcp-session', workspaceId: 'mcp-project', name: '会话', createdAt: new Date().toISOString() }
+    let store = SessionStore.open(path)
+    let agent: AgentSession | undefined
+    const name = 'mcp__github__issue_read'
+    const binding = { name, serverId: 'github', credentialRef: 'config-github', revision: 0, tool: {
+      name: 'issue_read', description: 'Read a GitHub issue', inputSchema: { type: 'object' as const },
+    } }
+    let available = [binding]
+    const contexts: ModelContext[] = []
+    const load = () => createSession({
+      compaction: { triggerTokens: 50_000, keepRecentTokens: 100 },
+      persistence: { store, summary, first: () => ({ ...summary }), history: store.loadSession(summary.id) },
+      mcp: {
+        listToolsForAgent: () => available, isCurrentTool: current => available.some(tool => tool === current),
+        listDiscoveryServers: () => [{ id: 'github', name: 'GitHub' }],
+        subscribeToolCatalog: () => () => {}, waitForToolDiscovery: async () => {},
+        callTool: async () => ({ content: [] }),
+      },
+      stream(_model, context) {
+        contexts.push(structuredClone(context))
+        if (!context.tools) return output(reply('已完成 GitHub 工具搜索的摘要。'))
+        if (context.messages.at(-1)?.content !== input.text || contexts.length !== 1) return output(reply())
+        return output(reply('', { stopReason: 'toolUse', content: [
+          { type: 'toolCall', id: 'load-github', name: 'tool_search', arguments: { query: 'issue_read' } },
+        ] }))
+      },
+    })
+    try {
+      agent = load()
+      await seed(agent)
+      expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+      expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      await agent.submit({ ...input, clientMessageId: 'mcp-compact', text: '/compact' })
+      await idle(agent)
+      expect((await state(agent)).compactions.at(-1)?.status).toBe('success')
+      await agent.close()
+      agent = undefined
+      store.close()
+      store = SessionStore.open(path)
+      available = []
+      agent = load()
+      await agent.submit({ ...input, clientMessageId: 'mcp-await-catalog', text: '目录仍在发现' })
+      await idle(agent)
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search'])
+      expect(JSON.stringify(contexts.at(-1)?.messages)).not.toContain('load-github')
+      available = [binding]
+      await agent.submit({ ...input, clientMessageId: 'mcp-catalog-ready', text: '继续当前 GitHub 任务' })
+      await idle(agent)
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      store.reconcileMcpToolLoads({ serverId: binding.serverId, credentialRef: binding.credentialRef, remoteToolNames: [] })
+      await agent.submit({ ...input, clientMessageId: 'mcp-returned-tool', text: '已退出并重新出现' })
+      await idle(agent)
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    } finally {
+      await agent?.close()
+      store.close()
+      await rm(folder, { recursive: true, force: true })
+    }
+  })
+
   it('manual command has its own receipt, preserves raw history and system/tools, and reuses the summary', async () => {
-    const { agent, contexts } = setup()
+    const completed = vi.fn()
+    const { agent, contexts } = setup(undefined, undefined, [{ path: 'compaction', entry(si) {
+      si.on('session_compact', async event => { completed(event, (await state(agent)).compactions.at(-1)) })
+    } }])
     await seed(agent)
     const before = await state(agent), normal = contexts[0]
     const receipt = await agent.submit({ ...input, text: ' /compact ' })
@@ -66,6 +135,8 @@ describe('AgentSession compaction', () => {
     expect(after.compactions[0]).toMatchObject({ id: receipt.compactionId, trigger: 'manual', status: 'success', summaryUsage: { input: 900 } })
     const record = after.compactions[0]
     if (record.status !== 'success') throw new Error('not successful')
+    expect(completed).toHaveBeenCalledExactlyOnceWith({ type: 'session_compact', reason: 'manual',
+      fromExtension: false, willRetry: false, compactionEntry: record }, record)
     expect(record.estimatedAfter).toBeLessThan(record.estimatedBefore)
     expect(after.contextUsage!.tokens!).toBeLessThan(before.contextUsage!.tokens!)
     await agent.submit({ ...input, text: '继续' }); await idle(agent)
@@ -103,7 +174,7 @@ describe('AgentSession compaction', () => {
     let runId: string
     let stopped: Promise<boolean> | undefined
     const path = join(project, 'note.txt')
-    const agent = new AgentSession({
+    const agent = new AgentSession({ skillHome: directory,
       resolveDirectory: async () => project,
       compaction: { triggerTokens: 10000, keepRecentTokens: 100 },
       tools: cwd => {
@@ -230,12 +301,17 @@ describe('AgentSession compaction', () => {
     ['not shorter', reply('s'.repeat(20000))],
     ['error', reply('', { stopReason: 'error', errorMessage: '安全错误' })],
   ] as const)('invalid summary (%s) never replaces effective context', async (_name, summary) => {
-    const { agent, contexts } = setup(summary)
+    const failed = vi.fn()
+    const { agent, contexts } = setup(summary, undefined, [{ path: 'compaction', entry(si) {
+      si.on('session_compact_failed', async event => { failed(event, (await state(agent)).compactions.at(-1)) })
+    } }])
     await seed(agent)
     const before = (await state(agent)).messages
     await agent.submit({ ...input, text: '/compact' }); await idle(agent)
     expect((await state(agent)).messages).toEqual(before)
     expect((await state(agent)).compactions.at(-1)).toMatchObject({ status: 'failed' })
+    expect(failed).toHaveBeenCalledExactlyOnceWith({ type: 'session_compact_failed', reason: 'manual', aborted: false,
+      fromExtension: false, willRetry: false, errorMessage: expect.any(String) }, expect.objectContaining({ status: 'failed' }))
     await agent.submit({ ...input, text: '继续' }); await idle(agent)
     expect(JSON.stringify(contexts.at(-1)!.messages)).toContain('u'.repeat(1600))
   })
@@ -249,6 +325,36 @@ describe('AgentSession compaction', () => {
       expect(contexts.slice(count).map(context => Boolean(context.tools))).toEqual([false, true])
       expect((await state(agent)).compactions.at(-1)).toMatchObject({ trigger: 'auto', status: fail ? 'failed' : 'success' })
     }
+  })
+
+  it('refreshes tool declarations and system instructions if permission changes during compression', async () => {
+    const started = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const contexts: ModelContext[] = []
+    const agent = createSession({
+      tools: [tool, { ...tool, name: 'edit' }],
+      compaction: { triggerTokens: 1700, keepRecentTokens: 100 },
+      stream: (_model, context) => {
+        contexts.push(structuredClone(context))
+        if (context.tools) return output(reply())
+        return { result: async () => reply('旧事实青禾'), async *[Symbol.asyncIterator]() {
+          started.resolve()
+          await release.promise
+          yield { type: 'done', reason: 'stop', message: reply('旧事实青禾') } as const
+        } }
+      },
+    })
+    await seed(agent)
+    const count = contexts.length
+    await agent.submit({ ...input, text: '继续' })
+    try {
+      await started.promise
+      agent.selectPermissionMode('read-only')
+    } finally { release.resolve() }
+    await idle(agent)
+    expect(contexts.slice(count).map(context => context.tools?.map(tool => tool.name))).toEqual([undefined, ['read']])
+    expect(contexts.at(-1)?.systemPrompt).toContain('- read：')
+    expect(contexts.at(-1)?.systemPrompt).not.toContain('- edit：')
   })
 
   it('abort waits for A’s summary cleanup and preserves A’s context while B keeps running', async () => {
@@ -306,7 +412,9 @@ describe('AgentSession compaction', () => {
       await seed(agent); mode = 'fail'
       await agent.submit({ ...input, text: '继续' }); await idle(agent)
       expect(calls).toBe(overflow ? 3 : 1)
-      expect((await state(agent)).compactions).toHaveLength(overflow ? 1 : 0)
+      const snapshot = await state(agent)
+      expect(snapshot.compactions).toHaveLength(overflow ? 1 : 0)
+      if (overflow) expect(snapshot.messages.at(-1)?.message).toMatchObject({ stopReason: 'error', failure: { kind: 'context-capacity' } })
     }
   })
 
@@ -371,6 +479,45 @@ describe('AgentSession compaction', () => {
     expect((await state(agent)).messages.filter(entry => entry.message.role === 'toolResult')).toHaveLength(2)
   })
 
+  it('publishes a cancelled assistant result when the user stops overflow compaction', async () => {
+    let overflowing = false
+    const timeline: unknown[] = []
+    const started = Promise.withResolvers<void>()
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
+      extensions: [{ path: 'compaction', entry(si) {
+        si.on('agent_end', ({ messages }) => { if (overflowing) timeline.push(messages.at(-1)) })
+        si.on('session_compact_failed', event => { timeline.push(event) })
+        si.on('agent_settled', event => { if (overflowing) timeline.push(event) })
+      } }],
+      stream: (_model, context, options) => {
+        if (!overflowing) return output(reply())
+        if (context.tools) return output(reply('', { stopReason: 'error', errorCode: 'context_overflow' }))
+        const answer = reply('', { stopReason: 'aborted' })
+        return { result: async () => answer, async *[Symbol.asyncIterator]() {
+          const signal = options!.signal!
+          started.resolve()
+          if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+          yield { type: 'error', reason: 'aborted', error: answer }
+        } }
+      },
+    })
+    await seed(agent)
+    overflowing = true
+    const receipt = await agent.submit({ ...input, text: '继续' })
+    if (receipt.kind !== 'message') throw new Error('wrong receipt')
+    await started.promise
+    expect(await agent.abort(receipt.userMessageId)).toBe(true)
+    const snapshot = await state(agent)
+    expect(snapshot.running).toBeNull()
+    expect(snapshot.compactions.at(-1)).toMatchObject({ trigger: 'overflow', status: 'aborted' })
+    expect(timeline).toMatchObject([
+      { role: 'assistant', errorCode: 'context_overflow' },
+      { type: 'session_compact_failed', reason: 'overflow', fromExtension: false, willRetry: true, aborted: true },
+      { type: 'agent_settled', aborted: true },
+    ])
+    expect(snapshot.messages.at(-1)?.message).toMatchObject({ stopReason: 'aborted' })
+  })
+
   it('overflow with no candidate or failed summary ends the request without retry', async () => {
     for (const seedHistory of [false, true]) {
       let failing = false, normalCalls = 0, summaries = 0
@@ -391,7 +538,16 @@ describe('AgentSession compaction', () => {
   it('a successful recovered reply resets the one-retry allowance for the next tool round', async () => {
     let failing = false, normalCalls = 0, summaries = 0, executions = 0
     const normalInputs: ModelContext[] = []
-    const agent = createSession({ tools: [{ ...tool, execute: async () => { executions++; return '实际完成'.repeat(200) } }], compaction: { triggerTokens: 10000, keepRecentTokens: 100 }, stream: (_m, context) => {
+    const hookOrder: string[] = []
+    const agent = createSession({ tools: [{ ...tool, execute: async () => { executions++; return '实际完成'.repeat(200) } }], compaction: { triggerTokens: 10000, keepRecentTokens: 100 },
+      extensions: [{ path: 'overflow', entry(si) {
+        si.on('agent_end', event => {
+          if (failing) hookOrder.push('agent_end:' + event.messages.flatMap(message => message.role === 'assistant' ? [message.stopReason] : []).join(','))
+        })
+        si.on('session_compact', event => { if (failing) hookOrder.push('compact:' + event.reason) })
+        si.on('agent_settled', () => { if (failing) hookOrder.push('settled') })
+      } }],
+      stream: (_m, context) => {
       if (!failing) return output(reply())
       if (!context.tools) { summaries++; return output(reply('项目青禾；继续完成任务。')) }
       normalCalls++
@@ -422,6 +578,8 @@ describe('AgentSession compaction', () => {
     expect(normalCalls).toBe(4)
     expect(summaries).toBe(2)
     expect(executions).toBe(1)
+    expect(hookOrder).toEqual(['agent_end:error', 'compact:overflow', 'agent_end:toolUse,error',
+      'compact:overflow', 'agent_end:stop', 'settled'])
     expect((await state(agent)).compactions.filter(record => record.status === 'success')).toHaveLength(2)
   })
 
@@ -452,7 +610,11 @@ describe('AgentSession compaction', () => {
   it('aborted summaries retain already reported provider usage without committing a candidate', async () => {
     let signal: AbortSignal | undefined, compressing = false
     const ready = Promise.withResolvers<void>(), terminal = Promise.withResolvers<void>()
-    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 5000, keepRecentTokens: 100 }, stream: (_m, context, options) => {
+    const observed = vi.fn()
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
+      extensions: [{ path: 'manual-abort', entry(si) {
+        si.on('session_compact_failed', async event => { observed(event, (await state(agent)).compactions.at(-1)) })
+      } }], stream: (_m, context, options) => {
       if (!compressing || context.tools) return output(reply())
       signal = options!.signal
       return { result: () => new Promise(() => {}), async *[Symbol.asyncIterator]() {
@@ -468,6 +630,9 @@ describe('AgentSession compaction', () => {
     expect(signal!.aborted).toBe(true)
     terminal.resolve(); await stopping
     expect((await state(agent)).compactions.at(-1)).toMatchObject({ status: 'aborted', summaryUsage: { input: 850, output: 5 } })
+    expect(observed).toHaveBeenCalledExactlyOnceWith({
+      type: 'session_compact_failed', aborted: true, reason: 'manual', fromExtension: false, willRetry: false,
+    }, expect.objectContaining({ status: 'aborted', id: receipt.compactionId }))
   })
 
   it.each([false, true])('an oversized retained message stops the task and preserves the original context (summary fails: %s)', async failure => {
@@ -500,7 +665,7 @@ describe('项目说明与压缩', () => {
   it('手动摘要只整理聊天，下一条普通请求仍有说明和摘要', async () => {
     await projectFixture(async cwd => {
       const contexts: ModelContext[] = []
-      const agent = new AgentSession({
+      const agent = new AgentSession({ skillHome: directory,
         resolveDirectory: async () => cwd, tools: () => [tool],
         compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
         stream: (_m, context) => { contexts.push(context); return output(context.tools ? reply() : reply('旧任务摘要')) },
@@ -527,7 +692,7 @@ describe('项目说明与压缩', () => {
     await projectFixture(async (cwd, path) => {
       const contexts: ModelContext[] = []
       const triggerTokens = 3000
-      const agent = new AgentSession({
+      const agent = new AgentSession({ skillHome: directory,
         resolveDirectory: async () => cwd, tools: () => [tool],
         compaction: { triggerTokens, keepRecentTokens: 100 },
         stream: (_m, context) => { contexts.push(context); return output(context.tools ? reply() : reply('已整理的旧聊天')) },
@@ -554,13 +719,16 @@ describe('项目说明与压缩', () => {
   it('超限压缩期间改写说明，恢复请求刷新一次且不重跑已完成工具', async () => {
     await projectFixture(async (cwd, path) => {
       const contexts: ModelContext[] = []
+      const next = { provider: 'moonshotai-cn', modelId: 'kimi-k3', reasoningEffort: 'low' } as const
       let running = false, calls = 0
       const execute = vi.fn(async () => '已完成的工具结果')
-      const agent = new AgentSession({
+      const agent = new AgentSession({ skillHome: directory,
         resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }],
         compaction: { triggerTokens: 10_000, keepRecentTokens: 100 },
-        stream: (_m, context) => {
+        stream: (model, context, options) => {
           if (!running) return output(reply())
+          expect(model.provider).toBe(next.provider)
+          expect(options?.reasoningEffort).toBe(next.reasoningEffort)
           contexts.push(context)
           if (!context.tools) return {
             result: async () => reply('恢复摘要'),
@@ -577,7 +745,8 @@ describe('项目说明与压缩', () => {
       })
       await seed(agent)
       running = true
-      await agent.submit({ ...input, text: '继续任务' }); await idle(agent)
+      agent.selectModel(next)
+      await agent.submit({ ...next, clientMessageId: 'switch-overflow', text: '继续任务' }); await idle(agent)
       expect(contexts).toHaveLength(4)
       expect(contexts[1].systemPrompt).toContain('project-rule-original')
       expect(JSON.stringify(contexts[2])).not.toContain('project-rule-')
@@ -597,7 +766,7 @@ describe('项目说明与压缩', () => {
         return '已修改说明'
       })
       const stream = vi.fn(() => output(reply('', { stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'kept', name: 'read', arguments: {} }] })))
-      const agent = new AgentSession({ resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }], stream })
+      const agent = new AgentSession({ skillHome: directory, resolveDirectory: async () => cwd, tools: () => [{ ...tool, execute }], stream })
       await agent.submit({ ...input, text: '更新项目说明' }); await idle(agent)
       expect(stream).toHaveBeenCalledTimes(1)
       expect(execute).toHaveBeenCalledTimes(1)
@@ -611,4 +780,113 @@ describe('项目说明与压缩', () => {
       ])
     })
   })
+})
+
+describe('里程碑 2 Feature 1 模型切换与容量', () => {
+  const next = { provider: 'moonshotai-cn', modelId: 'kimi-k3', reasoningEffort: 'low' } as const
+  const unavailable = '当前模型容量不足，无法继续这轮，请切换模型重新压缩。'
+  const modelRequest = (clientMessageId: string, text: string) => ({ ...next, clientMessageId, text })
+
+  it.each([
+    { contextWindow: 1500, summary: '简短摘要', reason: '摘要请求预计超出模型容量。', calls: 0 },
+    { contextWindow: 2100, summary: 's'.repeat(5900), reason: '压缩后仍预计超出模型容量，保留原上下文。', calls: 1 },
+  ])('小容量模型失败后原历史仍可压缩和接续（$reason）', async ({ contextWindow, summary, reason, calls }) => {
+    const models = await import('@agent-learning/model')
+    const original = models.findModel
+    const lookup = vi.spyOn(models, 'findModel').mockImplementation((id, provider) => {
+      const model = original(id, provider)
+      return model && provider === next.provider ? { ...model, contextWindow, maxTokens: 128 } : model
+    })
+    const requests: { provider: string; effort?: string; summary: boolean }[] = []
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 2600, keepRecentTokens: 100 },
+      stream: (model, context, options) => {
+        requests.push({ provider: model.provider, effort: options?.reasoningEffort, summary: !context.tools })
+        if (!context.tools) return output(reply(model.provider === next.provider ? summary : 'A 整理过的旧事实'))
+        return output(reply())
+      },
+    })
+    try {
+      await seed(agent)
+      agent.selectModel(next)
+      await agent.submit(modelRequest('small', '新的请求：' + 'u'.repeat(4200))); await idle(agent)
+      const failed = await state(agent)
+      expect(failed.messages.at(-1)?.message).toMatchObject({ stopReason: 'error', errorMessage: unavailable })
+      expect(failed.compactions.at(-1)).toMatchObject({ status: 'failed', reason })
+      expect(requests.filter(entry => entry.provider === next.provider)).toEqual(
+        Array.from({ length: calls }, () => ({ provider: next.provider, effort: 'low', summary: true })),
+      )
+      agent.selectModel({ provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'high' })
+      await agent.submit({ ...input, clientMessageId: 'manual', text: '/compact' }); await idle(agent)
+      expect((await state(agent)).compactions.at(-1)).toMatchObject({ status: 'success', summary: 'A 整理过的旧事实' })
+      agent.selectModel(next)
+      await agent.submit(modelRequest('retry', '请继续')); await idle(agent)
+      expect((await state(agent)).messages.at(-1)?.message).toMatchObject({ stopReason: 'stop' })
+      expect(requests.at(-1)).toEqual({ provider: next.provider, effort: 'low', summary: false })
+    } finally { await agent.close(); lookup.mockRestore() }
+  })
+
+  it('切换后由新模型按自己的档位自动压缩并续做', async () => {
+    const requests: { provider: string; effort?: string; messages: ModelContext['messages']; compact: boolean }[] = []
+    const agent = createSession({ tools: [tool], compaction: { triggerTokens: 2400, keepRecentTokens: 100 },
+      stream: (model, context, options) => {
+        requests.push({ provider: model.provider, effort: options?.reasoningEffort, messages: context.messages, compact: !context.tools })
+        return output(context.tools ? reply() : reply('新模型的摘要'))
+      },
+    })
+    try {
+      await seed(agent)
+      agent.selectModel(next)
+      await agent.submit(modelRequest('cross-model', 'b'.repeat(5000))); await idle(agent)
+      const switched = requests.filter(entry => entry.provider === next.provider)
+      expect(switched.map(item => [item.effort, item.compact])).toEqual([['low', true], ['low', false]])
+      expect(JSON.stringify(switched.at(-1)?.messages)).toContain('新模型的摘要')
+      expect((await state(agent)).messages[0]?.message.content).toBe(input.text)
+    } finally { await agent.close() }
+  })
+})
+
+it('运行中改选模型后，当前工具回填和自动摘要继续用原模型与档位', async () => {
+  const first = { provider: 'deepseek', modelId: 'deepseek-flash', reasoningEffort: 'low' } as const
+  const next = { provider: 'moonshotai-cn', modelId: 'kimi-k3', reasoningEffort: 'low' } as const
+  const started = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const execute = vi.fn(async () => '本轮真实工具结果')
+  const requests: { provider: string; effort?: string; compact: boolean; context: ModelContext }[] = []
+  const agent = createSession({ tools: [{ ...tool, execute }], compaction: { triggerTokens: 4000, keepRecentTokens: 100 },
+    stream: (model, context, options) => {
+      requests.push({ provider: model.provider, effort: options?.reasoningEffort, compact: !context.tools, context })
+      if (context.messages.at(-1)?.content === '现在调用工具') {
+        const call = reply('', { stopReason: 'toolUse', usage: { input: 5500 }, content: [
+          { type: 'toolCall', id: 'once', name: 'read', arguments: {} },
+        ] })
+        return {
+          result: async () => call,
+          async *[Symbol.asyncIterator]() {
+            started.resolve()
+            await release.promise
+            yield { type: 'done', reason: 'toolUse', message: call }
+          },
+        }
+      }
+      return output(context.tools ? reply() : reply('原模型完成自动压缩'))
+    },
+  })
+  try {
+    await seed(agent)
+    agent.selectModel(first)
+    const count = requests.length
+    await agent.submit({ ...first, clientMessageId: 'pinned', text: '现在调用工具' })
+    await started.promise
+    agent.selectModel(next)
+    await expect(agent.submit({ ...next, clientMessageId: 'early', text: '过早发送' })).rejects.toMatchObject({ code: 'busy' })
+    release.resolve()
+    await idle(agent)
+    expect(execute).toHaveBeenCalledOnce()
+    expect(requests.slice(count).map(item => [item.provider, item.effort, item.compact])).toEqual([
+      ['deepseek', 'low', false], ['deepseek', 'low', true], ['deepseek', 'low', false],
+    ])
+    expect(JSON.stringify(requests.at(-1)?.context.messages)).toContain('本轮真实工具结果')
+    await agent.submit({ ...next, clientMessageId: 'next', text: '现在用下一家' }); await idle(agent)
+    expect(requests.at(-1)).toMatchObject({ provider: next.provider, effort: 'low' })
+  } finally { release.resolve(); await agent.close() }
 })

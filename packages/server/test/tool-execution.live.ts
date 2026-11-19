@@ -35,7 +35,7 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
   const requests: { messages: { role: string; content: string; tool_calls?: { id: string }[]; tool_call_id?: string }[]; tools?: unknown[] }[] = []
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
@@ -83,8 +83,11 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
       if (frame.type === 'snapshot') ready()
       if (frame.type !== 'update') return
       const { change } = frame.update
-      if (change.type === 'model' && (change.event.type === 'done' || change.event.type === 'error')) {
-        messages.set(change.messageId, { id: change.messageId, message: change.event.type === 'done' ? change.event.message : change.event.error })
+      if (change.type === 'model') {
+        const event = change.event
+        const message = event.type === 'error' ? event.error
+          : event.type === 'done' || event.type === 'replace' && event.message.stopReason !== 'pending' ? event.message : undefined
+        if (message) messages.set(change.messageId, { id: change.messageId, message })
       } else if (change.type === 'task') {
         if (change.message) messages.set(change.message.id, change.message)
         if (!change.running) finish()
@@ -103,12 +106,12 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
     expect(calls.map(call => call.name), assistants[0]?.errorMessage).toEqual([scenario.name])
     const result = results[0]
     expect(results.map(item => item.toolName)).toEqual([scenario.name])
-    expect(result?.isError, result?.content.map(item => item.text).join('\n')).toBe(false)
-    const toolText = result!.content.map(item => item.text).join('\n')
+    const toolText = result?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n') ?? ''
+    expect(result?.isError, toolText).toBe(false)
     expect(toolText).toMatch(scenario.result)
     expect(requests).toHaveLength(2)
-    expect(requests[0]?.tools).toHaveLength(9)
-    expect(requests[1]?.tools).toHaveLength(9)
+    expect(requests[0]?.tools).toHaveLength(10)
+    expect(requests[1]?.tools).toHaveLength(10)
     expect(requests[1]?.messages.at(-2)?.tool_calls?.[0]?.id).toBe(calls[0]!.id)
     expect(requests[1]?.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: calls[0]!.id, content: toolText })
     const answer = assistants[1]?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('') ?? ''

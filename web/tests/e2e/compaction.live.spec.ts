@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { CompactionRecord, ConversationSnapshot } from '@agent-learning/server/protocol'
 import { createModelStream, findModel, type AssistantMessage, type ModelContext, type Tool } from '@agent-learning/model'
 import { WebServer } from '@agent-learning/server'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './chinese-fixture'
 import { buildModelHistory } from '../../../packages/coding-agent/src/compaction'
 import { readLiveKey } from './live-key'
 import { addWorkspace, authorize, observe, openSession, ready, saveKey, seedSession } from './test-utils'
@@ -24,14 +24,15 @@ function textOf(message: AssistantMessage) {
   return message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
 }
 
-async function submit(page: Page, observed: ReturnType<typeof observe>, prompt: string) {
+async function submit(page: Page, observed: ReturnType<typeof observe>, prompt: string, viaMenu = false) {
   const before = observed.updates.length
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
-  await editor.fill(prompt)
+  await editor.fill(viaMenu ? '/' : prompt)
   const send = page.getByRole('button', { name: '发送', exact: true })
   await expect(send).toBeEnabled()
   const receipt = page.waitForResponse(response => new URL(response.url()).pathname === '/api/messages')
-  await send.click()
+  if (viaMenu) await page.getByRole('option', { name: /compact/ }).click()
+  else await send.click()
   const response = await receipt
   expect(response.status()).toBe(202)
   const accepted: { kind: 'message' | 'compaction'; compactionId?: string } = await response.json()
@@ -77,11 +78,12 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
   const requests: WireRequest[] = []
   const createServer = (port = 0) => new WebServer({
     port, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, compaction: budget,
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
-      requests.push(JSON.parse(String(init?.body)))
+      const body = JSON.parse(String(init?.body))
+      if (!String(body.messages[0]?.content).startsWith('你是会话标题生成器。')) requests.push(body)
       return globalThis.fetch(url, init)
     } },
   })
@@ -111,19 +113,12 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     await submit(page, observed, `保持前面的事实、约束和待完成任务。以下只是没有业务意义的近期日志，后续摘要可以省略；不要调用工具，只回答“已收到”。\n${randomBytes(1200).toString('hex')}`)
     const beforeManual = await refresh(page, observed)
     expect(beforeManual.compactions).toEqual([])
-    const taskTemplate = requests.find(request => request.tools?.length === 9)!
-    expect(taskTemplate.tools).toHaveLength(9)
+    const taskTemplate = requests.find(request => request.tools?.length === 10)!
+    expect(taskTemplate.tools).toHaveLength(10)
     const systemPrompt = taskTemplate.messages[0]!.content!
     const tools = taskTemplate.tools!.map(tool => tool.function)
 
-    const editor = page.getByRole('textbox', { name: '消息', exact: true })
-    const submissionsBeforeMenu = observed.submissions.length
-    await editor.fill('/')
-    await page.getByRole('option', { name: /compact/ }).click()
-    await expect(editor).toHaveText('/compact')
-    await expect(editor).toBeFocused()
-    expect(observed.submissions.length).toBe(submissionsBeforeMenu)
-    const manual = await submit(page, observed, '/compact')
+    const manual = await submit(page, observed, '/compact', true)
     expect(manual.accepted.kind).toBe('compaction')
     const firstSnapshot = await refresh(page, observed)
     const firstRecord = requireSuccess(firstSnapshot, manual.accepted.compactionId!)
@@ -134,7 +129,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     expect(firstRecord.fileOperations).toMatchObject({ readFiles: expect.arrayContaining(firstReadFiles), modifiedFiles: [] })
     const firstRecordView = page.locator(`[data-compaction-id="${firstRecord.id}"]`)
     await firstRecordView.getByText('查看摘要', { exact: true }).click()
-    for (const path of firstReadFiles) await expect(firstRecordView.getByText(path, { exact: true })).toBeVisible()
+    for (const path of firstReadFiles) await expect(firstRecordView.getByRole('list', { name: '仅读文件', exact: true }).getByText(path, { exact: true })).toBeVisible()
 
     // Comparisons use the committed cut point and production history projection, never injected into Agent state.
     const compare = async (snapshot: ConversationSnapshot, record: Success, previous?: Success) => {
@@ -143,7 +138,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
       const entries = snapshot.messages.slice(0, last + 1)
       const probe = { role: 'user' as const, content: '本次仅验证上下文输入。不要调用工具，只回答“对照完成”。', timestamp: 0 }
       const inputs: ModelContext[] = [previous, record].map(latest => ({
-        systemPrompt, tools, messages: [...buildModelHistory(entries, latest), probe],
+        systemPrompt, tools, messages: [...buildModelHistory(entries.map(({ skillInvocation: _, references: _references, ...entry }) => entry), latest), probe],
       }))
       const actual: number[] = []
       for (const input of inputs) {
@@ -189,7 +184,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     expect(secondRecord.fileOperations).toMatchObject({
       readFiles: expect.arrayContaining([...firstReadFiles, join(workspacePath, 'progress.txt')]), modifiedFiles: [],
     })
-    const recent = buildModelHistory(secondSnapshot.messages, secondRecord).slice(1)
+    const recent = buildModelHistory(secondSnapshot.messages.map(({ skillInvocation: _, references: _references, ...entry }) => entry), secondRecord).slice(1)
     expect(JSON.stringify(recent)).not.toContain(deliveryId)
     const prior = secondSnapshot.compactions.filter((record): record is Success => record.status === 'success' && record.id !== secondRecord.id && record.startedAt <= secondRecord.startedAt).at(-1)
     expect(prior?.id).toBe(firstRecord.id)
@@ -217,7 +212,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     expect(restoredB.sessionId).toBe(b)
     expect(restoredB.snapshot.messages).toEqual(otherSnapshot.messages)
     expect(restoredB.snapshot.compactions).toEqual([])
-    const restoredA = await openSession(page, observed, '会话 1')
+    const restoredA = await openSession(page, observed, a)
     expect(restoredA.sessionId).toBe(a)
     expect(restoredA.snapshot.messages).toEqual(secondSnapshot.messages)
     expect(restoredA.snapshot.compactions).toEqual(secondSnapshot.compactions)
@@ -249,7 +244,7 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     const reads = toolResults.filter(result => result.toolName === 'read')
     expect(reads.length).toBeGreaterThanOrEqual(3)
     for (const fact of ['下一条线索在 note.txt', '项目名称：青禾', batchId]) {
-      expect(reads.some(result => result.content.some(block => block.text.includes(fact)))).toBe(true)
+      expect(reads.some(result => result.content.some(block => block.type === 'text' && block.text.includes(fact)))).toBe(true)
     }
     expect(toolResults.filter(result => result.toolName === 'write')).toHaveLength(1)
     expect(finalSnapshot.messages).toContainEqual(expect.objectContaining({
@@ -299,11 +294,12 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
   const requests: WireRequest[] = []
   const server = new WebServer({
     port: 0, sessionPath: join(temporary, 'sessions.sqlite'), directoryPicker: async () => cwd, compaction: { triggerTokens: 20_000, keepRecentTokens: 400 },
-    globalContextDirectory: join(temporary, 'global-context'),
+    skillHome: join(temporary, 'skill-home'), globalContextDirectory: join(temporary, 'global-context'),
     browserSecretPath: join(temporary, 'browser-auth.json'), modelAuthPath: join(temporary, 'auth.json'),
     workspacePath: join(temporary, 'workspaces.json'), webSettingsPath: join(temporary, 'settings.json'),
     modelOptions: { fetch: async (url, init) => {
-      requests.push(JSON.parse(String(init?.body)))
+      const body = JSON.parse(String(init?.body))
+      if (!String(body.messages[0]?.content).startsWith('你是会话标题生成器。')) requests.push(body)
       return globalThis.fetch(url, init)
     } },
   })
@@ -320,7 +316,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
       await submit(page, observed, `请记住本会话专用代号 ${code}。只调用 read 读取 ${filename}，记住实际工具结果，读完只回复“已记录”。之后我问“按原约定给出结果”时，不使用工具，按约定${order}。`)
       const [first, continuation] = requests.slice(start)
       expect(requests.length - start).toBe(2)
-      expect(first?.tools).toHaveLength(9)
+      expect(first?.tools).toHaveLength(10)
       const callId = continuation?.messages.at(-2)?.tool_calls?.[0]?.id
       expect(callId).toBeTruthy()
       expect(continuation?.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: callId, content })
@@ -345,15 +341,15 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
     const toolA = await verifyRead('a.txt', contentA, codeA, '先输出代号再输出文件原文')
     const b = await seedSession(page, observed, workspaceId)
     const toolB = await verifyRead('b.txt', contentB, codeB, '先输出文件原文再输出代号')
-    await openSession(page, observed, '会话 1')
+    await openSession(page, observed, a)
     const aRecalled = await verifyRecall(codeA, contentA, codeB, contentB, codeA, contentA)
     expect(aRecalled.input.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: toolA, content: contentA }))
-    await openSession(page, observed, '会话 2')
+    await openSession(page, observed, b)
     const bRecalled = await verifyRecall(codeB, contentB, codeA, contentA, contentB, codeB)
     expect(bRecalled.input.messages).toContainEqual(expect.objectContaining({ role: 'tool', tool_call_id: toolB, content: contentB }))
     const bBefore = await refresh(page, observed)
 
-    await openSession(page, observed, '会话 1')
+    await openSession(page, observed, a)
     await submit(page, observed, `以下是可省略的旧运行日志，后续摘要无需记录。只回复“收到”。\n${randomBytes(1200).toString('hex')}`)
     await submit(page, observed, `只回复“收到”。以下随机样本属于近期数据，无需记住或复述。\n${randomBytes(1600).toString('hex')}`)
     const aBefore = await refresh(page, observed)
@@ -372,7 +368,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
     expect(aResumed.input.messages[1]?.content).toContain(record.summary)
     expect(aResumed.input.messages.some(message => message.role === 'user' && message.content?.includes('以下随机样本属于近期数据'))).toBe(true)
     expect(aResumed.input.messages.some(message => message.role === 'tool' && message.tool_call_id === toolA)).toBe(false)
-    const bAfter = await openSession(page, observed, '会话 2')
+    const bAfter = await openSession(page, observed, b)
     expect(bAfter.sessionId).toBe(b)
     expect(bAfter.snapshot).toEqual(bBefore)
     const bResumed = await verifyRecall(codeB, contentB, codeA, contentA, contentB, codeB)

@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import { useRef, useState } from 'react'
 import type { ContextUsage } from '@agent-learning/server/protocol'
 import { Button } from './ui/button'
@@ -10,20 +11,21 @@ export function ContextMeter({ usage }: { usage?: ContextUsage | null }) {
 }
 
 function KnownContextMeter({ usage, tokens, capacity }: { usage: ContextUsage; tokens: number; capacity: number }) {
+  const { t, i18n } = useTranslation()
   const [open, setOpen] = useState(false)
   const nextTouchOpen = useRef<boolean | null>(null)
   const percentage = Math.min(100, Math.round(tokens / capacity * 100))
   const fraction = Math.min(1, tokens / capacity)
   const items = [
-    ['系统提示词', usage.breakdown.systemTokens],
-    ['工具定义', usage.breakdown.toolsTokens],
-    ['对话消息', usage.breakdown.messageTokens],
+    [t('context.system'), usage.breakdown.systemTokens],
+    [t('context.tools'), usage.breakdown.toolsTokens],
+    [t('context.messages'), usage.breakdown.messageTokens],
   ] as const
   const total = items.reduce((sum, item) => sum + item[1], 0)
   return <TooltipProvider delayDuration={0}>
     <Tooltip open={open} onOpenChange={setOpen}>
       <TooltipTrigger asChild>
-        <Button variant="ghost" size="sm" className="context-meter-trigger" type="button" aria-label={`对话容量 ${percentage}%`}
+        <Button variant="ghost" size="sm" className="context-meter-trigger" type="button" aria-label={t('context.capacity', { percentage })}
           onPointerDown={event => {
             // Radix can dismiss on pointer down, so decide the tap's result first.
             nextTouchOpen.current = event.pointerType === 'touch' ? !open : null
@@ -43,13 +45,13 @@ function KnownContextMeter({ usage, tokens, capacity }: { usage: ContextUsage; t
         </Button>
       </TooltipTrigger>
       <TooltipContent className="context-meter-panel" side="top" align="end" sideOffset={6} collisionPadding={8}>
-        <strong>上下文已用 {percentage}%</strong>
-        <p>~{tokens.toLocaleString('en-US')} / {capacity.toLocaleString('en-US')} token</p>
+        <strong>{t('context.used', { percentage })}</strong>
+        <p>~{tokens.toLocaleString(i18n.language)} / {capacity.toLocaleString(i18n.language)} token</p>
         <div className="context-bar"><div className="context-bar-used" style={{ width: `${fraction * 100}%` }}>
           {items.map(([name, value], index) => <span key={name} className={`context-color-${index}`} style={{ width: total ? `${value / total * 100}%` : '0%' }} />)}
         </div></div>
-        <dl>{items.map(([name, value], index) => <div key={name}><dt><i className={`context-color-${index}`} />{name}</dt><dd>~{value.toLocaleString('en-US')}</dd></div>)}</dl>
-        <p className="context-meter-note">总占用与各项均为近似值，各项之和可能不同。</p>
+        <dl>{items.map(([name, value], index) => <div key={name}><dt><i className={`context-color-${index}`} />{name}</dt><dd>~{value.toLocaleString(i18n.language)}</dd></div>)}</dl>
+        <p className="context-meter-note">{t('context.estimate')}</p>
       </TooltipContent>
     </Tooltip>
   </TooltipProvider>

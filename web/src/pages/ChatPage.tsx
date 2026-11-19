@@ -1,39 +1,52 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { FolderOpenIcon, FolderPlusIcon, PlusIcon } from 'lucide-react'
-import type { ModelDiscovery } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, SessionSummary, StartSessionAccepted, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
+import { useTranslation } from 'react-i18next'
+import { errorNotice, NoticeText, noticeSummary, type Notice } from '../i18n/messages'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, PlusIcon, XIcon } from 'lucide-react'
+import type { ModelDiscovery, ModelSelection } from '@agent-learning/model'
+import type { AbortRequest, AbortResult, ExtensionNotice, PermissionMode, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageResult, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
+import { ChatFileDrop } from '../components/ChatFileDrop'
+import { DraftAttachments } from '../components/MessageAttachments'
+import { PlanReview } from '../components/PlanReview'
+import { useAttachmentDrafts } from '../chat/attachment-drafts'
+import { PermissionPicker } from '../components/PermissionPicker'
+import { ModelPicker } from '../components/ModelPicker'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
 import { BackgroundTasks } from '../components/BackgroundTasks'
-import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat } from '../chat/client'
+import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, getMcpServers, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat, createSession } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger } from '../components/ui/sidebar'
 import { initialState, mergeSubmissions, settleSubmission, type Subscribe, type Subscription } from '../chat/state'
 import type { LocalSubmission } from '../types'
-import { newSessionDraft, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend } from '../chat/drafts'
+import { newSessionDraft, readDraftPermission, readExtensionDraft, writeExtensionDraft, writeDraftPermission, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend, readPlanDraft, writePlanDraft, readSourceSends, writeSourceSends, type StoredSourceSend } from '../chat/drafts'
 
 type Props = {
   subscribe?: Subscribe
+  getDefaultPermission?: typeof queryDefaultPermission
   getModels?: () => Promise<ModelDiscovery>
   getSessions?: () => Promise<SessionSummary[]>
-  startSession?: (input: StartSessionRequest) => Promise<StartSessionAccepted>
+  startSession?: (input: StartSessionRequest) => Promise<StartSessionResult>
   pickWorkspace?: typeof chooseWorkspace
   getWorkspaces?: () => Promise<WorkspaceView>
-  submitMessage?: (input: SubmitMessageRequest) => Promise<SubmitMessageAccepted>
+  submitMessage?: (input: SubmitMessageRequest) => Promise<SubmitMessageResult>
   abortMessage?: (input: AbortRequest) => Promise<AbortResult>
 }
 
 type FirstSend = { input: StartSessionRequest; revision: number; sending: boolean }
+type SentDraft = {
+  key: string; text: string; revision?: number; attachmentIds?: string[]; referenceSessionIds?: string[]
+}
+type SourceSend = SentDraft & StoredSourceSend & { pending: boolean; quote?: string }
 
-type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: string }
+type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: Notice }
 
-function useServerView<T>(load: () => Promise<T>) {
+function useServerView<T>(load: () => Promise<T>, failure: Notice['key']) {
   const [view, setView] = useState<T | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<Notice | null>(null)
   const version = useRef(0)
   const invalidate = useCallback(() => { version.current++ }, [])
   const apply = useCallback((value: T) => {
@@ -46,17 +59,47 @@ function useServerView<T>(load: () => Promise<T>) {
     try {
       const value = await load()
       if (request === version.current) apply(value)
+      return value
     } catch (error) {
       if (request !== version.current) return
-      setError(error instanceof Error ? error.message : '读取配置失败，请重试')
+      setError(errorNotice(failure, error))
     }
-  }, [apply, load])
+  }, [apply, failure, load])
   return { view, error, apply, refresh, invalidate, setView }
 }
 
-export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
+export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = queryDefaultPermission, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
+  const { t } = useTranslation()
   const [state, setState] = useState(initialState)
   const { sessionId } = state
+  const chatScroll = useRef<HTMLElement>(null)
+  const [showToBottom, setShowToBottom] = useState(false)
+  const updateToBottom = useCallback(() => {
+    const scroll = chatScroll.current
+    setShowToBottom(Boolean(scroll && scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop > 2))
+  }, [])
+  useLayoutEffect(() => {
+    if (chatScroll.current) chatScroll.current.scrollTop = 0
+    setShowToBottom(false)
+  }, [sessionId])
+  useEffect(() => {
+    const scroll = chatScroll.current
+    if (!scroll || sessionId === null) return
+    updateToBottom()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(updateToBottom)
+    observer.observe(scroll)
+    for (const child of scroll.children) observer.observe(child)
+    return () => observer.disconnect()
+  }, [sessionId, updateToBottom])
+
+  function scrollToBottom() {
+    const scroll = chatScroll.current
+    if (!scroll) return
+    scroll.querySelector<HTMLElement>('.message-list')?.focus({ preventScroll: true })
+    scroll.scrollTop = scroll.scrollHeight
+    updateToBottom()
+  }
   const stateRef = useRef(state)
   const [allSubmissions, setSubmissions] = useState<LocalSubmission[]>([])
   const submissionsRef = useRef(allSubmissions)
@@ -74,46 +117,166 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   const mounted = useRef(false)
   const [discovery, setDiscovery] = useState<ModelDiscovery | null>(null)
   const discoveryRef = useRef(discovery)
-  const [modelId, setModelId] = useState('')
-  const modelIdRef = useRef(modelId)
-  const [modelError, setModelError] = useState<string | null>(null)
+  const [selectionBusy, setSelectionBusy] = useState(false)
+  const savingSelection = useRef(false)
+  const [selectionError, setSelectionError] = useState<{ sessionId: string | null; message: Notice }>()
+  const [modelError, setModelError] = useState<Notice | null>(null)
   const requestVersion = useRef(0)
-  const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces)
-  const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings)
-  const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions)
+  const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces, 'chat.workspaceReadFailed')
+  const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings, 'chat.webSettingsReadFailed')
+  const { view: mcpServers, error: mcpError, refresh: refreshMcpServers, invalidate: invalidateMcpServers } = useServerView(getMcpServers, 'mcp.readFailed')
+  const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions, 'chat.sessionReadFailed')
+  const { view: defaultPermission, error: permissionReadError, refresh: refreshPermission, invalidate: invalidatePermission, setView: setDefaultPermissionView } =
+    useServerView(getDefaultPermission, 'permission.readFailed')
+  const [draftPermission, setDraftPermission] = useState(readDraftPermission)
+  const [permissionError, setPermissionError] = useState<{ sessionId: string; notice: Notice }>()
+  const savingSessionPermission = useRef(false)
+  const [sessionPermissionBusy, setSessionPermissionBusy] = useState(false)
+  const savingDefaultPermission = useRef(false)
+  const [defaultPermissionBusy, setDefaultPermissionBusy] = useState(false)
+  const [defaultPermissionError, setDefaultPermissionError] = useState<Notice>()
   const selected = useRef<string | null>(null)
   const initialized = useRef(false)
   const navigation = useRef(0)
   const opening = useRef(false)
-  const [sessionError, setSessionError] = useState<string | null>(null)
+  const [sessionError, setSessionError] = useState<Notice | null>(null)
   const [picking, setPicking] = useState(false)
   const pickingRef = useRef(false)
   const [draftWorkspaceId, setDraftWorkspaceId] = useState<string | null>(null)
   const firstSend = useRef<FirstSend | null>(null)
+  const extensionDrafts = useRef(new Map<string, string>())
+  const [extensionNotices, setExtensionNotices] = useState<{ sessionId: string | null; notices: ExtensionNotice[] }>()
+  const showExtensionNotices = useCallback((id: string | null, notices: ExtensionNotice[]) => {
+    if (notices.length && selected.current === id) setExtensionNotices({ sessionId: id, notices })
+  }, [])
+  useEffect(() => {
+    if (!extensionNotices) return
+    const timer = setTimeout(() => setExtensionNotices(undefined), 5000)
+    return () => clearTimeout(timer)
+  }, [extensionNotices])
   const [firstPhase, setFirstPhase] = useState<'sending' | 'unconfirmed' | null>(null)
-  const [firstError, setFirstError] = useState<string | null>(null)
-  const [saveNotice, setSaveNotice] = useState<{ sessionId: string | null; text: string } | null>(null)
+  const [firstError, setFirstError] = useState<Notice | null>(null)
+  const [saveNotice, setSaveNotice] = useState<{ sessionId: string | null; text: Notice } | null>(null)
   useEffect(() => {
     if (!saveNotice) return
     const timer = setTimeout(() => setSaveNotice(null), 3000)
     return () => clearTimeout(timer)
   }, [saveNotice])
-  const [pickError, setPickError] = useState<string | null>(null)
+  const [pickError, setPickError] = useState<Notice | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  useEffect(() => { if (settingsOpen) void refreshMcpServers() }, [settingsOpen, refreshMcpServers])
   const settingsButton = useRef<HTMLButtonElement>(null)
   const sidebarButton = useRef<HTMLButtonElement>(null)
-  const { draft, storageUnavailable, load: loadDraft, save: saveDraft, restore: restoreDraft, read: readStorage, write: writeStorage, revision: draftRevision, clearSent: clearSentDraft } = useDrafts()
+  const editor = useRef<HTMLDivElement>(null)
+  const [quotes, setQuotes] = useState<Record<string, string | symbol | undefined>>({})
+  const attachmentDrafts = useAttachmentDrafts()
+  const removeAttachments = attachmentDrafts.remove
+  const uploadDraftIds = useRef(new Map<string, string>())
+  const referenceDrafts = useRef(new Map<string, SessionSummary[]>())
+  const [referenceView, setReferenceView] = useState(() => new Map(referenceDrafts.current))
+  const sourceSends = useRef(new Map<string, SourceSend>())
+  const [draftIssue, setDraftIssue] = useState<{ key: string; notice: Notice }>()
+  const planCommand = useRef(false)
+  const planDrafts = useRef(new Map<string, NonNullable<ReturnType<typeof readPlanDraft>>>())
+  const [planBusy, setPlanBusy] = useState(false)
+  const discuss = useRef<{ sessionId: string; planId: string } | undefined>(undefined)
+  const pendingQuote = sessionId === null ? undefined : quotes[sessionId]
+  const quote = typeof pendingQuote === 'string' ? pendingQuote : undefined
+  const { draft, currentText, storageUnavailable, load: loadDraft, save: saveDraft, restore: restoreDraft, read: readStorage, write: writeStorage, revision: draftRevision, clearSent: clearSentDraft } = useDrafts()
   const session = sessions?.find(item => item.id === sessionId)
   const workspace = workspaces?.workspaces.find(item => item.id === session?.workspaceId)
   const pendingInput = firstSend.current?.input
   const draftWorkspace = workspaces?.workspaces.find(item => item.id === (pendingInput?.workspaceId ?? draftWorkspaceId))
   const isNew = sessionId === null
   const submissions = allSubmissions.filter(item => item.sessionId === sessionId)
+  const draftId = sessionId ?? newSessionDraft
+  const attachments = attachmentDrafts.items(draftId)
+  const references = referenceView.get(draftId) ?? []
+  const plan = state.snapshot?.plan
+  const planId = plan?.state === 'review' ? plan.assistantMessageId : null
+  const referenceWorkspace = isNew ? draftWorkspace?.id : workspace?.id
+  const referenceSessions = sessions?.filter(item => item.id !== sessionId).sort((a, b) =>
+    Number(b.workspaceId === referenceWorkspace) - Number(a.workspaceId === referenceWorkspace))
+
+  const writeReferences = useCallback((key: string, next: SessionSummary[]) => {
+    if (next.length) referenceDrafts.current.set(key, next)
+    else referenceDrafts.current.delete(key)
+    setReferenceView(new Map(referenceDrafts.current))
+  }, [])
+
+  const consumeSources = useCallback((sent: SentDraft) => {
+    const { attachmentIds, referenceSessionIds } = sent
+    if (attachmentIds?.length) removeAttachments(sent.key, item =>
+      item.status === 'ready' && attachmentIds.includes(item.attachment.id))
+    if (referenceSessionIds?.length) {
+      const items = referenceDrafts.current.get(sent.key)
+      if (items?.length) writeReferences(sent.key, items.filter(item => !referenceSessionIds.includes(item.id)))
+    }
+  }, [removeAttachments, writeReferences])
+
+  const forgetSourceSend = useCallback((id: string) => {
+    sourceSends.current.delete(id)
+    writeSourceSends(sourceSends.current.values())
+  }, [])
+
+  const clearSourceText = useCallback((sent: SourceSend) => {
+    if (!sent.edited && clearSentDraft(sent.key, sent.text, sent.revision ?? draftRevision(sent.key)) && selected.current === sent.key) loadDraft(sent.key)
+  }, [clearSentDraft, draftRevision, loadDraft])
+
+  const settleSourceDraft = useCallback((clientMessageId: string) => {
+    const sent = sourceSends.current.get(clientMessageId)
+    if (!sent) return
+    forgetSourceSend(clientMessageId)
+    consumeSources(sent)
+    if (sent.quote) setQuotes(current => current[sent.key] === sent.quote ? { ...current, [sent.key]: undefined } : current)
+    clearSourceText(sent)
+  }, [clearSourceText, consumeSources, forgetSourceSend])
+
+  function draftUploadScope(workspaceId: string) {
+    let draftSessionId = uploadDraftIds.current.get(workspaceId)
+    const extensionId = extensionDrafts.current.get(workspaceId) ?? readExtensionDraft(workspaceId)
+    if (!draftSessionId && extensionId && !sessions?.some(item => item.id === extensionId)) draftSessionId = extensionId
+    draftSessionId ??= crypto.randomUUID()
+    uploadDraftIds.current.set(workspaceId, draftSessionId)
+    return { workspaceId, draftSessionId }
+  }
+
+  const addFiles = (isNew ? draftWorkspace?.available && !firstSend.current : workspace?.available) ? (files: File[]) => {
+    if (selected.current !== sessionId || isNew && firstSend.current) return
+    const scope = sessionId ? { sessionId } : draftWorkspace && draftUploadScope(draftWorkspace.id)
+    if (!scope) return
+    const notice = attachmentDrafts.add(draftId, scope, files)
+    setDraftIssue(notice ? { key: draftId, notice } : undefined)
+  } : undefined
+
+  function selectReference(item: SessionSummary) {
+    const previous = referenceDrafts.current.get(draftId) ?? []
+    if (previous.some(reference => reference.id === item.id)) return
+    if (previous.length === 3) {
+      setDraftIssue({ key: draftId, notice: { key: 'chat.referenceLimit' } })
+      return
+    }
+    writeReferences(draftId, [...previous, item])
+    setDraftIssue(undefined)
+  }
+
+  function syncConversation(id: string) {
+    if (selected.current === id) subscription.current?.requestSnapshot?.()
+  }
+
+  useEffect(() => {
+    const request = discuss.current
+    if (request && state.connection === 'ready' && state.snapshot && request.sessionId === sessionId && request.planId !== planId) {
+      discuss.current = undefined
+      editor.current?.focus({ preventScroll: true })
+    }
+  }, [sessionId, planId, state.connection, state.snapshot])
 
   const openSession = useCallback((id: string | null, userAction = false) => {
     initialized.current = true
     if (userAction) navigation.current++
     setSessionError(null)
+    setPermissionError(undefined)
     if (selected.current === id) {
       if (id && userAction && stateRef.current.error) subscription.current?.requestSnapshot?.()
       return
@@ -137,31 +300,55 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
   }, [draftRevision, loadDraft, readStorage])
 
   const saveCurrentDraft = useCallback((text: string) => {
-    if (sessionId === selected.current) saveDraft(sessionId ?? newSessionDraft, text)
-  }, [sessionId, saveDraft])
+    if (sessionId !== selected.current) return
+    const key = sessionId ?? newSessionDraft
+    if (sourceSends.current.size && currentText(key) !== text) {
+      const sent = [...sourceSends.current.values()].find(item => item.key === key)
+      if (sent && !sent.edited) {
+        sent.edited = true
+        writeSourceSends(sourceSends.current.values())
+      }
+    }
+    saveDraft(key, text)
+  }, [currentText, sessionId, saveDraft])
 
   function chooseDraftWorkspace(id: string) {
     navigation.current++
+    if (draftWorkspace?.id !== id && attachmentDrafts.read(newSessionDraft).length) {
+      attachmentDrafts.rebind(newSessionDraft, newSessionDraft, draftUploadScope(id))
+    }
     setDraftWorkspaceId(id)
     writeStorage(recentWorkspaceKey, id)
     setFirstError(null)
   }
 
   function openNewSession(workspaceId?: string) {
+    if (!draftPermission && !firstSend.current) {
+      setDefaultPermissionView(null)
+      void refreshPermission()
+    }
     openSession(null, true)
     if (workspaceId) chooseDraftWorkspace(workspaceId)
   }
 
   const finishFirstSend = useCallback((session: SessionSummary) => {
     const pending = firstSend.current
-    if (!pending || pending.input.clientMessageId !== session.id || pending.input.workspaceId !== session.workspaceId) return
+    if (!pending || (pending.input.draftSessionId ?? pending.input.clientMessageId) !== session.id || pending.input.workspaceId !== session.workspaceId) return
     firstSend.current = null
     writeFirstSend(null)
+    extensionDrafts.current.delete(session.workspaceId)
+    uploadDraftIds.current.delete(session.workspaceId)
+    writeExtensionDraft(session.workspaceId)
+    consumeSources({ ...pending.input, key: newSessionDraft, revision: pending.revision })
+    writeDraftPermission(null)
+    setDraftPermission(null)
+    setDefaultPermissionView(null)
+    void refreshPermission()
     setFirstPhase(null)
     setFirstError(null)
     clearSentDraft(newSessionDraft, pending.input.text, pending.revision)
     if (selected.current === null) openSession(session.id)
-  }, [clearSentDraft, openSession])
+  }, [clearSentDraft, consumeSources, openSession, refreshPermission, setDefaultPermissionView])
 
   function attemptFirstSend(pending: FirstSend) {
     if (pending.sending || stateRef.current.connection !== 'ready') return
@@ -169,8 +356,20 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     pending.sending = true
     setFirstPhase('sending')
     setFirstError(null)
-    void Promise.resolve().then(() => startSession(pending.input)).then(({ session: created }) => {
+    void Promise.resolve().then(() => startSession(pending.input)).then(result => {
       if (!mounted.current || firstSend.current !== pending) return
+      if ('kind' in result) {
+        const { workspaceId, text } = pending.input
+        extensionDrafts.current.set(workspaceId, result.draftSessionId)
+        writeExtensionDraft(workspaceId, result.draftSessionId)
+        firstSend.current = null
+        writeFirstSend(null)
+        setFirstPhase(null)
+        if (clearSentDraft(newSessionDraft, text, pending.revision) && selected.current === null) loadDraft(newSessionDraft)
+        showExtensionNotices(null, result.notices)
+        return
+      }
+      const created = result.session
       invalidateSessions()
       setSessions(previous => previous?.some(item => item.id === created.id) ? previous : [...previous ?? [], created])
       finishFirstSend(created)
@@ -186,13 +385,18 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         firstSend.current = null
         writeFirstSend(null)
         setFirstPhase(null)
-        const text = error instanceof Error ? error.message : '首条消息被拒绝，请重试。'
+        const text = errorNotice(saveRejected ? 'request.saveFailed' : 'chat.firstRejected', error)
         if (saveRejected) setSaveNotice({ sessionId: null, text })
         else setFirstError(text)
+        if (error?.code === 'model_selection_changed') {
+          receiveModels(null)
+          void refreshModels()
+        }
         void refreshWorkspaces()
+        if (pending.input.draftSessionId) void refreshSessions()
       } else {
         setFirstPhase('unconfirmed')
-        if (authorizationRejected && error instanceof Error) setFirstError(error.message)
+        if (authorizationRejected && error instanceof Error) setFirstError(errorNotice('chat.firstRejected', error))
         void refreshSessions()
       }
     })
@@ -211,7 +415,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       void refreshWorkspaces()
       if (selected.current === null && !firstSend.current && request === navigation.current) chooseDraftWorkspace(result.workspaceId)
     } catch (error) {
-      if (mounted.current) setPickError(error instanceof Error ? error.message : '选择工作区失败，请重试')
+      if (mounted.current) setPickError(errorNotice('chat.workspacePickFailed', error))
     } finally {
       pickingRef.current = false
       if (mounted.current) setPicking(false)
@@ -226,13 +430,22 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     submissionsRef.current = unresolved
     setSubmissions(unresolved)
   }, [])
+  useEffect(() => {
+    const restored: LocalSubmission[] = []
+    for (const saved of readSourceSends()) {
+      const { input, afterMessageId } = saved
+      if (sourceSends.current.has(input.clientMessageId)) continue
+      sourceSends.current.set(input.clientMessageId, { ...saved, key: input.sessionId, pending: false,
+        attachmentIds: input.attachmentIds, referenceSessionIds: input.referenceSessionIds })
+      restored.push({ ...input, afterMessageId, state: 'unconfirmed', kind: 'message' })
+    }
+    if (restored.length) updateSubmissions([...submissionsRef.current, ...restored])
+  }, [updateSubmissions])
+
   const invalidateModels = useCallback(() => { requestVersion.current++ }, [])
   const receiveModels = useCallback((result: ModelDiscovery | null) => {
     discoveryRef.current = result
     setDiscovery(result)
-    const selected = result?.models.some(model => model.id === modelIdRef.current) ? modelIdRef.current : result?.models[0]?.id ?? ''
-    modelIdRef.current = selected
-    setModelId(selected)
   }, [])
   const refreshModels = useCallback(async () => {
     const version = ++requestVersion.current
@@ -244,7 +457,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     } catch (error) {
       if (version !== requestVersion.current) return
       receiveModels(null)
-      setModelError(error instanceof Error ? error.message : '模型查询失败，请重试')
+      setModelError(errorNotice('model.loadFailed', error))
     }
   }, [getModels, receiveModels])
   const applyModels = useCallback((result: ModelDiscovery) => {
@@ -259,6 +472,7 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
     void refreshWorkspaces()
     void refreshWebSettings()
     void refreshSessions()
+    void refreshPermission()
     let needsRefresh = true
     const stop = subscribe(next => {
       if (next.sessionId !== selected.current) return
@@ -268,7 +482,9 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         void refreshModels()
         void refreshWorkspaces()
         void refreshWebSettings()
+        void refreshMcpServers()
         void refreshSessions()
+        void refreshPermission()
       }
       if (next.connection === 'ready' && next.sessionId) {
         if (next.snapshot) {
@@ -279,14 +495,20 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
             writeStorage(recentSessionKey, next.sessionId)
           }
         } else if (next.error) {
-          setSessionError(next.error)
+          setSessionError({ key: 'chat.sessionReadFailed', detail: next.error })
           void refreshSessions()
         }
       }
       stateRef.current = next
+      if (sourceSends.current.size) {
+        for (const message of next.snapshot?.messages ?? []) {
+          if (message.clientMessageId) settleSourceDraft(message.clientMessageId)
+        }
+      }
       updateSubmissions(submissionsRef.current)
       setState(next)
-    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions)
+    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, refreshPermission,
+    (notice, id) => showExtensionNotices(id, [notice]), refreshMcpServers)
     subscription.current = stop
     stop.setSession(selected.current)
     return () => {
@@ -294,13 +516,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       invalidateModels()
       invalidateWorkspaces()
       invalidateWebSettings()
+      invalidateMcpServers()
       invalidateSessions()
+      invalidatePermission()
       stop()
       subscription.current = null
       for (const timer of timers.current) clearTimeout(timer)
       timers.current.clear()
     }
-  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateSessions, updateSubmissions, updateAbort, writeStorage])
+  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshMcpServers, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateMcpServers, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage, showExtensionNotices, settleSourceDraft])
 
   useEffect(() => {
     if (!sessions) return
@@ -314,32 +538,262 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       }
     } else if (!selected.current || sessions.some(item => item.id === selected.current)) return
     openSession(null)
-    setSessionError('之前打开的会话已不可用，请选择或新建会话。')
+    setSessionError({ key: 'chat.sessionUnavailable' })
   }, [sessions, openSession, readStorage])
 
   useEffect(() => {
-    const sent = sessions?.find(item => item.id === firstSend.current?.input.clientMessageId)
-    if (sent) finishFirstSend(sent)
-  }, [sessions, finishFirstSend])
+    const pending = firstSend.current?.input
+    if (!pending) return
+    const id = pending.draftSessionId ?? pending.clientMessageId
+    const sent = sessions?.find(item => item.id === id)
+    if (!sent) return
+    const snapshot = state.connection === 'ready' && state.sessionId === id ? state.snapshot : null
+    const confirmed = snapshot?.messages.some(message =>
+      message.message.role === 'user' && message.clientMessageId === pending.clientMessageId)
+      || snapshot?.runs?.some(run => run.kind === 'task' && run.clientMessageId === pending.clientMessageId)
+    // A shared draft ID can be promoted by another tab's first message.
+    if (id === pending.clientMessageId || confirmed) finishFirstSend(sent)
+  }, [finishFirstSend, sessions, state.connection, state.sessionId, state.snapshot])
 
-  const hasModel = () => discoveryRef.current?.deepseek.state === 'configured'
-    && discoveryRef.current.models.some(model => model.id === modelIdRef.current)
+  useEffect(() => {
+    if (selected.current === null && sessions && draftPermission === null && !firstSend.current && defaultPermission && !permissionReadError) {
+      writeDraftPermission(defaultPermission)
+      setDraftPermission(defaultPermission)
+    }
+  }, [sessions, isNew, draftPermission, defaultPermission, permissionReadError])
+
+  function changeDraftPermission(mode: PermissionMode) {
+    if (firstSend.current || selected.current !== null) return
+    writeDraftPermission(mode)
+    setDraftPermission(mode)
+  }
+
+  async function changeSessionPermission(id: string, mode: PermissionMode) {
+    if (savingSessionPermission.current || selected.current !== id || stateRef.current.connection !== 'ready') return
+    savingSessionPermission.current = true
+    setSessionPermissionBusy(true)
+    setPermissionError(undefined)
+    try {
+      await saveSessionPermission(id, mode)
+    } catch (error) {
+      if (mounted.current && selected.current === id) {
+        setPermissionError({ sessionId: id, notice: errorNotice('permission.saveFailed', error) })
+        subscription.current?.requestSnapshot?.()
+      }
+    } finally {
+      savingSessionPermission.current = false
+      if (mounted.current) setSessionPermissionBusy(false)
+    }
+  }
+
+  async function changeDefaultPermission(mode: PermissionMode) {
+    if (savingDefaultPermission.current) return
+    savingDefaultPermission.current = true
+    setDefaultPermissionBusy(true)
+    setDefaultPermissionError(undefined)
+    try {
+      await saveDefaultPermission(mode)
+      await refreshPermission()
+    } catch (error) {
+      const confirmed = await refreshPermission()
+      if (mounted.current && confirmed !== mode) setDefaultPermissionError(errorNotice('permission.saveFailed', error))
+    } finally {
+      savingDefaultPermission.current = false
+      if (mounted.current) setDefaultPermissionBusy(false)
+    }
+  }
+
+  const selection = state.snapshot?.modelSelection ?? discovery?.defaultSelection
+  const selectedModel = discovery?.models.find(model => model.id === selection?.modelId && model.provider === selection.provider)
+  const hasModel = () => !savingSelection.current && !!selection && discoveryRef.current?.models.some(model =>
+    model.id === selection.modelId && model.provider === selection.provider
+    && (model.reasoningEfforts ? model.reasoningEfforts.some(level => level === selection.reasoningEffort) : selection.reasoningEffort === undefined))
+
+  async function selectModel(next: ModelSelection) {
+    if (savingSelection.current || stateRef.current.connection !== 'ready' || selected.current !== sessionId
+      || (sessionId ? !stateRef.current.snapshot : !!firstSend.current)) return
+    if (next.provider === selection?.provider && next.modelId === selection.modelId && next.reasoningEffort === selection.reasoningEffort) return
+    savingSelection.current = true
+    setSelectionBusy(true)
+    setSelectionError(undefined)
+    try {
+      await saveModelSelection({ ...next, ...(sessionId && { sessionId }) })
+    } catch (error) {
+      if (mounted.current) setSelectionError({ sessionId, message: errorNotice('model.selectionUnconfirmed', error) })
+    } finally {
+      if (mounted.current) {
+        if (sessionId && selected.current === sessionId) subscription.current?.requestSnapshot?.()
+        await refreshModels()
+      }
+      savingSelection.current = false
+      if (mounted.current) setSelectionBusy(false)
+    }
+  }
   const canStart = () => selected.current === null && draftWorkspace?.available && !workspaceError && !pickingRef.current
-    && stateRef.current.connection === 'ready' && hasModel() && !firstSend.current
+    && stateRef.current.connection === 'ready' && hasModel() && draftPermission !== null && !firstSend.current && !planCommand.current
   const canSubmit = () => !!sessionId && sessionId === selected.current && workspace?.available && !workspaceError && stateRef.current.sessionId === sessionId && stateRef.current.connection === 'ready' && stateRef.current.snapshot !== null && stateRef.current.snapshot.running === null
-    && hasModel()
+    && hasModel() && !savingSessionPermission.current && !planCommand.current && planId === null
     && !submissionsRef.current.some(local => local.sessionId === sessionId && local.state !== 'failed')
 
+  async function activatePlan(draftText: string) {
+    if (!selection || !(sessionId === null ? canStart() : canSubmit())) return
+    const originalId = sessionId
+    const workspaceId = originalId ? workspace?.id : draftWorkspace?.id
+    let saved = workspaceId ? planDrafts.current.get(workspaceId) ?? readPlanDraft(workspaceId) : undefined
+    let targetId = sessionId ?? saved?.id
+    const revision = draftRevision(draftId)
+    const navigationVersion = navigation.current
+    planCommand.current = true
+    setPlanBusy(true)
+    setDraftIssue(undefined)
+    try {
+      if (!originalId && workspaceId && draftPermission) {
+        if (!targetId) {
+          const created = await createSession(workspaceId, draftPermission)
+          targetId = created.id
+          saved = { id: targetId, permissionMode: draftPermission }
+          planDrafts.current.set(workspaceId, saved)
+          writePlanDraft(workspaceId, saved)
+          if (!mounted.current) return
+          invalidateSessions()
+          setSessions(previous => previous?.some(item => item.id === created.id) ? previous : [...previous ?? [], created])
+        } else if (saved?.permissionMode !== draftPermission) {
+          await saveSessionPermission(targetId, draftPermission)
+          saved = { id: targetId, permissionMode: draftPermission }
+          planDrafts.current.set(workspaceId, saved)
+          writePlanDraft(workspaceId, saved)
+        }
+        await saveModelSelection({ ...selection, sessionId: targetId })
+      }
+      if (!targetId) return
+      await submitMessage({ ...selection, clientMessageId: crypto.randomUUID(), sessionId: targetId, text: '/plan' })
+      if (workspaceId && saved?.id === targetId) {
+        planDrafts.current.delete(workspaceId)
+        writePlanDraft(workspaceId)
+      }
+      if (!mounted.current) return
+      if (originalId) {
+        if (clearSentDraft(draftId, draftText, revision) && selected.current === originalId) loadDraft(draftId)
+        syncConversation(targetId)
+      } else if (selected.current === null && navigation.current === navigationVersion) {
+        if (!clearSentDraft(draftId, draftText, revision)) {
+          saveDraft(targetId, currentText(draftId))
+          saveDraft(draftId, '')
+        }
+        attachmentDrafts.rebind(draftId, targetId, { sessionId: targetId })
+        writeReferences(targetId, referenceDrafts.current.get(draftId) ?? [])
+        writeReferences(draftId, [])
+        openSession(targetId)
+      }
+    } catch (error) {
+      if (mounted.current) {
+        setDraftIssue({ key: draftId, notice: errorNotice('plan.commandFailed', error) })
+        if (targetId) syncConversation(targetId)
+      }
+    } finally {
+      planCommand.current = false
+      if (mounted.current) setPlanBusy(false)
+    }
+  }
+
+  async function exitPlan(commandDraft?: string) {
+    if (!sessionId || !selection || selected.current !== sessionId || planCommand.current || stateRef.current.connection !== 'ready') return
+    const revision = draftRevision(sessionId)
+    planCommand.current = true
+    setPlanBusy(true)
+    setDraftIssue(undefined)
+    try {
+      await submitMessage({ ...selection, sessionId, clientMessageId: crypto.randomUUID(), text: '/plan off' })
+      if (mounted.current && commandDraft !== undefined && clearSentDraft(sessionId, commandDraft, revision) && selected.current === sessionId) loadDraft(sessionId)
+    } catch (error) {
+      if (mounted.current) setDraftIssue({ key: sessionId, notice: errorNotice('plan.commandFailed', error) })
+    } finally {
+      planCommand.current = false
+      if (mounted.current) {
+        setPlanBusy(false)
+        syncConversation(sessionId)
+      }
+    }
+  }
+
+  async function sendSources(sent: SourceSend) {
+    if (sent.pending) return
+    const { input, key } = sent
+    const id = input.clientMessageId
+    const retry = submissionsRef.current.some(item => item.clientMessageId === id && item.state === 'unconfirmed')
+    sent.pending = true
+    updateSubmissions(settleSubmission(submissionsRef.current, id, { state: 'pending', errorMessage: undefined }))
+    try {
+      const result = await submitMessage(input)
+      if (!mounted.current || !sourceSends.current.has(id)) return
+      if (result.kind === 'handled') {
+        forgetSourceSend(id)
+        clearSourceText(sent)
+        updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== id))
+        showExtensionNotices(key, result.notices)
+      } else {
+        settleSourceDraft(id)
+        updateSubmissions(settleSubmission(submissionsRef.current, id, { accepted: result, state: 'pending' }))
+      }
+    } catch (cause) {
+      if (!mounted.current || !sourceSends.current.has(id)) return
+      const error = cause as { status?: number; code?: string } | null
+      const selectionChanged = error?.code === 'model_selection_changed'
+      const saveRejected = error?.code === 'save_rejected'
+      const status = error?.status
+      const rejected = saveRejected || selectionChanged || typeof status === 'number' && status >= 400 && status < 500
+        && !(retry && (status === 401 || status === 403))
+      if (rejected) {
+        forgetSourceSend(id)
+        updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== id))
+        setDraftIssue({ key, notice: errorNotice(saveRejected ? 'request.saveFailed' : selectionChanged ? 'model.selectionChanged' : 'chat.sendFailed', cause) })
+        if (selectionChanged) void refreshModels()
+        if (status === 404) void refreshSessions()
+        void refreshWorkspaces()
+      } else updateSubmissions(settleSubmission(submissionsRef.current, id, { state: 'unconfirmed', errorMessage: errorNotice('chat.notConfirmed', cause) }))
+      syncConversation(key)
+    } finally {
+      sent.pending = false
+    }
+  }
+
   const send = (text: string) => {
-    if (!text.trim()) return false
+    const control = text.trim() === '/compact' && !quote
+    const currentAttachments = control ? [] : attachmentDrafts.read(draftId)
+    if (currentAttachments.some(item => item.status !== 'ready') || !selection || !text.trim() && !currentAttachments.length) return false
+    const attachmentIds = currentAttachments.flatMap(item => item.status === 'ready' ? [item.attachment.id] : [])
+    const referenceSessionIds = control ? [] : (referenceDrafts.current.get(draftId) ?? []).map(item => item.id)
+    if (referenceSessionIds.length && !text.trim()) return false
+    const sources = {
+      ...(attachmentIds.length && { attachmentIds }),
+      ...(referenceSessionIds.length && { referenceSessionIds }),
+    }
+    const keepDraft = attachmentIds.length > 0 || referenceSessionIds.length > 0
+    setDraftIssue(undefined)
     if (sessionId === null) {
-      if (!canStart() || !draftWorkspace) return false
+      if (!canStart() || !draftWorkspace || !draftPermission) return false
       if (text.trim() === '/compact') {
-        setFirstError('请先发送消息，有聊天记录后再压缩。')
+        setFirstError({ key: 'chat.compactNeedsHistory' })
         return false
       }
+      const existingDraft = extensionDrafts.current.get(draftWorkspace.id) ?? readExtensionDraft(draftWorkspace.id)
+      let draftSessionId = sessions?.some(session => session.id === existingDraft) ? undefined : existingDraft
+      if (attachmentIds.length) {
+        const scope = draftUploadScope(draftWorkspace.id)
+        if (sessions?.some(item => item.id === scope.draftSessionId)) {
+          const next = { workspaceId: scope.workspaceId, draftSessionId: crypto.randomUUID() }
+          uploadDraftIds.current.set(next.workspaceId, next.draftSessionId)
+          attachmentDrafts.rebind(draftId, draftId, next)
+          return false
+        }
+        draftSessionId = scope.draftSessionId
+      }
+      if (existingDraft && !draftSessionId) {
+        extensionDrafts.current.delete(draftWorkspace.id)
+        writeExtensionDraft(draftWorkspace.id)
+      }
       const pending = firstSend.current = {
-        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, text },
+        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text, permissionMode: draftPermission, ...sources, ...(draftSessionId && { draftSessionId }) },
         revision: draftRevision(newSessionDraft), sending: false,
       }
       writeFirstSend(pending.input)
@@ -348,49 +802,89 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       return false
     }
     if (!canSubmit()) return false
-    const input: SubmitMessageRequest = { clientMessageId: crypto.randomUUID(), modelId: modelIdRef.current, sessionId, text }
+    setSelectionError(undefined)
+    const quotedText = quote && quote.split(/\r\n|\n|\r/).map(line => `> ${line}`).join('\n')
+    const body = text.trimStart()
+    let requestText = text
+    if (quotedText) {
+      requestText = /^\/plan\s/u.test(body)
+        ? `/plan ${quotedText}\n\n${body.slice(5).trimStart()}`
+        : `${quotedText}\n\n${text}`
+    }
+    const input: SubmitMessageRequest = {
+      clientMessageId: crypto.randomUUID(), ...selection, ...sources, sessionId, text: requestText,
+    }
     const clearedRevision = draftRevision(sessionId) + 1
     const syncTarget = () => {
       if (selected.current === sessionId) subscription.current?.requestSnapshot?.()
     }
-    const local: LocalSubmission = { ...input, kind: text.trim() === '/compact' ? 'compaction' : 'message', state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
+    const local: LocalSubmission = { ...input, kind: input.text.trim() === '/compact' ? 'compaction' : 'message', state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
     // 同步写门禁，React 渲染前的第二次发送手势也会被拦住。
     const previous = submissionsRef.current
     submissionsRef.current = [...previous, local]
-    let request: Promise<SubmitMessageAccepted>
+    if (keepDraft) {
+      const sent = { key: sessionId, text, revision: draftRevision(sessionId), ...sources, input, pending: false, quote, afterMessageId: local.afterMessageId }
+      sourceSends.current.set(input.clientMessageId, sent)
+      writeSourceSends(sourceSends.current.values())
+      void sendSources(sent)
+      return false
+    }
+    let request: Promise<SubmitMessageResult>
     try { request = submitMessage(input) }
     catch { submissionsRef.current = previous; return false }
+    const quoteSent = quote ? Symbol() : undefined
+    if (quoteSent) setQuotes(current => ({ ...current, [sessionId]: quoteSent }))
     updateSubmissions(submissionsRef.current)
     const timer = setTimeout(() => {
       timers.current.delete(timer)
       if (!mounted.current || !submissionsRef.current.some(item => item.clientMessageId === input.clientMessageId && item.state !== 'failed')) return
-      updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: 'unconfirmed', errorMessage: '十秒内未确认接收，正在重新同步' }))
+      updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: 'unconfirmed', errorMessage: { key: 'chat.receiptTimeout' } }))
       syncTarget()
     }, 10_000)
     timers.current.add(timer)
     void request.then(accepted => {
       if (!mounted.current) return
+      if (accepted.kind === 'handled') {
+        updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== input.clientMessageId))
+        showExtensionNotices(sessionId, accepted.notices)
+        return
+      }
       updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { accepted, state: 'pending', errorMessage: undefined }))
     }, error => {
       if (!mounted.current) return
       const saveRejected = error?.code === 'save_rejected'
-      const rejected = saveRejected || typeof error?.status === 'number' && error.status >= 400 && error.status < 500
-      const message = error instanceof Error ? error.message : '提交异常，未确认接收'
+      const selectionChanged = error?.code === 'model_selection_changed'
+      const rejected = saveRejected || selectionChanged || typeof error?.status === 'number' && error.status >= 400 && error.status < 500
+      const message = errorNotice(saveRejected ? 'request.saveFailed' : selectionChanged ? 'model.selectionChanged' : rejected ? 'chat.sendFailed' : 'chat.notConfirmed', error)
       const local = submissionsRef.current.find(item => item.clientMessageId === input.clientMessageId)
       if (!local || local.accepted) return
-      if (saveRejected) {
+      const restored = rejected && restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId, selectionChanged)
+      if (restored && quoteSent) setQuotes(current => current[sessionId] === quoteSent ? { ...current, [sessionId]: quote } : current)
+      if (saveRejected || selectionChanged && restored) {
         updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== input.clientMessageId))
-        setSaveNotice({ sessionId, text: message })
-      } else updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: message }))
+      } else updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: selectionChanged ? undefined : message }))
+      if (selectionChanged) {
+        setSelectionError({ sessionId, message })
+        syncTarget()
+      } else if (saveRejected) setSaveNotice({ sessionId, text: message })
       if (rejected) {
-        restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId)
         void refreshWorkspaces()
         if (error.status === 404) void refreshSessions()
       } else syncTarget()
-    }).finally(() => { clearTimeout(timer); timers.current.delete(timer) })
+    }).finally(() => {
+      clearTimeout(timer)
+      timers.current.delete(timer)
+      if (quoteSent && mounted.current) setQuotes(current => {
+        if (current[sessionId] !== quoteSent) return current
+        const next = { ...current }
+        delete next[sessionId]
+        return next
+      })
+    })
     return true
   }
 
+  const retryingSource = submissions.find(item => item.state === 'unconfirmed' && sourceSends.current.has(item.clientMessageId))
   const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions.filter(local => local.kind === 'message'))
   const waiting = submissions.some(local => local.state !== 'failed')
   const target = state.snapshot?.running?.runId
@@ -407,25 +901,27 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       await abortMessage({ sessionId, runId })
     } catch (error) {
       if (!mounted.current || abortRef.current.get(sessionId)?.runId !== runId) return
-      updateAbort(sessionId, { runId, status: 'unconfirmed', error: error instanceof Error ? error.message : '中止请求失败' })
+      updateAbort(sessionId, { runId, status: 'unconfirmed', error: errorNotice('request.abortFailed', error) })
     }
     if (mounted.current && selected.current === sessionId && abortRef.current.get(sessionId)?.runId === runId) subscription.current?.requestSnapshot?.()
   }
-  const status = state.error ?? (state.slow ? '连接较慢，正在等待对话恢复…' : {
-    connecting: '正在连接…', awaitingSnapshot: '正在恢复对话…',
-    ready: !sessionId ? firstPhase === 'sending' ? '正在发送第一条消息…' : '新会话' : state.snapshot?.running?.phase === 'compaction' ? '正在压缩对话…' : state.snapshot?.running?.phase === 'tools' ? '正在执行工具…' : state.snapshot?.running ? '正在生成回答…' : waiting ? '正在确认消息接收…' : '对话已同步',
-    disconnected: '连接已断开，正在重试…',
-  }[state.connection])
+  const statusKey = state.connectionNotice ?? (state.slow ? 'chat.connectionSlow' : ({
+    connecting: 'chat.connecting', awaitingSnapshot: 'chat.restoring', disconnected: 'chat.disconnected',
+    ready: !sessionId ? firstPhase === 'sending' ? 'chat.firstSending' : 'chat.new'
+      : state.snapshot?.running?.phase === 'compaction' ? 'chat.compacting'
+      : state.snapshot?.running?.phase === 'tools' ? 'chat.runningTools'
+      : state.snapshot?.running ? 'chat.generating' : waiting ? 'chat.waitingReceipt' : null,
+  } as const)[state.connection])
+  const status = state.error ? t('chat.sessionReadFailed') : statusKey ? t(statusKey) : ''
 
-  const selectedModel = isNew ? pendingInput?.modelId ?? modelId : modelId
-  const modelSelect = <Select value={discovery?.models.length ? selectedModel : ''}
-    onValueChange={value => { modelIdRef.current = value; setModelId(value) }}
-    disabled={!discovery?.models.length || (isNew && firstPhase !== null)}>
-    <SelectTrigger aria-label="模型" className="composer-model">
-      <SelectValue placeholder={modelError ? '模型查询失败' : discovery ? '无可用模型' : '正在查询模型…'} />
-    </SelectTrigger>
-    <SelectContent align="end">{discovery?.models.map(model => <SelectItem key={model.id} value={model.id}>{model.name}</SelectItem>)}</SelectContent>
-  </Select>
+  const modelSelect = <ModelPicker discovery={discovery} selection={selection} model={selectedModel}
+    disabled={!discovery?.models.length || selectionBusy || state.connection !== 'ready' || (isNew ? firstPhase !== null : !state.snapshot)}
+    placeholder={t(modelError ? 'model.loadFailed' : selection ? 'model.reselect' : discovery ? 'model.none' : 'model.loading')}
+    onSelect={next => { void selectModel(next) }} />
+  const providerError = discovery?.providers.find(item => item.status.state === 'error')?.status
+  const workspaceNotice = workspaceError ?? pickError
+  const sessionNotice = sessionError ?? listError
+
 
   return (
     <SidebarProvider>
@@ -433,15 +929,15 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
       <Sidebar>
         <div className="sidebar-title">SI</div>
         <SidebarDismiss>
-          <Button className="sidebar-new-session" variant="outline" aria-label="新会话" onClick={() => openNewSession()}>
+          <Button className="sidebar-new-session" variant="outline" aria-label={t('chat.new')} onClick={() => openNewSession()}>
             <PlusIcon aria-hidden="true" />
-            <span>新会话</span>
+            <span>{t('chat.new')}</span>
           </Button>
         </SidebarDismiss>
-        <nav className="sidebar-workspaces" aria-label="工作区">
+        <nav className="sidebar-workspaces" aria-label={t('chat.workspaces')}>
           <div className="sidebar-workspaces-heading">
-            <span>工作区</span>
-            <Button variant="ghost" size="icon-sm" aria-label="添加工作区" title="添加工作区" disabled={picking || !workspaces} onClick={() => { void pickWorkspace() }}>
+            <span>{t('chat.workspace')}</span>
+            <Button variant="ghost" size="icon-sm" aria-label={t('chat.addWorkspace')} title={t('chat.addWorkspace')} disabled={picking || !workspaces} onClick={() => { void pickWorkspace() }}>
               <FolderPlusIcon aria-hidden="true" />
             </Button>
           </div>
@@ -449,16 +945,16 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
             <div className="workspace-row" data-bound={group.id === workspace?.id}>
               <FolderOpenIcon aria-hidden="true" /><span title={group.path}>{group.name}</span>
               <SidebarDismiss>
-                <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label="新建会话" title={group.available ? '新建会话' : '工作区目录不可用'} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
+                <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label={t('chat.create')} title={t(group.available ? 'chat.create' : 'chat.workspaceUnavailable')} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
                   <PlusIcon aria-hidden="true" />
                 </Button>
               </SidebarDismiss>
             </div>
             {isNew && group.id === draftWorkspace?.id && <SidebarDismiss>
-              <Button className="workspace-conversation" variant="secondary" aria-label="未发送的新会话" aria-current="page" onClick={() => openNewSession()}>新会话</Button>
+              <Button className="workspace-conversation" variant="secondary" aria-label={t('chat.unsent')} aria-current="page" onClick={() => openNewSession()}>{t('chat.new')}</Button>
             </SidebarDismiss>}
             {sessions?.filter(item => item.workspaceId === group.id).map(item => <SidebarDismiss key={item.id}>
-              <Button className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>
+              <Button className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} data-session-id={item.id} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>
                 <span title={item.name}>{item.name}</span>
               </Button>
             </SidebarDismiss>)}
@@ -473,57 +969,127 @@ export function ChatPage({ subscribe = subscribeToChat, getModels = queryModels,
         const trigger = settingsButton.current
         if (trigger && !trigger.closest('[hidden]')) trigger.focus()
         else sidebarButton.current?.focus()
-      }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
+      }} permissionSettings={{ mode: defaultPermission, busy: defaultPermissionBusy,
+        readError: permissionReadError, saveError: defaultPermissionError,
+        onSelect: changeDefaultPermission, onRetry: () => { setDefaultPermissionError(undefined); void refreshPermission() },
+      }} mcpSettings={{ servers: mcpServers, error: mcpError, refresh: refreshMcpServers }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
         if (!mounted.current) return
         applyWebSettings(result)
         void refreshWebSettings()
       }} />
       <div className="chat-workspace">
       <div className="chat-page" data-new-session={isNew || undefined} data-connection={state.connection} data-session-id={sessionId ?? undefined}>
-      {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert">{saveNotice.text}</p>}
+      {extensionNotices?.sessionId === sessionId && <div className="save-notice" role="status">
+        {extensionNotices.notices.map(({ message, level }, index) => <div key={index} data-level={level}>{message}</div>)}
+      </div>}
+      {saveNotice?.sessionId === sessionId && <p className="save-notice" role="alert"><NoticeText notice={saveNotice.text} /></p>}
       {!isNew && <header className="chat-header">
-        <h1>聊天</h1>
+        <h1 title={session?.name}>{session?.name || t('chat.title')}</h1>
         <div className="chat-header-controls">
           <p className="connection-status" role="status">{status}</p>
           {sessionId && <BackgroundTasks sessionId={sessionId} />}
         </div>
       </header>}
-      <main className="chat-main">
-        {!isNew && <MessageList key={sessionId} messages={messages} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures} />}
+      <div className="chat-main-frame">
+      <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
+        {!isNew && <MessageList key={sessionId} messages={messages} showRetry={state.connection === 'ready'} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
+          onQuote={text => {
+            setQuotes(current => ({ ...current, [sessionId]: text }))
+            editor.current?.focus({ preventScroll: true })
+          }} />}
         <div className="composer-stack">
+          {!isNew && showToBottom && <Button type="button" className="chat-to-bottom" variant="outline" size="icon"
+            aria-label={t('chat.toBottom')} title={t('chat.toBottom')} onClick={scrollToBottom}>
+            <ChevronDownIcon aria-hidden="true" />
+          </Button>}
           {isNew && <>
             <h1 className="new-session-title">SI</h1>
             <div className="new-session-workspace">
               <FolderOpenIcon aria-hidden="true" />
-              <Select value={draftWorkspace?.id ?? ''} disabled={picking || !workspaces || firstPhase !== null} onValueChange={value => {
+              <Select value={draftWorkspace?.id ?? ''} disabled={picking || !workspaces || firstPhase !== null || planBusy} onValueChange={value => {
                 if (value === 'add-workspace') void pickWorkspace()
                 else chooseDraftWorkspace(value)
               }}>
-                <SelectTrigger aria-label="工作区"><SelectValue placeholder="选择工作区" /></SelectTrigger>
+                <SelectTrigger aria-label={t('chat.workspace')}><SelectValue placeholder={t('chat.chooseWorkspace')} /></SelectTrigger>
                 <SelectContent>
                   {workspaces?.workspaces.map(item => <SelectItem key={item.id} value={item.id} disabled={!item.available}>{item.name}</SelectItem>)}
-                  <SelectItem value="add-workspace">添加工作区…</SelectItem>
+                  <SelectItem value="add-workspace">{t('chat.addWorkspaceOption')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
           </>}
           {isNew && <p className={state.connection === 'ready' && firstPhase !== 'sending' ? 'sr-only' : 'connection-status new-session-status'} role="status">{status}</p>}
-          {(workspaceError || pickError) && <p className="configuration-error" role="alert">{workspaceError ?? pickError}</p>}
-          {(sessionError || listError) && <p className="configuration-error" role="alert">{sessionError ?? listError}</p>}
-          {listError && <Button variant="ghost" className="self-start" onClick={() => { void refreshSessions() }}>重新读取会话</Button>}
-          {isNew && firstError && <p className="configuration-error" role="alert">{firstError}</p>}
+          {workspaceNotice && <p className="configuration-error" role="alert"><NoticeText notice={workspaceNotice} /></p>}
+          {sessionNotice && <p className="configuration-error" role="alert"><NoticeText notice={sessionNotice} /></p>}
+          {listError && <Button variant="ghost" className="self-start" onClick={() => { void refreshSessions() }}>{t('chat.reloadSessions')}</Button>}
+          {isNew && firstError && <p className="configuration-error" role="alert"><NoticeText notice={firstError} /></p>}
           {isNew && firstPhase === 'unconfirmed' && <div className="new-session-retry">
-            <p className="configuration-error" role="alert">首条消息未确认接收，草稿已保留。</p>
-            <Button variant="outline" disabled={state.connection !== 'ready'} onClick={() => { if (firstSend.current) attemptFirstSend(firstSend.current) }}>重试首次发送</Button>
+            <p className="configuration-error" role="alert">{t('chat.firstUnconfirmed')}</p>
+            <Button variant="outline" disabled={state.connection !== 'ready'} onClick={() => { if (firstSend.current) attemptFirstSend(firstSend.current) }}>{t('chat.retryFirst')}</Button>
           </div>}
-          {(isNew ? draftWorkspace && !draftWorkspace.available : workspace && !workspace.available) && <p className="model-error configuration-error" role="alert">工作区目录不可用</p>}
-          {(modelError || discovery?.deepseek.state === 'error') && <p className="model-error configuration-error" role="alert">{modelError ?? (discovery?.deepseek.state === 'error' ? discovery.deepseek.message : '')}</p>}
-          {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">中止未确认：{activeAbort.error}，正在核对后台状态。</p>}
-          {storageUnavailable && <p className="configuration-error" role="alert">浏览器存储不可用，草稿可在本页保留，重新打开后无法恢复。</p>}
+          {(isNew ? draftWorkspace && !draftWorkspace.available : workspace && !workspace.available) && <p className="model-error configuration-error" role="alert">{t('chat.workspaceUnavailable')}</p>}
+          {(modelError || providerError?.state === 'error') && <p className="model-error configuration-error" role="alert"><NoticeText notice={modelError ?? { key: 'settings.error', detail: providerError?.state === 'error' ? providerError.message : undefined }} /></p>}
+          {selection && discovery && !hasModel() && !selectionBusy && <p className="model-error configuration-error" role="alert">{t('model.unavailable')}</p>}
+          {selectionError?.sessionId === sessionId && <p className="model-error configuration-error" role="alert"><NoticeText notice={selectionError.message} /></p>}
+          {activeAbort?.status === 'unconfirmed' && <p className="configuration-error" role="alert">{activeAbort.error ? t('chat.abortUnconfirmedDetail', { detail: noticeSummary(t, activeAbort.error) }) : t('chat.abortUnconfirmed')}{activeAbort.error?.detail && <> · <span>{activeAbort.error.detail}</span></>}</p>}
+          {storageUnavailable && <p className="configuration-error" role="alert">{t('chat.draftStorageUnavailable')}</p>}
           <CompactionRecords saveFailures={state.snapshot?.saveFailures} records={state.snapshot?.compactions ?? []} messages={state.snapshot?.messages ?? []} pending={submissions.filter(local => local.kind === 'compaction')} />
-          <MessageInput key={sessionId ?? newSessionDraft} draft={draft} onDraftChange={saveCurrentDraft} contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />} footerControl={modelSelect} commandsEnabled={!isNew} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()} action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
+          {isNew && !draftPermission && !pendingInput && permissionReadError && <p className="configuration-error" role="alert">
+            <NoticeText notice={permissionReadError} /> <Button variant="ghost" onClick={() => { void refreshPermission() }}>{t('common.retry')}</Button>
+          </p>}
+          {permissionError?.sessionId === sessionId && <p className="configuration-error" role="alert"><NoticeText notice={permissionError.notice} /></p>}
+          {draftIssue?.key === draftId && <p className="configuration-error" role="alert"><NoticeText notice={draftIssue.notice} /></p>}
+          {retryingSource && <Button variant="outline" className="self-start" disabled={state.connection !== 'ready'} onClick={() => {
+            const sent = sourceSends.current.get(retryingSource.clientMessageId)
+            if (sent) void sendSources(sent)
+          }}>{t('chat.retrySend')}</Button>}
+          <ChatFileDrop onAddFiles={settingsOpen ? undefined : addFiles} onDirectoryDrop={() => {
+            setDraftIssue({ key: draftId, notice: { key: 'attachment.folderUnsupported' } })
+          }} />
+          {sessionId && plan?.state === 'review' && <PlanReview
+            key={`${sessionId}:${plan.assistantMessageId}`} sessionId={sessionId} planId={plan.assistantMessageId} steps={plan.steps}
+            disabled={state.connection !== 'ready'} onSync={() => syncConversation(sessionId)}
+            onAction={action => { discuss.current = action === 'discuss' ? { sessionId, planId: plan.assistantMessageId } : undefined }} />}
+          <MessageInput key={draftId} editorRef={editor} draft={draft} onDraftChange={saveCurrentDraft}
+            attachments={<DraftAttachments items={attachments} remove={id => {
+              removeAttachments(draftId, item => item.key === id)
+              editor.current?.focus({ preventScroll: true })
+            }} retry={id => {
+              const scope = sessionId ? { sessionId } : draftWorkspace?.available ? draftUploadScope(draftWorkspace.id) : undefined
+              if (scope && (!isNew || !firstSend.current)) attachmentDrafts.retry(draftId, scope, id)
+            }} />}
+            onAddFiles={addFiles}
+            hasAttachments={attachments.length > 0} attachmentsPending={attachments.some(item => item.status !== 'ready')}
+            referenceSessions={referenceSessions} onSelectReference={selectReference}
+            referenceDraft={references.length > 0 && <div className="reference-list" role="group" aria-label={t('chat.selectedReferences')}>
+              {references.map(ref => {
+                const name = sessions?.find(item => item.id === ref.id)?.name ?? ref.name
+                return <span className="reference-draft" key={ref.id}><span>{name}</span>
+                  <Button type="button" variant="ghost" size="icon-sm" aria-label={t('chat.removeReference', { name })} onClick={() => {
+                    writeReferences(draftId, (referenceDrafts.current.get(draftId) ?? []).filter(item => item.id !== ref.id))
+                    setDraftIssue(undefined)
+                    editor.current?.focus({ preventScroll: true })
+                  }}><XIcon aria-hidden="true" /></Button>
+                </span>
+              })}
+            </div>}
+            quote={quote} onRemoveQuote={sessionId === null ? undefined : () => setQuotes(current => {
+              const next = { ...current }
+              delete next[sessionId]
+              return next
+            })}
+            contextMeter={<ContextMeter usage={state.snapshot?.contextUsage} />}
+            planActive={Boolean(plan)} onExitPlan={sessionId && selection && state.connection === 'ready' && !planBusy ? exitPlan : undefined}
+            permissionControl={<PermissionPicker mode={isNew ? pendingInput?.permissionMode ?? draftPermission : state.snapshot?.permissionMode ?? null}
+                disabled={state.connection !== 'ready' || (isNew ? firstPhase !== null : sessionPermissionBusy)}
+                onSelect={mode => { if (sessionId) void changeSessionPermission(sessionId, mode); else changeDraftPermission(mode) }} />}
+            footerControl={modelSelect}
+            skillWorkspaceId={quote ? undefined : (isNew ? draftWorkspace?.id : workspace?.id)}
+            commandsEnabled={!isNew && !quote} onPlan={text => { void activatePlan(text) }} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()}
+            action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>
+      </div>
       </div>
       </div>
     </SidebarProvider>

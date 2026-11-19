@@ -1,5 +1,8 @@
 export type {
   ModelInfo,
+  ModelSelection,
+  ModelStreamOptions,
+  ReasoningEffort,
   ModelDiscovery,
   ModelMessage,
   SystemMessage,
@@ -7,6 +10,7 @@ export type {
   AssistantMessage,
   ToolResultMessage,
   TextContent,
+  ImageContent,
   ThinkingContent,
   ToolCall,
   Tool,
@@ -14,10 +18,14 @@ export type {
   JsonObject,
   ModelUsage,
   ModelStopReason,
+  ModelFailureInfo,
+  ModelFailureKind,
   ModelContext,
   ContextEstimate,
   ModelEvent,
   ModelEventStream,
 } from './types.js'
-export { discoverModels, findModel, stream, createModelStream } from './deepseek.js'
+export { defaultSelection, discoverModels, findModel, isModelProvider, sameSelection } from './catalog.js'
+export { stream, createModelStream } from './pi-stream.js'
 export { estimateMessageTokens, estimateContextTokens } from './context.js'
+export { IMAGE_BUDGET_BYTES, omittedToolImageIndexes } from './request-images.js'

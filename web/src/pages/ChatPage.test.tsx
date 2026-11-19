@@ -1,5 +1,5 @@
 import { StrictMode, type ComponentProps } from 'react'
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatState, Subscribe } from '../chat/state'
 import { ChatPage as Page } from './ChatPage'
@@ -17,7 +17,7 @@ type TestState = Omit<ChatState, 'sessionId'>
 
 beforeEach(() => localStorage.setItem(recentSessionKey, sessionId))
 afterEach(() => localStorage.clear())
-const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -55,7 +55,7 @@ describe('ChatPage', () => {
       ],
     } }) })
     expect(screen.getAllByRole('listitem').map(item => item.textContent)).toEqual(['  你好\n世界  ', '第二条原文'])
-    expect(screen.getByRole('status')).toHaveTextContent('对话已同步')
+    expect(screen.getByRole('status')).toBeEmptyDOMElement()
     expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
     view.unmount()
     expect(source.cleanup).toHaveBeenCalledTimes(2)
@@ -81,8 +81,8 @@ describe('ChatPage', () => {
   })
 })
 
-const missing = { models: [], deepseek: { state: 'missing' as const } }
-const configured = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], deepseek: { state: 'configured' as const } }
+const missing = { models: [], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'missing' as const } }] }
+const configured = { models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536 }], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'configured' as const } }], defaultSelection: { provider: 'deepseek', modelId: 'deepseek-flash' } }
 
 const runningState = (id = 'user-1'): TestState => ({ connection: 'ready', slow: false, error: null, snapshot: {
   ...empty, seq: 1, running: { kind: 'task' as const, runId: id, assistantMessageId: 'answer', phase: 'model', activeTools: [] },
@@ -176,7 +176,7 @@ it('查询模型并响应配置通知与重连，旧查询不能覆盖新配置�
 
 it('区分查询网络失败和本地配置错误，错误时仍可打开设置', async () => {
   const getModels = vi.fn().mockRejectedValueOnce(new Error('网络请求失败，请检查连接后重试'))
-    .mockResolvedValue({ models: [], deepseek: { state: 'error', message: '模型文件格式错误' } })
+    .mockResolvedValue({ models: [], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'error', message: '模型文件格式错误' } }] })
   const source = controlled()
   render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
   expect(await screen.findByText('网络请求失败，请检查连接后重试')).toBeVisible()
@@ -197,8 +197,10 @@ it('晚到的配置保存结果后重新查询当前文件，避免恢复旧模�
     render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
     await screen.findByText('无可用模型')
     fireEvent.click(screen.getByRole('button', { name: '设置' }))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: '模型' }))
     fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
-    fireEvent.click(screen.getByRole('button', { name: 'DeepSeek' }))
+    fireEvent.keyDown(screen.getByRole('combobox', { name: '提供方' }), { key: 'Enter' })
+    fireEvent.click(screen.getByRole('option', { name: 'DeepSeek' }))
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'delayed-save-key' } })
     fireEvent.click(screen.getByRole('button', { name: '保存' }))
     await act(async () => { resolveSave(configured) })
@@ -208,25 +210,20 @@ it('晚到的配置保存结果后重新查询当前文件，避免恢复旧模�
   } finally { save.mockRestore() }
 })
 
-it('初始模型查询尚未完成时保存失败，仍接收查询结果且关闭后不会永久加载', async () => {
+it('初始模型查询尚未完成时等待提供方目录，读取完成后可继续设置', async () => {
   let resolveInitial: (value: typeof configured) => void = () => {}
   const getModels = vi.fn().mockImplementation(() => new Promise(resolve => { resolveInitial = resolve }))
-  const save = vi.spyOn(client, 'saveApiKey').mockRejectedValue(new Error('无法写入模型凭据文件'))
   const source = controlled()
-  try {
-    render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
-    expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('正在查询模型…')
-    fireEvent.click(screen.getByRole('button', { name: '设置' }))
-    fireEvent.click(screen.getByRole('button', { name: '添加提供方' }))
-    fireEvent.click(screen.getByRole('button', { name: 'DeepSeek' }))
-    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'failed-save-key' } })
-    fireEvent.click(screen.getByRole('button', { name: '保存' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('无法写入模型凭据文件')
-    await act(async () => { resolveInitial(configured) })
-    fireEvent.click(screen.getByRole('button', { name: '关闭设置' }))
-    expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('DeepSeek Flash')
-    expect(getModels).toHaveBeenCalledOnce()
-  } finally { save.mockRestore() }
+  render(<ChatPage getWorkspaces={getEmptyWorkspaces} subscribe={source.subscribe} getModels={getModels} />)
+  expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('正在查询模型…')
+  fireEvent.click(screen.getByRole('button', { name: '设置' }))
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: '模型' }))
+  expect(screen.getByRole('button', { name: '添加提供方' })).toBeDisabled()
+  await act(async () => { resolveInitial(configured) })
+  expect(screen.getByRole('button', { name: '编辑' })).toBeEnabled()
+  fireEvent.click(screen.getByRole('button', { name: '关闭设置' }))
+  expect(screen.getByRole('combobox', { name: '模型' })).toHaveTextContent('DeepSeek Flash')
+  expect(getModels).toHaveBeenCalledOnce()
 })
 
 async function pasteDraft(text: string) {
@@ -502,7 +499,7 @@ it('历史会话的工作区失效后恢复原稿并禁用发送', async () => {
   expect(send).toBeEnabled()
   await act(async () => { fireEvent.click(send) })
   expect(submitMessage).toHaveBeenCalledExactlyOnceWith({
-    sessionId, clientMessageId: expect.any(String), modelId: 'deepseek-flash', text: '  保留原文\n第二行  ',
+    sessionId, clientMessageId: expect.any(String), provider: 'deepseek', modelId: 'deepseek-flash', text: '  保留原文\n第二行  ',
   })
   expect(screen.getByRole('alert')).toHaveTextContent('工作区目录不可用')
   expect(editor).toHaveTextContent(/保留原文.*第二行/)

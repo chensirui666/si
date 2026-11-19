@@ -1,10 +1,13 @@
-import { access, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { addAbortListener } from 'node:events'
 import { homedir } from 'node:os'
 import { basename, dirname, relative, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import type { ToolResultMessage } from '@agent-learning/model'
+import { imageMimeType, MAX_IMAGE_SOURCE_BYTES, prepareReadImage } from './read-image.js'
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES, type ToolRuntime } from './tool-runtime.js'
-import type { BashParams, EditParams, FindParams, GrepParams, ProcessParams, ReadParams, WriteParams } from './tools.js'
+import type { BashParams, EditParams, FindParams, GrepParams, LsParams, ProcessParams, ReadParams, WriteParams } from './tools.js'
 
 export type LocalToolContext = { cwd: string; signal: AbortSignal; recordFileOperation?: (path: string) => void }
 
@@ -26,12 +29,41 @@ function pathFrom(cwd: string, value: string): string {
   return resolve(cwd, value)
 }
 
-async function readText(path: string, signal: AbortSignal, keepBom = false): Promise<string> {
+async function readBytes(path: string, signal: AbortSignal, allowImages = false): Promise<Buffer> {
   signal.throwIfAborted()
-  if (!(await stat(path)).isFile()) throw new Error(`不是文件：${path}`)
+  const info = await stat(path)
+  if (!info.isFile()) throw new Error(`不是文件：${path}`)
+  signal.throwIfAborted()
+  if (allowImages && info.size >= 3) {
+    const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK)
+    try {
+      const opened = await file.stat()
+      if (!opened.isFile()) throw new Error(`不是文件：${path}`)
+      signal.throwIfAborted()
+      const prefix = Buffer.alloc(12)
+      const { bytesRead } = await file.read(prefix, 0, prefix.length, 0)
+      if (imageMimeType(prefix.subarray(0, bytesRead))) {
+        if (opened.size > MAX_IMAGE_SOURCE_BYTES) throw new Error(`原始图片超过 50 MiB：${path}`)
+        const bytes = Buffer.allocUnsafe(opened.size + 1)
+        let offset = 0
+        while (offset < bytes.length) {
+          signal.throwIfAborted()
+          const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset)
+          if (!bytesRead) break
+          offset += bytesRead
+        }
+        if (offset !== opened.size) throw new Error(`图片大小在读取期间发生变化：${path}`)
+        return bytes.subarray(0, offset)
+      }
+    } finally { await file.close() }
+  }
   signal.throwIfAborted()
   const bytes = await readFile(path, { signal })
   signal.throwIfAborted()
+  return bytes
+}
+
+function decodeText(path: string, bytes: Buffer, keepBom = false): string {
   try {
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: keepBom }).decode(bytes)
     if (text.includes('\0')) throw new Error('binary')
@@ -41,12 +73,16 @@ async function readText(path: string, signal: AbortSignal, keepBom = false): Pro
   }
 }
 
-async function readWithAbort(path: string, signal: AbortSignal) {
+async function readText(path: string, signal: AbortSignal, keepBom = false): Promise<string> {
+  return decodeText(path, await readBytes(path, signal), keepBom)
+}
+
+async function readWithAbort<T>(signal: AbortSignal, read: () => Promise<T>): Promise<T> {
   signal.throwIfAborted()
   let subscription: ReturnType<typeof addAbortListener> | undefined
   try {
     return await Promise.race([
-      readText(path, signal),
+      read(),
       new Promise<never>((_, reject) => { subscription = addAbortListener(signal, () => reject(signal.reason)) }),
     ])
   } finally { subscription?.[Symbol.dispose]() }
@@ -75,24 +111,52 @@ class OutputLines {
   }
 }
 
-async function read({ path, offset = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: LocalToolContext) {
+function utf8ContinuationByte(byte: number) {
+  return (byte & 0xc0) === 0x80
+}
+
+function readLineSegment(bytes: Buffer, from: number, offset: number) {
+  const continuation = (next: number) => `\n\n[该行尚未读完，可用 offset=${offset} column=${next + 1} 继续读取]`
+  let end = from + MAX_OUTPUT_BYTES - Buffer.byteLength(continuation(from + MAX_OUTPUT_BYTES))
+  while (utf8ContinuationByte(bytes[end])) end--
+  return bytes.toString('utf8', from, end) + continuation(end)
+}
+
+async function read({ path, offset = 1, column = 1, limit }: ReadParams, { cwd, signal, recordFileOperation }: LocalToolContext): Promise<string | ToolResultMessage['content']> {
   const start = integer(offset, 'offset') - 1
+  const from = integer(column, 'column') - 1
   const count = limit === undefined ? Infinity : integer(limit, 'limit')
   const target = pathFrom(cwd, path)
-  const text = await readWithAbort(target, signal)
+  const bytes = await readWithAbort(signal, () => readBytes(target, signal, true))
+  signal.throwIfAborted()
+  const mimeType = imageMimeType(bytes)
+  if (mimeType) {
+    const image = await readWithAbort(signal, () => prepareReadImage(target, bytes, mimeType, signal))
+    signal.throwIfAborted()
+    recordFileOperation?.(target)
+    return [{ type: 'text', text: `已读取图片：${target}` }, image]
+  }
+  const text = decodeText(target, bytes)
   const lines = linesOf(text)
   if (start >= lines.length && (lines.length || start > 0)) throw new Error(`offset 超出文件范围（共 ${lines.length} 行）`)
+  const first = lines[start] ?? ''
+  const firstBytes = from ? Buffer.from(first) : undefined
+  if (firstBytes && (from >= firstBytes.length || utf8ContinuationByte(firstBytes[from]))) {
+    throw new Error('column 必须指向起始行中一个完整 UTF-8 字符的首字节')
+  }
   recordFileOperation?.(target)
+  if (firstBytes && firstBytes.length - from > MAX_OUTPUT_BYTES) return readLineSegment(firstBytes, from, offset)
 
   const output = new OutputLines()
   const requested = Math.min(lines.length - start, count)
   for (let i = 0; i < Math.min(requested, MAX_OUTPUT_LINES); i++) {
-    if (!output.append(lines[start + i]!)) break
+    const line = i === 0 && firstBytes ? firstBytes.toString('utf8', from) : lines[start + i]
+    if (!output.append(line)) break
   }
   const content = output.text()
   const next = start + output.lines.length
   if (output.lines.length < requested) {
-    if (!output.lines.length) return `[第 ${offset} 行超过 50 KiB，无法返回完整一行。可用 Bash 查看这一行，或用 offset=${offset + 1} 读取后续内容]`
+    if (!output.lines.length) return readLineSegment(Buffer.from(first), from, offset)
     return `${content}\n\n[输出已截断，可用 offset=${next + 1} 继续读取]`
   }
   if (next < lines.length) return `${content}\n\n[剩余 ${lines.length - next} 行，可用 offset=${next + 1} 继续读取]`
@@ -189,17 +253,18 @@ async function edit({ path, edits }: EditParams, { cwd, signal, recordFileOperat
   return `已在 ${target} 完成 ${edits.length} 处替换`
 }
 
-async function bash(runtime: ToolRuntime, sessionId: string, { command, timeout, background }: BashParams, { cwd, signal }: LocalToolContext) {
+async function bash(runtime: ToolRuntime, sessionId: string | undefined, { command, timeout, background }: BashParams, { cwd, signal }: LocalToolContext) {
   nonEmpty(command, 'command')
   if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) throw new Error('timeout 必须是正数')
   if (background) {
-    const job = await runtime.startBashJob(sessionId, command, cwd, signal, timeout)
+    const job = await runtime.startBashJob(nonEmpty(sessionId ?? '', 'sessionId'), command, cwd, signal, timeout)
     return JSON.stringify({ ...job, message: '后台进程已启动。可用 process 查询状态或日志。' })
   }
   return runtime.bash(command, cwd, signal, timeout)
 }
 
-async function manageProcess(runtime: ToolRuntime, sessionId: string, { action, jobId }: ProcessParams) {
+async function manageProcess(runtime: ToolRuntime, owner: string | undefined, { action, jobId }: ProcessParams) {
+  const sessionId = nonEmpty(owner ?? '', 'sessionId')
   if (action === 'list') return JSON.stringify(runtime.listJobs(sessionId))
   const id = nonEmpty(jobId ?? '', 'jobId')
   const result = action === 'log' ? runtime.jobLog(sessionId, id)
@@ -340,7 +405,7 @@ async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: L
     const label = stats.isDirectory() ? relative(search, match.path) : basename(match.path)
     if (context > 0 && contextPath !== match.path) {
       try {
-        lines = linesOf(await readWithAbort(match.path, signal))
+        lines = linesOf(await readWithAbort(signal, () => readText(match.path, signal)))
       } catch {
         signal.throwIfAborted()
         lines = []
@@ -371,9 +436,42 @@ async function grep(runtime: ToolRuntime, params: GrepParams, { cwd, signal }: L
   ].filter(Boolean).join('\n')
 }
 
-export function createLocalTools(runtime: ToolRuntime, sessionId: string) {
+async function ls({ path, limit = 500 }: LsParams, { cwd, signal }: LocalToolContext) {
+  const directory = pathFrom(cwd, path || '.')
+  const maxEntries = Math.max(1, Math.floor(limit))
+  return readWithAbort(signal, async () => {
+    const info = await stat(directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') throw new Error(`路径不存在：${directory}`, { cause: error })
+      throw new Error(`无法读取目录：${directory}`, { cause: error })
+    })
+    if (!info.isDirectory()) throw new Error(`不是目录：${directory}`)
+    signal.throwIfAborted()
+    const entries = await readdir(directory).catch(error => { throw new Error(`无法读取目录：${directory}`, { cause: error }) })
+    entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    const output = new OutputLines()
+    let count = 0
+    let bytesReached = false
+    const notices: string[] = []
+    for (const entry of entries) {
+      signal.throwIfAborted()
+      if (count >= maxEntries) {
+        notices.push(`已达到 ${maxEntries} 项上限，可用 limit=${maxEntries * 2} 查看更多`)
+        break
+      }
+      const child = await stat(resolve(directory, entry)).catch(() => undefined)
+      if (!child) continue
+      count++
+      if (!bytesReached) bytesReached = !output.append(entry + (child.isDirectory() ? '/' : ''))
+    }
+    if (bytesReached) notices.push('已达到 50 KiB 输出上限')
+    return (output.text() || '（空目录）') + (notices.length ? `\n\n[${notices.join('。')}]` : '')
+  })
+}
+
+export function createLocalTools(runtime: ToolRuntime, sessionId?: string) {
   return {
     read,
+    ls,
     write,
     edit,
     bash: (params: BashParams, context: LocalToolContext) => bash(runtime, sessionId, params, context),

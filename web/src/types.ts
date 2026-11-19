@@ -1,4 +1,5 @@
 import type { SubmitMessageAccepted } from '@agent-learning/server/protocol'
+import type { Notice } from './i18n/messages'
 export type { ConversationMessage } from '@agent-learning/server/protocol'
 
 export type LocalSubmission = {
@@ -9,6 +10,6 @@ export type LocalSubmission = {
   text: string
   afterMessageId?: string
   state: 'pending' | 'failed' | 'unconfirmed'
-  errorMessage?: string
+  errorMessage?: Notice
   accepted?: SubmitMessageAccepted
 }

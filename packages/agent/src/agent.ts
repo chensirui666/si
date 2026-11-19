@@ -1,6 +1,6 @@
 import { stream } from '@agent-learning/model'
-import type { AssistantMessage, ModelContext, ModelInfo, ToolResultMessage } from '@agent-learning/model'
-import type { AgentEvent, AgentResult, AgentRunInput } from './types.js'
+import type { AssistantMessage, ModelContext, ModelInfo, ToolCall, ToolResultMessage } from '@agent-learning/model'
+import type { AgentEvent, AgentObservations, AgentResult, AgentRunInput } from './types.js'
 
 export class Agent {
   private readonly listeners = new Set<(event: AgentEvent) => void>()
@@ -20,15 +20,22 @@ export class Agent {
   async run(input: AgentRunInput): Promise<AgentResult> {
     if (this.running) throw new Error('正在生成，请等待本次回答结束')
     this.running = true
-    try { return await this.loop(input) }
-    finally { this.running = false }
+    const messages: AgentObservations['agent_end']['messages'] = []
+    try {
+      if (input.observe) await input.observe('agent_start', {})
+      return await this.loop(input, messages)
+    } finally {
+      try { if (input.observe) await input.observe('agent_end', { messages }) }
+      finally { this.running = false }
+    }
   }
 
   continue(input: AgentRunInput): Promise<AgentResult> {
     return this.run(input)
   }
 
-  private async loop({ model, context, tools = [], signal, prepareContext, saveToolCheckpoint }: AgentRunInput): Promise<AgentResult> {
+  private async loop({ model, reasoningEffort, context, tools = [], signal, prepareContext, finalizeContext, beforeToolCall, saveToolCheckpoint, observe, userMessage, resolveTools, prepareToolCall,
+    rewriteToolResult, streamOptions }: AgentRunInput, messages: AgentObservations['agent_end']['messages']): Promise<AgentResult> {
     if (tools.length) context = {
       ...context,
       tools: tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
@@ -36,10 +43,20 @@ export class Agent {
     const failure = (message: string, reason: 'error' | 'aborted' = 'error', afterReply = false): AgentResult =>
       ({ type: 'failure', message, reason, afterReply })
     let afterReply = false
+    let turnIndex = 0
     try {
       for (;;) {
         afterReply = false
         signal.throwIfAborted()
+        if (observe) {
+          await observe('turn_start', { turnIndex, timestamp: Date.now() })
+          if (turnIndex === 0 && userMessage) {
+            messages.push(userMessage)
+            await observe('message_start', { message: userMessage })
+          }
+        }
+        signal.throwIfAborted()
+        turnIndex++
         if (prepareContext) {
           const prepared = prepareContext(context)
           const next = prepared instanceof Promise ? await prepared : prepared
@@ -47,7 +64,16 @@ export class Agent {
           if ('error' in next) return failure(next.error)
           context = next
         }
-        const response = await this.generate(model, context, signal)
+        if (finalizeContext) {
+          const pending = finalizeContext(context)
+          const final = pending instanceof Promise ? await pending : pending
+          signal.throwIfAborted()
+          if ('error' in final) return failure(final.error)
+          context = final
+        }
+        const roundTools = resolveTools?.() ?? tools
+        const response = await this.generate(model, context, signal, reasoningEffort, streamOptions?.(), observe)
+        messages.push(response)
         const complete: AgentResult = { type: 'response', message: response }
         if (response.stopReason === 'error' || response.stopReason === 'aborted') return complete
         const calls = response.content.flatMap((call, contentIndex) => call.type === 'toolCall' ? [{ call, contentIndex }] : [])
@@ -57,7 +83,7 @@ export class Agent {
         afterReply = true
         if (saveToolCheckpoint) await saveToolCheckpoint({ type: 'assistant', message: response })
         signal.throwIfAborted()
-        if (!context.tools?.length || !tools.length) return failure('本次请求未提供工具，工具调用未执行。')
+        if (!context.tools?.length || !roundTools.length) return failure('本次请求未提供工具，工具调用未执行。')
         const ids = calls.map(({ call }) => call.id)
         if (ids.some(id => !id.trim()) || new Set(ids).size !== ids.length) {
           return failure('工具调用编号缺失或重复，本批工具未执行。')
@@ -66,38 +92,68 @@ export class Agent {
         const publishResult = async (outcome: Extract<AgentEvent, { type: 'tool_result' }> & { executed: boolean }) => {
           if (saveToolCheckpoint) await saveToolCheckpoint(outcome)
           const { executed: _executed, ...event } = outcome
+          messages.push(event.result)
+          if (observe) await observe('message_start', { message: event.result })
           this.emit(event)
           return event.result
         }
         const execute = async ({ call, contentIndex }: typeof calls[number]) => {
           signal.throwIfAborted()
           const truncated = response.stopReason === 'length'
-          if (!truncated) this.emit({ type: 'tool_start', contentIndex })
-          let text: string
+          let output: string | ToolResultMessage['content']
           let isError = false
           let errorCode: string | undefined
           const details: unknown[] = []
           let executed = false
+          let actualArguments: ToolCall['arguments'] | undefined
+          let prepared = call
+          const identity = { toolCallId: call.id, toolName: call.name }
+          if (observe) await observe('tool_execution_start', { ...identity, args: call.arguments })
           try {
+            if (signal.aborted) throw Object.assign(new Error('任务已取消，工具未执行。'), { code: 'interrupted' })
             if (truncated) throw new Error('本批工具未执行：本轮回复截断，请重新提供完整的工具调用。')
             if (call.argumentsError) throw new Error(call.argumentsError)
-            const tool = tools.find(({ name }) => name === call.name)
-            if (!tool) throw new Error(`未知工具：${call.name}`)
+            const tool = roundTools.find(({ name }) => name === call.name)
+            if (!tool) {
+              const denied = beforeToolCall?.(call)
+              if (denied) throw Object.assign(new Error(denied.message), { code: denied.code })
+              throw new Error(`未知工具：${call.name}`)
+            }
+            if (prepareToolCall) {
+              const decision = await prepareToolCall(call, tool)
+              if (signal.aborted) throw Object.assign(new Error('任务已取消，工具未执行。'), { code: 'interrupted' })
+              if (decision.denial !== undefined) throw Object.assign(new Error(decision.denial), { code: 'hook_blocked' })
+              prepared = { ...call, arguments: decision.arguments }
+              if (JSON.stringify(call.arguments) !== JSON.stringify(prepared.arguments)) actualArguments = prepared.arguments
+            }
+            const denial = beforeToolCall?.(prepared)
+            if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
+            this.emit({ type: 'tool_start', contentIndex, ...(actualArguments && { actualArguments }) })
             executed = true
-            text = await tool.execute(call.arguments, { signal, recordDetails: detail => { details.push(detail) } })
+            const toolOutput = await tool.execute(prepareToolCall ? structuredClone(prepared.arguments) : prepared.arguments,
+              { signal, recordDetails: detail => { details.push(detail) } })
+            if (typeof toolOutput === 'string' || Array.isArray(toolOutput)) output = toolOutput
+            else ({ content: output, isError } = toolOutput)
           } catch (error) {
             isError = true
-            text = error instanceof Error ? error.message : '工具执行失败。'
+            output = error instanceof Error ? error.message : '工具执行失败。'
             if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string') errorCode = error.code
           }
-          const result: ToolResultMessage = {
+          let result: ToolResultMessage = {
             role: 'toolResult', toolCallId: call.id, toolName: call.name,
-            content: [{ type: 'text', text }], isError, timestamp: Date.now(),
+            content: typeof output === 'string' ? [{ type: 'text', text: output }] : output, isError, timestamp: Date.now(),
           }
-          return { type: 'tool_result' as const, contentIndex, result, details, executed, ...(errorCode && { errorCode }) }
+          if (executed && rewriteToolResult) result = await rewriteToolResult(prepared, result)
+          if (executed && (actualArguments || result.isError !== isError)) {
+            result = { ...result, content: [...result.content, { type: 'text', text:
+              (actualArguments ? `实际工具参数：${JSON.stringify(actualArguments)}。` : '') + `最终状态：${result.isError ? '失败' : '成功'}。` }] }
+          }
+          if (observe) await observe('tool_execution_end', { ...identity, result, isError: result.isError })
+          return { type: 'tool_result' as const, contentIndex, result, details, executed, ...(errorCode && { errorCode }),
+            ...(executed && actualArguments && { actualArguments }) }
         }
         const results: ToolResultMessage[] = []
-        if (calls.some(({ call }) => tools.find(tool => tool.name === call.name)?.executionMode === 'sequential')) {
+        if (calls.some(({ call }) => roundTools.find(tool => tool.name === call.name)?.executionMode === 'sequential')) {
           for (const call of calls) results.push(await publishResult(await execute(call)))
         } else if (saveToolCheckpoint) {
           const settled = await Promise.allSettled(calls.map(execute))
@@ -122,10 +178,22 @@ export class Agent {
     }
   }
 
-  private async generate(model: ModelInfo, context: ModelContext, signal: AbortSignal) {
+  private async generate(model: ModelInfo, context: ModelContext, signal: AbortSignal, reasoningEffort?: AgentRunInput['reasoningEffort'],
+    streamOptions?: ReturnType<NonNullable<AgentRunInput['streamOptions']>>, observe?: AgentRunInput['observe']) {
     let terminal: AssistantMessage | undefined
+    let started = false
     try {
-      for await (const event of (this.options.stream ?? stream)(model, context, { signal })) {
+      for await (const event of (this.options.stream ?? stream)(model, context, { signal, reasoningEffort, ...streamOptions })) {
+        if (observe) {
+          const message = event.type === 'done' ? event.message : event.type === 'error' ? event.error : event.partial
+          if (!started) {
+            started = true
+            await observe('message_start', { message })
+          }
+          if (event.type !== 'start' && event.type !== 'done' && event.type !== 'error') {
+            await observe('message_update', { message, assistantMessageEvent: event })
+          }
+        }
         this.emit({ type: 'model', event, context })
         if (event.type === 'done' || event.type === 'error') {
           terminal = event.type === 'done' ? event.message : event.error

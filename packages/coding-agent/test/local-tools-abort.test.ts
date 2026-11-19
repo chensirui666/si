@@ -3,6 +3,7 @@ import { getEventListeners } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import sharp from 'sharp'
 import { createTools } from '../src/tools.js'
 import { createLocalTools } from '../src/local-tools.js'
 import { ToolRuntime } from '../src/tool-runtime.js'
@@ -41,6 +42,33 @@ it.each(['stat', 'readFile'] as const)('read stops waiting during %s and discard
     expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
     if (stage === 'stat') expect(fs.readFile).not.toHaveBeenCalled()
   } finally { release.resolve() }
+})
+
+it('read discards a late image resize after cancellation', async () => {
+  const png = await sharp({ create: { width: 2400, height: 1200, channels: 3, background: 'white' } }).png().toBuffer()
+  await real.writeFile(join(cwd, 'large.png'), png)
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+  const resize = vi.spyOn(sharp.prototype, 'toBuffer').mockImplementationOnce(async () => {
+    entered.resolve()
+    await release.promise
+    return { data: Buffer.alloc(3), info: { width: 1, height: 1, channels: 3 } }
+  })
+  const controller = new AbortController()
+  const recordDetails = vi.fn()
+  const read = createTools(runtime, { web_search: async () => '', web_fetch: async () => '' }, cwd).find(tool => tool.name === 'read')!
+  const output = read.execute({ path: 'large.png' }, { signal: controller.signal, recordDetails })
+  try {
+    await Promise.race([entered.promise, output])
+    controller.abort()
+    await expect(output).rejects.toMatchObject({ code: 'interrupted' })
+    release.resolve()
+    await resize.mock.results[0].value
+    expect(recordDetails).not.toHaveBeenCalled()
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
+  } finally {
+    release.resolve()
+    resize.mockRestore()
+  }
 })
 
 it.each(['mkdir', 'writeFile'] as const)('write waits for %s to settle and then reports cancellation', async stage => {

@@ -1,21 +1,31 @@
-import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
+import { NoticeText, skillSourceKey } from '../i18n/messages'
+import { useTranslation } from 'react-i18next'
+import { useRef } from 'react'
+import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure, SkillInvocationView } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
+import { SentAttachments } from './MessageAttachments'
 import { SaveFailureNotice } from './SaveFailureNotice'
+import { QuoteSelection } from './QuoteSelection'
 
 type MessageRow =
-  | { type: 'user'; id: string; text: string; local?: LocalSubmission }
+  | { type: 'user'; id: string; text: string; local?: LocalSubmission; skill?: SkillInvocationView; attachments?: ConversationMessage['attachments']; references?: ConversationMessage['references'] }
   | { type: 'assistant'; id: string; userId: string; messages: AssistantEntry[] }
 
-export function MessageList({ messages, activeContent = [], running = null, runs = [], saveFailures = [] }: {
+export function MessageList({ messages, activeContent = [], running = null, showRetry = true, runs = [], saveFailures = [], onQuote }: {
   messages: readonly (ConversationMessage | LocalSubmission)[]
   activeContent?: readonly ActiveContent[]
   running?: RunningState
+  showRetry?: boolean
   runs?: readonly RunRecord[]
   saveFailures?: readonly SaveFailure[]
+  onQuote?: (text: string) => void
 }) {
+  const { t } = useTranslation()
+  const list = useRef<HTMLElement>(null)
   const rows: MessageRow[] = []
   const toolResults = new Map<string, Map<number, ConversationMessage>>()
+  const taskRuns = new Map(runs.filter(run => run.kind === 'task').map(run => [run.id, run]))
   let userId = ''
   for (const item of messages) {
     if ('state' in item) {
@@ -26,7 +36,8 @@ export function MessageList({ messages, activeContent = [], running = null, runs
     const { id, message, toolCall } = item
     if (message.role === 'user') {
       userId = id
-      rows.push({ type: 'user', id, text: typeof message.content === 'string' ? message.content : message.content.map(block => block.text).join('') })
+      rows.push({ type: 'user', id, skill: item.skillInvocation, attachments: item.attachments, references: item.references,
+        text: typeof message.content === 'string' ? message.content : message.content.filter(block => block.type === 'text').map(block => block.text).join('') })
     } else if (message.role === 'assistant') {
       const previous = rows.at(-1)
       if (previous?.type === 'assistant') previous.messages.push({ id, message })
@@ -37,33 +48,47 @@ export function MessageList({ messages, activeContent = [], running = null, runs
       toolResults.set(toolCall.assistantMessageId, results)
     }
   }
+  const answered = new Set(rows.flatMap(row => row.type === 'assistant' ? [row.userId] : []))
+  const shown = new Set<string>()
 
   return (
-    <div className="message-list-frame">
-      <section className="message-list" role="region" aria-label="消息列表" tabIndex={0}>
+    <section ref={list} className="message-list" role="region" aria-label={t('chat.messages')} tabIndex={0}>
         <ol className="message-items">
-          {rows.map((row, index) => {
+          {rows.flatMap(row => row.type === 'user' && (taskRuns.has(row.id) || running?.kind === 'task' && running.runId === row.id && running.retry) && !answered.has(row.id)
+            ? [row, { type: 'assistant' as const, id: `pending:${row.id}`, userId: row.id, messages: [] }]
+            : [row]).map((row, index, displayedRows) => {
             const runId = row.type === 'assistant' ? row.userId : row.id
             const run = runs.find(item => item.id === runId)
             const failure = saveFailures.find(item => item.runId === runId)
-            const next = rows[index + 1]
+            const next = displayedRows[index + 1]
             const endsTurn = row.type === 'assistant' || next?.type !== 'assistant' || next.userId !== runId
-            return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.id} data-message-id={row.id} data-run-status={run?.status}>
+            const activity = row.type === 'assistant' && !shown.has(runId) ? taskRuns.get(runId) : undefined
+            if (activity) shown.add(runId)
+            return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={row.type === 'assistant' && activity ? `run:${runId}` : row.id} data-message-id={row.id} data-run-status={run?.status}>
             {row.type === 'assistant'
-              ? <AssistantMessage messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure}
+              ? <AssistantMessage showRetry={showRetry} messages={row.messages} activeContent={activeContent} toolResults={toolResults} restored={run?.restored} saveFailure={failure} run={activity}
                 running={running?.kind === 'task' && (row.userId === running.runId || row.messages.some(entry => entry.id === running.assistantMessageId)) ? running : null} />
               : <>
-                <div className="message-text">{row.text}<br /></div>
+                {row.text && <div className="message-text">{row.text}<br /></div>}
+                {row.attachments && <SentAttachments attachments={row.attachments} />}
+                {!!row.references?.length && <div className="reference-list" role="group" aria-label={t('chat.selectedReferences')}>
+                  {row.references.map(ref => <span className="reference-draft" key={ref.sourceSessionId}>Session · {ref.label}</span>)}
+                </div>}
+                {row.skill && <div className="submission-status" data-skill-status={row.skill.status}>
+                  {row.skill.status === 'loaded'
+                    ? t('chat.skillLoaded', { name: row.skill.name })
+                    : t('chat.skillLoadFailed', { name: row.skill.name, reason: row.skill.reason })}
+                  {' · '}{t(skillSourceKey[row.skill.source])}
+                </div>}
                 {row.local && <div className="submission-status" data-state={row.local.state}>
-                  <span>{row.local.accepted ? '已接收，正在同步' : row.local.state === 'pending' ? '正在发送…' : row.local.state === 'failed' ? '发送失败' : '未确认接收'}</span>
-                  {row.local.errorMessage && <p>{row.local.errorMessage}</p>}
+                  <span>{t(row.local.accepted ? 'chat.accepted' : row.local.state === 'pending' ? 'chat.sending' : row.local.state === 'failed' ? 'chat.sendFailed' : 'chat.notConfirmed')}</span>
+                  {row.local.errorMessage && <p><NoticeText notice={row.local.errorMessage} /></p>}
                 </div>}
               </>}
-            {endsTurn && run?.status === 'interrupted' && <p className="message-ending" role="status">已中断</p>}
             {endsTurn && failure && <SaveFailureNotice failure={failure} />}
           </li>})}
         </ol>
-      </section>
-    </div>
+        {onQuote && <QuoteSelection list={list} onQuote={onQuote} />}
+    </section>
   )
 }

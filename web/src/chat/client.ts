@@ -1,8 +1,11 @@
 import type { ModelDiscovery } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, BashJobsView, ClientFrame, SessionList, SessionSummary, StartSessionAccepted, StartSessionRequest, StopBashJobResult, SubmitMessageAccepted, SubmitMessageRequest, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
-import { applyFrame, initialState, type ChatState, type Subscribe } from './state'
+import { isPermissionMode } from '@agent-learning/server/protocol'
+import type { BashJobsView, StopBashJobResult, WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, McpOAuthStartView, McpServerView, SaveMcpServerRequest, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import { RequestError } from '../i18n/messages'
+import type { CopyKey } from '../i18n/en'
+import { applyFrame, messageAttachment, extensionNotice, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
-export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged) => {
+export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged, onExtensionNotice, onMcpSettingsChanged) => {
   let state: ChatState = initialState
   let stopped = false
   let socket: WebSocket | null = null
@@ -27,10 +30,12 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     subscriptionId = ''
     previous.close()
   }
-  function fail(error = '连接异常，请重新打开启动链接后重试') {
+  function fail(key?: CopyKey) {
+    const running = state.snapshot?.running
+    const notice = key ?? (running?.kind === 'task' && running.retry ? 'chat.disconnected' : 'chat.connectionFailed')
     releaseSocket()
     if (stopped) return
-    publish({ ...state, connection: 'disconnected', slow: false, error })
+    publish({ ...state, connection: 'disconnected', slow: false, error: null, connectionNotice: notice })
     if (!navigator.onLine) return
     const upper = Math.min(500 * 2 ** retryCount, 10_000)
     retryCount = Math.min(retryCount + 1, 5)
@@ -41,7 +46,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     slowTimer = setTimeout(() => {
       if (!stopped && socket) publish({ ...state, slow: true })
     }, 3000)
-    deadline = setTimeout(() => fail('连接超时，正在重试；如持续异常，请重新打开启动链接'), 15_000)
+    deadline = setTimeout(() => fail('chat.connectionTimeout'), 15_000)
   }
   function requestSnapshot() {
     const sessionId = state.sessionId
@@ -53,7 +58,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
   function connect() {
     clearTimeout(retryTimer)
     if (stopped || !navigator.onLine || socket) return
-    publish({ ...state, connection: 'connecting', slow: false, error: null })
+    publish({ ...state, connection: 'connecting', slow: false, error: null, connectionNotice: undefined })
     try {
       const url = new URL('/api/events', window.location.href)
       url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -66,7 +71,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
       else {
         clearPreparation()
         retryCount = 0
-        publish({ ...state, connection: 'ready', slow: false, error: null })
+        publish({ ...state, connection: 'ready', slow: false, error: null, connectionNotice: undefined })
       }
     }
     const message = (event: MessageEvent) => {
@@ -77,6 +82,8 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
         if (frame.type === 'models_changed') { onModelsChanged?.(); return }
         if (frame.type === 'workspaces_changed') { onWorkspacesChanged?.(); return }
         if (frame.type === 'sessions_changed') { onSessionsChanged?.(); return }
+        if (frame.type === 'permission_settings_changed') { onPermissionSettingsChanged?.(); return }
+        if (frame.type === 'mcp_settings_changed') { onMcpSettingsChanged?.(); return }
         if (frame.type === 'web_settings_changed') { onWebSettingsChanged?.(); return }
       }
       const result = applyFrame(state, frame, subscriptionId)
@@ -84,6 +91,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
       if (result.state === state) return
       if (result.state.connection === 'ready') { clearPreparation(); retryCount = 0 }
       publish(result.state)
+      if (result.notice && result.state.sessionId) onExtensionNotice?.(result.notice, result.state.sessionId)
     }
     const failure = () => { if (!stopped && socket === current) fail() }
     current.addEventListener('open', open)
@@ -101,7 +109,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
   const offline = () => {
     clearTimeout(retryTimer)
     releaseSocket()
-    if (!stopped) publish({ ...state, connection: 'disconnected', slow: false, error: '网络已离线，联网后自动恢复' })
+    if (!stopped) publish({ ...state, connection: 'disconnected', slow: false, error: null, connectionNotice: 'chat.offline' })
   }
   const online = () => { if (!stopped) connect() }
   window.addEventListener('offline', offline)
@@ -124,7 +132,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
     },
     setSession: (sessionId: string | null) => {
       if (stopped || state.sessionId === sessionId) return
-      state = { ...state, sessionId, snapshot: null, slow: false, error: null }
+      state = { ...state, sessionId, snapshot: null, slow: false, error: null, connectionNotice: undefined }
       if (socket?.readyState !== 1) {
         publish(state)
         return
@@ -153,10 +161,13 @@ const credentialStatus = (value: unknown) => record(value) && (value.state === '
   || (value.state === 'error' && typeof value.message === 'string'))
 
 function modelDiscovery(value: unknown): value is ModelDiscovery {
-  if (!record(value) || !Array.isArray(value.models) || !record(value.deepseek)) return false
+  if (!record(value) || !Array.isArray(value.models) || !Array.isArray(value.providers)) return false
   return value.models.every(model => record(model) && ['id', 'name', 'provider', 'api'].every(key => typeof model[key] === 'string')
-    && ['contextWindow', 'maxTokens'].every(key => typeof model[key] === 'number' && Number.isSafeInteger(model[key]) && (model[key] as number) > 0))
-    && credentialStatus(value.deepseek)
+    && ['contextWindow', 'maxTokens'].every(key => typeof model[key] === 'number' && Number.isSafeInteger(model[key]) && (model[key] as number) > 0)
+    && (model.reasoningEfforts === undefined ? model.defaultReasoningEffort === undefined
+      : Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.every(reasoningEffort) && model.reasoningEfforts.some(level => level === model.defaultReasoningEffort)))
+    && value.providers.every(provider => record(provider) && typeof provider.id === 'string' && typeof provider.name === 'string' && credentialStatus(provider.status))
+    && (value.defaultSelection === undefined || modelSelection(value.defaultSelection))
 }
 
 function workspaceView(value: unknown): value is WorkspaceView {
@@ -188,42 +199,101 @@ function webSettings(value: unknown): value is WebSettingsView {
       && credentialStatus(provider.status))
 }
 
-async function requestView<T>(path: string, label: string, validate: (value: unknown) => value is T, options: RequestInit = {}, apiKey = ''): Promise<T> {
+async function requestView<T>(path: string, label: CopyKey, validate: (value: unknown) => value is T, options: RequestInit = {}, apiKey = ''): Promise<T> {
   let response: Response
   try { response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options }) }
-  catch { throw new Error('网络请求失败，请检查连接后重试') }
-  if (response.status === 401) throw new Error('授权已失效，请重新打开启动链接')
-  if (response.status === 403) throw new Error('访问来源不可信，请从启动链接进入')
+  catch { throw new RequestError({ key: 'request.network' }) }
+  if (response.status === 401) throw new RequestError({ key: 'request.unauthorized' })
+  if (response.status === 403) throw new RequestError({ key: 'request.forbidden' })
   let value: unknown
-  try { value = await response.json() } catch { throw new Error(`${label}响应无效，请重试`) }
+  try { if (response.status !== 204) value = await response.json() } catch { throw new RequestError({ key: 'request.invalid', label }) }
   if (!response.ok) {
-    const message = record(value) && typeof value.error === 'string' ? value.error : `${label}请求失败，请重试`
-    throw new Error(apiKey ? message.split(apiKey).join('•••') : message)
+    const detail = record(value) && typeof value.error === 'string' ? value.error : undefined
+    throw new RequestError({ key: 'request.failed', label, status: response.status, detail: apiKey ? detail?.split(apiKey).join('•••') : detail })
   }
-  if (!validate(value)) throw new Error(`${label}响应无效，请重试`)
+  if (!validate(value)) throw new RequestError({ key: 'request.invalid', label })
   return value
+}
+
+export function getWorkspaceSkills(workspaceId: string, signal: AbortSignal) {
+  return requestView(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills`, 'chat.skills',
+    (value): value is WorkspaceSkills => record(value) && typeof value.complete === 'boolean'
+      && Array.isArray(value.skills) && value.skills.every(skill => record(skill)
+        && typeof skill.name === 'string' && typeof skill.description === 'string'
+        && isSkillSource(skill.source) && typeof skill.disableModelInvocation === 'boolean'),
+    { signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) })
 }
 
 const putJson = (value: unknown): RequestInit => ({ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
 
-export const getModels = () => requestView('/api/models', '模型配置', modelDiscovery)
-export const saveApiKey = (apiKey: string) => requestView('/api/providers/deepseek', '模型配置', modelDiscovery, putJson({ apiKey }), apiKey)
-export const deleteApiKey = () => requestView('/api/providers/deepseek', '模型配置', modelDiscovery, { method: 'DELETE' })
+const permissionPath = '/api/settings/permission'
+const permissionSettings = (value: unknown): value is PermissionSettings =>
+  record(value) && isPermissionMode(value.defaultPermissionMode)
+const sessionPermission = (value: unknown): value is SessionPermission =>
+  record(value) && isPermissionMode(value.permissionMode)
 
-export const getWorkspaces = () => requestView('/api/workspaces', '工作区', workspaceView)
-export const pickWorkspace = () => requestView('/api/workspaces/pick', '工作区选择', workspacePick, { method: 'POST' })
+export async function getDefaultPermission() {
+  const view = await requestView(permissionPath, 'permission.label', permissionSettings, { signal: AbortSignal.timeout(5000) })
+  return view.defaultPermissionMode
+}
 
-export const getSessions = async () => (await requestView('/api/sessions', '会话列表', sessionList)).sessions
+export async function saveDefaultPermission(defaultPermissionMode: PermissionMode) {
+  const view = await requestView(permissionPath, 'permission.label', permissionSettings, {
+    ...putJson({ defaultPermissionMode }), signal: AbortSignal.timeout(5000),
+  })
+  if (view.defaultPermissionMode !== defaultPermissionMode) throw new Error('Unexpected default permission response')
+}
+
+export async function saveSessionPermission(sessionId: string, permissionMode: PermissionMode) {
+  const view = await requestView(`/api/sessions/${encodeURIComponent(sessionId)}/permission`, 'permission.label', sessionPermission, {
+    ...putJson({ permissionMode }), signal: AbortSignal.timeout(5000),
+  })
+  if (view.permissionMode !== permissionMode) throw new Error('Unexpected session permission response')
+}
+
+const languagePath = '/api/settings/language'
+
+async function languageFrom(response: Response): Promise<InterfaceLanguage> {
+  if (response.status !== 200) {
+    const error: unknown = await response.json().catch(() => undefined)
+    throw new RequestError({ key: 'settings.language.readFailed', status: response.status,
+      detail: record(error) && typeof error.error === 'string' ? error.error : undefined })
+  }
+  const value: unknown = await response.json()
+  if (!record(value) || (value.language !== 'en' && value.language !== 'zh-CN')) throw new Error('Invalid language settings response')
+  return value.language
+}
+
+export async function getLanguage() {
+  return languageFrom(await fetch(languagePath, { credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(2500) }))
+}
+
+export async function saveLanguage(language: InterfaceLanguage) {
+  const response = await fetch(languagePath, { ...putJson({ language }), credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(5000) })
+  if (await languageFrom(response) !== language) throw new Error('Unexpected language settings response')
+}
+
+export const getModels = () => requestView('/api/models', 'request.models', modelDiscovery)
+export const saveApiKey = (provider: string, apiKey: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, 'request.models', modelDiscovery, putJson({ apiKey }), apiKey)
+export const deleteApiKey = (provider: string) => requestView(`/api/providers/${encodeURIComponent(provider)}`, 'request.models', modelDiscovery, { method: 'DELETE' })
+
+export const saveModelSelection = (input: SaveModelSelectionRequest) =>
+  requestView('/api/model-selection', 'request.selection', modelSelection, { ...putJson(input), signal: AbortSignal.timeout(10_000) })
+
+export const getWorkspaces = () => requestView('/api/workspaces', 'request.workspaces', workspaceView)
+export const pickWorkspace = () => requestView('/api/workspaces/pick', 'request.workspacePicker', workspacePick, { method: 'POST' })
+
+export const getSessions = async () => (await requestView('/api/sessions', 'request.sessions', sessionList)).sessions
 
 const jobsPath = (sessionId: string) => `/api/sessions/${encodeURIComponent(sessionId)}/jobs`
 
-export const getBashJobs = async (sessionId: string, signal: AbortSignal) => (await requestView(jobsPath(sessionId), '后台任务列表',
+export const getBashJobs = async (sessionId: string, signal: AbortSignal) => (await requestView(jobsPath(sessionId), 'background.title',
   (value): value is BashJobsView => record(value) && value.sessionId === sessionId && Array.isArray(value.jobs)
     && value.jobs.every(job => record(job) && typeof job.jobId === 'string' && !!job.jobId && typeof job.command === 'string' && job.status === 'running')
     && new Set(value.jobs.map(job => job.jobId)).size === value.jobs.length,
   { signal })).jobs
 
-export const stopBashJob = (sessionId: string, jobId: string) => requestView(`${jobsPath(sessionId)}/${encodeURIComponent(jobId)}/stop`, '停止后台任务',
+export const stopBashJob = (sessionId: string, jobId: string) => requestView(`${jobsPath(sessionId)}/${encodeURIComponent(jobId)}/stop`, 'background.stop',
   (value): value is StopBashJobResult => record(value) && value.sessionId === sessionId && record(value.job) && value.job.jobId === jobId
     && typeof value.job.command === 'string' && (value.job.status === 'exited' || value.job.status === 'stopped' || value.job.status === 'failed')
     && (value.job.exitCode === null || Number.isInteger(value.job.exitCode))
@@ -231,25 +301,73 @@ export const stopBashJob = (sessionId: string, jobId: string) => requestView(`${
     && (value.job.reason === undefined || typeof value.job.reason === 'string'),
   { method: 'POST', signal: AbortSignal.timeout(10_000) })
 
-export const getWebSettings = () => requestView('/api/web/settings', '网页工具设置', webSettings)
+export const getWebSettings = () => requestView('/api/web/settings', 'request.web', webSettings)
 export const saveWebSettings = (selection: Pick<WebSettingsView, 'searchProvider' | 'fetchProvider'>) =>
-  requestView('/api/web/settings', '网页工具设置', webSettings, putJson(selection))
+  requestView('/api/web/settings', 'request.web', webSettings, putJson(selection))
 export const saveWebApiKey = (providerId: string, apiKey: string) =>
-  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, putJson({ apiKey }), apiKey)
+  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, 'request.web', webSettings, putJson({ apiKey }), apiKey)
 export const deleteWebApiKey = (providerId: string) =>
-  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, '网页工具设置', webSettings, { method: 'DELETE' })
+  requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, 'request.web', webSettings, { method: 'DELETE' })
+
+const mcpPath = '/api/mcp/servers'
+const mcpServerPath = (id: string) => `${mcpPath}/${encodeURIComponent(id)}`
+const mcpStatuses = [
+  'not_connected', 'connecting', 'connected', 'connection_failed', 'authorization_required', 'authorizing', 'disconnected', 'recovering', 'disabled',
+] satisfies McpServerView['status'][]
+
+function mcpServer(value: unknown): value is McpServerView {
+  return record(value) && typeof value.id === 'string' && typeof value.name === 'string' && typeof value.url === 'string'
+    && typeof value.enabled === 'boolean' && typeof value.hasCredential === 'boolean'
+    && (value.authMode === 'token' || value.authMode === 'oauth')
+    && (value.clientId === undefined || typeof value.clientId === 'string')
+    && (value.error === undefined || typeof value.error === 'string')
+    && (value.attemptId === undefined || typeof value.attemptId === 'string')
+    && mcpStatuses.some(status => status === value.status)
+    && Array.isArray(value.tools) && value.tools.every(tool => record(tool) && typeof tool.name === 'string'
+      && (tool.description === undefined || typeof tool.description === 'string'))
+}
+
+function mcpOAuthStart(value: unknown): value is McpOAuthStartView {
+  if (!record(value) || typeof value.attemptId !== 'string' || typeof value.authorizationUrl !== 'string') return false
+  try {
+    const url = new URL(value.authorizationUrl)
+    return (url.protocol === 'https:' || url.protocol === 'http:') && !url.username && !url.password
+  } catch { return false }
+}
+
+const requestMcp = <T>(path: string, validate: (value: unknown) => value is T, options?: RequestInit, secret?: string) =>
+  requestView(path, 'settings.mcp', validate, { signal: AbortSignal.timeout(30_000), ...options }, secret)
+
+export const getMcpServers = async () => (await requestMcp(mcpPath, (value): value is { servers: McpServerView[] } =>
+  record(value) && Array.isArray(value.servers) && value.servers.every(mcpServer))).servers
+
+export const saveMcpServer = (input: SaveMcpServerRequest, id?: string) =>
+  requestMcp(id ? mcpServerPath(id) : mcpPath, mcpServer, { ...putJson(input), method: id ? 'PUT' : 'POST' }, input.token ?? input.clientSecret)
+
+export const enableMcpServer = (id: string, enabled: boolean) =>
+  requestMcp(`${mcpServerPath(id)}/enabled`, mcpServer, putJson({ enabled }))
+
+export const deleteMcpServer = (id: string) => requestMcp(mcpServerPath(id),
+  (value): value is { removed: true; error?: string } => record(value) && value.removed === true
+    && (value.error === undefined || typeof value.error === 'string'), { method: 'DELETE' })
+
+export const startMcpOAuth = (id: string) =>
+  requestMcp(`${mcpServerPath(id)}/oauth`, mcpOAuthStart, { method: 'POST' })
+
+export const cancelMcpOAuth = (id: string, attemptId: string) =>
+  requestMcp(`${mcpServerPath(id)}/oauth/${encodeURIComponent(attemptId)}`, (value): value is undefined => value === undefined, { method: 'DELETE' })
 
 export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
   let response: Response
   try { response = await fetch('/api/abort', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) }
-  catch { throw new Error('网络请求失败，未确认中止') }
-  if (response.status === 401) throw new Error('授权已失效，请重新打开启动链接')
-  if (response.status === 403) throw new Error('访问来源不可信，请从启动链接进入')
+  catch { throw new RequestError({ key: 'request.abortNetwork' }) }
+  if (response.status === 401) throw new RequestError({ key: 'request.unauthorized' })
+  if (response.status === 403) throw new RequestError({ key: 'request.forbidden' })
   let value: unknown
   try { value = await response.json() } catch { value = null }
-  if (!response.ok) throw new Error(record(value) && typeof value.error === 'string' ? value.error : '中止请求失败，请重新同步后重试')
+  if (!response.ok) throw new RequestError({ key: 'request.abortFailed', detail: record(value) && typeof value.error === 'string' ? value.error : undefined })
   if (response.status !== 200 || !record(value) || value.sessionId !== input.sessionId || value.runId !== input.runId || typeof value.handled !== 'boolean') {
-    throw new Error('中止回执无效，未确认中止')
+    throw new RequestError({ key: 'request.abortInvalid' })
   }
   return value as AbortResult
 }
@@ -257,20 +375,22 @@ export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
 async function postSubmission(path: string, input: SubmitMessageRequest | StartSessionRequest, signal?: AbortSignal) {
   let response: Response
   try { response = await fetch(path, { ...putJson(input), method: 'POST', credentials: 'same-origin', cache: 'no-store', ...(signal && { signal }) }) }
-  catch { throw new Error('网络请求失败，未确认接收') }
+  catch { throw new RequestError({ key: 'request.sendNetwork' }) }
   let value: unknown
   try { value = await response.json() } catch { value = null }
   const code = record(value) ? value.code : undefined
-  if (code === 'save_rejected' || code === 'save_unconfirmed') {
-    const message = record(value) && typeof value.error === 'string' ? value.error : '会话保存失败'
-    throw Object.assign(new Error(message), { status: response.status, code })
+  if (code === 'save_rejected' || code === 'save_unconfirmed' || code === 'model_selection_changed') {
+    const key = code === 'model_selection_changed' ? 'model.selectionChanged' : code === 'save_unconfirmed' ? 'save.unconfirmed' : 'request.saveFailed'
+    const detail = record(value) && typeof value.error === 'string' ? value.error : undefined
+    throw Object.assign(new RequestError({ key, detail }), { status: response.status, code })
   }
   if (response.status >= 400 && response.status < 500) {
-    const message = response.status === 401 ? '授权已失效，请重新打开启动链接' : response.status === 403 ? '访问来源不可信，请从启动链接进入'
-      : record(value) && typeof value.error === 'string' ? value.error : response.status === 409 ? '正在生成，请等待回答结束' : `消息提交被拒绝（HTTP ${response.status}）`
-    throw Object.assign(new Error(message), { status: response.status })
+    const { status } = response
+    const key = status === 401 ? 'request.unauthorized' : status === 403 ? 'request.forbidden' : status === 409 ? 'request.busy' : 'request.sendRejected'
+    const detail = status !== 401 && status !== 403 && record(value) && typeof value.error === 'string' ? value.error : undefined
+    throw Object.assign(new RequestError({ key, detail, status }), { status })
   }
-  if (response.status !== 202) throw new Error('提交回执无效，未确认接收')
+  if (response.status !== 202) throw new RequestError({ key: 'request.sendInvalid' })
   return value
 }
 
@@ -281,19 +401,62 @@ function acceptedSubmission(value: unknown, sessionId: string, clientMessageId: 
     && Number.isSafeInteger(value.acceptedSeq) && (value.acceptedSeq as number) >= 0
 }
 
-export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageAccepted> {
-  const value = await postSubmission('/api/messages', input)
+function handledSubmission(value: unknown, id: string, key: 'sessionId' | 'draftSessionId', sessionId: string) {
+  return record(value) && value.kind === 'handled' && value.clientMessageId === id && value[key] === sessionId
+    && Array.isArray(value.notices) && value.notices.every(extensionNotice)
+    ? { kind: 'handled' as const, clientMessageId: id, notices: value.notices } : undefined
+}
+
+export async function submitMessage(input: SubmitMessageRequest): Promise<SubmitMessageResult> {
+  const awaitsReceipt = input.attachmentIds?.length || input.referenceSessionIds?.length || ['/plan', '/plan off'].includes(input.text.trim())
+  const value = await postSubmission('/api/messages', input, awaitsReceipt ? AbortSignal.timeout(10_000) : undefined)
+  const handled = input.text.trim() !== '/compact' && handledSubmission(value, input.clientMessageId, 'sessionId', input.sessionId)
+  if (handled) return { ...handled, sessionId: input.sessionId }
   if (!acceptedSubmission(value, input.sessionId, input.clientMessageId, input.text.trim() === '/compact' ? 'compaction' : 'message')) {
-    throw new Error('提交回执无效，未确认接收')
+    throw new RequestError({ key: 'request.sendInvalid' })
   }
   return value
 }
 
-export async function startSession(input: StartSessionRequest): Promise<StartSessionAccepted> {
+export async function startSession(input: StartSessionRequest): Promise<StartSessionResult> {
   const value = await postSubmission('/api/sessions/start', input, AbortSignal.timeout(10_000))
-  if (!record(value) || !sessionSummary(value.session) || value.session.id !== input.clientMessageId || value.session.workspaceId !== input.workspaceId
+  const draftSessionId = input.draftSessionId ?? input.clientMessageId
+  const handled = handledSubmission(value, input.clientMessageId, 'draftSessionId', draftSessionId)
+  if (handled) return { ...handled, draftSessionId }
+  if (!record(value) || !sessionSummary(value.session) || value.session.id !== draftSessionId || value.session.workspaceId !== input.workspaceId
     || !acceptedSubmission(value.accepted, value.session.id, input.clientMessageId, 'message')) {
-    throw new Error('首条消息回执无效，未确认接收')
+    throw new RequestError({ key: 'request.firstInvalid' })
   }
   return { session: value.session, accepted: value.accepted }
+}
+
+export type { MessageAttachment as Attachment } from '@agent-learning/server/protocol'
+export type AttachmentScope = { sessionId: string } | { workspaceId: string; draftSessionId: string }
+export const attachmentPath = (id: string) => `/api/attachments/${encodeURIComponent(id)}`
+
+export function uploadAttachment(scope: AttachmentScope, file: File, signal: AbortSignal) {
+  return requestView(`/api/attachments?${new URLSearchParams(scope)}`, 'attachment.uploadFailed',
+    messageAttachment,
+    { method: 'POST', headers: { 'X-Attachment-Name': encodeURIComponent(file.name) }, body: file, signal })
+}
+
+export function createSession(workspaceId: string, permissionMode: PermissionMode) {
+  return requestView('/api/sessions', 'chat.create', sessionSummary, {
+    ...putJson({ workspaceId, permissionMode }), method: 'POST', signal: AbortSignal.timeout(10_000),
+  })
+}
+
+export type PlanReviewAction = 'approve' | 'discuss'
+export async function reviewPlan(sessionId: string, planId: string, action: PlanReviewAction) {
+  let response: Response
+  try {
+    response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/plan/review`, {
+      ...putJson({ planId, action }), method: 'POST', credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10_000),
+    })
+  } catch {
+    throw new RequestError({ key: 'request.network' })
+  }
+  if (response.ok) return
+  const value: unknown = await response.json().catch(() => null)
+  throw new RequestError({ key: 'plan.reviewFailed', detail: record(value) && typeof value.error === 'string' ? value.error : undefined })
 }

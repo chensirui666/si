@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { abortMessage, deleteApiKey, getModels, saveApiKey, subscribe } from './client'
+import { abortMessage, deleteApiKey, getMcpServers, getModels, saveApiKey, subscribe } from './client'
 import type { ChatState, Subscription } from './state'
 
 class Socket extends EventTarget {
@@ -16,7 +16,7 @@ class Socket extends EventTarget {
 }
 
 const sessionId = 'session-a'
-const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 
 it.each([true, false])('abort validates the target and handled=%s with same-origin credentials', async handled => {
   const fetcher = vi.fn(async () => Response.json({ sessionId, runId: 'user-1', handled }))
@@ -33,6 +33,15 @@ it.each([
   vi.stubGlobal('fetch', async () => Response.json(body, { status }))
   await expect(abortMessage({ sessionId, runId: 'user-1' })).rejects.toThrow()
 })
+it('accepts the recovering MCP view with its enabled flag and retained tools', async () => {
+  const server = {
+    id: 'provider', name: 'Provider', url: 'https://example.test/mcp', enabled: true,
+    authMode: 'token', hasCredential: true, status: 'recovering', tools: [{ name: 'mcp__provider__lookup' }],
+  }
+  vi.stubGlobal('fetch', async () => Response.json({ servers: [server] }))
+  await expect(getMcpServers()).resolves.toEqual([server])
+})
+
 let online = true
 let states: ChatState[]
 let stop: Subscription | undefined
@@ -189,8 +198,8 @@ describe('browser subscription', () => {
 
   it('不把无法区分原因的 WS 异常报告为授权 401', () => {
     start(); socket().error()
-    expect(current().error).toContain('连接异常')
-    expect(current().error).not.toMatch(/401|授权失效|模型/)
+    expect(current().connectionNotice).toBe('chat.connectionFailed')
+    expect(current().error).toBeNull()
   })
 
   it('初始离线不创建连接，畸形 JSON 不中断后续有效快照', () => {
@@ -206,13 +215,13 @@ describe('browser subscription', () => {
 
 
 describe('model configuration client', () => {
-  const missing = { models: [], deepseek: { state: 'missing' } }
+  const missing = { models: [], providers: [{ id: 'deepseek', name: 'DeepSeek', status: { state: 'missing' } }] }
   it('同源查询、保存和删除，仅保存发送本次输入', async () => {
     const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => missing })
     vi.stubGlobal('fetch', fetch)
     await expect(getModels()).resolves.toEqual(missing)
-    await expect(saveApiKey('new-private-key')).resolves.toEqual(missing)
-    await expect(deleteApiKey()).resolves.toEqual(missing)
+    await expect(saveApiKey('deepseek', 'new-private-key')).resolves.toEqual(missing)
+    await expect(deleteApiKey('deepseek')).resolves.toEqual(missing)
     expect(fetch.mock.calls).toEqual([
       ['/api/models', { credentials: 'same-origin', cache: 'no-store' }],
       ['/api/providers/deepseek', { credentials: 'same-origin', cache: 'no-store', method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: 'new-private-key' }) }],
@@ -221,7 +230,7 @@ describe('model configuration client', () => {
   })
   it('请求错误不携带 Key，畸形响应不伪装为本地配置', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('new-private-key')))
-    await expect(saveApiKey('new-private-key')).rejects.toThrow('网络请求失败')
+    await expect(saveApiKey('deepseek', 'new-private-key')).rejects.toThrow('网络请求失败')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ models: [] }) }))
     await expect(getModels()).rejects.toThrow('模型配置响应无效')
   })

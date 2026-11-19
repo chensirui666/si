@@ -27,6 +27,7 @@ type ChildResult = { code: number | null; signal: NodeJS.Signals | null; stderr:
 type RunOptions = {
   cwd: string
   signal: AbortSignal
+  env?: NodeJS.ProcessEnv
   stdout?: (chunk: Buffer) => boolean | void
   outputFd?: number
   processGroup?: boolean
@@ -200,9 +201,9 @@ export class ToolRuntime {
 
   run(command: string, args: string[], options: RunOptions): Promise<ChildResult> {
     return this.active(options.signal, signal => new Promise((resolve, reject) => {
-      const { cwd, stdout, outputFd, processGroup = false, timeout, onSpawn, output, abortMessage = '任务已取消' } = options
+      const { cwd, stdout, outputFd, processGroup = false, timeout, env, onSpawn, output, abortMessage = '任务已取消' } = options
       const child = spawn(command, args, {
-        cwd, detached: processGroup,
+        cwd, env, detached: processGroup,
         stdio: ['ignore', outputFd ?? 'pipe', processGroup ? outputFd ?? 'pipe' : 'pipe'],
       })
       const decoder = new StringDecoder('utf8')
@@ -261,13 +262,51 @@ export class ToolRuntime {
   }
 
   bash(command: string, cwd: string, signal: AbortSignal, timeout = 240): Promise<string> {
+    return this.runWithSavedOutput('/bin/bash', ['-c', command], cwd, signal, timeout)
+  }
+
+  async gitReadOnly([verb, ...options]: string[], cwd: string, signal: AbortSignal, timeout = 30): Promise<string> {
+    const deadline = performance.now() + timeout * 1000
+    const env = {
+      PATH: '/usr/bin:/bin',
+      LANG: process.env.LANG,
+      GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_ALLOW_PROTOCOL: '',
+      GIT_NO_LAZY_FETCH: '1',
+    }
+    const config = ['--no-pager', '--no-optional-locks',
+      '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'submodule.recurse=false', '-c', 'diff.autoRefreshIndex=false']
+    // A working-tree comparison can otherwise run Git's configured conversion commands.
+    const chunks: Buffer[] = []
+    let bytes = 0
+    const result = await this.run('git', [...config, 'config', '--null', '--name-only', '--get-regexp', '^filter\\..*\\.(clean|process|required)$'], {
+      cwd, env, signal, timeout: Math.min(timeout, 5),
+      stdout(chunk) {
+        bytes += chunk.length
+        if (bytes > MAX_OUTPUT_BYTES) return false
+        chunks.push(chunk)
+      },
+    })
+    if (result.stopped || (result.code !== 0 && result.code !== 1)) {
+      throw Object.assign(new Error(result.stopped ?? '无法读取 Git 配置'), result.aborted ? { code: 'interrupted' } : {})
+    }
+    const filters = [...new Set(Buffer.concat(chunks).toString('utf8').split('\0').filter(Boolean))]
+      .flatMap(key => ['-c', key + (key.endsWith('.required') ? '=false' : '=')])
+    const flags = verb === 'diff' ? ['--no-ext-diff', '--no-textconv', '--ignore-submodules=all'] : ['--ignore-submodules=all']
+    const remaining = (deadline - performance.now()) / 1000
+    if (remaining <= 0) throw new Error(`执行超时（${timeout} 秒）`)
+    return this.runWithSavedOutput('git', [...config, ...filters, verb!, ...flags, ...options], cwd, signal, remaining, env)
+  }
+
+  private runWithSavedOutput(command: string, args: string[], cwd: string, signal: AbortSignal, timeout?: number, env?: NodeJS.ProcessEnv): Promise<string> {
     return this.active(signal, async activeSignal => {
       const path = join(await this.temporaryDirectory(), `bash-${randomUUID()}.txt`)
       const file = await open(path, 'wx+', 0o600)
       let keep = false
       try {
-        const result = await this.run('/bin/bash', ['-c', command], {
-          cwd, signal: activeSignal, outputFd: file.fd, processGroup: true, timeout,
+        const result = await this.run(command, args, {
+          cwd, signal: activeSignal, outputFd: file.fd, processGroup: true, timeout, env,
         })
         const size = (await file.stat()).size
         const bytes = Buffer.alloc(Math.min(size, MAX_OUTPUT_BYTES))

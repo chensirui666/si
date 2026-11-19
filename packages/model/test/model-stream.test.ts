@@ -1,10 +1,12 @@
+import { once } from 'node:events'
+import { createServer, type ServerResponse } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import * as modelApi from '../src/index.js'
 import type { ModelInfo } from '../src/index.js'
 
 const selected: ModelInfo = {
-  id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_048_576, maxTokens: 65_536,
+  id: 'deepseek-flash', name: 'DeepSeek Flash', provider: 'deepseek', api: 'openai-completions', contextWindow: 1_000_000, maxTokens: 65_536,
 }
 const context = { messages: [{ role: 'user' as const, content: '  你好\n第二行  ', timestamp: 1 }] }
 const credentials = { readApiKey: async () => 'test-private-key' }
@@ -117,7 +119,7 @@ describe('Model single SDK stream', () => {
     expect(modelApi.stream).toBeTypeOf('function')
     expect(modelApi.findModel('other')).toBeUndefined()
     const found = modelApi.findModel(selected.id)!
-    expect(found).toEqual(selected)
+    expect(found).toMatchObject(selected)
     found.name = 'changed'
     expect(modelApi.findModel(selected.id)!.name).toBe('DeepSeek Flash')
   })
@@ -584,6 +586,7 @@ describe('Model single SDK stream', () => {
     await vi.advanceTimersByTimeAsync(1)
     const { result } = await reading
     expect(result.stopReason).toBe('error')
+    expect(result.failure).toEqual({ kind: 'timeout' })
     expect(result.errorMessage).toMatch(/超时|timeout/i)
     expect(signal.aborted).toBe(true)
     expect(calls).toBe(1)
@@ -616,4 +619,371 @@ describe('Model single SDK stream', () => {
     expect(events.at(-1)?.type).toBe('error')
     expect(vi.getTimerCount()).toBe(0)
   })
+})
+
+it('streams a configured Moonshot model, sends its own Key and omits unknown usage', async () => {
+  const model = modelApi.findModel('kimi-k3', 'moonshotai-cn')!
+  const received: string[] = []
+  const output = await consume(modelApi.createModelStream({ readApiKey: async provider => {
+    expect(provider).toBe('moonshotai-cn')
+    return 'moonshot-test-key'
+  } }, { fetch: async (url, init) => {
+    received.push(String(url), new Headers(init?.headers).get('authorization') ?? '', JSON.parse(String(init?.body)).model)
+    return response([chunk({ content: 'moonshot' }), chunk({}, 'stop')])
+  } })(model, context))
+  expect(received).toEqual(['https://api.moonshot.cn/v1/chat/completions', 'Bearer moonshot-test-key', model.id])
+  expect(output.result).toMatchObject({ provider: 'moonshotai-cn', stopReason: 'stop', content: [{ type: 'text', text: 'moonshot' }] })
+  expect(output.result.usage).toBeUndefined()
+})
+
+it('replays foreign tool calls into DeepSeek with paired normalized IDs and no foreign reasoning', async () => {
+  const calls = [{ type: 'toolCall' as const, id: 'call_id|fc_' + '+/'.repeat(100), name: 'read', arguments: { path: 'note.txt' } }]
+  const history: modelApi.ModelContext = {
+    messages: [
+      { role: 'assistant', api: 'openai-responses', provider: 'openai', model: 'gpt-5', timestamp: 1,
+        stopReason: 'toolUse', content: [{ type: 'thinking', thinking: 'foreign-reasoning' }, ...calls] },
+      { role: 'toolResult', toolCallId: calls[0].id, toolName: 'read', isError: false, timestamp: 2, content: [{ type: 'text', text: 'note contents' }] },
+    ],
+    tools: [{ name: 'read', description: '', parameters: Type.Object({ path: Type.String() }) }],
+  }
+  let sent: { role: string; content: string; reasoning_content?: string; tool_calls?: { id: string }[]; tool_call_id?: string }[] = []
+  await consume(modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    sent = JSON.parse(String(init?.body)).messages
+    return response([chunk({ content: 'seen' }), chunk({}, 'stop')])
+  } })(selected, history))
+  expect(sent[0].reasoning_content).toBe('')
+  expect(sent[0].tool_calls?.[0].id).toMatch(/^[a-zA-Z0-9_-]{1,40}$/)
+  expect(sent[1]).toMatchObject({ tool_call_id: sent[0].tool_calls?.[0].id, content: 'note contents' })
+  expect(history.messages[1]).toMatchObject({ toolCallId: calls[0].id })
+})
+
+it('keeps both upload and read paths when DeepSeek Pro replays an image-bearing Flash conversation', async () => {
+  const model = modelApi.findModel('deepseek-v4-pro')!
+  const uploadPath = '/attachment-store/screenshot'
+  const readPath = '/workspace/read.png'
+  const image = { type: 'image' as const, mimeType: 'image/png' as const, data: 'AAAA' }
+  const history: modelApi.ModelContext = {
+    messages: [
+      { role: 'user', timestamp: 1, content: [{ type: 'text', text: uploadPath }, image] },
+      { role: 'assistant', api: selected.api, provider: selected.provider, model: selected.id, timestamp: 2,
+        stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'read-image', name: 'read', arguments: { path: readPath } }] },
+      { role: 'toolResult', toolCallId: 'read-image', toolName: 'read', isError: false, timestamp: 3,
+        content: [{ type: 'text', text: readPath }, image] },
+      { role: 'user', timestamp: 4, content: '继续之前的会话' },
+    ],
+    tools: [{ name: 'read', description: '', parameters: Type.Object({ path: Type.String() }) }],
+  }
+  const requests: { model: string; messages: { role: string; content: unknown; tool_call_id?: string; tool_calls?: { id: string }[] }[] }[] = []
+  const { result } = await consume(modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    requests.push(JSON.parse(String(init?.body)))
+    return response([chunk({ content: '已继续' }, 'stop')])
+  } })(model, history))
+  expect(result).toMatchObject({ model: model.id, stopReason: 'stop', content: [{ type: 'text', text: '已继续' }] })
+  expect(requests[0].model).toBe('deepseek-v4-pro')
+  const transcript = JSON.stringify(requests[0].messages)
+  expect(transcript).not.toContain('image_url')
+  expect(transcript).not.toContain(image.data)
+  expect(transcript).toContain(uploadPath)
+  const call = requests[0].messages.find(message => message.tool_calls?.length)?.tool_calls?.[0]
+  const outcome = requests[0].messages.find(message => message.role === 'tool')
+  expect(outcome?.tool_call_id).toBe(call?.id)
+  expect(outcome?.content).toContain(readPath)
+})
+
+it('keeps the advertised reply cap after an Anthropic-compatible adapter adds reasoning', async () => {
+  const model = modelApi.findModel('MiniMax-M3', 'minimax-cn')!
+  let outputBudget: number | undefined
+  await consume(modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    outputBudget = JSON.parse(String(init?.body)).max_tokens
+    return Response.json({ type: 'error', error: { type: 'authentication_error', message: 'controlled error' } }, { status: 401 })
+  } })(model, context, { reasoningEffort: 'high' }))
+  expect(outputBudget).toBeDefined()
+  expect(outputBudget).toBeLessThanOrEqual(model.maxTokens)
+})
+
+it('keeps a native effort boundary in same-model history without changing tool IDs', async () => {
+  const model = modelApi.findModel('claude-sonnet-5-5', 'anthropic')!
+  const content = [{ type: 'toolCall' as const, id: 'toolu_test', name: 'read', arguments: { path: 'note.txt' } }]
+  const responses = [{
+    type: 'message_start',
+    message: { id: 'msg_1', type: 'message', role: 'assistant', model: model.id, content: [], usage: { input_tokens: 25, output_tokens: 0 } },
+  }, {
+    type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: content[0].id, name: 'read', input: content[0].arguments },
+  }, { type: 'content_block_stop', index: 0 },
+  { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 20 } },
+  { type: 'message_stop' }]
+  const requests: { messages: unknown[]; output_config?: { effort: string } }[] = []
+  const stream = modelApi.createModelStream(credentials, { fetch: async (_url, init) => {
+    requests.push(JSON.parse(String(init?.body)))
+    return new Response(responses.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''), {
+      headers: { 'content-type': 'text/event-stream' },
+    })
+  } })
+  const first = await stream(model, context, { reasoningEffort: 'low' }).result()
+  expect(first).toMatchObject({ stopReason: 'toolUse', providerThinkingLevel: 'low' })
+  await stream(model, { messages: [...context.messages, first, {
+    role: 'toolResult', toolCallId: content[0].id, toolName: 'read', content: [{ type: 'text', text: 'read note' }],
+    isError: false, timestamp: 2,
+  }] }, { reasoningEffort: 'high' }).result()
+  expect(requests[0].messages.at(-1)).toMatchObject({ role: 'system', output_config: { effort: 'low' } })
+  expect(requests[1].messages.at(-1)).toMatchObject({ role: 'system', output_config: { effort: 'high' } })
+  expect(requests[1].messages).toEqual(expect.arrayContaining([
+    expect.objectContaining({ role: 'system', output_config: { effort: 'low' } }),
+    expect.objectContaining({ role: 'assistant', content: expect.arrayContaining([expect.objectContaining({ type: 'tool_use', id: content[0].id })]) }),
+    expect.objectContaining({ role: 'user', content: expect.arrayContaining([expect.objectContaining({ type: 'tool_result', tool_use_id: content[0].id })]) }),
+  ]))
+})
+
+it('sends the selected thinking level to Gemini 4 Hydrogen and records the response model', async () => {
+  const model = modelApi.findModel('gemini-4-hydrogen', 'google')!
+  const sent: unknown[] = []
+  vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
+    sent.push(JSON.parse(String(init.body)).generationConfig.thinkingConfig)
+    return response([{
+      modelVersion: 'gemini-4-hydrogen',
+      candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+    }], false)
+  })
+  try {
+    const run = modelApi.createModelStream(credentials)
+    const onProviderResponse = vi.fn(), onProviderStreamEvent = vi.fn()
+    const low = await run(model, context, { reasoningEffort: 'low', onProviderResponse, onProviderStreamEvent }).result()
+    expect(onProviderResponse).not.toHaveBeenCalled()
+    expect(onProviderStreamEvent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ modelVersion: 'gemini-4-hydrogen' }))
+    const high = await run(model, context, { reasoningEffort: 'high' }).result()
+    expect(sent).toEqual([
+      { includeThoughts: true, thinkingLevel: 'LOW' },
+      { includeThoughts: true, thinkingLevel: 'HIGH' },
+    ])
+    expect(low).toMatchObject({ model: 'gemini-4-hydrogen', responseModel: 'gemini-4-hydrogen', stopReason: 'stop' })
+    expect(high.responseModel).toBe(low.responseModel)
+  } finally { vi.unstubAllGlobals() }
+})
+
+it('times out a Gemini request waiting for HTTP headers using one attempt', async () => {
+  vi.useFakeTimers()
+  const model = modelApi.findModel('gemini-3.7-flash', 'google')!
+  const started = Promise.withResolvers<AbortSignal>()
+  const fetcher = vi.fn((_url: string, { signal }: RequestInit) => {
+    started.resolve(signal!)
+    return new Promise<Response>((_resolve, reject) => {
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })
+    })
+  })
+  vi.stubGlobal('fetch', fetcher)
+  try {
+    const stream = modelApi.createModelStream(credentials)(model, context)
+    const result = consume(stream)
+    const signal = await started.promise
+    await vi.advanceTimersByTimeAsync(299_999)
+    expect(signal.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    const settled = await result
+    expect(signal.aborted).toBe(true)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(settled.events.map(event => event.type)).toEqual(['error'])
+    expect(settled.result).toMatchObject({ stopReason: 'error', failure: { kind: 'timeout' } })
+  } finally { vi.unstubAllGlobals() }
+})
+
+it.each([
+  [418, undefined, 'http-error'],
+  [503, undefined, 'unavailable'],
+  [429, 'insufficient_quota', 'quota'],
+  [503, 'server_is_overloaded', 'overloaded'],
+] as const)('keeps safe failure evidence from HTTP %s (%s)', async (status, code, kind) => {
+  const received = Date.now()
+  const fetcher = vi.fn(async () => new Response(JSON.stringify({ error: { code, message: 'private test-private-key' } }), {
+    status, headers: { 'content-type': 'application/json', 'retry-after': '120' },
+  }))
+  const { result } = await consume(modelApi.createModelStream(credentials, { fetch: fetcher })(selected, context))
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(result.failure).toMatchObject({ kind, ...(kind === 'http-error' && { status }) })
+  if (kind !== 'quota') expect(result.failure?.retryAt).toBeGreaterThanOrEqual(received + 120_000)
+  expect(JSON.stringify(result)).not.toContain('test-private-key')
+})
+
+it('distinguishes a confirmed connection refusal from a general model request failure', async () => {
+  for (const [error, kind] of [[Object.assign(new Error('connect refused'), { code: 'ECONNREFUSED' }), 'connection'],
+    [new Error('upstream did not explain'), 'request-error']] as const) {
+    const fetcher = vi.fn(async () => { throw new TypeError('fetch failed', { cause: error }) })
+    const { result } = await consume(modelApi.createModelStream(credentials, { fetch: fetcher })(selected, context))
+    expect(result.failure).toEqual({ kind })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  }
+})
+
+const responsesText = [
+  { type: 'response.output_item.added', output_index: 0, item: { id: 'message', type: 'message', role: 'assistant', content: [], status: 'in_progress' } },
+  { type: 'response.content_part.added', output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+  { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'partial' },
+]
+const routes = [
+  [selected, [chunk({ content: 'partial' })]],
+  [modelApi.findModel('chat-latest', 'openai')!, responsesText],
+  [modelApi.findModel('kimi-k3', 'moonshotai-cn')!, [chunk({ content: 'partial' })]],
+  [modelApi.findModel('claude-sonnet-5-5', 'anthropic')!, [
+    { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+  ]],
+  [modelApi.findModel('gemini-4-hydrogen', 'google')!, [
+    { candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] } }] },
+  ]],
+  [modelApi.findModel('codestral-2508', 'mistral')!, [chunk({ content: 'partial' })]],
+] as const
+
+function writeSse(res: ServerResponse, items: readonly unknown[]) {
+  res.writeHead(200, { 'content-type': 'text/event-stream' })
+  for (const item of items) {
+    const { type } = item as { type?: string }
+    if (type) res.write('event: ' + type + '\n')
+    res.write('data: ' + JSON.stringify(item) + '\n\n')
+  }
+}
+
+it.each(routes.map(([model, frames]) => ({ model, frames })))('$model.provider [$model.api] classifies refused connections, 503, clean EOF and reset with one request per attempt', async ({ model, frames }) => {
+  let requests = 0
+  let fault: '503' | 'eof' | 'reset' = '503'
+  let response: ServerResponse | undefined
+  const server = createServer((req, res) => {
+    req.resume()
+    requests++
+    response = res
+    if (fault === '503') {
+      res.writeHead(503, { 'retry-after': '120', 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 503, message: 'service temporary test-private-key' } }))
+      return
+    }
+    writeSse(res, frames)
+    if (fault === 'eof') res.end()
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const baseURL = 'http://127.0.0.1:' + (server.address() as { port: number }).port
+  const run = modelApi.createModelStream(credentials, { baseURL })
+  try {
+    const { result } = await consume(run(model, context))
+    expect(result.failure?.kind).toBe('unavailable')
+    if (model.provider === 'google') expect(result.failure?.retryAt).toBeUndefined()
+    else expect(result.failure?.retryAt).toBeGreaterThan(Date.now() + 115_000)
+    expect(JSON.stringify(result)).not.toContain('test-private-key')
+    expect(requests).toBe(1)
+    fault = 'eof'
+    const eof = await consume(run(model, context))
+    expect(eof.events).toContainEqual(expect.objectContaining({ type: 'text_delta', delta: 'partial' }))
+    expect(eof.result.failure).toEqual({ kind: 'stream-ended' })
+    expect(requests).toBe(2)
+    fault = 'reset'
+    const stream = run(model, context)
+    for await (const event of stream) {
+      if (event.type === 'text_delta') response!.socket!.resetAndDestroy()
+    }
+    expect((await stream.result()).failure).toEqual({ kind: 'connection-reset' })
+    expect(requests).toBe(3)
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
+  const fetcher = vi.fn(globalThis.fetch)
+  if (model.provider === 'google') vi.stubGlobal('fetch', fetcher)
+  try {
+    const failed = await consume(modelApi.createModelStream(credentials, { baseURL, ...(model.provider !== 'google' && { fetch: fetcher }) })(model, context))
+    expect(failed.result.failure).toEqual({ kind: 'connection' })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  } finally { vi.unstubAllGlobals() }
+}, 10_000)
+
+it('classifies a Responses failure event with no code, and a local exception before sending', async () => {
+  const model = modelApi.findModel('chat-latest', 'openai')!
+  const fetcher = vi.fn(async () => response([{ type: 'response.failed' }], false))
+  const run = modelApi.createModelStream(credentials, { fetch: fetcher })
+  expect((await consume(run(model, context))).result.failure).toEqual({ kind: 'response-error' })
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  const badContext = { get messages(): never { throw new Error('local private test-private-key') } }
+  const prepared = await consume(run(model, badContext))
+  expect(prepared.result.failure).toEqual({ kind: 'unknown' })
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(JSON.stringify(prepared.result)).not.toContain('test-private-key')
+})
+
+it.each([
+  ['60', 60_000],
+  ['Mon, 16 Nov 2026 08:00:02 GMT', 2000],
+  ['Mon, 16 Nov 2026 07:00:00 GMT', 0],
+  ['1.5', undefined],
+  ['-3', undefined],
+  ['9999999999999999999', undefined],
+] as const)('normalizes Retry-After %s from the time the model response arrived', async (header, offset) => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const now = Date.parse('2026-11-16T08:00:00Z')
+  vi.setSystemTime(now)
+  const run = modelApi.createModelStream(credentials, { fetch: async () => new Response('{}', {
+    status: 429, headers: { 'retry-after': header },
+  }) })
+  const { result } = await consume(run(selected, context))
+  expect(result.failure?.kind).toBe('rate-limit')
+  expect(result.failure?.retryAt).toBe(offset === undefined ? undefined : now + offset)
+})
+
+it('classifies a socket closed after sending the Gemini request and before response headers', async () => {
+  let requests = 0
+  const server = createServer(request => {
+    requests++
+    request.once('end', () => request.socket.end())
+    request.resume()
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const baseURL = 'http://127.0.0.1:' + (server.address() as { port: number }).port
+  try {
+    const model = modelApi.findModel('gemini-3.7-flash', 'google')!
+    const { events, result } = await consume(modelApi.createModelStream(credentials, { baseURL })(model, context))
+    expect(requests).toBe(1)
+    expect(events.map(event => event.type)).toEqual(['error'])
+    expect(result.failure).toEqual({ kind: 'connection-reset' })
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
+})
+
+it.each([selected, modelApi.findModel('kimi-k3', 'moonshotai-cn')!])('observes HTTP metadata and raw chunks before consumption for $provider', async model => {
+  const timeline: string[] = []
+  const packets = [chunk({ content: '早' }), chunk({ content: '上' }), chunk({}, 'stop')]
+  const body = new ReadableStream<Uint8Array>({
+    pull(reader) {
+      timeline.push('body')
+      reader.enqueue(encoder.encode(packets.map(packet => `data: ${JSON.stringify(packet)}\n\n`).join('') + 'data: [DONE]\n\n'))
+      reader.close()
+    },
+  }, { highWaterMark: 0 })
+  const metadata = vi.fn(async () => { timeline.push('http') })
+  const raw: unknown[] = []
+  const stream = modelApi.createModelStream(credentials, { fetch: async () => new Response(body, { headers: {
+    'content-type': 'text/event-stream', 'x-test-observation': 'present',
+  } }) })(model, context, {
+    onProviderResponse: metadata,
+    onProviderStreamEvent: async packet => { raw.push(packet); timeline.push('raw:' + raw.length) },
+  })
+  for await (const event of stream) if (event.type === 'text_delta') timeline.push('text:' + event.delta)
+  expect(await stream.result()).toMatchObject({ stopReason: 'stop', content: [{ text: '早上' }] })
+  expect(metadata).toHaveBeenCalledExactlyOnceWith({ status: 200, headers: {
+    'content-type': 'text/event-stream', 'x-test-observation': 'present',
+  } })
+  expect(raw).toEqual(packets)
+  expect(timeline.slice(0, 2)).toEqual(['http', 'body'])
+  expect(timeline.indexOf('raw:1')).toBeLessThan(timeline.indexOf('text:早'))
+  expect(timeline.indexOf('raw:2')).toBeLessThan(timeline.indexOf('text:上'))
+})
+
+it('takes a per-delta snapshot for message Hooks even when the consumer is behind', async () => {
+  const stream = modelApi.createModelStream(credentials, { fetch: async () => response([
+    chunk({ content: '早' }), chunk({ content: '上' }), chunk({}, 'stop'),
+  ]) })(selected, context, { snapshotPartials: true })
+  await stream.result()
+  const { events } = await consume(stream)
+  expect(events.flatMap(event => event.type === 'text_delta' ? [[event.delta, event.partial.content[0]]] : [])).toEqual([
+    ['早', { type: 'text', text: '早' }], ['上', { type: 'text', text: '早上' }],
+  ])
 })

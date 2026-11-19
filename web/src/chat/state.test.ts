@@ -3,7 +3,7 @@ import { applyFrame, initialState as disconnected } from './state'
 
 const sessionId = 'session-a'
 const initialState = { ...disconnected, sessionId }
-const empty = { seq: 0, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
+const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, compactions: [], contextUsage: null, activeContent: [] }
 const ready = () => applyFrame(initialState, { type: 'snapshot', sessionId, subscriptionId: 'current', snapshot: empty }, 'current').state
 
 describe('conversation state', () => {
@@ -222,4 +222,33 @@ it.each([
   const result = applyFrame(state, { type: 'update', sessionId, subscriptionId: 'current', update: { seq: 1, change: { type: 'task', running: null }, contextUsage } }, 'current')
   expect(result.resubscribe).toBe(true)
   expect(result.state).toBe(state)
+})
+
+it('恢复期间只接受当前 Run 的助手消息替换，并原子清除等待状态', () => {
+  const user = { id: 'u', message: { role: 'user', content: '任务', timestamp: 1 } }
+  const old = { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+    timestamp: 2, stopReason: 'pending', content: [{ type: 'text', text: '旧片段' }] }
+  const running = { kind: 'task', runId: 'u', assistantMessageId: 'a', phase: 'model', activeTools: [],
+    retry: { mode: 'limited', phase: 'retrying', reason: 'http-error', status: 418, attempt: 3, maxAttempts: 5, incomplete: true } }
+  const snapshot = { ...empty, seq: 10, messages: [user, { id: 'a', message: old }], running }
+  const frame = { type: 'snapshot', sessionId, subscriptionId: 'current', snapshot }
+  const state = applyFrame(initialState, frame, 'current').state
+  expect(state.snapshot).toEqual(snapshot)
+  for (const retry of [{ ...running.retry, status: 399 }, { ...running.retry, attempt: 6 }, { ...running.retry, retryAt: 2 },
+    { ...running.retry, mode: 'connection' }, { ...running.retry, reason: '__proto__' }]) {
+    expect(applyFrame(initialState, { ...frame, snapshot: { ...snapshot, running: { ...running, retry } } }, 'current').state).toBe(initialState)
+  }
+
+  const message = { ...old, content: [{ type: 'text', text: '新正文' }] }
+  const activeContent = [{ messageId: 'a', contentIndex: 0, type: 'text' }]
+  const event = { type: 'replace', runId: 'u', message, activeContent }
+  const update = (event: unknown, messageId = 'a', seq = 11) => applyFrame(state, { type: 'update', sessionId, subscriptionId: 'current',
+    update: { seq, change: { type: 'model', messageId, event } } }, 'current')
+  expect(update({ ...event, runId: 'old' }).resubscribe).toBe(true)
+  expect(update(event, 'old').resubscribe).toBe(true)
+  expect(update(event, 'a', 12).resubscribe).toBe(true)
+  expect(update({ ...event, activeContent: [{ ...activeContent[0], contentIndex: 1 }] }).resubscribe).toBe(true)
+  expect(update(event).state.snapshot).toMatchObject({ seq: 11, messages: [user, { id: 'a', message }], activeContent,
+    running: { retry: undefined } })
+  expect(state.snapshot).toEqual(snapshot)
 })

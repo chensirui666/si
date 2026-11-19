@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { MessageInputHarness } from './MessageInputHarness'
+import { i18n } from '../i18n/copy'
 import '../styles.css'
+
+await i18n.changeLanguage('zh-CN')
 
 function InputEvents() {
   const [events, setEvents] = useState<string[]>([])

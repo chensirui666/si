@@ -137,7 +137,7 @@ test('发送、中止和正在中止切换保留同一编辑器、草稿、焦�
 })
 
 for (const method of ['click', 'Tab', 'Enter'] as const) {
-  test(`命令前缀通过 ${method} 仅补全，下一次 Enter 才发送`, async ({ mount }) => {
+  test(`命令前缀通过 ${method} 直接执行压缩`, async ({ mount }) => {
     const component = await mount(<div style={{ paddingTop: 180 }}><MessageInputHarness /></div>)
     const textbox = component.getByRole('textbox', { name: '消息' })
     await textbox.pressSequentially('/co')
@@ -146,26 +146,18 @@ for (const method of ['click', 'Tab', 'Enter'] as const) {
     await expect(option).toHaveAttribute('aria-selected', 'true')
     if (method === 'click') await option.click()
     else await textbox.press(method)
-    await expect(textbox).toHaveText('/compact')
-    await expect(textbox).toBeFocused()
-    await expect(component.getByRole('listbox')).toHaveCount(0)
-    await expect(component.getByLabel('已提交原文')).toHaveText('[]')
-    await textbox.press('Enter')
     await expect(component.getByLabel('已提交原文')).toHaveText('["/compact"]')
     await expect(textbox).toHaveText('')
+    await expect(textbox).toBeFocused()
+    await expect(component.getByRole('listbox')).toHaveCount(0)
+    await textbox.press('Enter')
+    await expect(component.getByLabel('已提交原文')).toHaveText('["/compact"]')
   })
 }
 
-test('补全保留撤销与重做，Esc 关闭保留前缀且普通重渲染不重开', async ({ mount }) => {
+test('Esc 关闭保留前缀且普通重渲染不重开', async ({ mount }) => {
   const component = await mount(<div style={{ paddingTop: 180 }}><MessageInputHarness /></div>)
   const textbox = component.getByRole('textbox', { name: '消息' })
-  await textbox.pressSequentially('/co')
-  await textbox.press('Tab')
-  await textbox.press('ControlOrMeta+z')
-  await expect(textbox).toHaveText('/co')
-  await textbox.press('ControlOrMeta+Shift+z')
-  await expect(textbox).toHaveText('/compact')
-  await textbox.press('ControlOrMeta+a')
   await textbox.pressSequentially('/co')
   await textbox.press('Escape')
   await expect(component.getByRole('listbox')).toHaveCount(0)
@@ -188,20 +180,13 @@ for (const text of ['请读取 src/index.txt', '/unknown']) {
   })
 }
 
-test('任务忙碌时仍能补全，失焦关闭菜单且不发送', async ({ mount, page }) => {
+test('任务忙碌时保留压缩草稿，确认动作无法提交', async ({ mount }) => {
   const component = await mount(<div style={{ paddingTop: 180 }}><MessageInputHarness sendDisabled action="abort" /></div>)
   const textbox = component.getByRole('textbox', { name: '消息' })
-  await textbox.pressSequentially('/')
-  await expect(component.getByRole('listbox')).toBeVisible()
-  await page.getByLabel('已提交原文').click()
-  await expect(component.getByRole('listbox')).toHaveCount(0)
-  await expect(textbox).toHaveText('/')
-  await textbox.click()
-  await textbox.press('End')
-  await textbox.pressSequentially('co')
-  await textbox.press('Tab')
-  await expect(textbox).toHaveText('/compact')
+  await textbox.pressSequentially('/co')
+  await expect(component.getByRole('option', { name: /compact/ })).toHaveCount(0)
   await textbox.press('Enter')
+  await expect(textbox).toHaveText('/co')
   await expect(component.getByLabel('已提交原文')).toHaveText('[]')
 })
 
@@ -216,4 +201,118 @@ test('Esc 关闭后清空并重新输入相同命令前缀会再次提供候选'
   await textbox.pressSequentially('/')
   await expect(component.getByRole('option', { name: /compact/ })).toBeVisible()
   await expect(component.getByLabel('已提交原文')).toHaveText('[]')
+})
+
+test('技能 08–14：目录按工作区加载，分组、来源、Tab、鼠标、输入法和失败反馈', async ({ mount, page }) => {
+  let releaseA!: () => void
+  const slow = new Promise<void>(resolve => { releaseA = resolve })
+  await page.route('**/api/workspaces/*/skills', async route => {
+    const id = new URL(route.request().url()).pathname.split('/')[3]
+    if (id === 'a') await slow
+    if (id === 'broken') { await route.fulfill({ status: 500, json: { error: '目录暂不可用' } }); return }
+    await route.fulfill({ json: { complete: true, skills: [
+      { name: `review-${id}`, description: '检查修改', source: 'project-si', disableModelInvocation: false },
+      { name: 'manual', description: '人工使用', source: 'bundled', disableModelInvocation: true },
+      { name: 'custom', description: '个人说明', source: 'user-si', disableModelInvocation: false },
+    ] } }).catch(() => {})
+  })
+  const component = await mount(<div style={{ paddingTop: 240 }}><MessageInputHarness skillWorkspaceId="a" /></div>)
+  const textbox = component.getByRole('textbox', { name: '消息' })
+  const requested = page.waitForRequest('**/api/workspaces/a/skills')
+  await textbox.pressSequentially('/')
+  await requested
+  await component.update(<div style={{ paddingTop: 240 }}><MessageInputHarness skillWorkspaceId="b" /></div>)
+  const review = component.getByRole('option', { name: /review-b/ })
+  await expect(review).toContainText('项目')
+  await expect(component.getByRole('option', { name: /manual/ })).toContainText('预置')
+  await expect(component.getByRole('option', { name: /custom/ })).toContainText('个人')
+  await expect(component.getByRole('group', { name: '命令', exact: true })).toContainText('/compact')
+  await expect(component.getByRole('group', { name: '技能', exact: true })).toContainText('review-b')
+  releaseA()
+  await expect(component.getByRole('option', { name: /review-a/ })).toHaveCount(0)
+  await expect(textbox).toHaveText('/')
+  await textbox.press('ArrowDown')
+  await textbox.press('Tab')
+  expect(await textbox.textContent()).toBe('/skill:review-b ')
+  await expect(textbox).toBeFocused()
+  await expect(component.getByLabel('已提交原文')).toHaveText('[]')
+
+  await textbox.fill('/rev')
+  await review.click()
+  expect(await textbox.textContent()).toBe('/skill:review-b ')
+  await expect(textbox.locator('[style*="--skill-prefix-color"]')).toHaveText('/skill:review-b')
+  await expect(textbox.locator('[style*="--skill-prefix-color"]')).toHaveCSS('color', 'rgb(37, 84, 199)')
+  await expect(component.getByLabel('已提交原文')).toHaveText('[]')
+  await textbox.press('ControlOrMeta+z')
+  await expect(textbox).toHaveText('/rev')
+  await textbox.press('ControlOrMeta+Shift+z')
+  await expect(textbox.locator('[style*="--skill-prefix-color"]')).toHaveText('/skill:review-b')
+  await textbox.pressSequentially('inspect')
+  await expect(textbox).toHaveText('/skill:review-b inspect')
+  await expect(textbox.locator('[style*="--skill-prefix-color"]')).toHaveText('/skill:review-b')
+  await textbox.press('Enter')
+  await expect(component.getByLabel('已提交原文')).toHaveText('["/skill:review-b inspect"]')
+
+  await component.update(<div style={{ paddingTop: 240 }}><MessageInputHarness skillWorkspaceId="broken" /></div>)
+  await textbox.fill('/')
+  await expect(component.getByText(/目录暂不可用/)).toBeVisible()
+  await component.getByRole('option', { name: /compact/ }).click()
+  await expect(textbox).toHaveText('')
+  await expect(component.getByLabel('已提交原文')).toHaveText('["/skill:review-b inspect","/compact"]')
+
+  await component.update(<div style={{ paddingTop: 240 }}><MessageInputHarness skillWorkspaceId="b" /></div>)
+  await textbox.fill('/')
+  await expect(review).toBeVisible()
+  await textbox.dispatchEvent('compositionstart')
+  await textbox.press('Enter')
+  await expect(textbox).toHaveText('/')
+  await expect(component.getByLabel('已提交原文')).toHaveText('["/skill:review-b inspect","/compact"]')
+  await textbox.dispatchEvent('compositionend')
+})
+
+test('添加菜单只含文件与计划，选择计划保留正文并在发送时生效', async ({ mount, page }) => {
+  const component = await mount(<div style={{ paddingTop: 180 }}><MessageInputHarness plan="available" /></div>)
+  const editor = component.getByRole('textbox', { name: '消息' })
+  const add = component.getByRole('button', { name: '添加', exact: true })
+  const menu = component.getByRole('menu', { name: '添加' })
+  const submitted = component.getByLabel('已提交原文')
+  await editor.fill('读一下 README')
+  await add.click()
+  await expect(menu.getByRole('menuitem')).toHaveText(['添加文件', '计划模式'])
+  const files = menu.getByRole('menuitem', { name: '添加文件' })
+  await expect(files).toBeFocused()
+  await files.press('ArrowDown')
+  await expect(menu.getByRole('menuitem', { name: '计划模式' })).toBeFocused()
+  await page.keyboard.press('Escape')
+  await expect(menu).toBeHidden()
+  await expect(add).toBeFocused()
+
+  await add.click()
+  const choosing = page.waitForEvent('filechooser')
+  await files.click()
+  await (await choosing).setFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('note') })
+  await expect(submitted).toHaveText('["notes.txt"]')
+  await add.click()
+  await menu.getByRole('menuitem', { name: '计划模式' }).click()
+  await expect(menu).toBeHidden()
+  await expect(editor).toBeFocused()
+  await expect(editor).toHaveText('/plan 读一下 README')
+  await expect(component.getByRole('button', { name: '退出计划模式' })).toHaveCount(0)
+  await expect(submitted).toHaveText('["notes.txt"]')
+  await editor.press('Enter')
+  await expect(submitted).toHaveText('["notes.txt","/plan 读一下 README"]')
+})
+
+test('运行中可点 Plan × 或手输退出，均与中止及发送正文独立', async ({ mount }) => {
+  const component = await mount(<MessageInputHarness plan="active" sendDisabled action="abort" />)
+  const editor = component.getByRole('textbox', { name: '消息' })
+  await expect(editor).toHaveAttribute('aria-placeholder', '描述你的任务以生成计划…')
+  await editor.fill('下一条消息')
+  await component.getByRole('button', { name: '退出计划模式' }).click()
+  await expect(editor).toHaveText('下一条消息')
+  await expect(component.getByLabel('已提交原文')).toHaveText('["exit"]')
+  await editor.fill('/plan   off')
+  await editor.press('Enter')
+  await expect(component.getByLabel('已提交原文')).toHaveText('["exit","/plan   off"]')
+  await expect(component.getByLabel('中止次数')).toHaveText('0')
 })

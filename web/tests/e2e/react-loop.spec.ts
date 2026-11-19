@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test, expect } from '@playwright/test'
+import { test, expect } from './chinese-fixture'
 import { addWorkspace, authorize, freeVitePort, observe, saveKey, seedSession, startBackend, startVite, stop } from './test-utils'
 import { startModelServer } from './model-server'
 
@@ -39,7 +39,7 @@ for (const mode of ['node', 'vite'] as const) {
       tools(1, [{ name: 'read', args: { path: 'note.txt' } }, { name: 'read', args: { path: 'status.txt' } }])
       await expect.poll(() => provider.exchanges.length).toBe(3)
       expect(provider.exchanges[2]!.body.messages.slice(-2)).toMatchObject([{ role: 'tool', content: '项目名称：青禾' }, { role: 'tool', content: '状态：测试中' }])
-      expect(provider.exchanges.every(exchange => Array.isArray(exchange.body.tools) && exchange.body.tools.length === 9)).toBe(true)
+      expect(provider.exchanges.every(exchange => Array.isArray(exchange.body.tools) && exchange.body.tools.length === 10)).toBe(true)
       tools(2, [{ name: 'bash', args: { command: 'printf 等待中; echo started >> launches.txt; sleep 30', timeout: 60 } }])
       await expect.poll(async () => readFile(join(temporary, 'launches.txt'), 'utf8').catch(() => '')).toBe('started\n')
       await expect(page.locator('.tool-status').last()).toHaveText('运行中')
@@ -54,7 +54,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(editor).toHaveText('停止后保留的草稿')
       await expect(page.locator('.tool-status')).toHaveText(['成功', '成功', '成功', '已停止'])
       expect(provider.exchanges).toHaveLength(3)
-      await page.getByText('执行过程', { exact: true }).click()
+      await page.locator('.process-group > summary').click()
       await page.locator('.tool-block').last().locator('summary').click()
       await expect(page.locator('.tool-result').last()).toContainText('等待中')
       await page.screenshot({ path: testInfo.outputPath(`${mode}-feature6-stopped.png`), fullPage: true })
