@@ -15,7 +15,7 @@ export type ChatState = {
   connectionNotice?: CopyKey
 }
 export type Subscription = (() => void) & { requestSnapshot?: () => void; setSession: (sessionId: string | null) => void }
-export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void, onPermissionSettingsChanged?: () => void, onExtensionNotice?: (notice: ExtensionNotice, sessionId: string) => void) => Subscription
+export type Subscribe = (onState: (state: ChatState) => void, onModelsChanged?: () => void, onWorkspacesChanged?: () => void, onWebSettingsChanged?: () => void, onSessionsChanged?: () => void, onPermissionSettingsChanged?: () => void, onExtensionNotice?: (notice: ExtensionNotice, sessionId: string) => void, onMcpSettingsChanged?: () => void) => Subscription
 export const initialState: ChatState = { sessionId: null, connection: 'connecting', snapshot: null, slow: false, error: null }
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)

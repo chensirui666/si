@@ -1,0 +1,17 @@
+{
+  "provider": "Notion",
+  "oauth": {
+    "registration": "CIMD",
+    "clientId": "https://si-mcp-identity.vercel.app/oauth/client.json",
+    "redirectUri": "http://127.0.0.1:62872/api/mcp/oauth/callback",
+    "registrationRequests": 0,
+    "tokenStatuses": [
+      200
+    ]
+  },
+  "toolCall": {
+    "title": "一些想法",
+    "callId": "call_00_zlwhmkLdYugxm4U69HCw6645",
+    "pageUrlVerified": true
+  }
+}

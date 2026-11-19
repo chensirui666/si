@@ -75,6 +75,53 @@ it('首发一起提交；任何一条写入失败就回滚会话登记', () => {
   } finally { store.close() }
 })
 
+it('完整 MCP 目录撤下缺失工具，加载记录按会话隔离并可重启恢复', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-store-mcp-'))
+  const path = join(directory, 'sessions.sqlite')
+  const active = { serverId: 'github', credentialRef: 'config', remoteToolName: 'issue_read' }
+  const removed = { ...active, remoteToolName: 'issue_write' }
+  const otherConfig = { ...removed, credentialRef: 'other' }
+  const assistant: ConversationMessage = {
+    id: 'mcp-search',
+    message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+      timestamp: 2, stopReason: 'toolUse', content: [{ type: 'toolCall', name: 'tool_search', id: 'search', arguments: { query: 'issue' } }] },
+  }
+  const result: ConversationMessage = {
+    id: 'mcp-search-result', toolCall: { assistantMessageId: assistant.id, contentIndex: 0 },
+    message: { role: 'toolResult', toolCallId: 'search', toolName: 'tool_search', isError: false, timestamp: 3,
+      content: [{ type: 'text', text: 'Found issue tools' }] },
+  }
+  let store = SessionStore.open(path)
+  try {
+    store.save(summary.id, { summary, run, messages: [user, assistant] })
+    expect(store.listMcpToolLoads(summary.id)).toEqual([])
+    const exec = DatabaseSync.prototype.exec
+    const failCommit = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql) {
+      if (sql === 'COMMIT') throw new Error('synthetic commit rejection')
+      exec.call(this, sql)
+    })
+    try { expect(() => store.save(summary.id, { runId: run.id, messages: [result], mcpToolLoads: [active] })).toThrow(/未保存/) }
+    finally { failCommit.mockRestore() }
+    expect(store.loadSession(summary.id)?.messages).toEqual([user, assistant])
+    expect(store.listMcpToolLoads(summary.id)).toEqual([])
+
+    store.save(summary.id, { runId: run.id, messages: [result], mcpToolLoads: [active, active, removed, otherConfig] })
+    const otherSession = { ...summary, id: 'another' }
+    store.save(otherSession.id, { summary: otherSession })
+    expect(store.listMcpToolLoads(otherSession.id)).toEqual([])
+    store.close()
+    store = SessionStore.open(path)
+    expect(store.listMcpToolLoads(summary.id)).toEqual([active, removed, otherConfig])
+    store.reconcileMcpToolLoads({ serverId: active.serverId, credentialRef: active.credentialRef, remoteToolNames: ['issue_read'] })
+    store.reconcileMcpToolLoads({ serverId: active.serverId, credentialRef: active.credentialRef, remoteToolNames: ['issue_read', 'issue_write'] })
+    expect(store.listMcpToolLoads(summary.id)).toEqual([active, otherConfig])
+    expect(store.loadSession(summary.id)?.messages).toEqual([user, assistant, result])
+  } finally {
+    store.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 it('同一 SQLite 库只由一个连接接管，关闭后可恢复原会话', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-store-'))
   const path = join(directory, 'sessions.sqlite')

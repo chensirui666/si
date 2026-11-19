@@ -204,3 +204,164 @@ test('默认权限保存回执断开后，按重读结果显示已保存的值',
   await expect(permission).toHaveText('只读')
   await expect(dialog.getByRole('alert')).toHaveCount(0)
 })
+
+test('MCP 开关和工具列表随服务端结果更新', async ({ mount, page }) => {
+  const path = '**/api/mcp/servers'
+  let status = 'not_connected'
+  let saved = false
+  const updates: boolean[] = []
+  const server = { id: 'test', name: 'github', url: 'https://example.test/mcp', authMode: 'token', hasCredential: true }
+  const view = () => ({ ...server, enabled: status !== 'disabled', status, tools: status === 'connected' ? [{ name: 'mcp__github__issue_read' }] : [] })
+  await page.route(path, async route => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { servers: saved ? [view()] : [] } })
+    expect(route.request().postDataJSON()).toEqual({ name: server.name, url: server.url, authMode: 'token', token: 'fake-mcp-token' })
+    saved = true
+    return route.abort()
+  })
+  await page.route(path + '/test/enabled', async route => {
+    expect(route.request().method()).toBe('PUT')
+    const { enabled } = route.request().postDataJSON()
+    updates.push(enabled)
+    status = enabled ? 'connected' : 'disabled'
+    await route.fulfill({ json: view() })
+  })
+  await mount(<ChatPageHarness />)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '设置', exact: true })
+  await dialog.getByRole('button', { name: 'MCP', exact: true }).click()
+  await dialog.getByRole('button', { name: '添加服务' }).click()
+  await dialog.getByLabel('服务名称').fill(server.name)
+  await dialog.getByLabel('服务地址').fill(server.url)
+  const token = dialog.getByLabel('访问令牌', { exact: true })
+  await token.fill('fake-mcp-token')
+  await expect(token).toHaveAttribute('type', 'password')
+  await dialog.getByRole('button', { name: '保存', exact: true }).click()
+  const row = dialog.getByRole('article', { name: server.name })
+  const toggle = row.getByRole('switch', { name: '切换 github' })
+  await expect(toggle).not.toBeChecked()
+  await expect(dialog.getByText('服务已保存到本机')).toBeVisible()
+  expect(updates).toEqual([])
+  const more = row.getByRole('button', { name: '更多操作' })
+  await more.click()
+  await expect(page.getByRole('menuitem')).toHaveText(['编辑', '删除'])
+  await page.getByRole('menuitem', { name: '编辑' }).click()
+  await expect(token).toHaveValue('')
+  await row.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(more).toBeFocused()
+  await more.click()
+  await page.getByRole('menuitem', { name: '删除' }).click()
+  const confirm = page.getByRole('dialog', { name: '删除 github？' })
+  await expect(confirm).toBeVisible()
+  await confirm.getByRole('button', { name: '取消' }).click()
+  await expect(confirm).toHaveCount(0)
+  await expect(more).toBeFocused()
+  await toggle.click()
+  await expect(toggle).toBeChecked()
+  await expect(row.getByText('已连接', { exact: true })).toHaveCount(0)
+  const tools = row.getByRole('button', { name: '工具（1）', exact: true })
+  await expect(tools).toHaveAttribute('aria-expanded', 'false')
+  await tools.click()
+  await expect(row.getByText('mcp__github__issue_read')).toBeVisible()
+  await toggle.click()
+  await expect(toggle).not.toBeChecked()
+  await expect(tools).toHaveCount(0)
+  expect(updates).toEqual([true, false])
+})
+
+test('MCP 只从开关发起授权，弹窗被拦截时可以打开授权链接', async ({ mount, page }) => {
+  const path = '**/api/mcp/servers'
+  let status = 'authorization_required'
+  let startRequests = 0
+  let cancelRequests = 0
+  const server = { id: 'oauth-fixture', name: 'notion', url: 'https://example.test/mcp', enabled: true, authMode: 'oauth', hasCredential: false, tools: [] }
+  await page.route(path, route => route.fulfill({ json: { servers: [{
+    ...server, status, ...(status === 'authorizing' && { attemptId: 'attempt-1' }),
+  }] } }))
+  await page.route(path + '/oauth-fixture/enabled', route => {
+    expect(route.request().method()).toBe('PUT')
+    expect(route.request().postDataJSON()).toEqual({ enabled: true })
+    return route.fulfill({ json: { ...server, status: 'connecting' } })
+  })
+  await page.route(path + '/oauth-fixture/oauth', route => {
+    startRequests++
+    if (startRequests === 3) {
+      status = 'connecting'
+      return route.fulfill({ status: 409, json: { error: 'The stored MCP authorization was refreshed. The service is connecting.' } })
+    }
+    status = 'authorizing'
+    return route.fulfill({ json: { attemptId: 'attempt-1', authorizationUrl: 'https://example.test/authorize' } })
+  })
+  await page.route(path + '/oauth-fixture/oauth/attempt-1', route => {
+    expect(route.request().method()).toBe('DELETE')
+    cancelRequests++
+    status = 'authorization_required'
+    return route.fulfill({ status: 204 })
+  })
+  await mount(<ChatPageHarness />)
+  await page.evaluate(() => { window.open = () => null })
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '设置', exact: true })
+  await dialog.getByRole('button', { name: 'MCP', exact: true }).click()
+  const row = dialog.getByRole('article', { name: server.name })
+  const toggle = row.getByRole('switch', { name: '切换 notion' })
+  await expect(toggle).not.toBeChecked()
+  expect(startRequests).toBe(0)
+  await toggle.click()
+  await expect(toggle).not.toBeChecked()
+  const fallback = row.getByRole('link', { name: '打开授权页' })
+  await expect(fallback).toHaveAttribute('href', 'https://example.test/authorize')
+  await expect(fallback).toHaveAttribute('target', '_blank')
+  await expect(fallback).toHaveAttribute('rel', 'noopener noreferrer')
+  await dialog.getByRole('button', { name: '关闭设置' }).click()
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await dialog.getByRole('button', { name: 'MCP', exact: true }).click()
+  await expect(toggle).not.toBeChecked()
+  await expect(fallback).toHaveCount(0)
+  expect(startRequests).toBe(1)
+  await row.getByRole('button', { name: '打开授权页' }).click()
+  await expect(fallback).toHaveAttribute('href', 'https://example.test/authorize')
+  await row.getByRole('button', { name: '取消授权' }).click()
+  await expect(fallback).toHaveCount(0)
+  await expect(toggle).not.toBeChecked()
+  expect(startRequests).toBe(2)
+  expect(cancelRequests).toBe(1)
+
+  await toggle.click()
+  await expect.poll(() => startRequests).toBe(3)
+  await expect(toggle).toHaveAttribute('aria-busy', 'true')
+  await expect(dialog.getByRole('alert')).toHaveCount(0)
+})
+
+
+test('MCP 初次连接保持关闭，恢复连接保持打开，点击都能停用', async ({ mount, page }) => {
+  const path = '**/api/mcp/servers'
+  const servers = ['connecting', 'recovering'].map(status => ({
+    id: status, name: status, url: 'https://example.test/mcp', status,
+    enabled: true, authMode: 'token', hasCredential: true, tools: [],
+  }))
+  const updates: Array<{ id: string; enabled: boolean }> = []
+  await page.route(path, route => route.fulfill({ json: { servers } }))
+  await page.route(path + '/*/enabled', route => {
+    const id = new URL(route.request().url()).pathname.split('/').at(-2)
+    const server = servers.find(server => server.id === id)
+    if (!server) return route.fulfill({ status: 404 })
+    const { enabled } = route.request().postDataJSON()
+    updates.push({ id: server.id, enabled })
+    server.enabled = enabled
+    server.status = 'disabled'
+    return route.fulfill({ json: server })
+  })
+  await mount(<ChatPageHarness />)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '设置', exact: true })
+  await dialog.getByRole('button', { name: 'MCP', exact: true }).click()
+  const connecting = dialog.getByRole('switch', { name: '切换 connecting' })
+  const recovering = dialog.getByRole('switch', { name: '切换 recovering' })
+  await expect(connecting).not.toBeChecked()
+  await expect(recovering).toBeChecked()
+  await connecting.click()
+  await expect.poll(() => updates).toEqual([{ id: 'connecting', enabled: false }])
+  await recovering.click()
+  await expect(recovering).not.toBeChecked()
+  expect(updates).toEqual([{ id: 'connecting', enabled: false }, { id: 'recovering', enabled: false }])
+})

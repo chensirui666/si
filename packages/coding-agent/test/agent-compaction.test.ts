@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
+import { SessionStore } from '../src/session-store.js'
 import type { ExecutableTool } from '@agent-learning/agent'
 import type { ConversationSnapshot } from '../src/types.js'
 import { createTools } from '../src/tools.js'
@@ -53,6 +54,70 @@ async function seed(agent: AgentSession) {
 }
 
 describe('AgentSession compaction', () => {
+  it('压缩与重开会话都保留搜索加载，完整目录确认撤下后需重新搜索', async () => {
+    const folder = await mkdtemp(join(tmpdir(), 'agent-mcp-loads-'))
+    const path = join(folder, 'sessions.sqlite')
+    const summary = { id: 'mcp-session', workspaceId: 'mcp-project', name: '会话', createdAt: new Date().toISOString() }
+    let store = SessionStore.open(path)
+    let agent: AgentSession | undefined
+    const name = 'mcp__github__issue_read'
+    const binding = { name, serverId: 'github', credentialRef: 'config-github', revision: 0, tool: {
+      name: 'issue_read', description: 'Read a GitHub issue', inputSchema: { type: 'object' as const },
+    } }
+    let available = [binding]
+    const contexts: ModelContext[] = []
+    const load = () => createSession({
+      compaction: { triggerTokens: 50_000, keepRecentTokens: 100 },
+      persistence: { store, summary, first: () => ({ ...summary }), history: store.loadSession(summary.id) },
+      mcp: {
+        listToolsForAgent: () => available, isCurrentTool: current => available.some(tool => tool === current),
+        listDiscoveryServers: () => [{ id: 'github', name: 'GitHub' }],
+        subscribeToolCatalog: () => () => {}, waitForToolDiscovery: async () => {},
+        callTool: async () => ({ content: [] }),
+      },
+      stream(_model, context) {
+        contexts.push(structuredClone(context))
+        if (!context.tools) return output(reply('已完成 GitHub 工具搜索的摘要。'))
+        if (context.messages.at(-1)?.content !== input.text || contexts.length !== 1) return output(reply())
+        return output(reply('', { stopReason: 'toolUse', content: [
+          { type: 'toolCall', id: 'load-github', name: 'tool_search', arguments: { query: 'issue_read' } },
+        ] }))
+      },
+    })
+    try {
+      agent = load()
+      await seed(agent)
+      expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+      expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      await agent.submit({ ...input, clientMessageId: 'mcp-compact', text: '/compact' })
+      await idle(agent)
+      expect((await state(agent)).compactions.at(-1)?.status).toBe('success')
+      await agent.close()
+      agent = undefined
+      store.close()
+      store = SessionStore.open(path)
+      available = []
+      agent = load()
+      await agent.submit({ ...input, clientMessageId: 'mcp-await-catalog', text: '目录仍在发现' })
+      await idle(agent)
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search'])
+      expect(JSON.stringify(contexts.at(-1)?.messages)).not.toContain('load-github')
+      available = [binding]
+      await agent.submit({ ...input, clientMessageId: 'mcp-catalog-ready', text: '继续当前 GitHub 任务' })
+      await idle(agent)
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      store.reconcileMcpToolLoads({ serverId: binding.serverId, credentialRef: binding.credentialRef, remoteToolNames: [] })
+      await agent.submit({ ...input, clientMessageId: 'mcp-returned-tool', text: '已退出并重新出现' })
+      await idle(agent)
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    } finally {
+      await agent?.close()
+      store.close()
+      await rm(folder, { recursive: true, force: true })
+    }
+  })
+
   it('manual command has its own receipt, preserves raw history and system/tools, and reuses the summary', async () => {
     const completed = vi.fn()
     const { agent, contexts } = setup(undefined, undefined, [{ path: 'compaction', entry(si) {

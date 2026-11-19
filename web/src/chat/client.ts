@@ -1,11 +1,11 @@
 import type { ModelDiscovery } from '@agent-learning/model'
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import type { WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, McpOAuthStartView, McpServerView, SaveMcpServerRequest, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
 import { applyFrame, messageAttachment, extensionNotice, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
 
-export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged, onExtensionNotice) => {
+export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChanged, onWebSettingsChanged, onSessionsChanged, onPermissionSettingsChanged, onExtensionNotice, onMcpSettingsChanged) => {
   let state: ChatState = initialState
   let stopped = false
   let socket: WebSocket | null = null
@@ -83,6 +83,7 @@ export const subscribe: Subscribe = (onState, onModelsChanged, onWorkspacesChang
         if (frame.type === 'workspaces_changed') { onWorkspacesChanged?.(); return }
         if (frame.type === 'sessions_changed') { onSessionsChanged?.(); return }
         if (frame.type === 'permission_settings_changed') { onPermissionSettingsChanged?.(); return }
+        if (frame.type === 'mcp_settings_changed') { onMcpSettingsChanged?.(); return }
         if (frame.type === 'web_settings_changed') { onWebSettingsChanged?.(); return }
       }
       const result = applyFrame(state, frame, subscriptionId)
@@ -205,10 +206,10 @@ async function requestView<T>(path: string, label: CopyKey, validate: (value: un
   if (response.status === 401) throw new RequestError({ key: 'request.unauthorized' })
   if (response.status === 403) throw new RequestError({ key: 'request.forbidden' })
   let value: unknown
-  try { value = await response.json() } catch { throw new RequestError({ key: 'request.invalid', label }) }
+  try { if (response.status !== 204) value = await response.json() } catch { throw new RequestError({ key: 'request.invalid', label }) }
   if (!response.ok) {
     const detail = record(value) && typeof value.error === 'string' ? value.error : undefined
-    throw new RequestError({ key: 'request.failed', label, detail: apiKey ? detail?.split(apiKey).join('•••') : detail })
+    throw new RequestError({ key: 'request.failed', label, status: response.status, detail: apiKey ? detail?.split(apiKey).join('•••') : detail })
   }
   if (!validate(value)) throw new RequestError({ key: 'request.invalid', label })
   return value
@@ -291,6 +292,54 @@ export const saveWebApiKey = (providerId: string, apiKey: string) =>
   requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, 'request.web', webSettings, putJson({ apiKey }), apiKey)
 export const deleteWebApiKey = (providerId: string) =>
   requestView(`/api/web/providers/${encodeURIComponent(providerId)}`, 'request.web', webSettings, { method: 'DELETE' })
+
+const mcpPath = '/api/mcp/servers'
+const mcpServerPath = (id: string) => `${mcpPath}/${encodeURIComponent(id)}`
+const mcpStatuses = [
+  'not_connected', 'connecting', 'connected', 'connection_failed', 'authorization_required', 'authorizing', 'disconnected', 'recovering', 'disabled',
+] satisfies McpServerView['status'][]
+
+function mcpServer(value: unknown): value is McpServerView {
+  return record(value) && typeof value.id === 'string' && typeof value.name === 'string' && typeof value.url === 'string'
+    && typeof value.enabled === 'boolean' && typeof value.hasCredential === 'boolean'
+    && (value.authMode === 'token' || value.authMode === 'oauth')
+    && (value.clientId === undefined || typeof value.clientId === 'string')
+    && (value.error === undefined || typeof value.error === 'string')
+    && (value.attemptId === undefined || typeof value.attemptId === 'string')
+    && mcpStatuses.some(status => status === value.status)
+    && Array.isArray(value.tools) && value.tools.every(tool => record(tool) && typeof tool.name === 'string'
+      && (tool.description === undefined || typeof tool.description === 'string'))
+}
+
+function mcpOAuthStart(value: unknown): value is McpOAuthStartView {
+  if (!record(value) || typeof value.attemptId !== 'string' || typeof value.authorizationUrl !== 'string') return false
+  try {
+    const url = new URL(value.authorizationUrl)
+    return (url.protocol === 'https:' || url.protocol === 'http:') && !url.username && !url.password
+  } catch { return false }
+}
+
+const requestMcp = <T>(path: string, validate: (value: unknown) => value is T, options?: RequestInit, secret?: string) =>
+  requestView(path, 'settings.mcp', validate, { signal: AbortSignal.timeout(30_000), ...options }, secret)
+
+export const getMcpServers = async () => (await requestMcp(mcpPath, (value): value is { servers: McpServerView[] } =>
+  record(value) && Array.isArray(value.servers) && value.servers.every(mcpServer))).servers
+
+export const saveMcpServer = (input: SaveMcpServerRequest, id?: string) =>
+  requestMcp(id ? mcpServerPath(id) : mcpPath, mcpServer, { ...putJson(input), method: id ? 'PUT' : 'POST' }, input.token ?? input.clientSecret)
+
+export const enableMcpServer = (id: string, enabled: boolean) =>
+  requestMcp(`${mcpServerPath(id)}/enabled`, mcpServer, putJson({ enabled }))
+
+export const deleteMcpServer = (id: string) => requestMcp(mcpServerPath(id),
+  (value): value is { removed: true; error?: string } => record(value) && value.removed === true
+    && (value.error === undefined || typeof value.error === 'string'), { method: 'DELETE' })
+
+export const startMcpOAuth = (id: string) =>
+  requestMcp(`${mcpServerPath(id)}/oauth`, mcpOAuthStart, { method: 'POST' })
+
+export const cancelMcpOAuth = (id: string, attemptId: string) =>
+  requestMcp(`${mcpServerPath(id)}/oauth/${encodeURIComponent(attemptId)}`, (value): value is undefined => value === undefined, { method: 'DELETE' })
 
 export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
   let response: Response

@@ -15,7 +15,7 @@ import { ModelPicker } from '../components/ModelPicker'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
-import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat, createSession } from '../chat/client'
+import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, getMcpServers, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat, createSession } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger } from '../components/ui/sidebar'
@@ -123,6 +123,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const requestVersion = useRef(0)
   const { view: workspaces, error: workspaceError, apply: applyWorkspaces, refresh: refreshWorkspaces, invalidate: invalidateWorkspaces } = useServerView(getWorkspaces, 'chat.workspaceReadFailed')
   const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings, 'chat.webSettingsReadFailed')
+  const { view: mcpServers, error: mcpError, refresh: refreshMcpServers, invalidate: invalidateMcpServers } = useServerView(getMcpServers, 'mcp.readFailed')
   const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions, 'chat.sessionReadFailed')
   const { view: defaultPermission, error: permissionReadError, refresh: refreshPermission, invalidate: invalidatePermission, setView: setDefaultPermissionView } =
     useServerView(getDefaultPermission, 'permission.readFailed')
@@ -162,6 +163,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   }, [saveNotice])
   const [pickError, setPickError] = useState<Notice | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  useEffect(() => { if (settingsOpen) void refreshMcpServers() }, [settingsOpen, refreshMcpServers])
   const settingsButton = useRef<HTMLButtonElement>(null)
   const sidebarButton = useRef<HTMLButtonElement>(null)
   const editor = useRef<HTMLDivElement>(null)
@@ -479,6 +481,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         void refreshModels()
         void refreshWorkspaces()
         void refreshWebSettings()
+        void refreshMcpServers()
         void refreshSessions()
         void refreshPermission()
       }
@@ -504,7 +507,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       updateSubmissions(submissionsRef.current)
       setState(next)
     }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, refreshPermission,
-    (notice, id) => showExtensionNotices(id, [notice]))
+    (notice, id) => showExtensionNotices(id, [notice]), refreshMcpServers)
     subscription.current = stop
     stop.setSession(selected.current)
     return () => {
@@ -512,6 +515,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       invalidateModels()
       invalidateWorkspaces()
       invalidateWebSettings()
+      invalidateMcpServers()
       invalidateSessions()
       invalidatePermission()
       stop()
@@ -519,7 +523,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       for (const timer of timers.current) clearTimeout(timer)
       timers.current.clear()
     }
-  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage, showExtensionNotices, settleSourceDraft])
+  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshMcpServers, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateMcpServers, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage, showExtensionNotices, settleSourceDraft])
 
   useEffect(() => {
     if (!sessions) return
@@ -967,7 +971,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       }} permissionSettings={{ mode: defaultPermission, busy: defaultPermissionBusy,
         readError: permissionReadError, saveError: defaultPermissionError,
         onSelect: changeDefaultPermission, onRetry: () => { setDefaultPermissionError(undefined); void refreshPermission() },
-      }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
+      }} mcpSettings={{ servers: mcpServers, error: mcpError, refresh: refreshMcpServers }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
         if (!mounted.current) return
         applyWebSettings(result)
         void refreshWebSettings()

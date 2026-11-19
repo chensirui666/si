@@ -3,12 +3,13 @@ import type { AddressInfo } from 'node:net'
 import { existsSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { extname, join, resolve, sep } from 'node:path'
+import { dirname, extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
 import {
   AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode, loadExtensions,
   AttachmentInputError, SessionAttachments, ATTACHMENT_TTL_MS, MAX_ATTACHMENT_UPLOAD_BYTES,
+  McpManager, McpSettingsError,
   type AttachmentScope, type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
@@ -19,6 +20,7 @@ import { WebSettings } from '../web-settings.js'
 import { isSettingsObject, readSettingsFile, updateSettingsFile } from '../settings-file.js'
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
+import { finishMcpOAuth, handleMcpSettings, isMcpOAuthCallback, isMcpSettingsPath, mcpClientMetadataDocuments } from './mcp.js'
 import type { ClientFrame, ConversationMessage as BrowserMessage, LanguageSettings, PermissionSettings, SessionPermission, ServerFrame, StartSessionResult, StartSessionRequest, WorkspaceSkills } from './protocol.js'
 
 type SessionTarget = {
@@ -86,6 +88,8 @@ export type WebServerOptions = {
   sessionPath?: string
   webSettingsPath?: string
   globalContextDirectory?: string
+  mcpConfigDirectory?: string
+  mcpClientMetadataBaseUrl?: string
   skillHome?: string
   extensionsDirectory?: string
   directoryPicker?: DirectoryPicker
@@ -182,6 +186,7 @@ export class WebServer {
   private ws?: WebSocketServer
   private heartbeat?: ReturnType<typeof setInterval>
   private origins = new Set<string>()
+  private listenOrigin?: string
   private auth?: BrowserAuth
   private readonly disposers = new Map<WebSocket, () => void>()
   private closing?: Promise<void>
@@ -193,6 +198,8 @@ export class WebServer {
   private readonly webSettings: WebSettings
   private selection?: AbortController
   private stopWatching?: () => void
+  private mcp?: McpManager
+  private stopWatchingMcp?: () => void
 
   constructor(private readonly options: WebServerOptions = {}) {
     this.credentials = new Credentials(options.modelAuthPath)
@@ -211,6 +218,7 @@ export class WebServer {
       getDefaultPermissionMode: () => this.readDefaultPermissionMode(),
       createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode, sessionId) => new AgentSession({
         resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd), compaction: this.options.compaction,
+        mcp: this.mcp,
         titleStream: stream, onTitleChanged: () => this.notify('sessions_changed'), attachments: this.attachments,
         referenceDirectory: resolve(this.sessionPath + '.files', 'references'),
         isWorkspaceRegistered: id => this.workspaces.isRegistered(id),
@@ -266,6 +274,15 @@ export class WebServer {
         server.listen(this.options.port ?? 3000, '127.0.0.1', () => { server.off('error', onError); done() })
       })
       const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+      const { mcpConfigDirectory, modelAuthPath } = this.options
+      const configDirectory = mcpConfigDirectory ?? (modelAuthPath ? dirname(resolve(modelAuthPath)) : join(homedir(), '.agent-learning'))
+      const mcp = this.mcp = new McpManager(configDirectory, mcpClientMetadataDocuments(this.options.mcpClientMetadataBaseUrl))
+      const stopChanges = mcp.subscribe(() => this.notify('mcp_settings_changed'))
+      const stopCatalog = mcp.subscribeToolCatalog(catalog => this.store?.reconcileMcpToolLoads(catalog))
+      this.stopWatchingMcp = () => { stopCatalog(); stopChanges() }
+      await mcp.start()
+      if (this.server !== server) throw new Error('服务启动已取消')
+      this.listenOrigin = url
       this.origins = new Set([url])
       if (this.options.devOrigin) this.origins.add(this.options.devOrigin)
       this.stopWatching = this.credentials.watch(() => {
@@ -283,7 +300,7 @@ export class WebServer {
       this.heartbeat.unref()
       return { url, authUrl: this.auth.authenticatedUrl(url), ...(this.options.devOrigin ? { devAuthUrl: this.auth.authenticatedUrl(this.options.devOrigin + '/auth') } : {}) }
     } catch (error) {
-      await this.close()
+      if (this.server === server) await this.close()
       throw new Error('服务启动失败：请检查端口是否被占用', { cause: error })
     }
   }
@@ -296,8 +313,15 @@ export class WebServer {
     res.end(text)
   }
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const target = req.url ?? '/'
+    if (req.method === 'GET' && isMcpOAuthCallback(target.split('?', 1)[0])) {
+      if (!this.listenOrigin || this.listenOrigin !== `http://${req.headers.host}`) { this.respond(res, 403, '访问地址不可信'); return }
+      const ok = !!this.mcp && !this.closing && await finishMcpOAuth(this.mcp, new URL(target, this.listenOrigin))
+      this.respond(res, ok ? 200 : 400, ok ? 'MCP 授权成功。请返回设置查看连接状态。' : 'MCP 授权未完成。请返回设置重试。')
+      return
+    }
     if (!trustedRequest(req.headers, this.origins)) { this.respond(res, 403, '访问地址或来源不可信'); return }
-    const url = new URL(req.url ?? '/', 'http://local.invalid')
+    const url = new URL(target, 'http://local.invalid')
     const tokens = url.searchParams.getAll('token')
     if (url.pathname === '/' && req.method === 'GET' && tokens.length) {
       if (tokens.length === 1 && this.auth!.matchesToken(tokens[0]!)) {
@@ -308,6 +332,17 @@ export class WebServer {
     }
     if (this.admit(req) !== 200) { this.respond(res, 401, '需要网页授权，请重新打开终端中的启动链接。'); return }
     if (this.closing) { this.json(res, 503, { error: '服务正在关闭' }); return }
+    if (this.mcp && this.listenOrigin && isMcpSettingsPath(url.pathname)) {
+      try {
+        const result = await handleMcpSettings(this.mcp, this.listenOrigin, url.pathname, req.method, () => readJson(req))
+        if (result.status === 204) this.respond(res, 204, '')
+        else this.json(res, result.status, result.body)
+      } catch (error) {
+        if (error instanceof McpSettingsError) this.json(res, error.statusCode, { error: error.message })
+        else this.sessionError(res, error, '无法读取或更新 MCP 设置，请检查本机配置后重试。')
+      }
+      return
+    }
     if (url.pathname === '/api/models' && req.method === 'GET') {
       try { this.json(res, 200, await this.modelDiscovery()) }
       catch (error) { this.sessionError(res, error, '无法读取模型选择') }
@@ -788,6 +823,9 @@ export class WebServer {
       this.selection?.abort()
       this.stopWatching?.()
       this.stopWatching = undefined
+      this.stopWatchingMcp?.()
+      this.stopWatchingMcp = undefined
+      this.listenOrigin = undefined
       for (const cleanup of this.disposers.values()) cleanup()
       for (const client of this.ws?.clients ?? []) client.terminate()
       this.missedPongs.clear()
@@ -795,7 +833,13 @@ export class WebServer {
       const ws = this.ws
       this.server = undefined
       this.ws = undefined
-      try { await this.sessions?.close() }
+      const mcp = this.mcp
+      this.mcp = undefined
+      try {
+        const results = await Promise.allSettled([this.sessions?.close(), mcp?.close()])
+        const failure = results.find(result => result.status === 'rejected')
+        if (failure) throw failure.reason
+      }
       finally {
         this.store?.close()
         this.store = undefined

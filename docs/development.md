@@ -87,3 +87,16 @@ MODEL_LIVE_KEY_FILE=/absolute/path/to/test.env npm --prefix packages/server run 
 ```
 
 入口、档位和完成状态见[里程碑 2 Feature 1 验收记录](../planning/里程碑2/feature1/feature1-多模型供应商与模型切换验收记录.md)。
+
+## MCP 公开客户端身份
+
+`deploy/mcp-client-identity/` 是独立的公开 HTTPS 服务。部署时只需 `api/oauth.mjs` 和 `vercel.json`。Vercel 项目需提供 `VERCEL_PROJECT_PRODUCTION_URL`，并允许外部授权服务器直接读取生产地址。部署后分别检查 `/oauth/client.json` 与 `/oauth/AaBbCcDdEeFf/client.json` 返回 JSON，且 `client_id` 与实际请求地址一致。
+
+SI 默认使用 [生产身份文件](https://si-mcp-identity.vercel.app/oauth/client.json)。自有部署可用 `AGENT_LEARNING_MCP_CLIENT_METADATA_BASE_URL` 指向身份文件所在的 HTTPS 目录。已有客户端登记继续用原回调。新连接使用公开身份时，文件声明回环地址的路径，由 SI 加上实际监听端口。换生产域名会改变客户端身份，使用旧地址授权的服务需要重新授权。
+
+```sh
+node --test deploy/mcp-client-identity/oauth.test.mjs
+npm --prefix web run test:e2e -- mcp.spec.ts
+```
+
+复跑 Notion 真实验收时，在 `web/tests/e2e/mcp.live.spec.ts` 的用例 30 所需变量之外设置 `MCP_CLIENT_METADATA_BASE_URL`。用例会核对浏览器实际使用该文件的 URL，并确认零次自动登记、成功换取令牌以及页面工具返回真实结果。

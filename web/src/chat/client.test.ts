@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { abortMessage, deleteApiKey, getModels, saveApiKey, subscribe } from './client'
+import { abortMessage, deleteApiKey, getMcpServers, getModels, saveApiKey, subscribe } from './client'
 import type { ChatState, Subscription } from './state'
 
 class Socket extends EventTarget {
@@ -33,6 +33,15 @@ it.each([
   vi.stubGlobal('fetch', async () => Response.json(body, { status }))
   await expect(abortMessage({ sessionId, runId: 'user-1' })).rejects.toThrow()
 })
+it('accepts the recovering MCP view with its enabled flag and retained tools', async () => {
+  const server = {
+    id: 'provider', name: 'Provider', url: 'https://example.test/mcp', enabled: true,
+    authMode: 'token', hasCredential: true, status: 'recovering', tools: [{ name: 'mcp__provider__lookup' }],
+  }
+  vi.stubGlobal('fetch', async () => Response.json({ servers: [server] }))
+  await expect(getMcpServers()).resolves.toEqual([server])
+})
+
 let online = true
 let states: ChatState[]
 let stop: Subscription | undefined

@@ -11,6 +11,7 @@ if (!/^\d+$/.test(portText) || !Number.isInteger(port) || port < 1 || port > 655
     browserSecretPath: process.env.AGENT_LEARNING_BROWSER_AUTH_FILE,
     modelAuthPath: process.env.AGENT_LEARNING_MODEL_AUTH_FILE,
     sessionPath: process.env.AGENT_LEARNING_SESSION_FILE,
+    mcpClientMetadataBaseUrl: process.env.AGENT_LEARNING_MCP_CLIENT_METADATA_BASE_URL ?? 'https://si-mcp-identity.vercel.app/oauth',
     ...(process.argv.includes('--dev') ? { devOrigin: 'http://127.0.0.1:5173' as const } : {}),
   })
   try {

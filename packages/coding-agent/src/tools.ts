@@ -75,7 +75,7 @@ const declarations = {
   web_fetch: { name: 'web_fetch', description: '获取指定网页的正文。', parameters: webFetchParameters },
 } satisfies Record<string, Tool>
 
-export type CodingTool = ExecutableTool & { promptSnippet?: string; planVersion?: CodingTool }
+export type CodingTool = ExecutableTool & { promptSnippet?: string; planVersion?: CodingTool; preserveFailure?: true }
 
 const promptSnippets: Record<string, string> = {
   bash: '在当前工作目录执行 Bash 命令。',

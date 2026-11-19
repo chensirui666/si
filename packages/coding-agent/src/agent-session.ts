@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { Agent } from '@agent-learning/agent'
 import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
 import { IMAGE_BUDGET_BYTES, estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
-import type { AssistantMessage, ModelContext, ModelDiscovery, ModelEvent, ModelInfo, ModelSelection, ModelStreamOptions, ReasoningEffort } from '@agent-learning/model'
+import type { AssistantMessage, JsonObject, ModelContext, ModelDiscovery, ModelEvent, ModelInfo, ModelSelection, ModelStreamOptions, ReasoningEffort } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
 import { SessionWriteError, runSelection, submissionReceipt, type SessionPersistence, type StoredRun } from './session-store.js'
@@ -18,10 +18,14 @@ import { access } from 'node:fs/promises'
 import { ATTACHMENT_TTL_MS, type AttachmentScope, type SessionAttachments } from './session-attachments.js'
 import { ReferenceInputError, prepareSessionReferences, removeReferenceSnapshots } from './session-references.js'
 import { generateSessionTitle, temporarySessionTitle } from './session-title.js'
+import type { McpToolIdentity } from './mcp/manager.js'
+import { createMcpToolSearch, isMcpToolSearchDetails, MCP_TOOL_SEARCH_NAME } from './mcp/tool-search.js'
+import { createMcpTools, mcpToolIdentity, mcpToolKey, type McpToolSource } from './mcp/tools.js'
 import { sameSubmissionSources, type SubmissionInput } from './types.js'
 import type { CompactionRecord, ExtensionNotice, SubmissionAccepted, SubmissionHandled, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, PlanState, RunRecord, RunningState, SaveFailure } from './types.js'
 
 type SubmissionResult = SubmissionAccepted | SubmissionHandled
+type AvailableTools = { local: CodingTool[]; remote?: CodingTool[]; servers?: ReturnType<McpToolSource['listDiscoveryServers']> }
 
 const readOnlyTools = new Set(['read', 'grep', 'find', 'ls'])
 
@@ -64,6 +68,8 @@ export class AgentSession {
   private gateSample?: typeof this.sample
   private readonly storedRuns = new Map<string, StoredRun>()
   private readonly savedMessages = new Set<string>()
+  private readonly loadedMcpTools = new Map<string, McpToolIdentity>()
+  private readonly unsubscribeMcpCatalog?: () => void
   private failure?: SaveFailure
   private permissionUnconfirmed = false
 
@@ -80,6 +86,7 @@ export class AgentSession {
     referenceDirectory?: string
     isWorkspaceRegistered?: (id: string) => Promise<boolean>
     tools?: (cwd: string) => CodingTool[]
+    mcp?: McpToolSource
     documentationRoot?: string
     skillHome?: string
     globalContextDirectory?: string
@@ -116,6 +123,14 @@ export class AgentSession {
       || budget.keepRecentTokens <= 0 || budget.triggerTokens <= budget.keepRecentTokens)) {
       throw new Error('压缩预算必须为正整数，近期预算必须小于触发预算')
     }
+    if (!options.persistence) this.unsubscribeMcpCatalog = options.mcp?.subscribeToolCatalog(({ serverId, credentialRef, remoteToolNames }) => {
+      const available = new Set(remoteToolNames)
+      for (const [key, tool] of this.loadedMcpTools) {
+        if (tool.serverId === serverId && (tool.credentialRef !== credentialRef || !available.has(tool.remoteToolName))) {
+          this.loadedMcpTools.delete(key)
+        }
+      }
+    })
   }
 
   private extensionContext(cwd: string, model?: ModelInfo, signal?: AbortSignal, notices?: ExtensionNotice[]): ExtensionContext {
@@ -146,7 +161,9 @@ export class AgentSession {
       const selected = model ?? (selection && findModel(selection.modelId, selection.provider))
       if (selected && selection && !model) selected.defaultReasoningEffort = selection.reasoningEffort
       const ctx = this.extensionContext(path, selected, signal)
-      await this.runtime!.initialize(ctx, [...defaultTools, ...this.options.tools?.(path) ?? []].map(tool => tool.name))
+      const reserved = [...defaultTools, ...this.options.tools?.(path) ?? []].map(tool => tool.name)
+      if (this.options.mcp) reserved.push(MCP_TOOL_SEARCH_NAME)
+      await this.runtime!.initialize(ctx, reserved)
       await this.runtime!.emit('session_start', { reason: this.options.persistence?.history ? 'resume' : 'new' }, ctx)
     }).catch(error => {
       this.initialization = undefined
@@ -199,18 +216,51 @@ export class AgentSession {
     this.publish({ type: 'permission', permissionMode })
   }
 
-  private availableTools(tools: CodingTool[], planning = Boolean(this.state.plan)): CodingTool[] {
-    if (this.state.permissionMode !== 'normal') return tools.filter(tool => readOnlyTools.has(tool.name))
-    if (!planning) return tools
-    return tools.flatMap(tool => planReadTools.has(tool.name) ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : [])
+  private availableTools(tools: CodingTool[], planning: boolean): AvailableTools {
+    const local = [...tools, ...this.runtime?.tools() ?? []]
+    if (this.state.permissionMode !== 'normal') return { local: local.filter(tool => readOnlyTools.has(tool.name)) }
+    if (planning) return { local: local.flatMap(tool => planReadTools.has(tool.name) ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : []) }
+    const mcp = this.options.mcp
+    const servers = mcp?.listDiscoveryServers()
+    if (!mcp || !servers?.length || local.some(tool => tool.name === MCP_TOOL_SEARCH_NAME)) return { local }
+
+    const saved = this.options.persistence?.store.listMcpToolLoads(this.sessionId)
+    const loaded = saved ? new Set(saved.map(mcpToolKey)) : this.loadedMcpTools
+    const bindings = loaded.size ? mcp.listToolsForAgent().filter(binding => loaded.has(mcpToolKey(mcpToolIdentity(binding)))) : []
+    const checkPermission = (name: string, args: JsonObject) => {
+      const denial = this.toolDenial(name, args, Boolean(this.state.plan), false)
+      if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
+    }
+    const remote = createMcpTools(local, bindings, mcp, checkPermission)
+    const declared = new Set([...local, ...remote].map(tool => tool.name))
+    const search = createMcpToolSearch(async signal => {
+      await mcp.waitForToolDiscovery(signal)
+      checkPermission(MCP_TOOL_SEARCH_NAME, {})
+      const namespaces = new Map(mcp.listDiscoveryServers().map(server => [server.id, server]))
+      return mcp.listToolsForAgent().filter(binding => !declared.has(binding.name))
+        .map(binding => ({ binding, namespace: namespaces.get(binding.serverId) }))
+    })
+    return { local: [...local, search], remote, servers }
   }
 
-  private configure(cwd: string, tools: CodingTool[], files: ProjectContextFile[], skills: readonly SkillSummary[]) {
+  private toolDenial(name: string, args: JsonObject, planning: boolean, planBash: boolean) {
+    if (this.permissionUnconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
+    if (this.state.permissionMode === 'read-only' && !readOnlyTools.has(name)) {
+      return { code: 'permission_denied', message: '只读模式下未执行此工具。' }
+    }
+    if (planning && !planReadTools.has(name) && (name !== 'bash' || !planBash || !planGitArgs(args.command))) {
+      return { code: 'permission_denied', message: '计划模式仅允许只读调查工具及获准的 Git 命令。' }
+    }
+  }
+
+  private configure(cwd: string, { local, remote, servers }: AvailableTools, files: ProjectContextFile[], skills: readonly SkillSummary[]) {
+    const tools = remote ? [...local, ...remote] : local
     const declarations = tools.map(({ name, description, parameters }) => ({ name, description, parameters }))
     this.configuration = {
-      systemPrompt: buildSystemPrompt(cwd, tools, this.options.documentationRoot, files, skills, this.options.skillHome),
+      systemPrompt: buildSystemPrompt(cwd, local, this.options.documentationRoot, files, skills, this.options.skillHome, servers),
       ...(declarations.length ? { tools: declarations } : {}),
     }
+    return tools
   }
 
   private changePlan(plan: PlanState | null, planCommand?: SubmissionInput) {
@@ -357,7 +407,7 @@ export class AgentSession {
       }
     }
     this.checkPreparing(signal)
-    this.configure(cwd, this.availableTools([...tools, ...this.runtime?.tools() ?? []], !approvedPlanId && (planArgument !== undefined || Boolean(this.state.plan))), files, skills)
+    this.configure(cwd, this.availableTools(tools, !approvedPlanId && (planArgument !== undefined || Boolean(this.state.plan))), files, skills)
     if (manual) {
       this.checkModelSelection(input, selection, directory)
       const record = this.newCompaction('manual', input.clientMessageId)
@@ -818,8 +868,7 @@ export class AgentSession {
     const configure = (files: ProjectContextFile[]) => {
       if (roundPlanning && !this.state.plan) leftPlan = true
       roundPlanning = Boolean(this.state.plan)
-      roundTools = this.availableTools([...tools, ...runtime?.tools() ?? []], roundPlanning)
-      this.configure(cwd, roundTools, files, skills)
+      roundTools = this.configure(cwd, this.availableTools(tools, roundPlanning), files, skills)
       if (systemPrompt !== undefined) this.configuration.systemPrompt = systemPrompt
       if (roundPlanning) this.configuration.systemPrompt += '\n\n' + planInstruction
       else if (leftPlan) this.configuration.systemPrompt += '\n\n用户已退出计划模式，当前采用普通模式。退出模式本身不表示用户已批准方案。'
@@ -881,16 +930,8 @@ export class AgentSession {
       return context
     }
 
-    const beforeToolCall: AgentRunInput['beforeToolCall'] = call => {
-      if (this.permissionUnconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
-      if (this.state.permissionMode === 'read-only' && !readOnlyTools.has(call.name)) {
-        return { code: 'permission_denied', message: '只读模式下未执行此工具。' }
-      }
-      if (roundPlanning && !planReadTools.has(call.name)
-        && (call.name !== 'bash' || !roundTools.some(tool => tool.name === 'bash') || !planGitArgs(call.arguments.command))) {
-        return { code: 'permission_denied', message: '计划模式仅允许只读调查工具及获准的 Git 命令。' }
-      }
-    }
+    const beforeToolCall: AgentRunInput['beforeToolCall'] = call =>
+      this.toolDenial(call.name, call.arguments, roundPlanning, call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
 
     let preview: Pick<ConversationSnapshot, 'messages' | 'activeContent'> | undefined
     const agent = new Agent({ stream: withModelRetry(this.options.stream ?? stream, retry => {
@@ -957,6 +998,9 @@ export class AgentSession {
       }
 
       activeTools = activeTools.filter(item => item.contentIndex !== event.contentIndex)
+      if (!this.options.persistence) {
+        for (const tool of this.mcpSearchLoads(event, signal) ?? []) this.loadedMcpTools.set(mcpToolKey(tool), tool)
+      }
       const assistantIndex = this.state.messages.findIndex(entry => entry.id === messageId)
       const preceding = this.state.messages.filter(entry => entry.toolCall?.assistantMessageId === messageId && entry.toolCall.contentIndex < event.contentIndex).length
       this.updateTask(currentTask(), savedToolResult ?? this.toolResult(messageId, event), assistantIndex + 1 + preceding)
@@ -975,7 +1019,7 @@ export class AgentSession {
         catch (error) { this.noteFailure(error, 'tool-call'); throw error }
       } else {
         const result = this.toolResult(messageId, checkpoint)
-        try { this.save({ messages: [result] }) }
+        try { this.save({ messages: [result], mcpToolLoads: this.mcpSearchLoads(checkpoint, signal) }) }
         catch (error) { this.noteFailure(error, 'tool-result', checkpoint.executed ? result.toolCall : undefined); throw error }
         savedToolResult = result
       }
@@ -987,7 +1031,7 @@ export class AgentSession {
         ...(runtime && {
           observe: <K extends keyof ExtensionEvents>(type: K, event: ExtensionEvents[K]) =>
             runtime.has(type) ? runtime.emit(type, event, ctx(), runId) : undefined,
-          ...toolHooks(runtime, ctx, runId),
+          ...toolHooks(runtime, ctx, runId, call => roundTools.some(tool => tool.name === call.name && tool.preserveFailure)),
         }),
       }
       const nextInput = () => ({ ...options, context: this.context(), streamOptions: () => ({
@@ -1098,6 +1142,14 @@ export class AgentSession {
       ...(event.result.isError && (event.errorCode === 'interrupted' || event.errorCode === 'permission_denied' || event.errorCode === 'hook_blocked') && { toolErrorCode: event.errorCode }),
       ...(fileOperation && { fileOperation }),
     }
+  }
+
+  private mcpSearchLoads(event: Extract<AgentEvent, { type: 'tool_result' }>, signal: AbortSignal): McpToolIdentity[] | undefined {
+    const mcp = this.options.mcp
+    if (!mcp || signal.aborted || event.result.isError || event.result.toolName !== MCP_TOOL_SEARCH_NAME
+      || this.toolDenial(MCP_TOOL_SEARCH_NAME, {}, Boolean(this.state.plan), false)) return
+    const details = event.details.find(isMcpToolSearchDetails)
+    return details?.bindings.filter(binding => mcp.isCurrentTool(binding)).map(mcpToolIdentity)
   }
 
   private fail(model: ModelInfo, messageId: string, errorMessage: string, aborted = false, kind?: NonNullable<AssistantMessage['failure']>['kind']) {
@@ -1226,6 +1278,7 @@ export class AgentSession {
   close(): Promise<void> {
     if (this.closing) return this.closing
     this.closed = true
+    this.unsubscribeMcpCatalog?.()
     this.initializing?.abort()
     this.preparing?.abort()
     this.titleRequest?.controller.abort()

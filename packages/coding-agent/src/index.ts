@@ -31,3 +31,5 @@ export { discoverSkills, type SkillSummary, type SkillInvocation, type SkillSour
 
 export { loadExtensions } from './extensions/loader.js'
 export type { ExtensionAPI, ExtensionContext, ExtensionEntry, ExtensionEvents, ExtensionMessage, ExtensionMessageEntry } from './extensions/runtime.js'
+export { McpManager, type McpOAuthStartView, type McpServerView } from './mcp/manager.js'
+export { McpSettingsError } from './mcp/settings.js'

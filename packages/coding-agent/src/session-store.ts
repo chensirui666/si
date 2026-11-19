@@ -5,6 +5,7 @@ import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import type { SessionSummary } from './sessions.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
 import { extensionMessage, isJson, object } from './extensions/runtime.js'
+import type { McpToolCatalog, McpToolIdentity } from './mcp/manager.js'
 import { planCommandArgument } from './plan-mode.js'
 import { skillCommand } from './skills.js'
 import type { AttachmentScope, MessageAttachment, StagedAttachment } from './session-attachments.js'
@@ -39,6 +40,7 @@ type SessionWrite = {
   run?: StoredRun
   runId?: string
   messages?: ConversationMessage[]
+  mcpToolLoads?: readonly McpToolIdentity[]
   compaction?: CompactionRecord
   modelSelection?: ModelSelection
   permissionMode?: PermissionMode
@@ -88,6 +90,12 @@ const schema = `
     seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL,
     id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
     UNIQUE(session_id, id), FOREIGN KEY(session_id, run_id) REFERENCES runs(session_id, id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS session_mcp_tool_loads (
+    session_id TEXT NOT NULL, server_id TEXT NOT NULL, credential_ref TEXT NOT NULL, remote_tool_name TEXT NOT NULL,
+    result_message_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, server_id, credential_ref, remote_tool_name),
+    FOREIGN KEY (session_id, result_message_id) REFERENCES messages(session_id, id)
   ) STRICT;
   CREATE TABLE IF NOT EXISTS compactions (
     seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL,
@@ -179,7 +187,7 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand }: SessionWrite) {
+  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand }: SessionWrite) {
     if (this.uncertain) throw new SessionWriteError('unconfirmed')
     let committing = false
     try {
@@ -207,6 +215,15 @@ export class SessionStore {
       if (messages?.length) {
         const insert = this.db.prepare('INSERT INTO messages (session_id, run_id, id, data) VALUES (?, ?, ?, ?)')
         for (const message of messages) insert.run(sessionId, runId!, message.id, JSON.stringify(storedMessage(message)))
+      }
+      if (mcpToolLoads?.length) {
+        const [entry] = messages ?? []
+        if (messages?.length !== 1 || entry?.message.role !== 'toolResult' ||
+          entry.message.toolName !== 'tool_search' || entry.message.isError) throw new Error('Invalid MCP search checkpoint')
+        const load = this.db.prepare(`INSERT INTO session_mcp_tool_loads
+          (session_id, server_id, credential_ref, remote_tool_name, result_message_id) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(session_id, server_id, credential_ref, remote_tool_name) DO NOTHING`)
+        for (const tool of mcpToolLoads) load.run(sessionId, tool.serverId, tool.credentialRef, tool.remoteToolName, entry.id)
       }
       if (attachments) {
         const [condition, values] = scopeWhere(attachments.scope)
@@ -311,6 +328,27 @@ export class SessionStore {
       if (this.uncertain) throw new Error('Commit state unknown')
       return this.db.prepare('SELECT * FROM sessions ORDER BY rowid').all().map(summaryFrom)
     } catch (error) { throw new SessionReadError('无法读取会话列表，请重试', { cause: error }) }
+  }
+
+  listMcpToolLoads(sessionId: string): McpToolIdentity[] {
+    try {
+      if (this.uncertain) throw new Error('Commit state unknown')
+      return this.db.prepare(`SELECT server_id, credential_ref, remote_tool_name FROM session_mcp_tool_loads
+        WHERE session_id = ? ORDER BY rowid`).all(sessionId).map(row => ({
+        serverId: String(row.server_id), credentialRef: String(row.credential_ref), remoteToolName: String(row.remote_tool_name),
+      }))
+    } catch (error) { throw new SessionReadError('无法读取会话的 MCP 工具，请重试', { cause: error }) }
+  }
+
+  reconcileMcpToolLoads({ serverId, credentialRef, remoteToolNames }: McpToolCatalog): void {
+    if (this.uncertain) throw new SessionWriteError('unconfirmed')
+    try {
+      this.db.prepare(`DELETE FROM session_mcp_tool_loads
+        WHERE server_id = ? AND credential_ref = ? AND remote_tool_name NOT IN (SELECT value FROM json_each(?))`)
+        .run(serverId, credentialRef, JSON.stringify(remoteToolNames))
+    } catch (error) {
+      throw new SessionWriteError(sqliteCode(error) === 13 ? 'storage-full' : 'write-failed', error)
+    }
   }
 
   loadSession(id: string): SessionHistory | undefined {

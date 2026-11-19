@@ -1,0 +1,22 @@
+{
+  "entry": "Chrome browser / production WebServer",
+  "model": "DeepSeek Flash",
+  "case-28-github-connected": {
+    "endpoint": "https://api.githubcopilot.com/mcp/x/issues/readonly",
+    "state": "connected",
+    "toolNames": [
+      "mcp__github__get_label",
+      "mcp__github__issue_read",
+      "mcp__github__list_issue_fields",
+      "mcp__github__list_issue_types",
+      "mcp__github__list_issues",
+      "mcp__github__search_issues"
+    ]
+  },
+  "case-29-github-issue": {
+    "title": "Port CLI Server",
+    "state": "closed",
+    "url": "https://github.com/github/github-mcp-server/issues/1",
+    "callId": "call_00_N9xsr3OtjIGRSStvt2BT7051"
+  }
+}

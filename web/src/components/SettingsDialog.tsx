@@ -1,5 +1,5 @@
 import { useRef, useState, type ComponentProps, type FormEvent } from 'react'
-import { GlobeIcon, LayersIcon, PlusIcon, SettingsIcon, SlidersHorizontalIcon } from 'lucide-react'
+import { GlobeIcon, LayersIcon, PlusIcon, PlugIcon, SettingsIcon, SlidersHorizontalIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { ModelDiscovery } from '@agent-learning/model'
 import type { PermissionMode, WebSettingsView } from '@agent-learning/server/protocol'
@@ -9,6 +9,7 @@ import type { CopyKey } from '../i18n/en'
 import { errorNotice, NoticeText, type Notice } from '../i18n/messages'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
+import { McpSettings, type McpSettingsProps } from './McpSettings'
 import { PermissionPicker } from './PermissionPicker'
 import { Input } from './ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select'
@@ -33,6 +34,7 @@ type Props = {
     onSelect(mode: PermissionMode): void
     onRetry(): void
   }
+  mcpSettings?: McpSettingsProps
   webSettings?: WebSettingsView | null
   webSettingsError?: Notice | null
   onWebSettingsChange?: (settings: WebSettingsView) => void
@@ -42,6 +44,7 @@ const sections = [
   { id: 'general', Icon: SlidersHorizontalIcon },
   { id: 'models', Icon: LayersIcon },
   { id: 'web', Icon: GlobeIcon },
+  { id: 'mcp', Icon: PlugIcon },
 ] as const
 type Section = typeof sections[number]['id']
 type Editor = { kind: 'add'; providerId?: string } | { kind: 'edit'; providerId: string }
@@ -55,7 +58,7 @@ export function SettingsButton(props: ComponentProps<typeof Button>) {
   </Button>
 }
 
-export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, permissionSettings, webSettings, webSettingsError, onWebSettingsChange }: Props) {
+export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, permissionSettings, mcpSettings, webSettings, webSettingsError, onWebSettingsChange }: Props) {
   const { t } = useTranslation()
   const { language, status: languageStatus, detail: languageDetail } = useLanguage()
   const languageBusy = languageStatus === 'loading' || languageStatus === 'saving'
@@ -268,7 +271,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
               <Button variant="ghost" onClick={permissionSettings.onRetry}>{t('common.retry')}</Button>
             </>}
           </>}
-        </> : section === 'web' ? <>
+        </> : section === 'mcp' ? mcpSettings && <McpSettings {...mcpSettings} /> : section === 'web' ? <>
           {webSettingsError && <p className="configuration-error" role="alert"><NoticeText notice={webSettingsError} /></p>}
           {!webSettings && !webSettingsError && <p className="settings-help">{t('settings.webLoading')}</p>}
           {webSettings && <>

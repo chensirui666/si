@@ -287,6 +287,13 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .provider-row { min-width: 0; padding: 12px 14px; border: .5px solid var(--border); border-radius: 20px; }
 .provider-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 500; }
 .provider-row-heading > span { min-width: 0; overflow-wrap: anywhere; }
+.mcp-server { padding: 10px 12px; border-radius: 14px; }
+.mcp-server-details { display: flex; justify-content: space-between; align-items: flex-end; gap: 8px; }
+.mcp-server-summary { min-width: 0; overflow-wrap: anywhere; }
+.mcp-tools { margin-top: 4px; }
+.mcp-tools button { margin-inline-start: -6px; }
+.mcp-tools ul { margin: 2px 0 0; padding-inline-start: 16px; list-style: disc; font: var(--type-support); }
+.mcp-authorization { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; }
 .provider-status { display: inline-block; width: 8px; height: 8px; margin-inline-start: 4px; border-radius: 50%; background: var(--muted-text); forced-color-adjust: none; }
 .provider-status[data-status="configured"] { background: var(--success); }
 .provider-status[data-status="error"] { background: var(--error); }
@@ -326,7 +333,7 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
   .settings-title { padding-inline-start: 16px; }
   .settings-dialog .dialog-close { right: 16px; }
   .settings-nav { flex-direction: row; overflow: auto hidden; padding: 12px 16px 14px; scrollbar-width: none; }
-  .settings-nav button { flex: 1 0 auto; justify-content: center; min-width: 108px; }
+  .settings-nav button { flex: 1 0 auto; justify-content: center; padding-inline: 8px; }
   .settings-content { grid-area: 3 / 1; padding-inline: 16px; }
 }
 @media (max-width: 600px) {
@@ -338,7 +345,10 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
   .sidebar-new-session, .workspace-conversation, .settings-trigger, .select-trigger { min-height: 44px; }
   .settings-nav button, .settings-dialog .select-trigger { min-height: 44px; }
   .settings-dialog .dialog-close { width: 44px; height: 44px; top: 12px; right: 8px; }
-  .provider-row-actions button, .provider-delete-dialog button { min-height: 44px; min-width: 44px; }
+  .provider-row-actions button, .provider-delete-dialog button, .mcp-server-details [data-slot="button"] { min-height: 44px; min-width: 44px; }
+  .mcp-server .provider-row-heading { min-height: 44px; }
+  .mcp-server [data-slot="switch"] { position: relative; }
+  .mcp-server [data-slot="switch"]::before { content: ""; position: absolute; inset: -12px -4px; }
 }
 @media (max-height: 500px) {
   .chat-page .message-editor { max-height: clamp(24px, calc(100dvh - 228px), 200px); }

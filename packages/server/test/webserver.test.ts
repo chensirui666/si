@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { request } from 'node:http'
 import { DatabaseSync } from 'node:sqlite'
@@ -11,7 +11,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { Type } from 'typebox'
 import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
-import { AgentSession, SessionStore, SessionWriteError, SessionReadError, ToolRuntime, createTools, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
+import { AgentSession, McpManager, SessionStore, SessionWriteError, SessionReadError, ToolRuntime, createTools, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
 import { createModelStream, type ModelContext, type AssistantMessage, type ModelEvent } from '@agent-learning/model'
 
 vi.mock('node:fs/promises', { spy: true })
@@ -81,6 +81,142 @@ async function rejectedHandshake(url: string, headers: Record<string, string>) {
   })
 }
 const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
+
+describe('MCP 设置入口', () => {
+  it('保存后保持关闭，通过启用请求连接，只向已授权网页返回状态并发送脱敏通知', async () => {
+    const app = await setup()
+    const endpoint = app.url + '/api/mcp/servers'
+    const auth = await cookie(app.authUrl)
+    const headers = { Cookie: auth, 'Content-Type': 'application/json' }
+    const body = JSON.stringify({ name: 'test-mcp', url: 'https://mcp.example.invalid/mcp', authMode: 'token', token: 'secret-mcp-token' })
+    expect((await http(endpoint)).status).toBe(401)
+    expect((await http(endpoint, { ...headers, Origin: 'https://example.invalid' }, 'POST', body)).status).toBe(403)
+    expect(JSON.parse((await http(endpoint, headers)).text)).toEqual({ servers: [] })
+    const socket = await connect(app.url, auth)
+    const notification = once(socket, 'message')
+    const response = await http(endpoint, headers, 'POST', body)
+    expect(response.status).toBe(201)
+    expect(response.text).not.toContain('secret-mcp-token')
+    const saved = JSON.parse(response.text)
+    expect(saved).toMatchObject({ name: 'test-mcp', hasCredential: true, enabled: false, status: 'disabled', tools: [] })
+    expect(JSON.parse(String((await notification)[0]))).toEqual({ type: 'mcp_settings_changed' })
+    expect(JSON.parse((await http(endpoint, headers)).text)).toEqual({ servers: [saved] })
+    expect((await http(`${endpoint}/${saved.id}/enabled`, headers, 'PUT', '{"enabled":false,"extra":true}')).status).toBe(400)
+    const initialize = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(null, { status: 401 }))
+    const enabling = await http(`${endpoint}/${saved.id}/enabled`, headers, 'PUT', '{"enabled":true}')
+    expect(enabling.status).toBe(200)
+    await vi.waitFor(async () => {
+      const response = await http(endpoint, headers)
+      expect(JSON.parse(response.text).servers[0]).toMatchObject({ enabled: false, status: 'connection_failed', tools: [] })
+    })
+    expect(initialize).toHaveBeenCalledOnce()
+    const disabled = await http(`${endpoint}/${saved.id}/enabled`, headers, 'PUT', '{"enabled":false}')
+    expect(JSON.parse(disabled.text)).toMatchObject({ enabled: false })
+    expect(JSON.parse((await http(`${endpoint}/${saved.id}`, headers, 'DELETE')).text)).toEqual({ removed: true })
+    expect(JSON.parse((await http(endpoint, headers)).text)).toEqual({ servers: [] })
+  })
+
+  it('仅实际后端 Host 和 GET 路径允许进入未认证回调，失败详情保持固定', async () => {
+    const app = await setup()
+    const path = '/api/mcp/oauth/callback'
+    const external = { Origin: 'https://example.invalid', 'Sec-Fetch-Site': 'cross-site' }
+    const callback = app.url + path + '/test-attempt?state=first&state=second&code=private-code'
+    const response = await http(callback, external)
+    expect(response.status).toBe(400)
+    expect(response.headers).toMatchObject({ 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
+    expect(response.text).not.toMatch(/first|second|private-code/)
+    expect((await http(callback, { ...external, Host: 'example.invalid' })).status).toBe(403)
+    expect((await http(callback, external, 'POST')).status).toBe(403)
+    expect((await http(app.url + path + '-other?state=test&code=private-code', external)).status).toBe(403)
+    expect((await http(app.url + '/api/mcp/servers', external)).status).toBe(403)
+    expect((await http(app.url + path + '/test-attempt?state=one&code=one&error=access_denied', external)).status).toBe(400)
+  })
+
+  it('重启时用远端首份完整目录撤下已有会话的 MCP 加载记录', async () => {
+    const app = await setup()
+    const definition = { name: 'issue_read', inputSchema: { type: 'object' } }
+    let tools = [definition]
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (init?.method !== 'POST') return new Response(null, { status: 405 })
+      const message = JSON.parse(String(init.body))
+      if (message.method === 'initialize') return Response.json({ jsonrpc: '2.0', id: message.id, result: {
+        protocolVersion: '2025-11-25', serverInfo: { name: 'test-mcp', version: '1' }, capabilities: { tools: {} },
+      } })
+      if (message.method === 'tools/list') return Response.json({ jsonrpc: '2.0', id: message.id, result: { tools } })
+      return new Response(null, { status: 202 })
+    })
+    const path = '/api/mcp/servers'
+    const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+    const saved = JSON.parse((await http(app.url + path, headers, 'POST', JSON.stringify({
+      name: 'github', url: 'https://mcp.example.invalid/mcp', authMode: 'token', token: 'fixture',
+    }))).text)
+    await http(app.url + path + '/' + saved.id + '/enabled', headers, 'PUT', '{"enabled":true}')
+    await vi.waitFor(async () => expect(JSON.parse((await http(app.url + path, headers)).text).servers[0].tools).toHaveLength(1))
+    await app.server.close()
+
+    const { servers: [config] } = JSON.parse(await readFile(join(dirname(app.config.modelAuthPath!), 'mcp.json'), 'utf8'))
+    const summary = { id: 'older', workspaceId: 'workspace', name: 'Older session', createdAt: new Date().toISOString() }
+    const store = SessionStore.open(app.config.sessionPath!)
+    try {
+      store.save(summary.id, {
+        summary, run: { id: 'run', sessionId: summary.id, clientMessageId: 'send', kind: 'task', status: 'completed',
+          startedAt: 1, finishedAt: 4, acceptedSeq: 1, modelId: 'deepseek-flash', text: 'Read an issue' },
+        messages: [
+          { id: 'run', clientMessageId: 'send', message: { role: 'user', content: 'Read an issue', timestamp: 1 } },
+          { id: 'assistant', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+            stopReason: 'toolUse', timestamp: 2, content: [{ type: 'toolCall', id: 'search', name: 'tool_search', arguments: { query: 'issue' } }] } },
+        ],
+      })
+      store.save(summary.id, { runId: 'run',
+        messages: [{ id: 'search-result', toolCall: { assistantMessageId: 'assistant', contentIndex: 0 },
+          message: { role: 'toolResult', toolCallId: 'search', toolName: 'tool_search', content: [], isError: false, timestamp: 3 } }],
+        mcpToolLoads: [{ serverId: config.id, credentialRef: config.credentialRef, remoteToolName: definition.name }],
+      })
+      expect(store.listMcpToolLoads(summary.id)).toHaveLength(1)
+    } finally { store.close() }
+
+    tools = []
+    const restarted = await app.server.start()
+    const restartedHeaders = { Cookie: await cookie(restarted.authUrl) }
+    await vi.waitFor(async () => expect(JSON.parse((await http(restarted.url + path, restartedHeaders)).text).servers[0])
+      .toMatchObject({ enabled: true, status: 'connected', tools: [] }))
+    await app.server.close()
+    const reopened = SessionStore.open(app.config.sessionPath!)
+    try {
+      expect(reopened.listMcpToolLoads(summary.id)).toEqual([])
+      expect(reopened.loadSession(summary.id)?.messages.at(-1)?.id).toBe('search-result')
+    }
+    finally { reopened.close() }
+  })
+
+  it('开发页授权使用真实后端回调地址，OAuth 参数只交给管理器', async () => {
+    const devOrigin = 'http://127.0.0.1:5173'
+    const app = await setup({ devOrigin })
+    const callbackPath = '/api/mcp/oauth/callback/test-service'
+    const start = vi.spyOn(McpManager.prototype, 'startOAuth').mockResolvedValue({
+      attemptId: 'attempt', authorizationUrl: 'https://mcp.example.invalid/authorize?state=private-state',
+    })
+    const finish = vi.spyOn(McpManager.prototype, 'finishOAuth').mockImplementation(async (path, params) =>
+      path === callbackPath && params.get('state') === 'private-state' && params.get('code') === 'private-code')
+    const endpoint = app.url + '/api/mcp/servers/test-service/oauth'
+    expect((await http(endpoint, {}, 'POST')).status).toBe(401)
+    const devHost = { Host: new URL(devOrigin).host }
+    const authUrl = new URL(app.devAuthUrl!)
+    const credential = await http(app.url + authUrl.search, devHost)
+    const cookie = credential.headers['set-cookie']![0].split(';')[0]
+    const started = await http(endpoint, { ...devHost, Cookie: cookie, Origin: devOrigin }, 'POST')
+    expect(started.status).toBe(200)
+    expect(started.headers['cache-control']).toBe('no-store')
+    expect(JSON.parse(started.text)).toEqual({ attemptId: 'attempt', authorizationUrl: 'https://mcp.example.invalid/authorize?state=private-state' })
+    expect(start).toHaveBeenCalledExactlyOnceWith('test-service', app.url + '/api/mcp/oauth/callback')
+    const callback = app.url + callbackPath + '?state=private-state&code=private-code'
+    expect((await http(callback, devHost)).status).toBe(403)
+    const response = await http(callback, { 'Sec-Fetch-Site': 'cross-site' })
+    expect(response.status).toBe(200)
+    expect(response.text).not.toMatch(/private-state|private-code/)
+    expect(finish).toHaveBeenCalledOnce()
+  })
+})
 
 describe('主动中止入口', () => {
   it('沿用来源、授权和 JSON 校验；无效请求不交付 Agent', async () => {

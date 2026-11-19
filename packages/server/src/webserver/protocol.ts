@@ -12,6 +12,16 @@ export type {
 export { isPermissionMode } from '@agent-learning/coding-agent/permissions'
 export type { WorkspaceView } from '../workspaces.js'
 export type { WebSettingsView } from '../web-settings.js'
+export type { McpOAuthStartView, McpServerView } from '@agent-learning/coding-agent'
+
+export type SaveMcpServerRequest = {
+  name: string
+  url: string
+  authMode: 'token' | 'oauth'
+  token?: string
+  clientId?: string
+  clientSecret?: string
+}
 
 export type WorkspaceSkills = { skills: Omit<SkillSummary, 'path'>[]; complete: boolean }
 export type SkillInvocationView = Pick<SkillInvocation, 'name' | 'source'> &
@@ -58,7 +68,7 @@ export type ServerFrame =
   | ({ type: 'snapshot'; snapshot: ConversationSnapshot } & SubscriptionTarget)
   | ({ type: 'update'; update: ConversationUpdate } & SubscriptionTarget)
   | ({ type: 'subscription_error'; error: string } & SubscriptionTarget)
-  | { type: 'models_changed' | 'workspaces_changed' | 'sessions_changed' | 'web_settings_changed' | 'permission_settings_changed' }
+  | { type: 'models_changed' | 'workspaces_changed' | 'sessions_changed' | 'web_settings_changed' | 'permission_settings_changed' | 'mcp_settings_changed' }
 
 export type BrowserCookiePayload = {
   version: 1

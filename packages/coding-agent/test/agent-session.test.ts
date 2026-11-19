@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { Type } from 'typebox'
 import { AgentSession } from '../src/agent-session.js'
 import { buildSystemPrompt } from '../src/system-prompt.js'
+import type { McpToolCatalog } from '../src/mcp/manager.js'
 import type { ExecutableTool } from '@agent-learning/agent'
 import { omittedToolImageIndexes } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelEvent, ModelEventStream, ToolCall } from '@agent-learning/model'
@@ -327,6 +328,24 @@ const toolCall = (id: string, overrides: Partial<ToolCall> = {}): ToolCall => ({
   type: 'toolCall', id, name: 'read', arguments: { path: id }, ...overrides,
 })
 
+const searchMcp = toolCall('search-issue', { name: 'tool_search', arguments: { query: 'issue_read' } })
+
+function mcpDiscovery() {
+  const listeners = new Set<(catalog: McpToolCatalog) => void>()
+  return {
+    listDiscoveryServers: () => [{ id: 'github', name: 'GitHub', instructions: 'Repository issues\nDo not include this line' }],
+    waitForToolDiscovery: async () => {},
+    isCurrentTool: () => true,
+    subscribeToolCatalog(listener: (catalog: McpToolCatalog) => void) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    publish(catalog: McpToolCatalog) {
+      for (const listener of listeners) listener(catalog)
+    },
+  }
+}
+
 function withTools(execute: ExecutableTool['execute'], executionMode?: ExecutableTool['executionMode']) {
   const first = controlled(), answer = controlled()
   const queues = [first, answer]
@@ -340,6 +359,96 @@ function withTools(execute: ExecutableTool['execute'], executionMode?: Executabl
 }
 
 describe('AgentSession 一批工具与最终回答', () => {
+  it('MCP 搜索命中后下一轮才可调用，撤下后移出声明并保留远端失败', async () => {
+    const queues = [controlled(), controlled(), controlled()], contexts: ModelContext[] = []
+    const name = 'mcp__github__issue_read'
+    const binding = { name, serverId: 'github', credentialRef: 'test', revision: 1, tool: {
+      name: 'issue_read', description: 'Read issue', inputSchema: { type: 'object', properties: { issue_number: { type: 'integer' } }, required: ['issue_number'] },
+    } }
+    let directory = [binding]
+    const callTool = vi.fn(async (_binding: typeof binding, _args: Record<string, unknown>) => {
+      directory = []
+      return { isError: true, content: [{ type: 'text' as const, text: '远端拒绝' }] }
+    })
+    const agent = createSession({
+      mcp: { ...mcpDiscovery(), listToolsForAgent: () => directory, callTool },
+      extensions: [{ path: 'test', entry(api) {
+        api.on('tool_call', event => { if (event.toolName === name) event.input.issue_number = 42 })
+        api.on('tool_result', event => event.toolName === name ? { isError: false, content: [{ type: 'text', text: '补充说明' }] } : undefined)
+      } }],
+      stream: (_model, context) => { contexts.push(context); return queues[contexts.length - 1]!.output },
+    })
+    await agent.submit(input)
+    await until(async () => contexts.length === 1)
+    expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    expect(contexts[0].systemPrompt).toContain('GitHub')
+    expect(contexts[0].systemPrompt).toContain('Repository issues')
+    expect(contexts[0].systemPrompt).not.toContain('Do not include this line')
+    expect(contexts[0].systemPrompt).not.toContain(name)
+    const undisclosed = toolCall('undisclosed-issue', { name, arguments: { issue_number: 1 } })
+    queues[0].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [searchMcp, undisclosed] } })
+    await until(async () => contexts.length === 2)
+    expect(callTool).not.toHaveBeenCalled()
+    expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+    expect(contexts[1].systemPrompt).not.toContain(name)
+    expect(contexts[1].messages).toContainEqual(expect.objectContaining({ toolCallId: undisclosed.id, isError: true }))
+    const call = toolCall('issue-call-1', { name, arguments: { issue_number: 1 } })
+    queues[1].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [call] } })
+    await until(async () => contexts.length === 3)
+    expect(callTool).toHaveBeenCalledOnce()
+    expect(callTool.mock.calls[0]?.[1]).toEqual({ issue_number: 42 })
+    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    const result = { role: 'toolResult', toolCallId: call.id, isError: true,
+      content: expect.arrayContaining([{ type: 'text', text: '远端拒绝' }, { type: 'text', text: '补充说明' }]) }
+    expect(contexts[2].messages).toContainEqual(expect.objectContaining(result))
+    expect((await snapshot(agent)).messages).toContainEqual(expect.objectContaining({ message: expect.objectContaining(result) }))
+    queues[2].push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    await until(async () => (await snapshot(agent)).running === null)
+    await agent.close()
+  })
+
+  it('等待 MCP 发送期间切换只读，按原编号回填权限拦截，下一轮只声明本地只读工具', async () => {
+    const queues = [controlled(), controlled(), controlled()], contexts: ModelContext[] = []
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const name = 'mcp__github__issue_read'
+    const binding = { name, serverId: 'github', credentialRef: 'test', revision: 1, tool: {
+      name: 'issue_read', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true },
+    } }
+    const sent = vi.fn()
+    const local = ['read', 'grep', 'find', 'ls', 'write'].map(name => ({ name, description: name,
+      parameters: Type.Object({}), execute: async () => '' }))
+    const agent = createSession({
+      tools: local,
+      mcp: { ...mcpDiscovery(), listToolsForAgent: () => [binding], async callTool(_binding, _args, _signal, checkPermission) {
+        entered.resolve()
+        await release.promise
+        checkPermission()
+        sent()
+        return { content: [] }
+      } },
+      stream: (_model, context) => { contexts.push(context); return queues[contexts.length - 1]!.output },
+    })
+    await agent.submit(input)
+    await until(async () => contexts.length === 1)
+    expect(contexts[0].tools?.map(tool => tool.name)).not.toContain(name)
+    queues[0].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [searchMcp] } })
+    await until(async () => contexts.length === 2)
+    const call = toolCall('mcp-read-only', { name, arguments: {} })
+    queues[1].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [call] } })
+    await entered.promise
+    try { agent.selectPermissionMode('read-only') }
+    finally { release.resolve() }
+    await until(async () => contexts.length === 3)
+    expect(sent).not.toHaveBeenCalled()
+    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['read', 'grep', 'find', 'ls'])
+    expect(contexts[2].systemPrompt).not.toContain('GitHub')
+    expect((await snapshot(agent)).messages).toContainEqual(expect.objectContaining({ toolErrorCode: 'permission_denied',
+      message: expect.objectContaining({ role: 'toolResult', toolCallId: call.id, isError: true }) }))
+    queues[2].push({ type: 'done', reason: 'stop', message: { ...assistant(), stopReason: 'stop' } })
+    await until(async () => (await snapshot(agent)).running === null)
+    await agent.close()
+  })
+
   it('完整首轮结束后才执行，回填并保持忙碌直到最终回答结束', async () => {
     const executions: string[] = []
     let release!: () => void

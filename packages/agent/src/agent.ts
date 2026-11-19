@@ -130,7 +130,10 @@ export class Agent {
             if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
             this.emit({ type: 'tool_start', contentIndex, ...(actualArguments && { actualArguments }) })
             executed = true
-            output = await tool.execute(prepareToolCall ? structuredClone(prepared.arguments) : prepared.arguments, { signal, recordDetails: detail => { details.push(detail) } })
+            const toolOutput = await tool.execute(prepareToolCall ? structuredClone(prepared.arguments) : prepared.arguments,
+              { signal, recordDetails: detail => { details.push(detail) } })
+            if (typeof toolOutput === 'string' || Array.isArray(toolOutput)) output = toolOutput
+            else ({ content: output, isError } = toolOutput)
           } catch (error) {
             isError = true
             output = error instanceof Error ? error.message : '工具执行失败。'
