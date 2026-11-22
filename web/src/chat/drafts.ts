@@ -36,20 +36,22 @@ export function writeExtensionDraft(workspaceId: string, id?: string) {
 }
 
 const firstSendKey = 'agent-learning:first-send'
+type FirstSendSource = 'schedule'
 
-export function readFirstSend(): StartSessionRequest | undefined {
+export function readFirstSend(): (StartSessionRequest & { source?: FirstSendSource }) | undefined {
   try {
     const value = JSON.parse(sessionStorage.getItem(firstSendKey) ?? 'null')
     if (value && typeof value.workspaceId === 'string' && typeof value.clientMessageId === 'string'
       && typeof value.modelId === 'string' && typeof value.text === 'string'
       && (value.draftSessionId === undefined || typeof value.draftSessionId === 'string')
-      && (value.permissionMode === undefined || isPermissionMode(value.permissionMode))) return value
+      && (value.permissionMode === undefined || isPermissionMode(value.permissionMode))
+      && (value.source === undefined || value.source === 'schedule')) return value
   } catch { /* Drafts still work within the page when storage is unavailable. */ }
 }
 
-export function writeFirstSend(input: StartSessionRequest | null) {
+export function writeFirstSend(input: StartSessionRequest | null, source?: FirstSendSource) {
   try {
-    if (input) sessionStorage.setItem(firstSendKey, JSON.stringify(input))
+    if (input) sessionStorage.setItem(firstSendKey, JSON.stringify({ ...input, source }))
     else sessionStorage.removeItem(firstSendKey)
   } catch { /* The current page retains the request for retries. */ }
 }

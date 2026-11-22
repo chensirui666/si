@@ -8,7 +8,7 @@
 
 [AgentSession](../../packages/coding-agent/src/agent-session.ts) 在每轮普通模型请求前读取适用的项目说明，再调用 [buildSystemPrompt](../../packages/coding-agent/src/system-prompt.ts) 组装提示词。[convertMessages](../../packages/model/src/context.ts) 将结果放入 DeepSeek 请求的第一条 `system` 消息。工具定义和本轮聊天历史各自加入请求。
 
-说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。有 read 工具时，模型可自动调用的 Skill 摘要放在 <available_skills> 中，正文按需读取。下面是使用全部工具且没有项目说明或 Skill 摘要时的原文。摘要请求使用独立的摘要提示词。
+说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。有 read 工具时，模型可自动调用的 Skill 摘要放在 <available_skills> 中，正文按需读取。下面是普通权限的手动聊天使用内置工具且没有项目说明或 Skill 摘要时的原文。摘要请求使用独立的摘要提示词。
 
 展开 `this.configuration` 后，请求数据如下。
 
@@ -36,6 +36,7 @@ const context: ModelContext = {
 - ls：列出目录的直接子项，包括隐藏项。目录名以 / 结尾。
 - web_search：搜索网页，返回标题、链接和相关片段。
 - web_fetch：获取指定公网网页的正文。
+- cronjob_manage：管理当前会话的重复定时任务。仅在用户明确请求时创建或变更。支持每天、工作日、每周指定星期几。信息不足先询问，明确只执行一次时说明目前仅支持重复任务。根据保存回执报告实际结果。
 </tools>
 
 <rules>

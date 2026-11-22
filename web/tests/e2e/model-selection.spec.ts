@@ -213,12 +213,12 @@ test('Feature 1 小模型容量不足后，从同一网页用大模型压缩，�
   const target = original.getModels().find(item => item.id === 'kimi-k3')!
   piModels.setProvider(createProvider({
     id: original.id, name: original.name, auth: original.auth, api: openAICompletionsApi(),
-    models: [{ ...target, contextWindow: 2400, maxTokens: 128 }],
+    models: [{ ...target, contextWindow: 3200, maxTokens: 128 }],
   }))
   const directory = await mkdtemp(join(tmpdir(), 'agent-model-capacity-'))
   const model = await startModelServer()
   const server = new WebServer({
-    port: 0, directoryPicker: async () => directory, compaction: { triggerTokens: 5000, keepRecentTokens: 100 },
+    port: 0, directoryPicker: async () => directory, compaction: { triggerTokens: 8000, keepRecentTokens: 100 },
     workspacePath: join(directory, 'workspaces.json'), sessionPath: join(directory, 'sessions.sqlite'),
     browserSecretPath: join(directory, 'browser-auth.json'), modelAuthPath: join(directory, 'auth.json'),
     webSettingsPath: join(directory, 'settings.json'), skillHome: join(directory, 'skill-home'), globalContextDirectory: join(directory, 'global'),
@@ -233,10 +233,10 @@ test('Feature 1 小模型容量不足后，从同一网页用大模型压缩，�
     const saved = await page.request.put(url + '/api/providers/moonshotai-cn', { data: { apiKey: 'controlled-test-key' } })
     expect(saved.status()).toBe(200)
     for (const index of [0, 1]) {
-      await editor(page).fill('原有历史' + 'a'.repeat(3400))
+      await editor(page).fill('原有历史' + 'a'.repeat(5000))
       await send(page).click()
       await expect.poll(() => model.exchanges.length).toBe(index + 1)
-      model.exchanges[index].delta({ content: '原回复' + 'b'.repeat(2200) })
+      model.exchanges[index].delta({ content: '原回复' + 'b'.repeat(3000) })
       model.exchanges[index].finish()
       await expect(send(page)).toBeDisabled()
       await expect(page.getByRole('button', { name: '中止', exact: true })).toHaveCount(0)

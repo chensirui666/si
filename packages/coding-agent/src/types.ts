@@ -143,6 +143,7 @@ export type RunRecord = {
   id: string
   sessionId: string
   clientMessageId: string
+  scheduledRunId?: string
   modelId: string
   provider?: string
   reasoningEffort?: ModelSelection['reasoningEffort']

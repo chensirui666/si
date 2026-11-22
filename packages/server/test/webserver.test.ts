@@ -1241,8 +1241,8 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
   expect(systemPrompt.replace(/\n\n如果任务符合[^\n]+\n<available_skills>[\s\S]*?<\/available_skills>/, ''))
     .toBe(expectedPrompt)
   expect(requests[1].messages[0]).toEqual(requests[0].messages[0])
-  expect(requests[0].tools).toHaveLength(10)
-  expect(requests[1].tools).toHaveLength(10)
+  expect(requests[0].tools).toHaveLength(11)
+  expect(requests[1].tools).toHaveLength(11)
   expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })
   expect(await readFile(join(app.workspace, 'written.txt'), 'utf8')).toBe('working-directory')
   let history!: ConversationSnapshot
