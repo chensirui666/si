@@ -19,12 +19,43 @@ test('桌面切换分类保持弹窗尺寸，窄屏铺满窗口且长内容独�
   const close = dialog.getByRole('button', { name: '关闭设置' })
   const frame = await dialog.boundingBox()
   const closePosition = await close.boundingBox()
-  expect(frame).toMatchObject({ width: 800, height: 752 })
+  expect(frame).toMatchObject({ width: 800, height: 600 })
+  const title = await dialog.getByRole('heading', { name: '设置', exact: true }).boundingBox()
+  const headerCenter = closePosition!.y + closePosition!.height / 2
+  expect(title!.y + title!.height / 2).toBe(headerCenter)
+
   await expect(nav.getByRole('button').first()).toBeFocused()
   await expect(nav.getByRole('button').first()).toHaveCSS('background-color', 'rgb(240, 240, 238)')
-  await nav.getByRole('button', { name: '模型' }).click()
-  expect(await dialog.boundingBox()).toEqual(frame)
-  expect(await close.boundingBox()).toEqual(closePosition)
+  const web = nav.getByRole('button', { name: '网页工具', exact: true })
+  await web.hover()
+  await expect(web).toHaveCSS('background-color', 'rgb(247, 247, 245)')
+
+  const checkHeading = async (name: string) => {
+    const heading = dialog.getByRole('heading', { name, exact: true })
+    await expect(heading).toBeVisible()
+    const box = (await heading.boundingBox())!
+    expect(box.y + box.height / 2).toBe(headerCenter)
+    return box.x
+  }
+  const headingStart = await checkHeading('通用设置')
+  const general = dialog.getByRole('region', { name: '通用设置', exact: true }).getByRole('combobox')
+  await expect(general).toHaveCount(2)
+  const generalChoice = (await general.first().boundingBox())!
+  expect(await general.last().boundingBox()).toMatchObject({ x: generalChoice.x, width: generalChoice.width })
+
+  for (const name of ['网页工具', 'MCP', '模型']) {
+    await nav.getByRole('button', { name, exact: true }).click()
+    expect(await checkHeading(name)).toBe(headingStart)
+    expect(await dialog.boundingBox()).toEqual(frame)
+    expect(await close.boundingBox()).toEqual(closePosition)
+    if (name === '网页工具') {
+      const webChoices = dialog.getByRole('region', { name, exact: true }).getByRole('combobox')
+      await expect(webChoices).toHaveCount(2)
+      for (const choice of await webChoices.all()) {
+        expect(await choice.boundingBox()).toMatchObject({ x: generalChoice.x, width: generalChoice.width })
+      }
+    }
+  }
 
   await page.setViewportSize({ width: 390, height: 360 })
   expect(await dialog.boundingBox()).toEqual({ x: 0, y: 0, width: 390, height: 360 })

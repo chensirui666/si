@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { ListIcon } from 'lucide-react'
 import type { BashJobsView } from '@agent-learning/server/protocol'
 import { getBashJobs, stopBashJob } from '../chat/client'
 import { Button } from './ui/button'
@@ -10,6 +11,7 @@ type StopAttempt = { job: Job; checking: boolean }
 
 export function BackgroundTasks({ sessionId }: { sessionId: string }) {
   const { t } = useTranslation()
+  const title = t('background.title')
   const [open, setOpen] = useState(false)
   const panelId = useId()
   const trigger = useRef<HTMLButtonElement>(null)
@@ -19,8 +21,9 @@ export function BackgroundTasks({ sessionId }: { sessionId: string }) {
       trigger.current?.focus()
     }
   }}>
-    <Button ref={trigger} type="button" variant="outline" size="sm" aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => setOpen(value => !value)}>
-      {t('background.title')}
+    <Button ref={trigger} type="button" variant={open ? 'secondary' : 'ghost'} size="icon" aria-label={title} title={title}
+      aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => setOpen(value => !value)}>
+      <ListIcon aria-hidden="true" />
     </Button>
     {open && <BackgroundTaskList key={sessionId} sessionId={sessionId} panelId={panelId} />}
   </div>

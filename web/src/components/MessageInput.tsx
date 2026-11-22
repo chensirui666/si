@@ -37,6 +37,7 @@ import { errorNotice, NoticeText, skillSourceKey, type Notice } from '../i18n/me
 import { Button } from '@/components/ui/button'
 import { ComposerAddMenu } from './ComposerAddMenu'
 import { $styleSkillPrefix, skillPrefix } from './skill-prefix'
+import './message-input.css'
 
 type MessageInputProps = {
   onSend: (text: string, restoreDraft: () => void) => boolean
@@ -465,13 +466,15 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
             Plan <XIcon aria-hidden="true" />
           </Button>}
         </div>}
-        {footerControl}
-        {contextMeter}
-        <Button className="send-button" size="icon" type="button" aria-label={label} title={label}
-          disabled={action === 'send' ? !canSubmit : action === 'aborting' || abortDisabled || !onAbort}
-          onClick={() => { if (action === 'send') submit(editor.read($readDraft)); else if (action === 'abort') onAbort?.() }}>
-          {action === 'send' ? <ArrowUpIcon aria-hidden="true" /> : <SquareIcon aria-hidden="true" fill="currentColor" />}
-        </Button>
+        <div className="composer-trailing">
+          {footerControl}
+          {contextMeter}
+          <Button className="send-button" size="icon" type="button" aria-label={label} title={label}
+            disabled={action === 'send' ? !canSubmit : action === 'aborting' || abortDisabled || !onAbort}
+            onClick={() => { if (action === 'send') submit(editor.read($readDraft)); else if (action === 'abort') onAbort?.() }}>
+            {action === 'send' ? <ArrowUpIcon aria-hidden="true" /> : <SquareIcon aria-hidden="true" fill="currentColor" />}
+          </Button>
+        </div>
       </div>
     </div>
   )

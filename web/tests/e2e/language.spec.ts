@@ -31,6 +31,9 @@ for (const mode of ['node', 'vite'] as const) {
       await authorize(page, vitePort ? backend.result.devAuthUrl : backend.result.authUrl)
       await expect(page).toHaveTitle('Chat · Agent Learning')
       await expect(page.locator('html')).toHaveAttribute('lang', 'en')
+      const welcome = page.getByRole('heading', { name: 'What are we working on today?', exact: true })
+      await expect(welcome).toHaveCSS('font-family', /^"?EB Garamond/)
+      await expect(welcome).toHaveCSS('font-size', '24px')
       expect(await readFile(filename, 'utf8')).toBe(JSON.stringify(old))
       await page.getByRole('button', { name: 'Settings', exact: true }).click()
       await expect(page.getByRole('button', { name: 'General', exact: true })).toHaveAttribute('aria-current', 'true')
@@ -50,6 +53,7 @@ for (const mode of ['node', 'vite'] as const) {
       expect(JSON.parse(await readFile(filename, 'utf8'))).toEqual({ ...old, locale: { preference: 'zh-CN' } })
       await page.reload()
       await expect(page).toHaveTitle('聊天 · Agent Learning')
+      await expect(page.getByRole('heading', { name: '今天想做什么？', exact: true })).toBeVisible()
 
       await stop(backend.child)
       backend = await startBackend(secret, port, '', vitePort)

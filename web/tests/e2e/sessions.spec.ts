@@ -40,13 +40,31 @@ test('未发送的新会话共用一份草稿，首次发送使用最后选中�
     await authorize(page, authUrl)
     const workspaceA = await addWorkspace(page)
     await saveKey(page, 'controlled-stage3-key')
-    const heading = page.getByRole('heading', { name: 'SI', exact: true })
+    const heading = page.getByRole('heading', { name: '今天想做什么？', exact: true })
     const workspace = page.getByRole('combobox', { name: '工作区', exact: true })
     const newConversation = page.getByRole('button', { name: '新会话', exact: true })
     const draftRow = page.getByRole('button', { name: '未发送的新会话', exact: true })
     const editor = page.getByRole('textbox', { name: '消息', exact: true })
     const send = page.getByRole('button', { name: '发送', exact: true })
     const draft = '  读取 answer.txt\n保留原文  '
+    await page.setViewportSize({ width: 320, height: 700 })
+    const composer = page.locator('.message-input')
+    await expect(heading).toHaveCSS('font-size', '22px')
+    for (const control of [
+      composer.getByRole('button', { name: '添加', exact: true }),
+      composer.getByRole('combobox', { name: '权限', exact: true }),
+      composer.getByRole('combobox', { name: '模型', exact: true }),
+      composer.getByRole('combobox', { name: '推理强度', exact: true }),
+      send,
+    ]) {
+      await expect(control).toBeInViewport({ ratio: 1 })
+      const card = (await composer.boundingBox())!
+      const bounds = (await control.boundingBox())!
+      expect(bounds.x).toBeGreaterThanOrEqual(card.x)
+      expect(bounds.x + bounds.width).toBeLessThanOrEqual(card.x + card.width)
+    }
+    await expect(composer.getByRole('combobox', { name: '推理强度', exact: true })).toHaveCSS('border-top-width', '0px')
+    await page.setViewportSize({ width: 1280, height: 800 })
     await expect(heading).toBeVisible()
     await expect(workspace).toHaveText('workspace-a')
     await editor.fill(draft)
@@ -182,7 +200,7 @@ test('Feature8 运行中的会话可切换、并行与独立中止，重开页�
     await ready(otherPage, other, 0, false)
     expect(other.snapshots.at(-1)?.sessionId).toBe(a)
     await page.getByRole('button', { name: '新会话', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'SI', exact: true })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '今天想做什么？', exact: true })).toBeVisible()
     await expect(editor).toHaveText('')
     const beforeStart = observed.snapshots.length
     await editor.fill('B 任务')

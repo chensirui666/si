@@ -15,6 +15,38 @@ test.beforeEach(async ({ page }) => {
   }))
 })
 
+test('粒子只在新会话显示，侧栏用 SI 图标标识', async ({ mount, page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await mount(<ChatPageHarness messages={['已有消息']} modelConfigured />)
+  const particles = page.locator('.new-chat-particles')
+  await expect(page.getByText('已有消息', { exact: true })).toBeVisible()
+  await expect(particles).toHaveCount(0)
+
+  const brand = page.locator('.sidebar-title')
+  const icon = brand.getByRole('img', { name: 'SI' })
+  await expect(icon).toBeVisible()
+  await expect(brand).toHaveText('')
+  expect(await icon.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+
+  await page.getByRole('button', { name: '新会话', exact: true }).click()
+  await expect(particles).toBeVisible()
+  await expect(particles).toHaveAttribute('aria-hidden', 'true')
+  await expect(particles).toHaveCSS('pointer-events', 'none')
+  await expect.poll(() => particles.evaluate(element => {
+    const canvas = element as HTMLCanvasElement
+    return canvas.getContext('2d')?.getImageData(0, 0, 80, 32).data
+      .some((value, index) => index % 4 === 3 && value > 0)
+  })).toBe(true)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await editor.click()
+  await editor.fill('新会话草稿')
+  await expect(editor).toHaveText('新会话草稿')
+
+  await page.getByRole('button', { name: '会话 1', exact: true }).click()
+  await expect(page.getByText('已有消息', { exact: true })).toBeVisible()
+  await expect(particles).toHaveCount(0)
+})
+
 test('连接切换、快照恢复和输入区增高时保留草稿、焦点与阅读位置', async ({ mount, page }) => {
   const history = Array.from({ length: 26 }, (_, i) => `旧消息 ${i}：${'用于验证独立滚动的内容。'.repeat(12)}`)
   await mount(<ChatPageHarness messages={history} />)
@@ -181,6 +213,15 @@ test('白色页面的正文与输入框同轴，输入框两侧各宽出 16px', 
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const list = page.getByRole('region', { name: '消息列表' })
   const composer = page.locator('.message-input')
+  await expect(composer).toHaveCSS('border-radius', '28px')
+  const add = composer.getByRole('button', { name: '添加', exact: true })
+  await expect(add).toHaveCSS('border-radius', '50%')
+  await expect(add).toHaveCSS('width', '32px')
+  await expect(add).toHaveCSS('height', '32px')
+  await expect(add.locator('svg')).toHaveCSS('width', '18px')
+  for (const name of ['权限', '模型']) {
+    await expect(composer.getByRole('combobox', { name, exact: true })).toHaveCSS('border-top-width', '0px')
+  }
   await expect(page.locator('html')).toHaveCSS('background-color', 'rgb(255, 255, 255)')
   await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('font-size', '20px')
   await expect(page.getByRole('heading', { name: '会话 1' })).toHaveCSS('line-height', '28px')
@@ -207,6 +248,8 @@ test('白色页面的正文与输入框同轴，输入框两侧各宽出 16px', 
   await expect(list.getByRole('listitem')).toHaveCSS('max-width', '72%')
   await expect(list.getByRole('listitem')).toHaveCSS('padding', '10px 16px')
   await page.setViewportSize({ width: 390, height: 700 })
+  await expect(add).toHaveCSS('width', '44px')
+  await expect(add).toHaveCSS('height', '44px')
   const mobileToggleBox = (await page.getByRole('button', { name: '展开侧边栏' }).boundingBox())!
   expect((await title.boundingBox())!.x).toBeGreaterThanOrEqual(mobileToggleBox.x + mobileToggleBox.width)
   await expect(list.getByRole('listitem')).toHaveCSS('max-width', '88%')
@@ -362,11 +405,33 @@ test('消息区键盘焦点使用固定局部标记，滚动和高对比度下�
   const list = page.getByRole('region', { name: '消息列表' })
   const frame = page.locator('.chat-main-frame')
   const scroll = page.locator('.chat-main')
-  await page.getByRole('heading', { name: '会话 1' }).click()
+  const title = page.getByRole('heading', { name: '会话 1' })
+  const tasks = page.getByRole('button', { name: '后台任务', exact: true })
+  await expect(title).toHaveCSS('font-size', '16px')
+  await expect(tasks).toHaveText('')
+  const taskIcon = tasks.locator('svg')
+  await expect(taskIcon).toHaveCSS('width', '16px')
+  await expect(taskIcon).toHaveCSS('height', '16px')
+  const [headerBox, toggleBox, homeBox, tasksBox, titleBox, iconBox] = await Promise.all([
+    page.locator('.chat-header').boundingBox(),
+    page.getByRole('button', { name: '收起侧边栏' }).boundingBox(),
+    page.getByRole('combobox', { name: '内容区', exact: true }).boundingBox(),
+    tasks.boundingBox(),
+    title.boundingBox(),
+    taskIcon.boundingBox(),
+  ])
+  expect(headerBox!.height).toBe(48)
+  expect(toggleBox).toMatchObject({ y: 16, height: 31.5 })
+  expect(homeBox!.y).toBe(60)
+  expect(titleBox!.y + titleBox!.height / 2).toBe(headerBox!.y + headerBox!.height / 2)
+  expect(iconBox!.y + iconBox!.height / 2).toBe(headerBox!.y + headerBox!.height / 2)
+  expect(headerBox!.x + headerBox!.width - (tasksBox!.x + tasksBox!.width)).toBe(12)
+
+  await title.click()
   await expect(frame).toHaveCount(1)
   expect(await frame.evaluate(el => getComputedStyle(el, '::after').opacity)).toBe('0')
   await page.keyboard.press('Tab')
-  await expect(page.getByRole('button', { name: '后台任务', exact: true })).toBeFocused()
+  await expect(tasks).toBeFocused()
   await page.keyboard.press('Tab')
   await expect(list).toBeFocused()
   await expect(list).toHaveCSS('border-width', '0px')
@@ -607,6 +672,98 @@ const workspace = { id: 'workspace-1', path: '/tmp/青禾', name: '青禾', avai
 const sessionA = { id: 'session-a', workspaceId: workspace.id, name: '会话 1', createdAt: '2026-11-09T08:00:00Z' }
 const sessionB = { ...sessionA, id: 'session-b', name: '会话 2' }
 
+test('侧栏文案随语言切换，未开放的定时任务不改变当前会话', async ({ mount, page }) => {
+  await page.route('**/api/settings/language', route => route.fulfill({
+    json: { language: route.request().method() === 'GET' ? 'zh-CN' : 'en' },
+  }))
+  await mount(<ChatPageHarness modelConfigured sessions={[sessionA]} />, { hooksConfig: { loadSavedLanguage: true } })
+  const sidebar = page.locator('.chat-sidebar')
+  await sidebar.getByRole('button', { name: sessionA.name, exact: true }).click()
+  const section = sidebar.getByRole('combobox', { name: '内容区', exact: true })
+  await expect(section).toHaveText('首页')
+  await expect(section.locator('.sidebar-section-icon')).toHaveCSS('background-color', 'rgb(57, 78, 235)')
+  await section.press('Enter')
+  await expect(page.getByRole('option', { name: '首页', exact: true })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByRole('option', { name: '定时任务 · 未开放' })).toBeDisabled()
+  await page.keyboard.press('Escape')
+  await expect(section).toBeFocused()
+  await expect(sidebar.getByRole('button', { name: '新会话', exact: true })).toBeVisible()
+  await expect(sidebar.getByRole('button', { name: '添加工作区', exact: true })).toBeVisible()
+  await sidebar.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('combobox', { name: '语言' }).click()
+  await page.getByRole('option', { name: 'English', exact: true }).click()
+  await expect(page.getByRole('combobox', { name: 'Language' })).toBeEnabled()
+  await page.keyboard.press('Escape')
+  const englishSection = sidebar.getByRole('combobox', { name: 'Content area', exact: true })
+  await expect(englishSection).toHaveText('Home')
+  const newChat = sidebar.getByRole('button', { name: 'New chat', exact: true })
+  await expect(newChat).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+  await expect(sidebar.getByRole('navigation', { name: 'Workspaces', exact: true })).toBeVisible()
+  const workspaceLabel = sidebar.getByText('Workspace', { exact: true })
+  await expect(workspaceLabel).toHaveCSS('text-transform', 'uppercase')
+  await expect(workspaceLabel).toHaveCSS('font-size', '12px')
+  await expect(sidebar.getByRole('button', { name: 'Add workspace', exact: true })).toBeVisible()
+  await expect(sidebar.getByRole('button', { name: 'Settings', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Collapse sidebar', exact: true })).toBeVisible()
+  await englishSection.click()
+  const scheduled = page.getByRole('option', { name: 'Scheduled tasks · Coming soon' })
+  await expect(scheduled).toBeDisabled()
+  await expect(scheduled.locator('.sidebar-section-icon')).toHaveCSS('background-color', 'rgb(250, 213, 96)')
+  const home = page.getByRole('option', { name: 'Home', exact: true })
+  await expect(home.locator('.sidebar-section-icon')).toHaveCSS('background-color', 'rgb(57, 78, 235)')
+  await home.click()
+  await expect(sidebar.getByRole('button', { name: sessionA.name })).toHaveAttribute('aria-current', 'page')
+  await newChat.press('Enter')
+  await expect(newChat).toHaveAttribute('aria-current', 'page')
+  await expect(newChat).toHaveCSS('background-color', 'rgb(240, 240, 238)')
+})
+
+test('侧栏在桌面及窄屏共用图标与文字对齐线，项目和会话在桌面等高', async ({ mount, page }) => {
+  await mount(<ChatPageHarness modelConfigured sessions={Array.from({ length: 24 }, (_, index) => ({
+    ...sessionA, id: `session-${index}`, name: `会话 ${index}`,
+  }))} />)
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 600 })
+    if (width === 390) await page.getByRole('button', { name: '展开侧边栏' }).click()
+    const sidebar = page.getByRole('complementary', { name: '侧栏' })
+    const collapse = page.getByRole('button', { name: '收起侧边栏' }).locator('svg')
+    const add = sidebar.getByRole('button', { name: '添加工作区' }).locator('svg')
+    const project = sidebar.locator('.workspace-row')
+    const projectAdd = project.getByRole('button', { name: '新建会话' })
+    const home = sidebar.getByRole('combobox', { name: '内容区' })
+    const newChat = sidebar.getByRole('button', { name: '新会话', exact: true })
+    const conversation = sidebar.getByRole('button', { name: '会话 0', exact: true })
+    const settings = sidebar.getByRole('button', { name: '设置', exact: true })
+    const leadingIcons = [home.locator('.sidebar-section-icon svg'), newChat.locator('svg'), project.locator(':scope > svg'), settings.locator('svg')]
+    const trailingIcons = [collapse, home.locator(':scope > svg'), add, projectAdd.locator('svg')]
+    for (const icon of [...leadingIcons, ...trailingIcons]) {
+      await expect(icon).toHaveCSS('width', '16px')
+      await expect(icon).toHaveCSS('height', '16px')
+    }
+    const [leading, trailing, labels] = await Promise.all([
+      Promise.all(leadingIcons.map(icon => icon.boundingBox())),
+      Promise.all(trailingIcons.map(icon => icon.boundingBox())),
+      Promise.all([
+        home.getByText('首页', { exact: true }), newChat.getByText('新会话', { exact: true }),
+        project.getByText('workspace', { exact: true }), conversation.locator('span'), settings.getByText('设置', { exact: true }),
+      ].map(label => label.boundingBox())),
+    ])
+    for (const icon of leading) expect(icon!.x).toBeCloseTo(leading[0]!.x, 0)
+    for (const icon of trailing) expect(icon!.x + icon!.width).toBeCloseTo(trailing[0]!.x + trailing[0]!.width, 0)
+    for (const label of labels) expect(label!.x).toBeCloseTo(labels[0]!.x, 0)
+    if (width === 1280) {
+      await expect(project).toHaveCSS('height', '32px')
+      await expect(conversation).toHaveCSS('height', '32px')
+      await expect(projectAdd).toHaveCSS('opacity', '0')
+      await project.hover()
+      await expect(projectAdd).toHaveCSS('opacity', '1')
+      await home.hover()
+      await projectAdd.focus()
+      await expect(projectAdd).toHaveCSS('opacity', '1')
+    }
+  }
+})
+
 test('侧栏不横滚，收起后保留草稿和容量，展开后可以继续切换会话', async ({ mount, page }) => {
   const longName = '很长的会话标题'.repeat(12)
   await mount(<ChatPageHarness modelConfigured sessions={[{ ...sessionA, name: longName }, sessionB]} />)
@@ -616,6 +773,16 @@ test('侧栏不横滚，收起后保留草稿和容量，展开后可以继续�
   await expect(toggle).toBeVisible({ timeout: 1500 })
   await sidebar.getByRole('button', { name: longName }).click()
   await expect(sidebar.getByRole('button', { name: '新建会话' })).toBeInViewport({ ratio: 1 })
+  const conversations = sidebar.locator('.workspace-conversations')
+  await expect(conversations).toHaveCSS('border-inline-start-width', '0px')
+  const [first, second, newChat] = await Promise.all([
+    conversations.getByRole('button', { name: longName }).boundingBox(),
+    conversations.getByRole('button', { name: sessionB.name }).boundingBox(),
+    sidebar.getByRole('button', { name: '新会话', exact: true }).boundingBox(),
+  ])
+  expect(first!.x).toBe(newChat!.x)
+  expect(first!.width).toBe(newChat!.width)
+  expect(second!.y - (first!.y + first!.height)).toBe(2)
   expect(await workspaces.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
 
   const editor = page.getByRole('textbox', { name: '消息' })
@@ -677,7 +844,7 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
     } })
   })
   await mount(<ChatPageHarness modelConfigured useWorkspaceApi />)
-  const heading = page.getByRole('heading', { name: 'SI', exact: true })
+  const heading = page.getByRole('heading', { name: '今天想做什么？', exact: true })
   const workspaceSelect = page.getByRole('combobox', { name: '工作区', exact: true })
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const send = page.getByRole('button', { name: '发送', exact: true })
@@ -688,20 +855,40 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
   const groupB = page.getByRole('group', { name: '白榆', exact: true })
   const model = page.getByRole('combobox', { name: '模型', exact: true })
   await expect(heading).toBeVisible()
-  await expect(heading).toHaveCSS('font-family', /^"?EB Garamond/)
-  await expect(heading).toHaveCSS('font-size', '32px')
-  await expect(heading).toHaveCSS('line-height', '40px')
+  await expect(heading).toHaveCSS('font-family', /^system-ui/)
+  await expect(heading).toHaveCSS('font-size', '24px')
+  await expect(heading).toHaveCSS('line-height', '32px')
   await expect(heading).toHaveCSS('font-weight', '400')
   await expect(workspaceSelect).toHaveCSS('font-size', '14px')
+  const composer = page.locator('.message-input')
+  await expect(composer).toHaveCSS('border-radius', '28px')
+  await expect(composer).toHaveCSS('background-color', 'rgb(255, 255, 255)')
+  const addControl = composer.getByRole('button', { name: '添加', exact: true })
+  await expect(addControl).toHaveCSS('width', '32px')
+  await expect(addControl).toHaveCSS('height', '32px')
+  await expect(addControl).toHaveCSS('border-radius', '50%')
+  await expect(addControl.locator('svg')).toHaveCSS('width', '18px')
+  await expect(addControl).toHaveCSS('border-top-width', '1px')
+  await expect(addControl).toHaveCSS('border-top-color', 'rgb(222, 222, 219)')
+  for (const control of [composer.getByRole('combobox', { name: '权限', exact: true }), model]) {
+    await expect(control).toHaveCSS('height', '32px')
+    await expect(control).toHaveCSS('border-top-width', '0px')
+  }
+  await expect(page.locator('.composer-stack img')).toHaveCount(0)
+  await expect(workspaceSelect.locator('.new-session-folder')).toHaveCSS('width', '16px')
   const headingBox = (await heading.boundingBox())!
-  const editorBox = (await editor.boundingBox())!
-  const workspaceBox = (await workspaceSelect.boundingBox())!
+  const composerBox = (await composer.boundingBox())!
+  const workspaceBox = (await page.locator('.new-session-workspace').boundingBox())!
+  const contentBox = (await page.locator('.chat-main').boundingBox())!
   const modelBox = (await model.boundingBox())!
   const sendBox = (await send.boundingBox())!
-  expect(headingBox.x + headingBox.width / 2).toBeCloseTo(editorBox.x + editorBox.width / 2, 0)
+  expect(composerBox.x + composerBox.width / 2).toBeCloseTo(contentBox.x + contentBox.width / 2, 0)
+  expect((headingBox.y + composerBox.y + composerBox.height) / 2).toBeCloseTo(contentBox.y + contentBox.height / 2, -1)
+  expect(headingBox.x + headingBox.width / 2).toBeCloseTo(composerBox.x + composerBox.width / 2, 0)
+  expect(workspaceBox.x).toBe(composerBox.x)
+  await expect(heading).toHaveCSS('text-align', 'center')
   expect(headingBox.y + headingBox.height).toBeLessThan(workspaceBox.y)
-  expect(workspaceBox.y + workspaceBox.height).toBeLessThan(editorBox.y)
-  expect(workspaceBox.x).toBeLessThan(editorBox.x + editorBox.width / 2)
+  expect(composerBox.y - (workspaceBox.y + workspaceBox.height)).toBe(8)
   expect(modelBox.x + modelBox.width).toBeLessThan(sendBox.x)
   expect(modelBox.y + modelBox.height / 2).toBeCloseTo(sendBox.y + sendBox.height / 2, 0)
 
@@ -737,6 +924,7 @@ test('新会话居中，键盘打开草稿，工作区入口共用一份草稿�
 
   await chooseWorkspace(otherWorkspace.name)
   await expect(send).toBeEnabled()
+  await expect(send).toHaveCSS('background-color', 'rgb(26, 26, 26)')
   await editor.press('Enter')
   const history = groupB.getByRole('button', { name: '会话 1', exact: true })
   await expect(history).toHaveAttribute('aria-current', 'page')
@@ -775,11 +963,18 @@ test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', as
   const model = page.getByRole('combobox', { name: '模型', exact: true })
   const editor = page.getByRole('textbox', { name: '消息', exact: true })
   const send = page.getByRole('button', { name: '发送', exact: true })
-  await expect(page.getByRole('heading', { name: 'SI', exact: true })).toBeInViewport({ ratio: 1 })
+  const heading = page.getByRole('heading', { name: '今天想做什么？', exact: true })
+  await expect(heading).toBeInViewport({ ratio: 1 })
+  await expect(heading).toHaveCSS('font-size', '22px')
   const sidebarToggle = page.getByRole('button', { name: '展开侧边栏' })
   await sidebarToggle.press('Enter')
   const sidebar = page.getByRole('dialog', { name: '侧栏' })
   await expect(sidebar).toBeVisible()
+  const section = sidebar.getByRole('combobox', { name: '内容区' })
+  await section.click()
+  await expect(page.getByRole('option', { name: '定时任务 · 未开放' })).toBeDisabled()
+  await page.keyboard.press('Escape')
+  await expect(section).toBeFocused()
   const settings = sidebar.getByRole('button', { name: '设置' })
   await settings.click()
   const settingsDialog = page.getByRole('dialog', { name: '设置' })
@@ -812,6 +1007,12 @@ test('窄屏草稿仍可选择工作区和模型，发送按钮完整可见', as
   await expect(editor).toBeInViewport({ ratio: 1 })
   await expect(send).toBeInViewport({ ratio: 1 })
   await expect(send).toBeEnabled()
+  const composer = page.locator('.message-input')
+  const add = composer.getByRole('button', { name: '添加', exact: true })
+  const permission = composer.getByRole('combobox', { name: '权限', exact: true })
+  await expect(add).toHaveCSS('width', '44px')
+  await expect(add).toHaveCSS('height', '44px')
+  await expect(permission).toHaveCSS('height', '44px')
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && document.documentElement.scrollHeight <= innerHeight)).toBe(true)
 })
 

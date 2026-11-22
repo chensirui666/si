@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next'
 import { errorNotice, NoticeText, noticeSummary, type Notice } from '../i18n/messages'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, PlusIcon, XIcon } from 'lucide-react'
+import { CalendarClockIcon, ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, HouseIcon, PlusIcon, XIcon } from 'lucide-react'
 import type { ModelDiscovery, ModelSelection } from '@agent-learning/model'
 import type { AbortRequest, AbortResult, ExtensionNotice, PermissionMode, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageResult, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
@@ -16,6 +16,7 @@ import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
 import { BackgroundTasks } from '../components/BackgroundTasks'
+import { NewChatParticles } from '../components/NewChatParticles'
 import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, getMcpServers, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat, createSession } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
@@ -69,7 +70,7 @@ function useServerView<T>(load: () => Promise<T>, failure: Notice['key']) {
 }
 
 export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = queryDefaultPermission, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const [state, setState] = useState(initialState)
   const { sessionId } = state
   const chatScroll = useRef<HTMLElement>(null)
@@ -927,9 +928,28 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     <SidebarProvider>
       <SidebarTrigger ref={sidebarButton} />
       <Sidebar>
-        <div className="sidebar-title">SI</div>
+        <div className="sidebar-title">
+          <img src="/si-mark.svg" width={22} height={22} alt="SI" />
+        </div>
+        <Select value="home">
+          <SelectTrigger className="sidebar-section" aria-label={t('sidebar.section')}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="home">
+              <span className="sidebar-section-value">
+                <span className="sidebar-section-icon" aria-hidden="true"><HouseIcon /></span><span>{t('sidebar.home')}</span>
+              </span>
+            </SelectItem>
+            <SelectItem value="scheduled" disabled>
+              <span className="sidebar-section-value">
+                <span className="sidebar-section-icon" data-tone="gold" aria-hidden="true"><CalendarClockIcon /></span><span>{t('sidebar.scheduledUnavailable')}</span>
+              </span>
+            </SelectItem>
+          </SelectContent>
+        </Select>
         <SidebarDismiss>
-          <Button className="sidebar-new-session" variant="outline" aria-label={t('chat.new')} onClick={() => openNewSession()}>
+          <Button className="sidebar-new-session" variant={isNew ? 'secondary' : 'ghost'} aria-label={t('chat.new')} aria-current={isNew ? 'page' : undefined} onClick={() => openNewSession()}>
             <PlusIcon aria-hidden="true" />
             <span>{t('chat.new')}</span>
           </Button>
@@ -941,24 +961,28 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
               <FolderPlusIcon aria-hidden="true" />
             </Button>
           </div>
-          {workspaces?.workspaces.map(group => <div className="sidebar-workspace" key={group.id} role="group" aria-label={group.name}>
-            <div className="workspace-row" data-bound={group.id === workspace?.id}>
-              <FolderOpenIcon aria-hidden="true" /><span title={group.path}>{group.name}</span>
-              <SidebarDismiss>
-                <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label={t('chat.create')} title={t(group.available ? 'chat.create' : 'chat.workspaceUnavailable')} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
-                  <PlusIcon aria-hidden="true" />
-                </Button>
-              </SidebarDismiss>
-            </div>
-            {isNew && group.id === draftWorkspace?.id && <SidebarDismiss>
-              <Button className="workspace-conversation" variant="secondary" aria-label={t('chat.unsent')} aria-current="page" onClick={() => openNewSession()}>{t('chat.new')}</Button>
-            </SidebarDismiss>}
-            {sessions?.filter(item => item.workspaceId === group.id).map(item => <SidebarDismiss key={item.id}>
-              <Button className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} data-session-id={item.id} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>
-                <span title={item.name}>{item.name}</span>
-              </Button>
-            </SidebarDismiss>)}
-          </div>)}
+          <div className="sidebar-workspace-list">
+            {workspaces?.workspaces.map(group => <div className="sidebar-workspace" key={group.id} role="group" aria-label={group.name}>
+              <div className="workspace-row" data-bound={group.id === workspace?.id}>
+                <FolderOpenIcon aria-hidden="true" /><span title={group.path}>{group.name}</span>
+                <SidebarDismiss>
+                  <Button className="workspace-add-session" variant="ghost" size="icon-sm" aria-label={t('chat.create')} title={t(group.available ? 'chat.create' : 'chat.workspaceUnavailable')} disabled={!group.available || firstPhase !== null} onClick={() => openNewSession(group.id)}>
+                    <PlusIcon aria-hidden="true" />
+                  </Button>
+                </SidebarDismiss>
+              </div>
+              <div className="workspace-conversations">
+                {isNew && group.id === draftWorkspace?.id && <SidebarDismiss>
+                  <Button className="workspace-conversation" variant="secondary" aria-label={t('chat.unsent')} aria-current="page" onClick={() => openNewSession()}>{t('chat.new')}</Button>
+                </SidebarDismiss>}
+                {sessions?.filter(item => item.workspaceId === group.id).map(item => <SidebarDismiss key={item.id}>
+                  <Button className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} data-session-id={item.id} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>
+                    <span title={item.name}>{item.name}</span>
+                  </Button>
+                </SidebarDismiss>)}
+              </div>
+            </div>)}
+          </div>
         </nav>
         <SidebarDismiss>
           <SettingsButton ref={settingsButton} aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)} />
@@ -991,6 +1015,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         </div>
       </header>}
       <div className="chat-main-frame">
+      {isNew && <NewChatParticles />}
       <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
         {!isNew && <MessageList key={sessionId} messages={messages} showRetry={state.connection === 'ready'} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
           onQuote={text => {
@@ -1003,14 +1028,16 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
             <ChevronDownIcon aria-hidden="true" />
           </Button>}
           {isNew && <>
-            <h1 className="new-session-title">SI</h1>
+            <h1 className="new-session-title" lang={i18n.language}>{t('chat.welcome')}</h1>
             <div className="new-session-workspace">
-              <FolderOpenIcon aria-hidden="true" />
               <Select value={draftWorkspace?.id ?? ''} disabled={picking || !workspaces || firstPhase !== null || planBusy} onValueChange={value => {
                 if (value === 'add-workspace') void pickWorkspace()
                 else chooseDraftWorkspace(value)
               }}>
-                <SelectTrigger aria-label={t('chat.workspace')}><SelectValue placeholder={t('chat.chooseWorkspace')} /></SelectTrigger>
+                <SelectTrigger aria-label={t('chat.workspace')}>
+                  <FolderOpenIcon className="new-session-folder" aria-hidden="true" />
+                  <SelectValue placeholder={t('chat.chooseWorkspace')} />
+                </SelectTrigger>
                 <SelectContent>
                   {workspaces?.workspaces.map(item => <SelectItem key={item.id} value={item.id} disabled={!item.available}>{item.name}</SelectItem>)}
                   <SelectItem value="add-workspace">{t('chat.addWorkspaceOption')}</SelectItem>

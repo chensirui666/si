@@ -1,0 +1,76 @@
+.message-input {
+  flex: none;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 28px;
+  padding: 16px;
+  background: var(--background);
+  box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.04);
+  position: relative;
+}
+
+.message-editor {
+  min-height: 24px;
+  max-height: min(200px, 35dvh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--type-reading);
+  outline: none;
+}
+.message-editor p { margin: 0; }
+.message-placeholder { pointer-events: none; position: absolute; top: 16px; left: 16px; right: 16px; color: var(--secondary-text); font: var(--type-reading); }
+
+.composer-actions { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
+.composer-tools, .composer-trailing { display: flex; align-items: center; }
+.composer-tools { gap: 4px; }
+.composer-trailing { min-width: 0; gap: 6px; margin-inline-start: auto; }
+
+.message-input :is(.composer-add-trigger, .composer-permission, .composer-model) {
+  height: 32px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--secondary-text);
+  font: var(--type-control);
+}
+.message-input .composer-add-trigger {
+  width: 32px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+}
+.message-input .composer-add-trigger svg { width: 18px; height: 18px; }
+.message-input .composer-model { padding-inline: 8px; }
+.message-input .composer-model-controls > button:first-child { flex-shrink: 1; }
+
+.send-button {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  opacity: 1;
+  box-shadow: none;
+  transition: none;
+}
+.send-button:not(:disabled):hover { background: #333333; }
+.send-button:not(:disabled):active { background: var(--primary); }
+.send-button:disabled { background: var(--surface); color: var(--muted-text); opacity: 1; }
+.send-button svg { width: 16px; height: 16px; }
+.send-button svg.lucide-square { width: 10px; height: 10px; }
+
+@media (max-width: 600px), (pointer: coarse) {
+  .message-input :is(.composer-add-trigger, .composer-permission, .composer-model) { min-height: 44px; }
+  .message-input .composer-add-trigger { width: 44px; }
+  .send-button { width: 44px; height: 44px; }
+}
+@media (max-width: 360px) {
+  .composer-actions { flex-wrap: wrap; }
+  .composer-tools { flex-basis: 100%; }
+}
+@media (max-height: 500px) {
+  .message-editor { max-height: clamp(24px, calc(100dvh - 184px), 200px); }
+}

@@ -54,7 +54,7 @@ type DeleteTarget = { provider: Provider; trigger: HTMLButtonElement; fallback: 
 export function SettingsButton(props: ComponentProps<typeof Button>) {
   const { t } = useTranslation()
   return <Button className="settings-trigger" type="button" variant="ghost" aria-haspopup="dialog" {...props}>
-    <SettingsIcon aria-hidden="true" />{t('settings.title')}
+    <SettingsIcon aria-hidden="true" /><span>{t('settings.title')}</span>
   </Button>
 }
 
@@ -227,6 +227,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
     }}>
       <DialogTitle className="settings-title">{t('settings.title')}</DialogTitle>
       <DialogDescription className="sr-only">{t('settings.description')}</DialogDescription>
+      <h3 className="settings-section-title">{t(`settings.${section}`)}</h3>
       <nav className="settings-nav" aria-label={t('settings.sections')}>
         {sections.map(({ id, Icon }) => <Button key={id} ref={id === 'models' ? modelTab : id === 'web' ? webTab : undefined} variant="ghost"
           aria-current={section === id ? 'true' : undefined} onClick={() => { if (section !== id) navigate(id) }}>
@@ -234,9 +235,8 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
         </Button>)}
       </nav>
       <section key={section} className="settings-content" aria-label={t(`settings.${section}`)}>
-        {section !== 'general' && <h3>{t(`settings.${section}`)}</h3>}
         {section === 'general' ? <>
-          <div className="language-setting">
+          <div className="settings-option-row">
             <label htmlFor="settings-language">{t('settings.language')}</label>
             <Select value={language} open={languageMenuOpen && !languageBusy} onOpenChange={next => {
               if (!next || !languageBusy) setLanguageMenuOpen(next)
@@ -256,7 +256,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
             {languageStatus === 'readFailed' && <Button variant="ghost" onClick={() => { void loadLanguage() }}>{t('common.retry')}</Button>}
           </>}
           {permissionSettings && <>
-            <div className="language-setting">
+            <div className="settings-option-row">
               <div>
                 <label htmlFor="settings-permission">{t('permission.label')}</label>
                 <p className="settings-help">{t('permission.defaultHelp')}</p>
@@ -281,7 +281,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
                 {([
                   { field: 'searchProvider', capability: 'search', label: 'settings.search' },
                   { field: 'fetchProvider', capability: 'fetch', label: 'settings.fetch' },
-                ] as const).map(({ field, capability, label }) => <div key={field}>
+                ] as const).map(({ field, capability, label }) => <div className="settings-option-row" key={field}>
                   <label htmlFor={field}>{t(label)}</label>
                   <Select value={webSettings[field]} disabled={busy} onValueChange={value => updateSelection(field, value)}>
                     <SelectTrigger id={field}><SelectValue /></SelectTrigger>
