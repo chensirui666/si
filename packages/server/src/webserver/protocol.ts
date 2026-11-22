@@ -4,6 +4,7 @@ import type {
   PermissionMode, SessionSummary, SkillInvocation, SkillSummary, SubmissionAccepted, SubmissionHandled, SubmissionSources, FinishedBashJob, RunningBashJob,
 } from '@agent-learning/coding-agent'
 import type { WorkspaceRegistration } from '../workspaces.js'
+import type { ScheduledPlan, ScheduledRunView as StoredScheduledRun } from '@agent-learning/coding-agent'
 
 export type {
   ExtensionNotice, ActiveContent, CompactionRecord, ContextUsage, ModelFrame, ModelRetryState, PermissionMode, RunRecord, RunningState, SaveFailure,
@@ -43,6 +44,11 @@ export type ConversationUpdate = Omit<StoredUpdate, 'change'> & {
 export type WorkspacePick = { cancelled: true } | ({ cancelled: false } & WorkspaceRegistration)
 export type CreateSessionRequest = { workspaceId: string; permissionMode?: PermissionMode }
 export type SessionList = { sessions: SessionSummary[] }
+export type ScheduleView = Omit<ScheduledPlan, 'creationRunId' | 'deleted'>
+export type ScheduledRunView = Omit<StoredScheduledRun, 'submission'>
+export type SchedulePatch = { action: 'pause' | 'resume' } | {
+  action: 'update'; prompt?: string; schedule?: ScheduleView['schedule']; sessionMode?: ScheduleView['sessionMode']
+}
 export type SubmitMessageRequest = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & SubmissionSources
   & { clientMessageId: string; text: string; sessionId: string }
 export type SaveModelSelectionRequest = ModelSelection & { sessionId?: string }

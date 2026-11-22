@@ -1,6 +1,7 @@
 import type { ModelDiscovery } from '@agent-learning/model'
 import { isPermissionMode } from '@agent-learning/server/protocol'
 import type { BashJobsView, StopBashJobResult, WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, McpOAuthStartView, McpServerView, SaveMcpServerRequest, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import type { SchedulePatch, ScheduleView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
 import { applyFrame, messageAttachment, extensionNotice, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
@@ -185,6 +186,7 @@ function sessionSummary(value: unknown): value is SessionSummary {
     && typeof value.workspaceId === 'string' && !!value.workspaceId.trim()
     && typeof value.name === 'string' && !!value.name.trim()
     && typeof value.createdAt === 'string' && Number.isFinite(Date.parse(value.createdAt))
+    && (value.hasScheduledTask === undefined || typeof value.hasScheduledTask === 'boolean')
 }
 
 function sessionList(value: unknown): value is SessionList {
@@ -284,6 +286,43 @@ export const getWorkspaces = () => requestView('/api/workspaces', 'request.works
 export const pickWorkspace = () => requestView('/api/workspaces/pick', 'request.workspacePicker', workspacePick, { method: 'POST' })
 
 export const getSessions = async () => (await requestView('/api/sessions', 'request.sessions', sessionList)).sessions
+
+const schedulesPath = '/api/schedules'
+const schedulePath = (id: string) => `${schedulesPath}/${encodeURIComponent(id)}`
+const isTimestamp = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(new Date(value).getTime())
+
+function isTimeZone(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  try { return Boolean(new Intl.DateTimeFormat('en', { timeZone: value })) }
+  catch { return false }
+}
+
+function isSchedule(value: unknown): value is ScheduleView {
+  if (!record(value) || !record(value.schedule)) return false
+  const rule = value.schedule
+  return typeof value.id === 'string' && typeof value.sessionId === 'string' && typeof value.workspaceId === 'string'
+    && typeof value.prompt === 'string' && isTimeZone(value.timezone)
+    && (value.status === 'enabled' || value.status === 'paused') && (value.sessionMode === 'reuse' || value.sessionMode === 'new')
+    && (value.nextRunAt === null || isTimestamp(value.nextRunAt))
+    && typeof rule.time === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(rule.time)
+    && (rule.kind === 'daily' || rule.kind === 'weekdays' || (rule.kind === 'weekly' && Array.isArray(rule.weekdays)
+      && rule.weekdays.length > 0 && rule.weekdays.every(day => Number.isInteger(day) && day >= 1 && day <= 7)))
+}
+
+export async function getSchedules(signal: AbortSignal) {
+  return (await requestView(schedulesPath, 'schedule.title',
+    (value): value is { schedules: ScheduleView[] } => record(value) && Array.isArray(value.schedules) && value.schedules.every(isSchedule),
+    { signal })).schedules
+}
+
+export async function updateSchedule(id: string, patch: SchedulePatch) {
+  return (await requestView(schedulePath(id), 'schedule.title',
+    (value): value is { schedule: ScheduleView } => record(value) && isSchedule(value.schedule) && value.schedule.id === id,
+    { ...putJson(patch), method: 'PATCH', signal: AbortSignal.timeout(10_000) })).schedule
+}
+
+export const deleteSchedule = (id: string) => requestView(schedulePath(id), 'schedule.title',
+  (value): value is undefined => value === undefined, { method: 'DELETE', signal: AbortSignal.timeout(10_000) })
 
 const jobsPath = (sessionId: string) => `/api/sessions/${encodeURIComponent(sessionId)}/jobs`
 

@@ -21,6 +21,7 @@ import { generateSessionTitle, temporarySessionTitle } from './session-title.js'
 import type { McpToolIdentity } from './mcp/manager.js'
 import { createMcpToolSearch, isMcpToolSearchDetails, MCP_TOOL_SEARCH_NAME } from './mcp/tool-search.js'
 import { createMcpTools, mcpToolIdentity, mcpToolKey, type McpToolSource } from './mcp/tools.js'
+import { createCronjobTool, CRONJOB_TOOL_NAME, type ManageSchedule } from './cronjob-tool.js'
 import { sameSubmissionSources, type SubmissionInput } from './types.js'
 import type { CompactionRecord, ExtensionNotice, SubmissionAccepted, SubmissionHandled, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, PlanState, RunRecord, RunningState, SaveFailure } from './types.js'
 
@@ -42,7 +43,7 @@ function isFileOperation(detail: unknown): detail is NonNullable<ConversationMes
 }
 
 export class AgentSession {
-  private submitting?: { input: SubmissionInput; settled: Promise<SubmissionResult> }
+  private submitting?: { input: SubmissionInput; scheduled: boolean; settled: Promise<SubmissionResult> }
   private preparing?: AbortController
   private initialization?: Promise<void>
   private initializing?: AbortController
@@ -82,6 +83,8 @@ export class AgentSession {
     stream?: typeof stream
     titleStream?: typeof stream
     onTitleChanged?: () => void
+    onScheduledRunFinished?: (id: string) => void
+    manageSchedule?: ManageSchedule
     attachments?: SessionAttachments
     referenceDirectory?: string
     isWorkspaceRegistered?: (id: string) => Promise<boolean>
@@ -163,6 +166,7 @@ export class AgentSession {
       const ctx = this.extensionContext(path, selected, signal)
       const reserved = [...defaultTools, ...this.options.tools?.(path) ?? []].map(tool => tool.name)
       if (this.options.mcp) reserved.push(MCP_TOOL_SEARCH_NAME)
+      if (this.options.manageSchedule) reserved.push(CRONJOB_TOOL_NAME)
       await this.runtime!.initialize(ctx, reserved)
       await this.runtime!.emit('session_start', { reason: this.options.persistence?.history ? 'resume' : 'new' }, ctx)
     }).catch(error => {
@@ -216,8 +220,8 @@ export class AgentSession {
     this.publish({ type: 'permission', permissionMode })
   }
 
-  private availableTools(tools: CodingTool[], planning: boolean): AvailableTools {
-    const local = [...tools, ...this.runtime?.tools() ?? []]
+  private availableTools(tools: CodingTool[], planning: boolean, scheduled: boolean): AvailableTools {
+    const local = [...tools, ...this.runtime?.tools() ?? []].filter(tool => !scheduled || tool.name !== CRONJOB_TOOL_NAME)
     if (this.state.permissionMode !== 'normal') return { local: local.filter(tool => readOnlyTools.has(tool.name)) }
     if (planning) return { local: local.flatMap(tool => planReadTools.has(tool.name) ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : []) }
     const mcp = this.options.mcp
@@ -231,7 +235,7 @@ export class AgentSession {
       const denial = this.toolDenial(name, args, Boolean(this.state.plan), false)
       if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
     }
-    const remote = createMcpTools(local, bindings, mcp, checkPermission)
+    const remote = createMcpTools(local, bindings, mcp, checkPermission).filter(tool => !scheduled || tool.name !== CRONJOB_TOOL_NAME)
     const declared = new Set([...local, ...remote].map(tool => tool.name))
     const search = createMcpToolSearch(async signal => {
       await mcp.waitForToolDiscovery(signal)
@@ -301,16 +305,27 @@ export class AgentSession {
     return this.submitMessage(input)
   }
 
-  private async submitMessage(input: SubmissionInput, approvedPlanId?: string): Promise<SubmissionResult> {
+  getScheduledSettings() {
+    const selection = this.state.modelSelection
+    return { modelSelection: selection && { ...selection }, permissionMode: this.state.permissionMode }
+  }
+
+  async submitScheduled(input: SubmissionInput, signal?: AbortSignal): Promise<SubmissionResult> {
+    if (!this.options.persistence) throw new SessionSubmitError('invalid', '当前会话不支持定时任务')
+    return this.submitMessage(input, undefined, true, signal)
+  }
+
+  private async submitMessage(input: SubmissionInput, approvedPlanId?: string, scheduled = false, admissionSignal?: AbortSignal): Promise<SubmissionResult> {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
     if (typeof input?.modelId !== 'string' || !input.provider && input.modelId !== 'deepseek-flash'
       || typeof input.text !== 'string' || (!input.text.trim() && !input.attachmentIds?.length)
       || typeof input.clientMessageId !== 'string' || !input.clientMessageId.trim() || input.clientMessageId.length > 128) {
       throw new SessionSubmitError('invalid', '请提交有效原文、支持的模型和临时编号')
     }
-    const planArgument = planCommandArgument(input.text)
+    const planArgument = scheduled ? undefined : planCommandArgument(input.text)
+    const manualCompaction = !scheduled && input.text.trim() === '/compact'
     const planControl = planArgument === '' || planArgument === 'off'
-    if ((planControl || input.text.trim() === '/compact') && (input.attachmentIds?.length || input.referenceSessionIds?.length)) {
+    if ((planControl || manualCompaction) && (input.attachmentIds?.length || input.referenceSessionIds?.length)) {
       throw new SessionSubmitError('invalid', '控制命令不能同时发送附件或会话引用')
     }
     const selection = runSelection(input)
@@ -319,7 +334,7 @@ export class AgentSession {
       await this.submitting.settled.catch(() => undefined)
       if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
     }
-    const previous = this.replay(input, selection)
+    const previous = this.replay(input, selection, scheduled)
     if (previous) return previous
     if (planControl) {
       if (this.options.persistence?.first && !this.storedRuns.size) {
@@ -340,34 +355,44 @@ export class AgentSession {
       throw new SessionSubmitError('invalid', '所选模型不支持此推理强度')
     }
     while (this.submitting?.input.clientMessageId === input.clientMessageId) {
+      if (this.submitting.scheduled !== scheduled) throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
       this.checkReplay(this.submitting.input, input, selection)
       await this.submitting.settled.catch(() => undefined)
       if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
       const approved = approvedPlanId && this.approvedPlans.get(approvedPlanId)
       if (approved) return { ...approved }
-      const accepted = this.replay(input, selection)
+      const accepted = this.replay(input, selection, scheduled)
       if (accepted) return accepted
     }
     if (this.submitting || this.state.running) throw new SessionSubmitError('busy', '正在接收或生成，请等待本次回答结束')
-    if (this.state.plan?.state === 'review' && !approvedPlanId && input.text.trim() !== '/compact') {
+    if (this.state.plan?.state === 'review' && !approvedPlanId && !manualCompaction) {
       throw new SessionSubmitError('busy', '请先确认当前方案，或选择去聊天里说。')
     }
+    if (admissionSignal) this.checkPreparing(admissionSignal)
     const controller = this.preparing = new AbortController()
-    const promise = this.accept(input, selection, model, controller, approvedPlanId, planArgument)
-    this.submitting = { input, settled: promise }
+    const stopPreparing = () => {
+      if (this.controller === controller) return
+      controller.abort()
+      this.initializing?.abort()
+    }
+    admissionSignal?.addEventListener('abort', stopPreparing, { once: true })
+    const promise = this.accept(input, selection, model, controller, { approvedPlanId, planArgument, scheduled, manualCompaction })
+    this.submitting = { input, scheduled, settled: promise }
     try {
       return await promise
     } finally {
+      admissionSignal?.removeEventListener('abort', stopPreparing)
       this.submitting = undefined
       this.preparing = undefined
     }
   }
 
-  private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo, controller: AbortController, approvedPlanId?: string, planArgument?: string): Promise<SubmissionResult> {
+  private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo, controller: AbortController,
+    { approvedPlanId, planArgument, scheduled, manualCompaction: manual }: { approvedPlanId?: string; planArgument?: string; scheduled: boolean; manualCompaction: boolean },
+  ): Promise<SubmissionResult> {
     const { signal } = controller
     const cwd = await this.options.resolveDirectory()
     const directory = await this.options.discoverModels?.()
-    const manual = input.text.trim() === '/compact'
     this.checkPreparing(signal)
     this.checkModelSelection(input, selection, directory)
     model.defaultReasoningEffort = selection.reasoningEffort
@@ -381,7 +406,7 @@ export class AgentSession {
     this.checkPreparing(signal)
     const submittedText = planArgument ?? input.text
     let text = submittedText
-    if (!manual && !approvedPlanId && this.runtime?.has('input')) {
+    if (!manual && !scheduled && !approvedPlanId && this.runtime?.has('input')) {
       const notices: ExtensionNotice[] = []
       const result = await this.runtime.input(text, this.extensionContext(cwd, model, signal, notices))
       this.checkPreparing(signal)
@@ -397,7 +422,14 @@ export class AgentSession {
     const namedSkill = skillCommand.exec(text)?.[1]
     const selectedSkill = namedSkill ? skills.find(skill => skill.name === namedSkill) : undefined
     const skillInvocation = selectedSkill ? await loadSkill(selectedSkill) : undefined
-    const tools = this.options.tools?.(cwd) ?? []
+    const userId = randomUUID()
+    const tools = [...this.options.tools?.(cwd) ?? []]
+    const storage = this.options.persistence
+    const manageSchedule = this.options.manageSchedule
+    if (!manual && !scheduled && storage && manageSchedule) {
+      const { id: sessionId, workspaceId } = storage.summary
+      tools.push(createCronjobTool(args => manageSchedule({ sessionId, workspaceId, runId: userId }, args)))
+    }
     let files = this.projectContext?.cwd === cwd ? this.projectContext.files : []
     if (!manual && this.runtime?.has('before_agent_start')) {
       try { files = await this.loadContextFiles(cwd, model, signal) }
@@ -407,7 +439,7 @@ export class AgentSession {
       }
     }
     this.checkPreparing(signal)
-    this.configure(cwd, this.availableTools(tools, !approvedPlanId && (planArgument !== undefined || Boolean(this.state.plan))), files, skills)
+    this.configure(cwd, this.availableTools(tools, !approvedPlanId && (planArgument !== undefined || Boolean(this.state.plan)), scheduled), files, skills)
     if (manual) {
       this.checkModelSelection(input, selection, directory)
       const record = this.newCompaction('manual', input.clientMessageId)
@@ -432,7 +464,7 @@ export class AgentSession {
     }
     const prepared = await this.prepareSources(input, model)
     const user: ConversationMessage = {
-      id: randomUUID(), clientMessageId: input.clientMessageId,
+      id: userId, clientMessageId: input.clientMessageId,
       message: { role: 'user', content: text, timestamp: Date.now() },
       ...(skillInvocation && { skillInvocation }),
       ...(prepared.attachments.length && { attachments: prepared.attachments }),
@@ -459,7 +491,7 @@ export class AgentSession {
         messages: [user, ...extra], plan: planChange,
         ...(prepared.scope && { attachments: { ids: prepared.attachments.map(attachment => attachment.id),
           scope: prepared.scope, cutoff: Date.now() - ATTACHMENT_TTL_MS } }),
-      }, text, approvedPlanId, title)
+      }, text, approvedPlanId, title, scheduled)
     } catch (error) {
       if (!(error instanceof SessionWriteError && error.reason === 'unconfirmed')) await removeReferenceSnapshots(prepared.references)
       throw error
@@ -473,7 +505,7 @@ export class AgentSession {
     const receipt: SubmissionAccepted = { kind: 'message', clientMessageId: input.clientMessageId, userMessageId: user.id, acceptedSeq: this.state.seq }
     if (approvedPlanId) this.approvedPlans.set(approvedPlanId, { ...receipt })
     if (planChange !== undefined) this.publish({ type: 'plan', plan: planChange })
-    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal, user, systemPrompt))
+    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal, user, systemPrompt, scheduled))
     if (run && title) this.startTitle(model, submittedText, title)
     return receipt
   }
@@ -568,14 +600,16 @@ export class AgentSession {
     return selection
   }
 
-  private replay(input: SubmissionInput, selection: ModelSelection) {
+  private replay(input: SubmissionInput, selection: ModelSelection, scheduled: boolean) {
     const handled = this.handled.get(input.clientMessageId)
     if (handled) {
+      if (scheduled) throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
       this.checkReplay(handled.input, input, selection)
       return structuredClone(handled.result)
     }
     const previous = this.storedRuns.get(input.clientMessageId)
     if (!previous) return
+    if (Boolean(previous.scheduledRunId) !== scheduled) throw new SessionSubmitError('busy', '此提交编号已用于另一条消息')
     this.checkReplay({ ...previous, permissionMode: previous.firstPermissionMode }, input, selection)
     return submissionReceipt(previous)
   }
@@ -594,7 +628,7 @@ export class AgentSession {
 
   private saveStart(input: SubmissionInput, selection: ModelSelection, id: string, kind: RunRecord['kind'],
     data: Pick<Parameters<SessionPersistence['store']['save']>[1], 'messages' | 'compaction' | 'plan' | 'attachments'>,
-    finalText?: string, approvedPlanId?: string, title?: string) {
+    finalText?: string, approvedPlanId?: string, title?: string, scheduled = false) {
     const storage = this.options.persistence
     if (!storage) return
     const { permissionMode, ...message } = input
@@ -603,10 +637,13 @@ export class AgentSession {
     const run: StoredRun = {
       ...message, ...(finalText !== undefined && finalText !== input.text && { finalText }), ...(summary && permissionMode !== undefined && { firstPermissionMode: permissionMode }),
       ...(summary && title && { firstTitle: title }),
+      ...(scheduled && { scheduledRunId: input.clientMessageId }),
       ...(approvedPlanId && { approvedPlanId }), ...selection, id, kind, sessionId: storage.summary.id, status: 'running', startedAt: Date.now(), acceptedSeq: this.state.seq + 1,
     }
     this.save({ ...data, run, summary, ...(summary && { permissionMode: this.state.permissionMode }),
       ...(!summary && title && { name: { value: title, expected: storage.summary.name } }),
+      ...(scheduled && { scheduledSubmission: { sessionId: run.sessionId, workspaceId: storage.summary.workspaceId,
+        text: input.text, modelSelection: selection, permissionMode: this.state.permissionMode } }),
       modelSelection: this.state.modelSelection ? undefined : selection })
     if (summary) Object.assign(storage.summary, summary)
     else if (title) storage.summary.name = title
@@ -799,6 +836,10 @@ export class AgentSession {
       } catch (error) {
         this.noteFailure(error, plainAnswer ? 'answer' : 'finish')
         run = this.endedRun(stored, 'failed')
+        if (stored.scheduledRunId && error instanceof SessionWriteError && error.reason !== 'unconfirmed') {
+          // Preserve the terminal result even if the answer and its checkpoint could not be saved together.
+          try { this.save({ run }) } catch { /* The existing save failure remains visible in the session. */ }
+        }
         plan = undefined
       }
     }
@@ -817,6 +858,10 @@ export class AgentSession {
     this.publish({ type: 'task', running: null }, run && this.publicRun(run), this.failure)
     if (plan) this.publish({ type: 'plan', plan })
     this.failure = undefined
+    const scheduledRunId = run?.scheduledRunId
+    if (scheduledRunId && this.options.onScheduledRunFinished) {
+      void Promise.resolve().then(() => this.options.onScheduledRunFinished?.(scheduledRunId)).catch(() => undefined)
+    }
   }
 
   private followup(compaction: Extract<CompactionRecord, { status: 'success' }> | undefined, entry: ConversationMessage) {
@@ -847,7 +892,7 @@ export class AgentSession {
     this.publish(message ? { type: 'task', running, message, messageIndex: visibleIndex } : { type: 'task', running })
   }
 
-  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], skills: readonly SkillSummary[], signal: AbortSignal, user: ConversationMessage, systemPrompt?: string) {
+  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], skills: readonly SkillSummary[], signal: AbortSignal, user: ConversationMessage, systemPrompt: string | undefined, scheduled: boolean) {
     let messageId = running.assistantMessageId
     let advanceRound = false
     let recovered = false
@@ -868,7 +913,7 @@ export class AgentSession {
     const configure = (files: ProjectContextFile[]) => {
       if (roundPlanning && !this.state.plan) leftPlan = true
       roundPlanning = Boolean(this.state.plan)
-      roundTools = this.configure(cwd, this.availableTools(tools, roundPlanning), files, skills)
+      roundTools = this.configure(cwd, this.availableTools(tools, roundPlanning, scheduled), files, skills)
       if (systemPrompt !== undefined) this.configuration.systemPrompt = systemPrompt
       if (roundPlanning) this.configuration.systemPrompt += '\n\n' + planInstruction
       else if (leftPlan) this.configuration.systemPrompt += '\n\n用户已退出计划模式，当前采用普通模式。退出模式本身不表示用户已批准方案。'
@@ -931,7 +976,9 @@ export class AgentSession {
     }
 
     const beforeToolCall: AgentRunInput['beforeToolCall'] = call =>
-      this.toolDenial(call.name, call.arguments, roundPlanning, call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
+      scheduled && call.name === CRONJOB_TOOL_NAME
+        ? { code: 'permission_denied', message: '定时执行不能管理定时任务。' }
+        : this.toolDenial(call.name, call.arguments, roundPlanning, call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
 
     let preview: Pick<ConversationSnapshot, 'messages' | 'activeContent'> | undefined
     const agent = new Agent({ stream: withModelRetry(this.options.stream ?? stream, retry => {

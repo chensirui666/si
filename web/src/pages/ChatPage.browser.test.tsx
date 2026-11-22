@@ -1134,3 +1134,108 @@ test('草稿进入计划时复用已创建的会话，失败保留命令可重�
   expect(creates).toBe(1)
   expect(submissions).toBe(2)
 })
+
+test('定时任务记住所选会话，行尾菜单只显示管理操作', async ({ mount, page }) => {
+  const owner = { id: 'session-a', workspaceId: 'workspace-1', name: '计划来源', createdAt: '2026-11-18T08:00:00Z' }
+  const other = { ...owner, id: 'other-session', name: '其他会话' }
+  let enabled = true
+  await page.route('**/api/workspaces', route => route.fulfill({ json: {
+    workspaces: [{ id: owner.workspaceId, name: 'workspace', path: '/tmp/workspace', available: true }],
+  } }))
+  await page.route('**/api/sessions', route => route.fulfill({ json: {
+    sessions: [{ ...owner, hasScheduledTask: enabled }, other],
+  } }))
+  await page.route('**/api/schedules', route => route.fulfill({ json: { schedules: [{
+    id: 'schedule-1', sessionId: owner.id, workspaceId: owner.workspaceId, prompt: '汇总项目结果',
+    timezone: 'Asia/Shanghai', schedule: { kind: 'weekly', weekdays: [1, 3], time: '09:00' },
+    status: enabled ? 'enabled' : 'paused', sessionMode: 'reuse',
+    nextRunAt: enabled ? Date.parse('2026-11-23T01:00:00Z') : null,
+  }] } }))
+  await mount(<ChatPageHarness useWorkspaceApi modelConfigured />)
+  const ownerRow = page.getByRole('button', { name: owner.name, exact: true })
+  await expect(ownerRow).toHaveAccessibleDescription('有重复定时任务')
+  const otherRow = page.getByRole('button', { name: other.name, exact: true })
+  await expect(otherRow).not.toHaveAccessibleDescription('有重复定时任务')
+
+  const section = page.getByRole('combobox', { name: '内容区' })
+  await section.click()
+  await page.getByRole('option', { name: '定时任务', exact: true }).click()
+  const plans = page.getByRole('main', { name: '定时任务', exact: true })
+  await expect(plans).toBeVisible()
+  const task = page.getByRole('button', { name: /^计划来源/ })
+  const actions = page.getByRole('button', { name: '管理定时任务：计划来源', exact: true })
+  await expect(task).toContainText(owner.name)
+  await expect(task).not.toContainText('汇总项目结果')
+  const row = task.locator('..')
+  await actions.hover()
+  await expect(row).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+  await expect(actions).toHaveCSS('background-color', 'rgb(240, 240, 238)')
+  await actions.click()
+  await expect(page.getByRole('menuitem', { name: '编辑', exact: true })).toBeVisible()
+  await expect(plans).toBeVisible()
+  await page.keyboard.press('Escape')
+  await task.click()
+  await expect(task).toHaveAttribute('aria-current', 'true')
+  await expect(row).toHaveCSS('background-color', 'rgb(240, 240, 238)')
+  await expect(page.getByRole('heading', { name: owner.name, exact: true })).toBeVisible()
+  await expect(plans).toBeHidden()
+  await actions.hover()
+  await expect(actions).toHaveCSS('background-color', 'rgb(222, 222, 219)')
+  await actions.click()
+  await expect(page.getByRole('menuitem')).toHaveText(['暂停', '立即运行', '编辑', '删除'])
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('heading', { name: owner.name, exact: true })).toBeVisible()
+
+  await expect(task).toHaveAttribute('aria-current', 'true')
+  await section.click()
+  await page.getByRole('option', { name: '首页', exact: true }).click()
+  await otherRow.click()
+  await expect(page.getByRole('heading', { name: other.name, exact: true })).toBeVisible()
+  await section.click()
+  await page.getByRole('option', { name: '定时任务', exact: true }).click()
+  await expect(task).toHaveAttribute('aria-current', 'true')
+  await expect(page.getByRole('heading', { name: owner.name, exact: true })).toBeVisible()
+  await section.click()
+  await page.getByRole('option', { name: '首页', exact: true }).click()
+  await expect(page.getByRole('heading', { name: other.name, exact: true })).toBeVisible()
+  enabled = false
+  owner.name = '会话已改名'
+  await page.evaluate(() => {
+    for (const connection of ['disconnected', 'ready']) {
+      window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection, snapshot: null, slow: false, error: null } }))
+    }
+  })
+  const renamedOwner = page.getByRole('button', { name: owner.name, exact: true })
+  await expect(renamedOwner).toBeVisible()
+  await expect(renamedOwner).not.toHaveAccessibleDescription('有重复定时任务')
+  await renamedOwner.click()
+  await expect(page.getByRole('heading', { name: owner.name, exact: true })).toBeVisible()
+
+  await page.setViewportSize({ width: 375, height: 720 })
+  await page.getByRole('button', { name: '展开侧边栏' }).click()
+  await section.click()
+  await page.getByRole('option', { name: '定时任务', exact: true }).click()
+  await expect(page.getByRole('dialog', { name: '侧栏' })).toBeHidden()
+  await expect(page.getByRole('heading', { name: owner.name, exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '展开侧边栏' }).click()
+  await page.getByRole('button', { name: '新建任务', exact: true }).click()
+  const createDialog = page.getByRole('dialog', { name: '设置定时任务', exact: true })
+  await expect(createDialog).toBeVisible()
+  await expect(page.getByRole('dialog', { name: '侧栏' })).toBeHidden()
+  await createDialog.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(createDialog).toBeHidden()
+  await expect(page.getByRole('button', { name: '展开侧边栏' })).toBeFocused()
+  await page.getByRole('button', { name: '展开侧边栏' }).click()
+  await page.getByRole('region', { name: '已暂停', exact: true }).getByRole('button', { name: /^会话已改名/ }).click()
+  await expect(page.getByRole('dialog', { name: '侧栏' })).toBeHidden()
+  await expect(page.getByRole('heading', { name: owner.name, exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '展开侧边栏' }).click()
+  await page.getByRole('button', { name: '管理定时任务：会话已改名', exact: true }).click()
+  await expect(page.getByRole('menuitem', { name: '恢复', exact: true })).toBeVisible()
+  await page.getByRole('menuitem', { name: '删除', exact: true }).click()
+  const deleteDialog = page.getByRole('dialog', { name: '删除定时任务', exact: true })
+  await deleteDialog.getByRole('button', { name: '关闭', exact: true }).click()
+  await expect(deleteDialog).toBeHidden()
+  await expect(page.getByRole('button', { name: '展开侧边栏' })).toBeFocused()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375)
+})

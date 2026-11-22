@@ -7,7 +7,7 @@ import { Button } from './button'
 // shadcn/ui Sidebar's desktop offcanvas and mobile Sheet, scoped to the left rail.
 const mobileQuery = '(max-width: 600px)'
 const sidebarId = 'chat-sidebar'
-const SidebarContext = createContext<{ mobile: boolean; open: boolean; toggle: () => void } | null>(null)
+const SidebarContext = createContext<{ mobile: boolean; open: boolean; toggle: () => void; dismissOnMobile: () => void } | null>(null)
 
 function subscribeToViewport(update: () => void) {
   const query = window.matchMedia?.(mobileQuery)
@@ -15,7 +15,7 @@ function subscribeToViewport(update: () => void) {
   return () => query?.removeEventListener('change', update)
 }
 
-function useSidebar() {
+export function useSidebar() {
   const sidebar = useContext(SidebarContext)
   if (!sidebar) throw new Error('SidebarProvider is required')
   return sidebar
@@ -26,7 +26,7 @@ export function SidebarProvider({ children }: { children: ReactNode }) {
   const [openDesktop, setOpenDesktop] = useState(true)
   const [openMobile, setOpenMobile] = useState(false)
   const open = mobile ? openMobile : openDesktop
-  return <SidebarContext.Provider value={{ mobile, open, toggle: () => setOpenDesktop(value => !value) }}>
+  return <SidebarContext.Provider value={{ mobile, open, toggle: () => setOpenDesktop(value => !value), dismissOnMobile: () => { if (mobile) setOpenMobile(false) } }}>
     <Sheet.Root open={mobile && openMobile} onOpenChange={setOpenMobile}>
       <div className="chat-layout" data-slot="sidebar-wrapper" data-sidebar-expanded={!mobile && openDesktop}>
         {children}

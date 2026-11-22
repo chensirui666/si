@@ -12,6 +12,7 @@ export type SessionSummary = {
   workspaceId: string
   name: string
   createdAt: string
+  hasScheduledTask?: boolean
 }
 
 type FirstMessage = Parameters<AgentSession['submit']>[0] & { workspaceId: string; draftSessionId?: string }
@@ -20,7 +21,7 @@ type Draft<T> = { summary: SessionSummary; session: T; close(): Promise<void>; s
 
 export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (selection: ModelSelection) => void | Promise<void>; initialize?: () => Promise<void> | undefined }> {
   private readonly sessions = new Map<string, { summary: SessionSummary; session: T }>()
-  private readonly starts = new Map<string, { input: FirstMessage; result: Promise<StartedSession> }>()
+  private readonly starts = new Map<string, { input: FirstMessage; scheduled: boolean; result: Promise<StartedSession> }>()
   private readonly drafts = new Map<string, { workspaceId: string; pending: Promise<Draft<T>> }>()
   private closing?: Promise<void>
 
@@ -60,13 +61,13 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     return summary
   }
 
-  async start(input: FirstMessage, submit: (session: T) => Promise<SubmissionAccepted | SubmissionHandled>): Promise<StartedSession> {
+  async start(input: FirstMessage, submit: (session: T) => Promise<SubmissionAccepted | SubmissionHandled>, scheduled = false): Promise<StartedSession> {
     this.ensureOpen()
     const id = input.clientMessageId
     const draftId = input.draftSessionId ?? id
     const previous = this.starts.get(id)
     if (previous) {
-      if (previous.input.workspaceId !== input.workspaceId || previous.input.draftSessionId !== input.draftSessionId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text || previous.input.permissionMode !== input.permissionMode
+      if (previous.scheduled !== scheduled || previous.input.workspaceId !== input.workspaceId || previous.input.draftSessionId !== input.draftSessionId || !sameSelection(runSelection(previous.input), runSelection(input)) || previous.input.text !== input.text || previous.input.permissionMode !== input.permissionMode
         || !sameSubmissionSources(previous.input, input)) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
       }
@@ -75,7 +76,7 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     const history = this.options.store?.loadSession(draftId)
     if (history) {
       const run = history.runs[0]
-      if (run?.kind !== 'task' || run.clientMessageId !== id || history.summary.workspaceId !== input.workspaceId
+      if (run?.kind !== 'task' || run.clientMessageId !== id || Boolean(run.scheduledRunId) !== scheduled || history.summary.workspaceId !== input.workspaceId
         || run.text !== input.text || run.firstPermissionMode !== input.permissionMode || !sameSelection(runSelection(run), runSelection(input))
         || !sameSubmissionSources(run, input)) {
         throw new SessionSubmitError('busy', '此临时编号已用于另一条首次发送')
@@ -83,11 +84,13 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
       return { session: run.firstTitle ? { ...history.summary, name: run.firstTitle } : history.summary, accepted: submissionReceipt(run) }
     }
     if (this.sessions.has(draftId)) throw new SessionSubmitError('busy', '此会话编号已被使用')
-    if (input.text.trim() === '/compact') throw new SessionSubmitError('invalid', '新会话没有可压缩的内容')
-    const planArgument = planCommandArgument(input.text)
-    if (planArgument === '' || planArgument === 'off') throw new SessionSubmitError('invalid', '请先创建会话，再开启计划模式')
+    if (!scheduled) {
+      if (input.text.trim() === '/compact') throw new SessionSubmitError('invalid', '新会话没有可压缩的内容')
+      const planArgument = planCommandArgument(input.text)
+      if (planArgument === '' || planArgument === 'off') throw new SessionSubmitError('invalid', '请先创建会话，再开启计划模式')
+    }
     const result = this.acceptFirst(input, submit)
-    this.starts.set(id, { input, result })
+    this.starts.set(id, { input, scheduled, result })
     try {
       const accepted = await result
       if (this.options.store && 'session' in accepted) this.starts.delete(id)

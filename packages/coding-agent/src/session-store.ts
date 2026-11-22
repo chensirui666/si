@@ -12,6 +12,7 @@ import type { AttachmentScope, MessageAttachment, StagedAttachment } from './ses
 import type { ReferenceSource } from './session-references.js'
 import { numberedSessionTitle, temporarySessionTitle } from './session-title.js'
 import type { CompactionRecord, ConversationMessage, PlanState, RunRecord, SubmissionAccepted, SubmissionInput } from './types.js'
+import { scheduleSchema, ScheduleStore, type ScheduledSubmission } from './schedule-store.js'
 
 export type StoredRun = Omit<RunRecord, 'restored'> & {
   text: string; finalText?: string; acceptedSeq: number; firstPermissionMode?: PermissionMode; approvedPlanId?: string
@@ -47,6 +48,7 @@ type SessionWrite = {
   plan?: PlanState | null
   planCommand?: SubmissionInput
   defaultSelection?: ModelSelection
+  scheduledSubmission?: ScheduledSubmission
 }
 type Row = Record<string, SQLOutputValue>
 
@@ -113,6 +115,7 @@ const schema = `
       OR (state = 'review' AND assistant_message_id IS NOT NULL AND steps IS NOT NULL)),
     FOREIGN KEY(session_id, assistant_message_id) REFERENCES messages(session_id, id)
   ) STRICT;
+  ${scheduleSchema}
 `
 
 function sqliteCode(error: unknown): number | undefined {
@@ -150,12 +153,18 @@ function summaryFrom(row: Row): SessionSummary {
     || typeof name !== 'string' || !name || typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))) {
     throw new Error('Invalid session summary')
   }
-  return { id, workspaceId, name, createdAt }
+  return { id, workspaceId, name, createdAt, ...(row.hasScheduledTask === 1 && { hasScheduledTask: true }) }
 }
 
 export class SessionStore {
   private uncertain = false
-  private constructor(private readonly db: DatabaseSync) {}
+  readonly schedules: ScheduleStore
+
+  private constructor(private readonly db: DatabaseSync) {
+    this.schedules = new ScheduleStore(db, operation => this.write(operation), () => {
+      if (this.uncertain) throw new SessionReadError('定时任务保存状态未确认，请重启服务后核对')
+    })
+  }
 
   static open(path: string): SessionStore {
     let db: DatabaseSync | undefined
@@ -187,11 +196,8 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand }: SessionWrite) {
-    if (this.uncertain) throw new SessionWriteError('unconfirmed')
-    let committing = false
-    try {
-      this.db.exec('BEGIN')
+  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand, scheduledSubmission }: SessionWrite) {
+    return this.write(() => {
       if (summary) {
         this.db.prepare('INSERT INTO sessions (id, workspaceId, name, createdAt) VALUES (?, ?, ?, ?)')
           .run(summary.id, summary.workspaceId, summary.name, summary.createdAt)
@@ -215,6 +221,10 @@ export class SessionStore {
       if (messages?.length) {
         const insert = this.db.prepare('INSERT INTO messages (session_id, run_id, id, data) VALUES (?, ?, ?, ?)')
         for (const message of messages) insert.run(sessionId, runId!, message.id, JSON.stringify(storedMessage(message)))
+      }
+      if (scheduledSubmission) {
+        if (!run?.scheduledRunId || run.id !== runId || run.sessionId !== scheduledSubmission.sessionId) throw new Error('无效的定时执行关联')
+        this.schedules.accept(run.scheduledRunId, run.id, scheduledSubmission)
       }
       if (mcpToolLoads?.length) {
         const [entry] = messages ?? []
@@ -249,9 +259,19 @@ export class SessionStore {
         if (modelSelection) upsert.run(sessionId, sessionId, JSON.stringify(modelSelection))
         if (defaultSelection) upsert.run('', null, JSON.stringify(defaultSelection))
       }
+      return renamed === true
+    })
+  }
+
+  private write<T>(operation: () => T): T {
+    if (this.uncertain) throw new SessionWriteError('unconfirmed')
+    let committing = false
+    try {
+      this.db.exec('BEGIN')
+      const result = operation()
       committing = true
       this.db.exec('COMMIT')
-      return renamed === true
+      return result
     } catch (error) {
       // SQLite may automatically roll back a failed statement. A failed COMMIT without an active transaction is ambiguous.
       if (this.db.isTransaction) {
@@ -326,7 +346,10 @@ export class SessionStore {
   listSessions(): SessionSummary[] {
     try {
       if (this.uncertain) throw new Error('Commit state unknown')
-      return this.db.prepare('SELECT * FROM sessions ORDER BY rowid').all().map(summaryFrom)
+      return this.db.prepare(`SELECT s.*, EXISTS (
+        SELECT 1 FROM schedules p WHERE p.session_id = s.id AND p.deleted = 0
+          AND p.status = 'enabled' AND p.session_mode = 'reuse' AND p.next_run_at IS NOT NULL
+      ) AS hasScheduledTask FROM sessions s ORDER BY s.rowid`).all().map(summaryFrom)
     } catch (error) { throw new SessionReadError('无法读取会话列表，请重试', { cause: error }) }
   }
 
@@ -391,7 +414,8 @@ export class SessionStore {
           || (run.finalText !== undefined && (run.kind !== 'task' || typeof run.finalText !== 'string' || !run.finalText.trim()))
           || (run.firstPermissionMode !== undefined && !isPermissionMode(run.firstPermissionMode))
           || typeof run.modelId !== 'string' || !['task', 'compaction'].includes(run.kind)
-          || !['running', 'completed', 'failed', 'aborted'].includes(run.status)
+          || (run.scheduledRunId !== undefined && (run.kind !== 'task' || run.scheduledRunId !== run.clientMessageId))
+          || !['running', 'completed', 'failed', 'aborted', ...(run.scheduledRunId ? ['interrupted'] : [])].includes(run.status)
           || !Number.isFinite(run.startedAt) || (run.status !== 'running' && !Number.isFinite(run.finishedAt))
           || !Number.isSafeInteger(run.acceptedSeq) || run.acceptedSeq < 1) throw new Error('Invalid run')
         return run

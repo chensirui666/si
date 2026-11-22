@@ -10,13 +10,15 @@ import {
   AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode, loadExtensions,
   AttachmentInputError, SessionAttachments, ATTACHMENT_TTL_MS, MAX_ATTACHMENT_UPLOAD_BYTES,
   McpManager, McpSettingsError,
-  type AttachmentScope, type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
+  type AttachmentScope, type ScheduledRun, type ScheduledSubmission, type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, defaultSelection, discoverModels, isModelProvider, type AssistantMessage, type ModelSelection, type ToolCall } from '@agent-learning/model'
 import { pickDirectory, type DirectoryPicker } from '../directory-picker.js'
 import { Workspaces, WorkspaceBindingError } from '../workspaces.js'
 import { WebSettings } from '../web-settings.js'
+import { Schedules, ScheduleError } from '../schedules.js'
+import { ScheduleRunner } from '../schedule-runner.js'
 import { isSettingsObject, readSettingsFile, updateSettingsFile } from '../settings-file.js'
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
@@ -25,7 +27,7 @@ import type { BashJobsView, StopBashJobResult, ClientFrame, ConversationMessage 
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
-} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'initialize' | 'selectModel' | 'selectPermissionMode' | 'reviewPlan'>>
+} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'initialize' | 'selectModel' | 'selectPermissionMode' | 'reviewPlan' | 'getScheduledSettings' | 'submitScheduled'>>
 
 type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
 
@@ -183,6 +185,8 @@ export class WebServer {
   private sessions!: Sessions<SessionTarget>
   private runtime!: ToolRuntime
   private store?: SessionStore
+  private schedules?: Schedules
+  private scheduleRunner?: ScheduleRunner
   private server?: Server
   private ws?: WebSocketServer
   private heartbeat?: ReturnType<typeof setInterval>
@@ -220,6 +224,11 @@ export class WebServer {
       createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode, sessionId) => new AgentSession({
         resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd, persistence?.summary.id ?? sessionId), compaction: this.options.compaction,
         mcp: this.mcp,
+        ...(this.schedules && { manageSchedule: (owner, input) => {
+          if (!this.schedules) throw new InputError(503, '定时任务服务暂时不可用')
+          return this.schedules.manageFromChat(owner, input)
+        } }),
+        onScheduledRunFinished: id => this.scheduleRunner?.finished(id),
         titleStream: stream, onTitleChanged: () => this.notify('sessions_changed'), attachments: this.attachments,
         referenceDirectory: resolve(this.sessionPath + '.files', 'references'),
         isWorkspaceRegistered: id => this.workspaces.isRegistered(id),
@@ -232,8 +241,8 @@ export class WebServer {
     })
   }
   async start(): Promise<{ url: string; authUrl: string; devAuthUrl?: string }> {
-    if (this.server) throw new Error('服务已经启动')
     if (this.closing) await this.closing
+    if (this.server) throw new Error('服务已经启动')
     const secret = await loadOrCreateBrowserSecret(this.options.browserSecretPath)
     const extensions = this.options.createSession ? [] : await loadExtensions(this.options.extensionsDirectory
       ?? join(this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'), 'extensions'),
@@ -243,6 +252,7 @@ export class WebServer {
     this.closing = undefined
     if (!this.options.createSession || this.options.sessionPath) {
       this.store = SessionStore.open(this.sessionPath)
+      this.schedules = new Schedules(this.store, this.options.now ?? Date.now, () => this.notify('sessions_changed'))
     }
     try { this.sessions = this.createSessions(extensions) }
     catch (error) { this.store?.close(); this.store = undefined; throw error }
@@ -299,12 +309,61 @@ export class WebServer {
         }
       }, 2000)
       this.heartbeat.unref()
+      if (this.store) {
+        this.scheduleRunner = new ScheduleRunner({
+          store: this.store.schedules, now: this.options.now ?? Date.now,
+          prepare: run => this.prepareScheduled(run), submit: (run, signal) => this.submitScheduled(run, signal),
+          changed: () => this.notify('sessions_changed'),
+          report: error => console.error('定时任务扫描失败', error),
+        })
+        await this.scheduleRunner.start()
+      }
+      if (this.server !== server) throw new Error('服务启动已取消')
       return { url, authUrl: this.auth.authenticatedUrl(url), ...(this.options.devOrigin ? { devAuthUrl: this.auth.authenticatedUrl(this.options.devOrigin + '/auth') } : {}) }
     } catch (error) {
       if (this.server === server) await this.close()
       throw new Error('服务启动失败：请检查端口是否被占用', { cause: error })
     }
   }
+  scanScheduledTasks(): Promise<void> {
+    return this.scheduleRunner?.scan() ?? Promise.resolve()
+  }
+
+  private async prepareScheduled(run: ScheduledRun): Promise<ScheduledSubmission> {
+    const submission = run.submission
+    if (!submission) throw new Error('定时任务缺少提交内容')
+    if (submission.modelSelection && submission.permissionMode) return submission
+
+    const reuse = submission.sessionId !== run.id
+    const target = reuse ? this.sessions.get(submission.sessionId) : undefined
+    if (reuse && !target?.getScheduledSettings) throw new InputError(404, '原会话已不可用')
+    const settings = target?.getScheduledSettings?.()
+    const modelSelection = settings?.modelSelection ?? (await this.modelDiscovery()).defaultSelection
+    if (!modelSelection) throw new InputError(400, '没有可用模型，请先配置模型')
+    const permissionMode = settings?.permissionMode ?? await this.readDefaultPermissionMode()
+    return { ...submission, modelSelection, permissionMode }
+  }
+
+  private async submitScheduled(run: ScheduledRun, signal: AbortSignal) {
+    const submission = run.submission
+    if (!submission?.modelSelection) throw new InputError(400, '定时任务缺少模型选择')
+    const { workspaceId, sessionId, modelSelection, permissionMode, text } = submission
+    const input = { ...modelSelection, text, clientMessageId: run.id }
+    const submit = (target: SessionTarget, firstPermission?: PermissionMode) => {
+      if (!target.submitScheduled) throw new InputError(503, '当前会话不支持定时执行')
+      return target.submitScheduled({ ...input, ...(firstPermission && { permissionMode: firstPermission }) }, signal)
+    }
+    if (sessionId === run.id) {
+      const result = await this.sessions.start({ ...input, workspaceId, permissionMode }, target => submit(target, permissionMode), true)
+      if (!('session' in result)) throw new InputError(409, '会话未接收定时任务')
+      return
+    }
+    const target = this.sessions.get(sessionId)
+    if (!target) throw new InputError(404, '原会话已不可用')
+    const result = await submit(target)
+    if (result.kind === 'handled') throw new InputError(409, '会话未接收定时任务')
+  }
+
   private admit(req: IncomingMessage): number {
     if (!trustedRequest(req.headers, this.origins)) return 403
     return this.auth!.authenticated(req.headers.host!, req.headers.cookie) ? 200 : 401
@@ -342,6 +401,22 @@ export class WebServer {
         if (error instanceof McpSettingsError) this.json(res, error.statusCode, { error: error.message })
         else this.sessionError(res, error, '无法读取或更新 MCP 设置，请检查本机配置后重试。')
       }
+      return
+    }
+    const scheduleRoute = /^\/api\/schedules\/([^/]+)(\/runs)?$/.exec(url.pathname)
+    if ((url.pathname === '/api/schedules' && req.method === 'GET') ||
+      (scheduleRoute && (scheduleRoute[2] ? req.method === 'GET' : req.method === 'PATCH' || req.method === 'DELETE'))) {
+      try {
+        const schedules = this.schedules
+        if (!schedules) throw new InputError(503, '定时任务服务暂时不可用')
+        if (!scheduleRoute) this.json(res, 200, { schedules: schedules.list() })
+        else {
+          const id = checkedPathId(scheduleRoute[1]!)
+          if (scheduleRoute[2]) this.json(res, 200, { runs: schedules.runs(id) })
+          else if (req.method === 'PATCH') this.json(res, 200, { schedule: schedules.edit(id, await readJson(req)) })
+          else { schedules.remove(id); this.respond(res, 204, '') }
+        }
+      } catch (error) { this.sessionError(res, error, '定时任务请求失败，请重试') }
       return
     }
     if (url.pathname === '/api/models' && req.method === 'GET') {
@@ -642,7 +717,7 @@ export class WebServer {
       })
     } else if (error instanceof SessionReadError) {
       this.json(res, 500, { error: error.message })
-    } else if (error instanceof InputError) {
+    } else if (error instanceof InputError || error instanceof ScheduleError) {
       this.json(res, error.status, { error: error.message })
     } else if (error instanceof AttachmentInputError) {
       this.json(res, 400, { error: error.message })
@@ -831,6 +906,9 @@ export class WebServer {
   close(): Promise<void> {
     if (this.closing) return this.closing
     this.closing = (async () => {
+      await this.scheduleRunner?.stop()
+      this.scheduleRunner = undefined
+      this.schedules = undefined
       if (this.heartbeat) clearInterval(this.heartbeat)
       this.heartbeat = undefined
       if (this.attachmentCleanup) clearInterval(this.attachmentCleanup)

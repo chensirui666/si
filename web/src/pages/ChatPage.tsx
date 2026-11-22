@@ -1,9 +1,9 @@
 import { useTranslation } from 'react-i18next'
 import { errorNotice, NoticeText, noticeSummary, type Notice } from '../i18n/messages'
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, PlusIcon, XIcon } from 'lucide-react'
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from 'react'
+import { AlarmClockIcon, CalendarClockIcon, ChevronDownIcon, FolderOpenIcon, FolderPlusIcon, HouseIcon, PlusIcon, XIcon } from 'lucide-react'
 import type { ModelDiscovery, ModelSelection } from '@agent-learning/model'
-import type { AbortRequest, AbortResult, ExtensionNotice, PermissionMode, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageResult, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
+import type { AbortRequest, AbortResult, ExtensionNotice, PermissionMode, ScheduleView, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageResult, SubmitMessageRequest, WorkspaceView } from '@agent-learning/server/protocol'
 import { SettingsButton, SettingsDialog } from '../components/SettingsDialog'
 import { MessageInput } from '../components/MessageInput'
 import { ChatFileDrop } from '../components/ChatFileDrop'
@@ -16,10 +16,11 @@ import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
 import { MessageList } from '../components/MessageList'
 import { BackgroundTasks } from '../components/BackgroundTasks'
+import { ScheduleActionDialog, ScheduleCreateDialog, ScheduledTasks, ScheduledTaskSidebar, useScheduleCatalog, type ScheduleDialogRequest } from '../components/ScheduledTasks'
 import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, getMcpServers, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat, createSession } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
-import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger } from '../components/ui/sidebar'
+import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger, useSidebar } from '../components/ui/sidebar'
 import { initialState, mergeSubmissions, settleSubmission, type Subscribe, type Subscription } from '../chat/state'
 import type { LocalSubmission } from '../types'
 import { newSessionDraft, readDraftPermission, readExtensionDraft, writeExtensionDraft, writeDraftPermission, readFirstSend, recentSessionKey, recentWorkspaceKey, useDrafts, writeFirstSend, readPlanDraft, writePlanDraft, readSourceSends, writeSourceSends, type StoredSourceSend } from '../chat/drafts'
@@ -36,13 +37,38 @@ type Props = {
   abortMessage?: (input: AbortRequest) => Promise<AbortResult>
 }
 
-type FirstSend = { input: StartSessionRequest; revision: number; sending: boolean }
+type FirstSend = { input: StartSessionRequest; source?: 'schedule'; revision: number; sending: boolean }
 type SentDraft = {
   key: string; text: string; revision?: number; attachmentIds?: string[]; referenceSessionIds?: string[]
 }
 type SourceSend = SentDraft & StoredSourceSend & { pending: boolean; quote?: string }
 
 type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: Notice }
+
+type SidebarSection = 'home' | 'scheduled'
+
+function SectionPicker({ section, onChange }: { section: SidebarSection; onChange(next: SidebarSection): void }) {
+  const { t } = useTranslation()
+  const { dismissOnMobile } = useSidebar()
+  return <Select value={section} onValueChange={value => {
+    onChange(value === 'scheduled' ? 'scheduled' : 'home')
+    dismissOnMobile()
+  }}>
+    <SelectTrigger className="sidebar-section" aria-label={t('sidebar.section')}><SelectValue /></SelectTrigger>
+    <SelectContent>
+      <SelectItem value="home">
+        <span className="sidebar-section-value">
+          <span className="sidebar-section-icon" aria-hidden="true"><HouseIcon /></span><span>{t('sidebar.home')}</span>
+        </span>
+      </SelectItem>
+      <SelectItem value="scheduled">
+        <span className="sidebar-section-value">
+          <span className="sidebar-section-icon" data-tone="gold" aria-hidden="true"><CalendarClockIcon /></span><span>{t('schedule.title')}</span>
+        </span>
+      </SelectItem>
+    </SelectContent>
+  </Select>
+}
 
 function useServerView<T>(load: () => Promise<T>, failure: Notice['key']) {
   const [view, setView] = useState<T | null>(null)
@@ -71,6 +97,17 @@ function useServerView<T>(load: () => Promise<T>, failure: Notice['key']) {
 export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = queryDefaultPermission, getModels = queryModels, getWorkspaces = queryWorkspaces, getSessions = querySessions, startSession = postFirstMessage, pickWorkspace: pickDirectory = chooseWorkspace, submitMessage = postMessage, abortMessage = postAbort }: Props) {
   const { t } = useTranslation()
   const [state, setState] = useState(initialState)
+  const [section, setSection] = useState<SidebarSection>('home')
+  const activeSection = useRef<SidebarSection>('home')
+  const homeSessionId = useRef<string | null>(null)
+  const [scheduleRevision, setScheduleRevision] = useState(0)
+  const scheduleCatalog = useScheduleCatalog(scheduleRevision, section === 'scheduled')
+  const [selectedScheduleId, setSelectedScheduleId] = useState<string>()
+  const selectedSchedule = scheduleCatalog.view?.find(schedule => schedule.id === selectedScheduleId)
+  const [scheduleDialog, setScheduleDialog] = useState<ScheduleDialogRequest>()
+  const [scheduleRun, setScheduleRun] = useState<{ schedule: ScheduleView; navigation: number }>()
+  const [scheduleCreateTrigger, setScheduleCreateTrigger] = useState<HTMLButtonElement>()
+  const scheduleCreateFocus = useRef<HTMLButtonElement>(null)
   const { sessionId } = state
   const chatScroll = useRef<HTMLElement>(null)
   const [showToBottom, setShowToBottom] = useState(false)
@@ -126,6 +163,14 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const { view: webSettings, error: webSettingsError, apply: applyWebSettings, refresh: refreshWebSettings, invalidate: invalidateWebSettings } = useServerView(getWebSettings, 'chat.webSettingsReadFailed')
   const { view: mcpServers, error: mcpError, refresh: refreshMcpServers, invalidate: invalidateMcpServers } = useServerView(getMcpServers, 'mcp.readFailed')
   const { view: sessions, error: listError, refresh: refreshSessions, invalidate: invalidateSessions, setView: setSessions } = useServerView(getSessions, 'chat.sessionReadFailed')
+  const refreshSessionDirectory = useCallback(() => {
+    void refreshSessions()
+    setScheduleRevision(value => value + 1)
+  }, [refreshSessions])
+  function refreshEditedSchedule(saved?: ScheduleView) {
+    if (saved) scheduleCatalog.setView(current => current?.map(schedule => schedule.id === saved.id ? saved : schedule))
+    refreshSessionDirectory()
+  }
   const { view: defaultPermission, error: permissionReadError, refresh: refreshPermission, invalidate: invalidatePermission, setView: setDefaultPermissionView } =
     useServerView(getDefaultPermission, 'permission.readFailed')
   const [draftPermission, setDraftPermission] = useState(readDraftPermission)
@@ -272,13 +317,18 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     }
   }, [sessionId, planId, state.connection, state.snapshot])
 
-  const openSession = useCallback((id: string | null, userAction = false) => {
+  const openSession = useCallback((id: string | null, userSection?: SidebarSection) => {
     initialized.current = true
-    if (userAction) navigation.current++
+    if (userSection) {
+      navigation.current++
+      activeSection.current = userSection
+      setSection(userSection)
+    }
+    if (activeSection.current === 'home') homeSessionId.current = id
     setSessionError(null)
     setPermissionError(undefined)
     if (selected.current === id) {
-      if (id && userAction && stateRef.current.error) subscription.current?.requestSnapshot?.()
+      if (id && userSection && stateRef.current.error) subscription.current?.requestSnapshot?.()
       return
     }
     selected.current = id
@@ -289,15 +339,28 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     subscription.current?.setSession(id)
   }, [loadDraft])
 
+  function openScheduledSession(schedule: ScheduleView) {
+    setSelectedScheduleId(schedule.id)
+    openSession(schedule.sessionId, 'scheduled')
+  }
+
+  function switchSection(next: SidebarSection) {
+    if (next === activeSection.current) return
+    if (next === 'home') openSession(homeSessionId.current, 'home')
+    else openSession(selectedSchedule?.sessionId ?? null, 'scheduled')
+  }
+
   useEffect(() => {
     setDraftWorkspaceId(readStorage(recentWorkspaceKey) ?? null)
     if (selected.current === null) loadDraft(newSessionDraft)
     const pending = readFirstSend()
     if (pending) {
-      firstSend.current = { input: pending, revision: draftRevision(newSessionDraft), sending: false }
+      const { source, ...input } = pending
+      firstSend.current = { input, source, revision: draftRevision(newSessionDraft), sending: false }
+      if (source === 'schedule') openSession(null)
       setFirstPhase('unconfirmed')
     }
-  }, [draftRevision, loadDraft, readStorage])
+  }, [draftRevision, loadDraft, openSession, readStorage])
 
   const saveCurrentDraft = useCallback((text: string) => {
     if (sessionId !== selected.current) return
@@ -327,7 +390,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       setDefaultPermissionView(null)
       void refreshPermission()
     }
-    openSession(null, true)
+    openSession(null, 'home')
     if (workspaceId) chooseDraftWorkspace(workspaceId)
   }
 
@@ -336,6 +399,13 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     if (!pending || (pending.input.draftSessionId ?? pending.input.clientMessageId) !== session.id || pending.input.workspaceId !== session.workspaceId) return
     firstSend.current = null
     writeFirstSend(null)
+    setFirstPhase(null)
+    setFirstError(null)
+    if (pending.source === 'schedule') {
+      setScheduleCreateTrigger(undefined)
+      if (scheduleCreateTrigger || selected.current === null) openSession(session.id, 'home')
+      return
+    }
     extensionDrafts.current.delete(session.workspaceId)
     uploadDraftIds.current.delete(session.workspaceId)
     writeExtensionDraft(session.workspaceId)
@@ -344,11 +414,12 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     setDraftPermission(null)
     setDefaultPermissionView(null)
     void refreshPermission()
-    setFirstPhase(null)
-    setFirstError(null)
     clearSentDraft(newSessionDraft, pending.input.text, pending.revision)
-    if (selected.current === null) openSession(session.id)
-  }, [clearSentDraft, consumeSources, openSession, refreshPermission, setDefaultPermissionView])
+    if (homeSessionId.current === null) {
+      if (activeSection.current === 'home') openSession(session.id)
+      else homeSessionId.current = session.id
+    }
+  }, [clearSentDraft, consumeSources, openSession, refreshPermission, scheduleCreateTrigger, setDefaultPermissionView])
 
   function attemptFirstSend(pending: FirstSend) {
     if (pending.sending || stateRef.current.connection !== 'ready') return
@@ -359,6 +430,13 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     void Promise.resolve().then(() => startSession(pending.input)).then(result => {
       if (!mounted.current || firstSend.current !== pending) return
       if ('kind' in result) {
+        if (pending.source === 'schedule') {
+          firstSend.current = null
+          writeFirstSend(null)
+          setFirstPhase(null)
+          setFirstError({ key: 'schedule.notSent' })
+          return
+        }
         const { workspaceId, text } = pending.input
         extensionDrafts.current.set(workspaceId, result.draftSessionId)
         writeExtensionDraft(workspaceId, result.draftSessionId)
@@ -386,7 +464,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         writeFirstSend(null)
         setFirstPhase(null)
         const text = errorNotice(saveRejected ? 'request.saveFailed' : 'chat.firstRejected', error)
-        if (saveRejected) setSaveNotice({ sessionId: null, text })
+        if (saveRejected && pending.source !== 'schedule') setSaveNotice({ sessionId: null, text })
         else setFirstError(text)
         if (error?.code === 'model_selection_changed') {
           receiveModels(null)
@@ -402,7 +480,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     })
   }
 
-  async function pickWorkspace() {
+  async function pickWorkspace(updateDraft = true) {
     if (pickingRef.current || !workspaces) return
     const request = navigation.current
     pickingRef.current = true
@@ -413,7 +491,8 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       if (!mounted.current || result.cancelled) return
       applyWorkspaces(result.view)
       void refreshWorkspaces()
-      if (selected.current === null && !firstSend.current && request === navigation.current) chooseDraftWorkspace(result.workspaceId)
+      if (updateDraft && selected.current === null && !firstSend.current && request === navigation.current) chooseDraftWorkspace(result.workspaceId)
+      return result.workspaceId
     } catch (error) {
       if (mounted.current) setPickError(errorNotice('chat.workspacePickFailed', error))
     } finally {
@@ -483,7 +562,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         void refreshWorkspaces()
         void refreshWebSettings()
         void refreshMcpServers()
-        void refreshSessions()
+        refreshSessionDirectory()
         void refreshPermission()
       }
       if (next.connection === 'ready' && next.sessionId) {
@@ -507,7 +586,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       }
       updateSubmissions(submissionsRef.current)
       setState(next)
-    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessions, refreshPermission,
+    }, refreshModels, refreshWorkspaces, refreshWebSettings, refreshSessionDirectory, refreshPermission,
     (notice, id) => showExtensionNotices(id, [notice]), refreshMcpServers)
     subscription.current = stop
     stop.setSession(selected.current)
@@ -524,7 +603,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       for (const timer of timers.current) clearTimeout(timer)
       timers.current.clear()
     }
-  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshMcpServers, refreshSessions, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateMcpServers, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage, showExtensionNotices, settleSourceDraft])
+  }, [subscribe, refreshModels, refreshWorkspaces, refreshWebSettings, refreshMcpServers, refreshSessions, refreshSessionDirectory, invalidateModels, invalidateWorkspaces, invalidateWebSettings, invalidateMcpServers, invalidateSessions, refreshPermission, invalidatePermission, updateSubmissions, updateAbort, writeStorage, showExtensionNotices, settleSourceDraft])
 
   useEffect(() => {
     if (!sessions) return
@@ -605,9 +684,9 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
 
   const selection = state.snapshot?.modelSelection ?? discovery?.defaultSelection
   const selectedModel = discovery?.models.find(model => model.id === selection?.modelId && model.provider === selection.provider)
-  const hasModel = () => !savingSelection.current && !!selection && discoveryRef.current?.models.some(model =>
-    model.id === selection.modelId && model.provider === selection.provider
-    && (model.reasoningEfforts ? model.reasoningEfforts.some(level => level === selection.reasoningEffort) : selection.reasoningEffort === undefined))
+  const hasModel = (choice = selection) => !savingSelection.current && !!choice && discoveryRef.current?.models.some(model =>
+    model.id === choice.modelId && model.provider === choice.provider
+    && (model.reasoningEfforts ? model.reasoningEfforts.some(level => level === choice.reasoningEffort) : choice.reasoningEffort === undefined))
 
   async function selectModel(next: ModelSelection) {
     if (savingSelection.current || stateRef.current.connection !== 'ready' || selected.current !== sessionId
@@ -634,6 +713,28 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const canSubmit = () => !!sessionId && sessionId === selected.current && workspace?.available && !workspaceError && stateRef.current.sessionId === sessionId && stateRef.current.connection === 'ready' && stateRef.current.snapshot !== null && stateRef.current.snapshot.running === null
     && hasModel() && !savingSessionPermission.current && !planCommand.current && planId === null
     && !submissionsRef.current.some(local => local.sessionId === sessionId && local.state !== 'failed')
+
+  function queueFirstSend(input: StartSessionRequest, source?: FirstSend['source']) {
+    const pending = firstSend.current = { input, source, revision: draftRevision(newSessionDraft), sending: false }
+    writeFirstSend(input, source)
+    attemptFirstSend(pending)
+  }
+
+  function openScheduleCreate(trigger: HTMLButtonElement) {
+    if (firstSend.current) return
+    setFirstError(null)
+    scheduleCreateFocus.current = trigger
+    setScheduleCreateTrigger(trigger)
+    void refreshPermission()
+  }
+
+  function createScheduleConversation(workspaceId: string, text: string) {
+    const choice = discoveryRef.current?.defaultSelection
+    if (!choice || !hasModel(choice) || firstSend.current || planCommand.current || pickingRef.current
+      || stateRef.current.connection !== 'ready' || defaultPermission !== 'normal'
+      || workspaceError || !workspaces?.workspaces.some(item => item.id === workspaceId && item.available)) return
+    queueFirstSend({ ...choice, workspaceId, clientMessageId: crypto.randomUUID(), text, permissionMode: defaultPermission }, 'schedule')
+  }
 
   async function activatePlan(draftText: string) {
     if (!selection || !(sessionId === null ? canStart() : canSubmit())) return
@@ -757,12 +858,13 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     }
   }
 
-  const send = (text: string) => {
-    const control = text.trim() === '/compact' && !quote
-    const currentAttachments = control ? [] : attachmentDrafts.read(draftId)
+  const send = (text: string, fromSchedule = false) => {
+    const draftQuote = fromSchedule ? undefined : quote
+    const control = text.trim() === '/compact' && !draftQuote
+    const currentAttachments = control || fromSchedule ? [] : attachmentDrafts.read(draftId)
     if (currentAttachments.some(item => item.status !== 'ready') || !selection || !text.trim() && !currentAttachments.length) return false
     const attachmentIds = currentAttachments.flatMap(item => item.status === 'ready' ? [item.attachment.id] : [])
-    const referenceSessionIds = control ? [] : (referenceDrafts.current.get(draftId) ?? []).map(item => item.id)
+    const referenceSessionIds = control || fromSchedule ? [] : (referenceDrafts.current.get(draftId) ?? []).map(item => item.id)
     if (referenceSessionIds.length && !text.trim()) return false
     const sources = {
       ...(attachmentIds.length && { attachmentIds }),
@@ -771,6 +873,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     const keepDraft = attachmentIds.length > 0 || referenceSessionIds.length > 0
     setDraftIssue(undefined)
     if (sessionId === null) {
+      if (fromSchedule) return false
       if (!canStart() || !draftWorkspace || !draftPermission) return false
       if (text.trim() === '/compact') {
         setFirstError({ key: 'chat.compactNeedsHistory' })
@@ -792,18 +895,14 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         extensionDrafts.current.delete(draftWorkspace.id)
         writeExtensionDraft(draftWorkspace.id)
       }
-      const pending = firstSend.current = {
-        input: { workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text, permissionMode: draftPermission, ...sources, ...(draftSessionId && { draftSessionId }) },
-        revision: draftRevision(newSessionDraft), sending: false,
-      }
-      writeFirstSend(pending.input)
-      attemptFirstSend(pending)
+      queueFirstSend({ workspaceId: draftWorkspace.id, clientMessageId: crypto.randomUUID(), ...selection, text, permissionMode: draftPermission,
+        ...sources, ...(draftSessionId && { draftSessionId }) })
       // Keep the text until the server accepts the first message.
       return false
     }
     if (!canSubmit()) return false
     setSelectionError(undefined)
-    const quotedText = quote && quote.split(/\r\n|\n|\r/).map(line => `> ${line}`).join('\n')
+    const quotedText = draftQuote && draftQuote.split(/\r\n|\n|\r/).map(line => `> ${line}`).join('\n')
     const body = text.trimStart()
     let requestText = text
     if (quotedText) {
@@ -832,7 +931,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     let request: Promise<SubmitMessageResult>
     try { request = submitMessage(input) }
     catch { submissionsRef.current = previous; return false }
-    const quoteSent = quote ? Symbol() : undefined
+    const quoteSent = draftQuote ? Symbol() : undefined
     if (quoteSent) setQuotes(current => ({ ...current, [sessionId]: quoteSent }))
     updateSubmissions(submissionsRef.current)
     const timer = setTimeout(() => {
@@ -858,8 +957,8 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       const message = errorNotice(saveRejected ? 'request.saveFailed' : selectionChanged ? 'model.selectionChanged' : rejected ? 'chat.sendFailed' : 'chat.notConfirmed', error)
       const local = submissionsRef.current.find(item => item.clientMessageId === input.clientMessageId)
       if (!local || local.accepted) return
-      const restored = rejected && restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId, selectionChanged)
-      if (restored && quoteSent) setQuotes(current => current[sessionId] === quoteSent ? { ...current, [sessionId]: quote } : current)
+      const restored = rejected && !fromSchedule && restoreDraft(sessionId, text, clearedRevision, selected.current === sessionId, selectionChanged)
+      if (restored && quoteSent) setQuotes(current => current[sessionId] === quoteSent ? { ...current, [sessionId]: draftQuote } : current)
       if (saveRejected || selectionChanged && restored) {
         updateSubmissions(submissionsRef.current.filter(item => item.clientMessageId !== input.clientMessageId))
       } else updateSubmissions(settleSubmission(submissionsRef.current, input.clientMessageId, { state: rejected ? 'failed' : 'unconfirmed', errorMessage: selectionChanged ? undefined : message }))
@@ -883,6 +982,21 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     })
     return true
   }
+
+  const sendScheduledPrompt = useEffectEvent((schedule: ScheduleView) => {
+    if (!send(schedule.prompt, true)) setDraftIssue({ key: schedule.sessionId, notice: { key: 'schedule.runUnavailable' } })
+  })
+  useEffect(() => {
+    if (!scheduleRun) return
+    const { schedule } = scheduleRun
+    if (section !== 'scheduled' || scheduleRun.navigation !== navigation.current || selectedSchedule?.id !== schedule.id) {
+      setScheduleRun(undefined)
+      return
+    }
+    if (sessionId !== schedule.sessionId || (state.connection !== 'disconnected' && !state.error && !state.snapshot)) return
+    setScheduleRun(undefined)
+    sendScheduledPrompt(schedule)
+  }, [scheduleRun, section, selectedSchedule?.id, sessionId, state])
 
   const retryingSource = submissions.find(item => item.state === 'unconfirmed' && sourceSends.current.has(item.clientMessageId))
   const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions.filter(local => local.kind === 'message'))
@@ -921,6 +1035,12 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const providerError = discovery?.providers.find(item => item.status.state === 'error')?.status
   const workspaceNotice = workspaceError ?? pickError
   const sessionNotice = sessionError ?? listError
+  const scheduleCreateBlocker: Notice | undefined = workspaceError ?? permissionReadError
+    ?? (state.connection !== 'ready' ? { key: 'schedule.connection' }
+      : !discovery?.defaultSelection || !hasModel(discovery.defaultSelection) ? { key: 'schedule.modelRequired' }
+      : defaultPermission === 'read-only' ? { key: 'schedule.normalRequired' }
+      : defaultPermission === null || planBusy ? { key: 'schedule.loading' } : undefined)
+  const scheduleCreateAction = { onCreate: openScheduleCreate, createDisabled: firstPhase !== null }
 
 
   return (
@@ -928,6 +1048,12 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       <SidebarTrigger ref={sidebarButton} />
       <Sidebar>
         <div className="sidebar-title">SI</div>
+        <SectionPicker section={section} onChange={switchSection} />
+        {section === 'scheduled' ? <ScheduledTaskSidebar schedules={scheduleCatalog.view} sessions={sessions} selectedId={selectedSchedule?.id}
+          onSelect={openScheduledSession} onRun={schedule => {
+            openScheduledSession(schedule)
+            setScheduleRun({ schedule, navigation: navigation.current })
+          }} onDialog={setScheduleDialog} onChanged={refreshEditedSchedule} {...scheduleCreateAction} /> : <>
         <SidebarDismiss>
           <Button className="sidebar-new-session" variant="outline" aria-label={t('chat.new')} onClick={() => openNewSession()}>
             <PlusIcon aria-hidden="true" />
@@ -950,16 +1076,26 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
                 </Button>
               </SidebarDismiss>
             </div>
-            {isNew && group.id === draftWorkspace?.id && <SidebarDismiss>
+            {section === 'home' && isNew && group.id === draftWorkspace?.id && <SidebarDismiss>
               <Button className="workspace-conversation" variant="secondary" aria-label={t('chat.unsent')} aria-current="page" onClick={() => openNewSession()}>{t('chat.new')}</Button>
             </SidebarDismiss>}
-            {sessions?.filter(item => item.workspaceId === group.id).map(item => <SidebarDismiss key={item.id}>
-              <Button className="workspace-conversation" variant={item.id === sessionId ? 'secondary' : 'ghost'} data-session-id={item.id} aria-current={item.id === sessionId ? 'page' : undefined} onClick={() => openSession(item.id, true)}>
-                <span title={item.name}>{item.name}</span>
-              </Button>
-            </SidebarDismiss>)}
+            {sessions?.filter(item => item.workspaceId === group.id).map(item => {
+              const active = section === 'home' && item.id === sessionId
+              const alarmDescription = item.hasScheduledTask ? `schedule-mark-${item.id}` : undefined
+              return <SidebarDismiss key={item.id}>
+                <Button className="workspace-conversation" variant={active ? 'secondary' : 'ghost'} data-session-id={item.id}
+                  aria-current={active ? 'page' : undefined} aria-describedby={alarmDescription} onClick={() => openSession(item.id, 'home')}>
+                  <span className="sidebar-session-title" title={item.name}>{item.name}</span>
+                  {alarmDescription && <>
+                    <AlarmClockIcon className="workspace-conversation-alarm" aria-hidden="true" />
+                    <span id={alarmDescription} hidden>{t('schedule.sessionMark')}</span>
+                  </>}
+                </Button>
+              </SidebarDismiss>
+            })}
           </div>)}
         </nav>
+        </>}
         <SidebarDismiss>
           <SettingsButton ref={settingsButton} aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)} />
         </SidebarDismiss>
@@ -977,7 +1113,32 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         applyWebSettings(result)
         void refreshWebSettings()
       }} />
-      <div className="chat-workspace">
+      {section === 'scheduled' && !selectedSchedule && <ScheduledTasks catalog={scheduleCatalog} {...scheduleCreateAction} />}
+      {scheduleDialog && <ScheduleActionDialog request={scheduleDialog}
+        workspace={workspaces?.workspaces.find(item => item.id === scheduleDialog.schedule.workspaceId)}
+        onChanged={refreshEditedSchedule}
+        onDeleted={id => {
+          scheduleCatalog.setView(current => current?.filter(schedule => schedule.id !== id))
+          setSelectedScheduleId(current => current === id ? undefined : current)
+        }}
+        onClose={() => setScheduleDialog(undefined)} restoreFocus={() => {
+          const trigger = scheduleDialog.trigger
+          if (trigger?.isConnected && !trigger.closest('[hidden]')) trigger.focus()
+          else sidebarButton.current?.focus()
+        }} />}
+      {scheduleCreateTrigger && <ScheduleCreateDialog workspaces={workspaces} preferredWorkspaceId={workspace?.id ?? draftWorkspace?.id}
+        picking={picking} blocker={scheduleCreateBlocker} error={firstError ?? pickError} phase={firstPhase}
+        onPickWorkspace={() => pickWorkspace(false)} onSubmit={createScheduleConversation}
+        onRetry={() => { if (firstSend.current?.source === 'schedule') attemptFirstSend(firstSend.current) }}
+        onClose={() => {
+          setScheduleCreateTrigger(undefined)
+          if (firstPhase === 'unconfirmed') openSession(null, 'home')
+        }} restoreFocus={() => {
+          const trigger = scheduleCreateFocus.current
+          if (trigger?.isConnected && !trigger.closest('[hidden]')) trigger.focus()
+          else sidebarButton.current?.focus()
+        }} />}
+      <div className="chat-workspace" hidden={section === 'scheduled' && !selectedSchedule}>
       <div className="chat-page" data-new-session={isNew || undefined} data-connection={state.connection} data-session-id={sessionId ?? undefined}>
       {extensionNotices?.sessionId === sessionId && <div className="save-notice" role="status">
         {extensionNotices.notices.map(({ message, level }, index) => <div key={index} data-level={level}>{message}</div>)}
@@ -1085,7 +1246,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
                 onSelect={mode => { if (sessionId) void changeSessionPermission(sessionId, mode); else changeDraftPermission(mode) }} />}
             footerControl={modelSelect}
             skillWorkspaceId={quote ? undefined : (isNew ? draftWorkspace?.id : workspace?.id)}
-            commandsEnabled={!isNew && !quote} onPlan={text => { void activatePlan(text) }} onSend={send} sendDisabled={isNew ? !canStart() : !canSubmit()}
+            commandsEnabled={!isNew && !quote} onPlan={text => { void activatePlan(text) }} onSend={text => send(text)} sendDisabled={isNew ? !canStart() : !canSubmit()}
             action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>

@@ -20,6 +20,8 @@ export type {
   SessionSubscriptionEvent,
 } from './types.js'
 export { SessionStore, SessionReadError, SessionWriteError, type SessionPersistence } from './session-store.js'
+export type { ScheduleRule, ScheduledPlan, ScheduledSubmission, ScheduledRun, ScheduledRunView } from './schedule-store.js'
+export type { ScheduleToolContext } from './cronjob-tool.js'
 export {
   SessionAttachments, AttachmentInputError, ATTACHMENT_TTL_MS, MAX_ATTACHMENT_UPLOAD_BYTES,
   type AttachmentScope, type MessageAttachment,
