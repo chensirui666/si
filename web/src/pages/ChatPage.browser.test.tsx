@@ -1120,6 +1120,9 @@ test('28 历史读取失败时不能发送，收到完整快照后恢复', async
 
 test('超限压缩由页面状态显示，本轮详情在压缩和恢复时隐藏', async ({ mount, page }) => {
   await mount(<ChatPageHarness messages={['任务']} />)
+  const messages = page.getByRole('region', { name: '消息列表' })
+  await expect(messages).toContainText('任务')
+  const status = page.locator('header').getByRole('status')
   for (const phase of ['compaction', 'model'] as const) {
     await page.evaluate(phase => {
       window.dispatchEvent(new CustomEvent('chat-test-state', { detail: { connection: 'ready', slow: false, error: null,
@@ -1129,11 +1132,9 @@ test('超限压缩由页面状态显示，本轮详情在压缩和恢复时隐�
         running: { kind: 'task', runId: 'u', assistantMessageId: 'a', phase, activeTools: [] }, compactions: [], contextUsage: null, activeContent: [] },
       } }))
     }, phase)
-    const status = page.locator('header').getByRole('status')
-    if (phase === 'compaction') await expect(status).toHaveText('正在压缩对话…')
-    else await expect(status).not.toHaveText('正在压缩对话…')
+    await expect(status).toHaveText(phase === 'compaction' ? '正在压缩对话…' : '正在生成回答…')
     await expect(page.locator('[data-run-detail]')).toHaveCount(0)
-    await expect(page.getByRole('region', { name: '消息列表' })).not.toContainText('回答生成失败')
+    await expect(messages).not.toContainText('回答生成失败')
   }
 })
 
