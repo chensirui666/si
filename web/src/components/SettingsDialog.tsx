@@ -1,5 +1,5 @@
 import { useRef, useState, type ComponentProps, type FormEvent } from 'react'
-import { GlobeIcon, LayersIcon, PlusIcon, PlugIcon, SettingsIcon, SlidersHorizontalIcon } from 'lucide-react'
+import { GlobeIcon, LayersIcon, PlusIcon, PlugIcon, SettingsIcon, SlidersHorizontalIcon, UserRoundIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { ModelDiscovery } from '@agent-learning/model'
 import type { PermissionMode, WebSettingsView } from '@agent-learning/server/protocol'
@@ -10,6 +10,7 @@ import { errorNotice, NoticeText, type Notice } from '../i18n/messages'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
 import { McpSettings, type McpSettingsProps } from './McpSettings'
+import { MemorySettings } from './MemorySettings'
 import { PermissionPicker } from './PermissionPicker'
 import { Input } from './ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select'
@@ -42,6 +43,7 @@ type Props = {
 
 const sections = [
   { id: 'general', Icon: SlidersHorizontalIcon },
+  { id: 'personalization', Icon: UserRoundIcon },
   { id: 'models', Icon: LayersIcon },
   { id: 'web', Icon: GlobeIcon },
   { id: 'mcp', Icon: PlugIcon },
@@ -271,7 +273,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
               <Button variant="ghost" onClick={permissionSettings.onRetry}>{t('common.retry')}</Button>
             </>}
           </>}
-        </> : section === 'mcp' ? mcpSettings && <McpSettings {...mcpSettings} /> : section === 'web' ? <>
+        </> : section === 'personalization' ? <MemorySettings /> : section === 'mcp' ? mcpSettings && <McpSettings {...mcpSettings} /> : section === 'web' ? <>
           {webSettingsError && <p className="configuration-error" role="alert"><NoticeText notice={webSettingsError} /></p>}
           {!webSettings && !webSettingsError && <p className="settings-help">{t('settings.webLoading')}</p>}
           {webSettings && <>

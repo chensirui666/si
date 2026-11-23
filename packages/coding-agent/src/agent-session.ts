@@ -10,7 +10,11 @@ import { discoverSkills, loadSkill, skillCommand, type SkillSummary } from './sk
 import { withModelRetry } from './model-retry.js'
 import { extractPlan, planCommandArgument, planGitArgs, planInstruction, planReadTools } from './plan-mode.js'
 import { buildSystemPrompt } from './system-prompt.js'
-import { defaultTools, type CodingTool } from './tools.js'
+import { defaultTools, protectMemoryRead, type CodingTool } from './tools.js'
+import { createMemoryTool, MEMORY_TOOL_NAME } from './memory-tool.js'
+import { createMemorySourceTool, MEMORY_SOURCE_TOOL_NAME } from './memory-source-tool.js'
+import { formatMemoryInstructions, formatProjectMemory, formatUserMemory, formatUserMemoryTargets } from './memory-prompt.js'
+import { projectMemoryLines, type MemoryProject, type MemoryStore, type ProjectMemory, type UserMemory } from './memory-store.js'
 import { beforeStart, requestMessages, toolHooks } from './extensions/dispatch.js'
 import { ExtensionRuntime, extensionMessage, object, type ExtensionContext, type ExtensionEntry, type ExtensionEvents, type ExtensionMessage } from './extensions/runtime.js'
 import { isPermissionMode, type PermissionMode } from './permissions.js'
@@ -27,6 +31,7 @@ import type { CompactionRecord, ExtensionNotice, SubmissionAccepted, SubmissionH
 
 type SubmissionResult = SubmissionAccepted | SubmissionHandled
 type AvailableTools = { local: CodingTool[]; remote?: CodingTool[]; servers?: ReturnType<McpToolSource['listDiscoveryServers']> }
+type MemorySettings = { enabled: boolean; generation: number }
 
 const readOnlyTools = new Set(['read', 'grep', 'find', 'ls'])
 
@@ -64,7 +69,10 @@ export class AgentSession {
   private closed = false
   private model?: ModelInfo
   private configuration: Omit<ModelContext, 'messages'> = {}
+  private configurationKeyBeforeMemory?: string
   private projectContext?: { cwd: string; files: ProjectContextFile[] }
+  private memoryEnabled = false
+  private memoryUser?: { generation: number; document: UserMemory }
   private sample?: { key: string; config: string; messages: string[]; input: number; estimate: number }
   private gateSample?: typeof this.sample
   private readonly storedRuns = new Map<string, StoredRun>()
@@ -88,6 +96,7 @@ export class AgentSession {
     attachments?: SessionAttachments
     referenceDirectory?: string
     isWorkspaceRegistered?: (id: string) => Promise<boolean>
+    resolveWorkspaceDirectory?: (id: string) => Promise<string>
     tools?: (cwd: string) => CodingTool[]
     mcp?: McpToolSource
     documentationRoot?: string
@@ -96,6 +105,7 @@ export class AgentSession {
     resolveDirectory: () => Promise<string>
     discoverModels?: typeof import('@agent-learning/model').discoverModels
     compaction?: { triggerTokens: number; keepRecentTokens: number }
+    memory?: { store: MemoryStore; settings: () => Promise<MemorySettings> }
   }) {
     this.sessionId = options.persistence?.summary.id ?? options.sessionId ?? randomUUID()
     if (options.extensions?.length) this.runtime = new ExtensionRuntime(options.extensions, options.reportExtensionError)
@@ -167,6 +177,7 @@ export class AgentSession {
       const reserved = [...defaultTools, ...this.options.tools?.(path) ?? []].map(tool => tool.name)
       if (this.options.mcp) reserved.push(MCP_TOOL_SEARCH_NAME)
       if (this.options.manageSchedule) reserved.push(CRONJOB_TOOL_NAME)
+      if (this.options.memory) reserved.push(MEMORY_TOOL_NAME, MEMORY_SOURCE_TOOL_NAME)
       await this.runtime!.initialize(ctx, reserved)
       await this.runtime!.emit('session_start', { reason: this.options.persistence?.history ? 'resume' : 'new' }, ctx)
     }).catch(error => {
@@ -222,8 +233,9 @@ export class AgentSession {
 
   private availableTools(tools: CodingTool[], planning: boolean, scheduled: boolean): AvailableTools {
     const local = [...tools, ...this.runtime?.tools() ?? []].filter(tool => !scheduled || tool.name !== CRONJOB_TOOL_NAME)
-    if (this.state.permissionMode !== 'normal') return { local: local.filter(tool => readOnlyTools.has(tool.name)) }
-    if (planning) return { local: local.flatMap(tool => planReadTools.has(tool.name) ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : []) }
+    if (this.state.permissionMode !== 'normal') return { local: local.filter(tool => readOnlyTools.has(tool.name) || this.isMemorySourceTool(tool.name)) }
+    if (planning) return { local: local.flatMap(tool => planReadTools.has(tool.name) || this.isMemorySourceTool(tool.name)
+      ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : []) }
     const mcp = this.options.mcp
     const servers = mcp?.listDiscoveryServers()
     if (!mcp || !servers?.length || local.some(tool => tool.name === MCP_TOOL_SEARCH_NAME)) return { local }
@@ -247,8 +259,13 @@ export class AgentSession {
     return { local: [...local, search], remote, servers }
   }
 
+  private isMemorySourceTool(name: string) {
+    return this.memoryEnabled && name === MEMORY_SOURCE_TOOL_NAME
+  }
+
   private toolDenial(name: string, args: JsonObject, planning: boolean, planBash: boolean) {
     if (this.permissionUnconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
+    if (this.isMemorySourceTool(name)) return
     if (this.state.permissionMode === 'read-only' && !readOnlyTools.has(name)) {
       return { code: 'permission_denied', message: '只读模式下未执行此工具。' }
     }
@@ -260,6 +277,7 @@ export class AgentSession {
   private configure(cwd: string, { local, remote, servers }: AvailableTools, files: ProjectContextFile[], skills: readonly SkillSummary[]) {
     const tools = remote ? [...local, ...remote] : local
     const declarations = tools.map(({ name, description, parameters }) => ({ name, description, parameters }))
+    this.configurationKeyBeforeMemory = undefined
     this.configuration = {
       systemPrompt: buildSystemPrompt(cwd, local, this.options.documentationRoot, files, skills, this.options.skillHome, servers),
       ...(declarations.length ? { tools: declarations } : {}),
@@ -454,6 +472,7 @@ export class AgentSession {
       this.task = Promise.resolve().then(async () => {
         let status: RunRecord['status'] = 'failed'
         try {
+          await this.loadMemorySettings()
           await this.compact(model, selection.reasoningEffort, 'manual', running, controller.signal, record)
           status = this.storedRuns.get(input.clientMessageId)?.status ?? 'completed'
         } catch (error) {
@@ -673,9 +692,34 @@ export class AgentSession {
     return [...this.state.compactions].reverse().find((record): record is Extract<CompactionRecord, { status: 'success' }> => record.status === 'success')
   }
 
+  private async loadMemorySettings() {
+    const current = await this.options.memory?.settings().catch(() => undefined)
+    this.memoryEnabled = current?.enabled ?? false
+    if (!this.memoryEnabled || this.memoryUser?.generation !== current?.generation) this.memoryUser = undefined
+    return current
+  }
+
+  private hiddenMemoryPath() {
+    const store = this.options.memory?.store
+    return store && !this.memoryEnabled ? (path: string) => store.isManagedPath(path) : undefined
+  }
+
+  private async readMemorySession(memory: MemoryStore, project: MemoryProject, id: string) {
+    const persistence = this.options.persistence
+    const summary = persistence?.store.readSessionSummary(id)
+    if (!persistence || !summary) return
+    if (summary.workspaceId !== persistence.summary.workspaceId) {
+      const directory = await this.options.resolveWorkspaceDirectory?.(summary.workspaceId).catch(() => undefined)
+      if (!directory) return
+      const sourceProject = await memory.resolveProject(directory).catch(() => undefined)
+      if (sourceProject?.projectId !== project.projectId) return
+    }
+    return persistence.store.loadSession(id)?.messages
+  }
+
   private context(compaction = this.latestCompaction()): ModelContext {
     return {
-      ...this.configuration, messages: buildModelHistory(this.historyMessages(), compaction, !!this.options.persistence, this.options.attachments),
+      ...this.configuration, messages: buildModelHistory(this.historyMessages(), compaction, !!this.options.persistence, this.options.attachments, this.hiddenMemoryPath()),
       ...(this.state.running?.kind === 'task' && { currentUserMessageId: this.state.running.runId }),
       omittedToolImageResults: this.omittedToolImageResults,
     }
@@ -686,7 +730,7 @@ export class AgentSession {
     return estimate.systemTokens + estimate.toolsTokens + estimate.messageTokens
   }
 
-  private configKey() { return JSON.stringify(this.configuration) }
+  private configKey() { return this.configurationKeyBeforeMemory ?? JSON.stringify([this.memoryEnabled, this.configuration]) }
   private modelKey(model: ModelInfo) { return JSON.stringify([model.provider, model.id, model.defaultReasoningEffort]) }
 
   private pressure(context: ModelContext, model: ModelInfo) {
@@ -741,7 +785,8 @@ export class AgentSession {
     let summaryUsage: AssistantMessage['usage']
     try {
       signal.throwIfAborted()
-      const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000, Boolean(this.configuration.tools?.length), !!this.options.persistence, model, this.options.attachments)
+      const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000,
+        Boolean(this.configuration.tools?.length), !!this.options.persistence, model, this.options.attachments, this.hiddenMemoryPath())
       if (preparation.status === 'skipped') {
         final = { ...record, status: 'skipped', finishedAt: Date.now(), reason: preparation.reason === 'already_compacted' ? '刚压缩完成，尚无新内容。' : '没有可压缩的较早内容。' }
       } else {
@@ -793,7 +838,10 @@ export class AgentSession {
         { ...boundary, aborted: signal.aborted, ...(!signal.aborted && { errorMessage: failed.reason }) }, ctx(), running.runId)
       throw error
     }
-    if (final.status === 'success') this.gateSample = undefined
+    if (final.status === 'success') {
+      this.gateSample = undefined
+      this.memoryUser = undefined
+    }
     this.state.compactions[index] = final
     this.publish({ type: 'compaction', record: final, running: working }, run && this.publicRun(run))
     if (final.status === 'success' && runtime?.has('session_compact')) {
@@ -907,13 +955,22 @@ export class AgentSession {
     if (runtime) this.cwd = cwd
     const ctx = () => this.extensionContext(cwd, model, signal)
     const runId = running.runId
+    const memoryStore = this.options.memory?.store
+    let memorySettings: MemorySettings | undefined
+    let memoryProject: MemoryProject | undefined
+    let projectMemory: ProjectMemory | undefined
+    let memoryTool: CodingTool | undefined
+    let memorySourceTool: CodingTool | undefined
+    const canWriteMemory = () => this.memoryEnabled && !this.permissionUnconfirmed && this.state.permissionMode === 'normal' && !this.state.plan
+    const turnTools = memoryStore ? tools.map(tool => tool.name === 'read' ? protectMemoryRead(tool, cwd, memoryStore,
+      () => ({ enabled: this.memoryEnabled, project: memoryProject })) : tool) : tools
     let roundTools = tools
     let roundPlanning = Boolean(this.state.plan)
     let leftPlan = false
-    const configure = (files: ProjectContextFile[]) => {
+    const configure = (files: ProjectContextFile[], memoryTools: CodingTool[] = []) => {
       if (roundPlanning && !this.state.plan) leftPlan = true
       roundPlanning = Boolean(this.state.plan)
-      roundTools = this.configure(cwd, this.availableTools(tools, roundPlanning, scheduled), files, skills)
+      roundTools = this.configure(cwd, this.availableTools([...turnTools, ...memoryTools], roundPlanning, scheduled), files, skills)
       if (systemPrompt !== undefined) this.configuration.systemPrompt = systemPrompt
       if (roundPlanning) this.configuration.systemPrompt += '\n\n' + planInstruction
       else if (leftPlan) this.configuration.systemPrompt += '\n\n用户已退出计划模式，当前采用普通模式。退出模式本身不表示用户已批准方案。'
@@ -953,6 +1010,11 @@ export class AgentSession {
         modelPhase()
         context = this.context()
       }
+      if (memoryStore && memorySettings?.enabled && !this.memoryUser) {
+        const document = await memoryStore.readUser().catch(() => undefined)
+        signal.throwIfAborted()
+        if (document) this.memoryUser = { document, generation: memorySettings.generation }
+      }
       if (!runtime?.has('context')) return context
       const messages = await runtime.chain('context', ctx(), context.messages, messages => ({ messages }), (_current, event, result) => {
         const messages = result?.messages === undefined ? event.messages : result.messages
@@ -964,9 +1026,49 @@ export class AgentSession {
 
     // Snapshot mode and executable tools together after all asynchronous preparation.
     const finalizeContext: AgentRunInput['finalizeContext'] = prepared => {
-      configure(this.projectContext?.files ?? [])
-      const context = { ...prepared, ...this.configuration, tools: this.configuration.tools }
+      const files = this.projectContext?.files ?? []
+      configure(files)
+      const base = () => ({ ...prepared, ...this.configuration, tools: this.configuration.tools })
+      let context: ModelContext = base()
       if (!withinBudget(context)) return { error: capacityError }
+      if (this.memoryEnabled) {
+        const baseKey = this.configKey()
+        const candidate = (context: ModelContext, block: string) => ({ ...context, systemPrompt: `${context.systemPrompt ?? ''}\n\n${block}` })
+        const append = (block: string) => {
+          const next = candidate(context, block)
+          if (!block || !withinBudget(next)) return false
+          context = next
+          return true
+        }
+        const personal = this.memoryUser?.document
+        const memoryTools: CodingTool[] = []
+        if (memoryTool && canWriteMemory()) memoryTools.push(memoryTool)
+        if (memorySourceTool && (personal?.entries.length || projectMemory?.entries.length)) memoryTools.push(memorySourceTool)
+        const declared = (name: string) => roundTools.some(tool => tool.name === name)
+        if (memoryTools.length) {
+          configure(files, memoryTools)
+          this.configurationKeyBeforeMemory = baseKey
+          const withMemory = candidate(base(), formatMemoryInstructions(declared(MEMORY_TOOL_NAME), declared(MEMORY_SOURCE_TOOL_NAME)))
+          if (withinBudget(withMemory)) context = withMemory
+          else configure(files)
+        }
+        const hasMemoryTool = declared(MEMORY_TOOL_NAME) || declared(MEMORY_SOURCE_TOOL_NAME)
+        if (!hasMemoryTool) append(formatMemoryInstructions(false))
+        if (personal && append(formatUserMemory(personal)) && hasMemoryTool) append(formatUserMemoryTargets(personal))
+        if (projectMemory?.entries.length) {
+          const lines = projectMemoryLines(projectMemory)
+          let low = 0, high = lines.length
+          while (low < high) {
+            const middle = Math.ceil((low + high) / 2)
+            if (withinBudget(candidate(context, formatProjectMemory(projectMemory, lines.slice(0, middle))))) low = middle
+            else high = middle - 1
+          }
+          if (low) append(formatProjectMemory(projectMemory, lines.slice(0, low)))
+        }
+        // Memory data can change each round, so calibrate against the underlying task configuration.
+        this.configurationKeyBeforeMemory = baseKey
+        this.configuration.systemPrompt = context.systemPrompt
+      }
       usedCompaction = this.latestCompaction()
       for (const index of omittedToolImageIndexes(context)) {
         const result = context.messages[index]
@@ -975,10 +1077,13 @@ export class AgentSession {
       return context
     }
 
-    const beforeToolCall: AgentRunInput['beforeToolCall'] = call =>
-      scheduled && call.name === CRONJOB_TOOL_NAME
-        ? { code: 'permission_denied', message: '定时执行不能管理定时任务。' }
-        : this.toolDenial(call.name, call.arguments, roundPlanning, call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
+    const beforeToolCall: AgentRunInput['beforeToolCall'] = call => {
+      if (scheduled && call.name === CRONJOB_TOOL_NAME) return { code: 'permission_denied', message: '定时执行不能管理定时任务。' }
+      if (memoryStore && (call.name === MEMORY_TOOL_NAME || call.name === MEMORY_SOURCE_TOOL_NAME) && !this.memoryEnabled) {
+        return { code: 'permission_denied', message: '已关闭长期记忆，工具未执行。' }
+      }
+      return this.toolDenial(call.name, call.arguments, roundPlanning, call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
+    }
 
     let preview: Pick<ConversationSnapshot, 'messages' | 'activeContent'> | undefined
     const agent = new Agent({ stream: withModelRetry(this.options.stream ?? stream, retry => {
@@ -1072,6 +1177,18 @@ export class AgentSession {
       }
     }
     try {
+      memorySettings = await this.loadMemorySettings()
+      signal.throwIfAborted()
+      if (memoryStore && memorySettings?.enabled) {
+        memoryProject = await memoryStore.resolveProject(cwd).catch(() => undefined)
+        signal.throwIfAborted()
+        if (memoryProject) projectMemory = await memoryStore.prepareProject(memoryProject, { prune: canWriteMemory(), signal, canCommit: canWriteMemory }).catch(() => undefined)
+        signal.throwIfAborted()
+        memoryTool = createMemoryTool({ store: memoryStore, project: memoryProject, sessionId: this.sessionId, canWrite: canWriteMemory })
+        const project = memoryProject
+        if (this.options.persistence && project) memorySourceTool = createMemorySourceTool({ store: memoryStore, project,
+          readSession: id => this.readMemorySession(memoryStore, project, id) })
+      }
       const options: Omit<AgentRunInput, 'context'> = {
         model, reasoningEffort, tools, signal, prepareContext, finalizeContext, beforeToolCall,
         resolveTools: () => roundTools, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined,

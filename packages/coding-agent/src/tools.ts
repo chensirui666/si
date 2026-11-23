@@ -2,7 +2,9 @@ import { Type, type Static, type TSchema } from 'typebox'
 import { Check } from 'typebox/value'
 import type { ExecutableTool } from '@agent-learning/agent'
 import type { Tool, ToolResultMessage } from '@agent-learning/model'
-import { createLocalTools, type LocalToolContext } from './local-tools.js'
+import { realpath } from 'node:fs/promises'
+import { createLocalTools, pathFrom, type LocalToolContext } from './local-tools.js'
+import type { MemoryProject, MemoryStore } from './memory-store.js'
 import type { WebTools } from './web-tools.js'
 import type { ToolRuntime } from './tool-runtime.js'
 import { planBashDescription, planGitArgs } from './plan-mode.js'
@@ -85,6 +87,22 @@ const declarations = {
 } satisfies Record<string, Tool>
 
 export type CodingTool = ExecutableTool & { promptSnippet?: string; planVersion?: CodingTool; preserveFailure?: true }
+
+export function protectMemoryRead(tool: CodingTool, cwd: string, store: MemoryStore, access: () => { enabled: boolean; project?: MemoryProject }): CodingTool {
+  return { ...tool, async execute(args, context) {
+    if (!Check(readParameters, args)) return tool.execute(args, context)
+    const target = pathFrom(cwd, args.path)
+    const actual = await realpath(target).catch(() => target)
+    context.signal.throwIfAborted()
+    if (store.isManagedPath(target) || store.isManagedPath(actual)) {
+      const { enabled, project } = access()
+      if (!enabled) throw Object.assign(new Error('已关闭长期记忆，无法读取记忆文件。'), { code: 'permission_denied' })
+      await store.validateRead(project, actual)
+      context.signal.throwIfAborted()
+    }
+    return tool.execute(actual === target ? args : { ...args, path: actual }, context)
+  } }
+}
 
 const promptSnippets: Record<string, string> = {
   bash: '在当前工作目录执行 Bash 命令，默认前台限时 240 秒。传入 background: true 可在后台运行。',

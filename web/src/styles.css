@@ -411,7 +411,7 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .delete-provider { color: var(--error); }
 .delete-provider:hover { color: var(--error); }
 .provider-delete-overlay { z-index: 12; backdrop-filter: blur(2px); }
-:is(.provider-delete-dialog, .schedule-dialog) {
+:is(.provider-delete-dialog, .schedule-dialog, .memory-dialog) {
   width: min(480px, calc(100vw - 32px));
   max-height: calc(100dvh - 32px);
   overflow: auto;
@@ -421,12 +421,36 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
   box-shadow: 0 8px 24px rgb(0 0 0 / 8%);
 }
 .provider-delete-dialog { z-index: 13; }
-:is(.provider-delete-dialog, .schedule-dialog) .dialog-close { position: absolute; top: 16px; right: 16px; }
+:is(.provider-delete-dialog, .schedule-dialog, .memory-dialog) .dialog-close { position: absolute; top: 16px; right: 16px; }
 .provider-delete-dialog h2 { margin: 0 36px 12px 0; font: var(--type-section-title); overflow-wrap: anywhere; }
 .provider-delete-dialog p { margin: 0; overflow-wrap: anywhere; }
 .provider-delete-dialog .configuration-error { margin-top: 12px; }
 .provider-delete-dialog .provider-actions { margin-top: 24px; }
 .provider-delete-dialog .delete-provider { border-color: var(--error); }
+.memory-settings-rows .settings-option-row > button { justify-self: end; }
+.memory-settings-rows .settings-option-row + .settings-option-row { border-top: 1px solid var(--border); }
+.memory-dialog { z-index: 13; display: grid; gap: 12px; }
+.memory-dialog h2 { margin: 0 36px 0 0; font: var(--type-section-title); }
+.memory-dialog :is(.configuration-error, .configuration-success) { margin: 0; }
+.memory-dialog > button:not(.dialog-close) { justify-self: start; }
+.user-memory-form { display: grid; gap: 8px; min-width: 0; }
+.user-memory-form label { font: var(--type-support); }
+.user-memory-form textarea { min-height: 180px; font-family: ui-monospace, monospace; }
+.user-memory-form textarea.memory-latest { min-height: 96px; }
+.memory-review-button { justify-self: start; }
+.memory-projects { display: grid; gap: 8px; min-width: 0; }
+.memory-project { min-width: 0; border: 1px solid var(--border); border-radius: 12px; }
+.memory-project-trigger { width: 100%; justify-content: start; }
+.memory-project-trigger > span:first-of-type { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.memory-project-trigger > span:last-child { margin-inline-start: auto; }
+.memory-project-trigger svg { rotate: -90deg; }
+.memory-project-trigger[data-state="open"] svg { rotate: 0deg; }
+.memory-project-entries { padding: 0 10px; }
+.memory-project-entries > li { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 10px 0; border-top: 1px solid var(--border); }
+.memory-entry-content { min-width: 0; overflow-wrap: anywhere; }
+.memory-entry-path { display: flex; align-items: center; gap: 4px; color: var(--secondary-text); }
+.memory-entry-path code { font-size: 12px; }
+.memory-project-entries button[aria-disabled="true"] { opacity: .5; cursor: default; }
 @media (max-width: 480px) {
   .schedule-dialog { padding: 16px; }
   .schedule-dialog .dialog-close { top: 8px; right: 8px; }

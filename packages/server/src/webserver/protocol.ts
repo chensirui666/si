@@ -66,6 +66,18 @@ export type StopBashJobResult = { sessionId: string; job: FinishedBashJob }
 export type InterfaceLanguage = 'en' | 'zh-CN'
 export type LanguageSettings = { language: InterfaceLanguage }
 
+export type MemorySettingsView = { memoryEnabled: boolean }
+export type UserMemoryView = { markdown: string; revision: number }
+export type ProjectMemoryEntryView = {
+  entryId: string; revision: number; title: string; summary: string; path: string; line: string
+}
+export type ProjectMemoryView = {
+  projectId: string; name: string; path: string; directoryPath: string; markdown: string
+  count: number; bytes: number; entries: ProjectMemoryEntryView[]
+}
+export type ProjectMemoriesView = { projects: ProjectMemoryView[] }
+export type DeleteMemoryEntryView = { project: ProjectMemoryView | null }
+
 type SubscriptionTarget = { sessionId: string; subscriptionId: string }
 
 export type ClientFrame =

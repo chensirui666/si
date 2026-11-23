@@ -21,7 +21,7 @@ function integer(value: number, name: string, minimum = 1): number {
   return value
 }
 
-function pathFrom(cwd: string, value: string): string {
+export function pathFrom(cwd: string, value: string): string {
   nonEmpty(value, 'path')
   if (value.includes('\0')) throw new Error('path 不能包含空字符')
   if (value === '~') return homedir()

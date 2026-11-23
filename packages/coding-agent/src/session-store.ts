@@ -353,6 +353,14 @@ export class SessionStore {
     } catch (error) { throw new SessionReadError('无法读取会话列表，请重试', { cause: error }) }
   }
 
+  readSessionSummary(id: string): SessionSummary | undefined {
+    try {
+      if (this.uncertain) throw new Error('Commit state unknown')
+      const row = this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id)
+      return row ? summaryFrom(row) : undefined
+    } catch (error) { throw new SessionReadError('无法读取会话信息，请重试', { cause: error }) }
+  }
+
   listMcpToolLoads(sessionId: string): McpToolIdentity[] {
     try {
       if (this.uncertain) throw new Error('Commit state unknown')
@@ -378,8 +386,8 @@ export class SessionStore {
     try {
       if (this.uncertain) throw new Error('Commit state unknown')
       this.db.exec('BEGIN')
-      const session = this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id)
-      const history = session ? this.readHistory(summaryFrom(session)) : undefined
+      const summary = this.readSessionSummary(id)
+      const history = summary ? this.readHistory(summary) : undefined
       this.db.exec('COMMIT')
       return history
     } catch (error) {

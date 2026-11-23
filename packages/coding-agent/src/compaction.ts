@@ -27,6 +27,24 @@ function effectiveEntries(entries: ConversationMessage[], latest?: LatestCompact
 }
 
 type AttachmentReader = Pick<SessionAttachments, 'path'> & Partial<Pick<SessionAttachments, 'image'>>
+type HiddenMemoryPath = (path: string) => boolean
+const isMemoryTool = (name: string) => name === 'memory' || name === 'memory_source'
+
+function omitMemory(entries: ConversationMessage[], hiddenPath: HiddenMemoryPath | undefined) {
+  if (!hiddenPath) return entries
+  return entries.map(entry => {
+    const { message, fileOperation } = entry
+    if (message.role === 'toolResult' && (isMemoryTool(message.toolName) || (fileOperation && hiddenPath(fileOperation.path)))) {
+      return { ...entry, message: { ...message, content: [{ type: 'text' as const, text: '已关闭长期记忆，本条工具结果中的记忆内容已省略。' }] } }
+    }
+    if (message.role !== 'assistant' || !message.content.some(block => block.type === 'toolCall' && isMemoryTool(block.name))) return entry
+    return { ...entry, message: { ...message, content: message.content.map(block => {
+      if (block.type !== 'toolCall' || !isMemoryTool(block.name)) return block
+      const { argumentsError: _error, ...call } = block
+      return { ...call, arguments: {} }
+    }) } }
+  })
+}
 
 function messageForModel({ id, message, imageOmitted, skillInvocation, attachments, references }: ConversationMessage, files?: AttachmentReader): ModelMessage {
   if (message.role === 'user' && typeof message.content === 'string') {
@@ -93,10 +111,16 @@ function modelMessages(entries: ConversationMessage[], recoverTools: boolean, fi
   })
 }
 
-export function buildModelHistory(entries: ConversationMessage[], latest?: LatestCompaction, recoverTools = false, files?: AttachmentReader): ModelMessage[] {
-  const messages = modelMessages(effectiveEntries(entries, latest), recoverTools, files)
+export function buildModelHistory(entries: ConversationMessage[], latest?: LatestCompaction, recoverTools = false, files?: AttachmentReader,
+  hiddenPath?: HiddenMemoryPath): ModelMessage[] {
+  const messages = modelMessages(omitMemory(effectiveEntries(entries, latest), hiddenPath), recoverTools, files)
   if (latest) {
-    const files = latest.fileOperations ? `\n\n工具确认的文件操作（readFiles 仅读，modifiedFiles 已改）：${JSON.stringify(latest.fileOperations)}` : ''
+    const operations = latest.fileOperations
+    const visible = operations && hiddenPath ? {
+      readFiles: operations.readFiles.filter(path => !hiddenPath(path)), modifiedFiles: operations.modifiedFiles.filter(path => !hiddenPath(path)),
+    } : operations
+    const files = visible && (visible.readFiles.length || visible.modifiedFiles.length)
+      ? `\n\n工具确认的文件操作（readFiles 仅读，modifiedFiles 已改）：${JSON.stringify(visible)}` : ''
     const summary = latest.summary + files
     messages.unshift({
       role: 'user', timestamp: latest.finishedAt,
@@ -109,8 +133,9 @@ export function buildModelHistory(entries: ConversationMessage[], latest?: Lates
 export function prepareCompaction(
   entries: ConversationMessage[], latest: LatestCompaction | undefined,
   keepRecentTokens: number, includeThinking: boolean, recoverTools = false, model?: ModelInfo, files?: Pick<SessionAttachments, 'path'>,
+  hiddenPath?: HiddenMemoryPath,
 ): CompactionPreparation {
-  const effective = effectiveEntries(entries, latest)
+  const effective = omitMemory(effectiveEntries(entries, latest), hiddenPath)
   const last = effective.at(-1)
   if (latest && last?.id === latest.contextLastMessageId) return { status: 'skipped', reason: 'already_compacted' }
   let tokens = 0

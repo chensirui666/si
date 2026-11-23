@@ -1,7 +1,7 @@
 import type { ModelDiscovery } from '@agent-learning/model'
 import { isPermissionMode } from '@agent-learning/server/protocol'
 import type { BashJobsView, StopBashJobResult, WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, McpOAuthStartView, McpServerView, SaveMcpServerRequest, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
-import type { SchedulePatch, ScheduleView } from '@agent-learning/server/protocol'
+import type { DeleteMemoryEntryView, MemorySettingsView, ProjectMemoriesView, ProjectMemoryView, SchedulePatch, ScheduleView, UserMemoryView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
 import { applyFrame, messageAttachment, extensionNotice, initialState, isSkillSource, modelSelection, reasoningEffort, type ChatState, type Subscribe } from './state'
@@ -227,6 +227,39 @@ export function getWorkspaceSkills(workspaceId: string, signal: AbortSignal) {
 }
 
 const putJson = (value: unknown): RequestInit => ({ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
+
+const memorySettingsPath = '/api/settings/memory'
+const userMemoryPath = '/api/memory/user'
+const projectMemoriesPath = '/api/memory/projects'
+const validRevision = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+const isMemorySettings = (value: unknown): value is MemorySettingsView =>
+  record(value) && typeof value.memoryEnabled === 'boolean'
+const isUserMemory = (value: unknown): value is UserMemoryView =>
+  record(value) && typeof value.markdown === 'string' && validRevision(value.revision)
+function isProjectMemory(value: unknown): value is ProjectMemoryView {
+  return record(value) && typeof value.projectId === 'string' && typeof value.name === 'string'
+    && typeof value.path === 'string' && typeof value.directoryPath === 'string' && typeof value.markdown === 'string'
+    && validRevision(value.count) && validRevision(value.bytes) && Array.isArray(value.entries) && value.count === value.entries.length
+    && value.entries.every(entry => record(entry) && typeof entry.entryId === 'string' && validRevision(entry.revision)
+      && typeof entry.title === 'string' && typeof entry.summary === 'string' && typeof entry.path === 'string' && typeof entry.line === 'string')
+}
+
+export const getMemorySettings = () => requestView(memorySettingsPath, 'memory.title', isMemorySettings, { signal: AbortSignal.timeout(5000) })
+export const saveMemorySettings = (memoryEnabled: boolean) => requestView(memorySettingsPath, 'memory.title', isMemorySettings, {
+  ...putJson({ memoryEnabled }), signal: AbortSignal.timeout(5000),
+})
+export const getUserMemory = () => requestView(userMemoryPath, 'memory.user', isUserMemory, { signal: AbortSignal.timeout(5000) })
+export const saveUserMemory = (markdown: string, expectedRevision: number) => requestView(userMemoryPath, 'memory.user', isUserMemory, {
+  ...putJson({ markdown, expectedRevision }), signal: AbortSignal.timeout(5000),
+})
+export const getProjectMemories = () => requestView(projectMemoriesPath, 'memory.projects',
+  (value): value is ProjectMemoriesView => record(value) && Array.isArray(value.projects) && value.projects.every(isProjectMemory),
+  { signal: AbortSignal.timeout(5000) })
+export const deleteProjectMemoryEntry = (projectId: string, entryId: string, expectedRevision: number) =>
+  requestView(`${projectMemoriesPath}/${encodeURIComponent(projectId)}/entries/${encodeURIComponent(entryId)}`, 'memory.projects',
+    (value): value is DeleteMemoryEntryView => record(value) && (value.project === null || isProjectMemory(value.project)),
+    { ...putJson({ expectedRevision }), method: 'DELETE', signal: AbortSignal.timeout(5000) })
 
 const permissionPath = '/api/settings/permission'
 const permissionSettings = (value: unknown): value is PermissionSettings =>

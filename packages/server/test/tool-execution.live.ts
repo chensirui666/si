@@ -12,7 +12,7 @@ import type { ConversationMessage, ServerFrame, SessionSummary } from '../src/we
 const publicPage = 'https://1.1.1.1/'
 const cases = [
   { name: 'bash', prompt: '使用 bash，command 为 ls，timeout 为 10。最后列出工具实际看到的两个文件名。', result: /draft\.txt[\s\S]*note\.txt/, answer: /draft\.txt[\s\S]*note\.txt|note\.txt[\s\S]*draft\.txt/ },
-  { name: 'edit', prompt: '我已读过 note.txt，确认旧文本“状态：开发中”完整且唯一。本次只允许一次工具调用，请直接调用 edit，参数为 {"path":"note.txt","edits":[{"oldText":"状态：开发中","newText":"状态：测试中"}]}。无须再次读取。收到工具结果后报告实际状态和文件名。', result: /note\.txt/, answer: /测试中/ },
+  { name: 'edit', prompt: '我已读过 note.txt，确认旧文本“状态：开发中”完整且唯一。本次只允许一次工具调用，请直接调用 edit，参数为 {"path":"note.txt","edits":[{"oldText":"状态：开发中","newText":"状态：测试中"}]}。无须再次读取。收到工具成功结果后，回答文件名和文件里“状态”字段的新值。', result: /note\.txt/, answer: /测试中/ },
   { name: 'write', prompt: '参数为 {"path":"notes/note.txt","content":"项目名称：青禾"}。write 会创建父目录。收到工具结果后报告实际写入路径。', result: /notes\/note\.txt/, answer: /notes\/note\.txt/ },
   { name: 'find', prompt: '使用 find 在 samples 子目录按通配符 *.txt 查找，limit 为 10。最后给出实际找到的文件名。', result: /matched\.txt/, answer: /matched\.txt/ },
   { name: 'grep', prompt: '参数为 {"path":"note.txt","pattern":"开发中","literal":true,"context":1,"limit":5}。收到工具结果后报告命中行号和完整命中文本。', result: /note\.txt:2:.*状态：开发中/, answer: /状态：开发中/ },
@@ -113,14 +113,14 @@ for (const scenario of cases) it(`T2–T8 live: ${scenario.name} 执行、回填
     expect(result?.isError, toolText).toBe(false)
     expect(toolText).toMatch(scenario.result)
     expect(requests).toHaveLength(2)
-    expect(requests[0]?.tools).toHaveLength(11)
-    expect(requests[1]?.tools).toHaveLength(11)
+    expect(requests[0]?.tools).toHaveLength(12)
+    expect(requests[1]?.tools).toHaveLength(12)
     expect(requests[1]?.messages.at(-2)?.tool_calls?.[0]?.id).toBe(calls[0]!.id)
     expect(requests[1]?.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: calls[0]!.id, content: toolText })
+    if (scenario.name === 'edit') expect(await readFile(join(cwd, 'note.txt'), 'utf8')).toBe('项目名称：青禾\n状态：测试中\n负责人：小林\n')
     const answer = assistants[1]?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('') ?? ''
     expect(assistants[1]?.stopReason, assistants[1]?.errorMessage).toBe('stop')
     expect(answer).toMatch(scenario.answer)
-    if (scenario.name === 'edit') expect(await readFile(join(cwd, 'note.txt'), 'utf8')).toBe('项目名称：青禾\n状态：测试中\n负责人：小林\n')
     if (scenario.name === 'write') expect(await readFile(join(cwd, 'notes/note.txt'), 'utf8')).toBe('项目名称：青禾')
     if (scenario.name === 'find') expect(toolText).not.toContain('ignored.md')
     if (scenario.name === 'grep') expect(toolText).toMatch(/note\.txt[-:]1[-:].*项目名称：青禾[\s\S]*note\.txt[-:]3[-:].*负责人：小林/)

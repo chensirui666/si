@@ -113,8 +113,8 @@ test('Feature7/10 live 68/21：两次压缩并实测用量，服务重启后继�
     await submit(page, observed, `保持前面的事实、约束和待完成任务。以下只是没有业务意义的近期日志，后续摘要可以省略；不要调用工具，只回答“已收到”。\n${randomBytes(1200).toString('hex')}`)
     const beforeManual = await refresh(page, observed)
     expect(beforeManual.compactions).toEqual([])
-    const taskTemplate = requests.find(request => request.tools?.length === 11)!
-    expect(taskTemplate.tools).toHaveLength(11)
+    const taskTemplate = requests.find(request => request.tools?.length === 12)!
+    expect(taskTemplate.tools).toHaveLength(12)
     const systemPrompt = taskTemplate.messages[0]!.content!
     const tools = taskTemplate.tools!.map(tool => tool.function)
 
@@ -316,7 +316,7 @@ test('Feature8 live 38–39: 两段会话按各自的真实文件和历史接续
       await submit(page, observed, `请记住本会话专用代号 ${code}。只调用 read 读取 ${filename}，记住实际工具结果，读完只回复“已记录”。之后我问“按原约定给出结果”时，不使用工具，按约定${order}。`)
       const [first, continuation] = requests.slice(start)
       expect(requests.length - start).toBe(2)
-      expect(first?.tools).toHaveLength(11)
+      expect(first?.tools).toHaveLength(12)
       const callId = continuation?.messages.at(-2)?.tool_calls?.[0]?.id
       expect(callId).toBeTruthy()
       expect(continuation?.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: callId, content })

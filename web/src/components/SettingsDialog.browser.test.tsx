@@ -396,3 +396,117 @@ test('MCP 初次连接保持关闭，恢复连接保持打开，点击都能停�
   await expect(recovering).not.toBeChecked()
   expect(updates).toEqual([{ id: 'connecting', enabled: false }, { id: 'recovering', enabled: false }])
 })
+
+test('个性化开关等服务端确认，关闭后仍可编辑个人记忆且冲突保留草稿', async ({ mount, page }) => {
+  let enable: () => void
+  const pending = new Promise<void>(resolve => { enable = resolve })
+  await page.route('**/api/settings/memory', async route => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { memoryEnabled: true } })
+    expect(route.request().postDataJSON()).toEqual({ memoryEnabled: false })
+    await pending
+    await route.fulfill({ json: { memoryEnabled: false } })
+  })
+  const markdown = '## 沟通\n先说用户会看到什么。'
+  const newest = '## 沟通\n另一会话写入的偏好。'
+  let saved = { markdown, revision: 4 }
+  await page.route('**/api/memory/user', route => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: saved })
+    const { markdown: draft, expectedRevision } = route.request().postDataJSON()
+    if (saved.revision === 4) {
+      expect(expectedRevision).toBe(4)
+      saved = { markdown: newest, revision: 5 }
+      return route.fulfill({ status: 409, json: { code: 'version_conflict', error: '版本冲突' } })
+    }
+    expect(expectedRevision).toBe(5)
+    expect(draft).toBe('保留的编辑稿，合并了新偏好')
+    saved = { markdown: draft, revision: 6 }
+    return route.fulfill({ json: saved })
+  })
+  await mount(<ChatPageHarness />)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('button', { name: '个性化' }).click()
+  const memorySwitch = page.getByRole('switch', { name: '启用记忆' })
+  await expect(memorySwitch).toBeChecked()
+  await memorySwitch.click()
+  await expect(memorySwitch).toBeDisabled()
+  await expect(memorySwitch).toBeChecked()
+  enable!()
+  await expect(memorySwitch).not.toBeChecked()
+
+  const manage = page.getByRole('button', { name: '管理用户摘要' })
+  await manage.click()
+  const dialog = page.getByRole('dialog', { name: '用户摘要' })
+  const draft = dialog.getByRole('textbox', { name: 'Markdown', exact: true })
+  await expect(draft).toHaveValue(markdown)
+  await draft.fill('保留的编辑稿')
+  await dialog.getByRole('button', { name: '保存', exact: true }).click()
+  await expect(dialog.getByRole('alert')).toContainText('草稿已保留')
+  await expect(draft).toHaveValue('保留的编辑稿')
+  await expect(dialog.getByRole('button', { name: '保存', exact: true })).toBeDisabled()
+  await dialog.getByRole('button', { name: '查看最新版' }).click()
+  await expect(dialog.getByRole('textbox', { name: '已保存的 Markdown' })).toHaveValue(newest)
+  await expect(draft).toHaveValue('保留的编辑稿')
+  await draft.fill('保留的编辑稿，合并了新偏好')
+  await dialog.getByRole('button', { name: '保存此草稿' }).click()
+  await expect(dialog.getByRole('status')).toContainText('摘要已保存')
+  await expect(draft).toHaveValue('保留的编辑稿，合并了新偏好')
+  await expect(dialog.getByRole('textbox', { name: '已保存的 Markdown' })).toHaveCount(0)
+  await page.keyboard.press('Escape')
+  await expect(manage).toBeFocused()
+})
+
+test('项目摘要展开显示笔记地址，最后一条删除成功后移除项目', async ({ mount, page, context }) => {
+  const path = '/local/memory/projects/project-a/feedback.md'
+  const project = {
+    projectId: 'project-a', name: '集成测试', path: '/local/workspace',
+    directoryPath: '/local/memory/projects/project-a/MEMORY.md',
+    markdown: '- [测试数据库](feedback.md) — 先检查迁移\n', count: 1, bytes: 59,
+    entries: [{ entryId: 'entry-a', revision: 2, title: '测试数据库', summary: '先检查迁移', path, line: '- [测试数据库](feedback.md) — 先检查迁移' }],
+  }
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  await page.route('**/api/settings/memory', route => route.fulfill({ json: { memoryEnabled: true } }))
+  await page.route('**/api/memory/projects', route => route.fulfill({ json: { projects: [project] } }))
+  await page.route('**/api/memory/projects/project-a/entries/entry-a', route => {
+    expect(route.request().method()).toBe('DELETE')
+    expect(route.request().postDataJSON()).toEqual({ expectedRevision: 2 })
+    return route.fulfill({ json: { project: null } })
+  })
+  await mount(<ChatPageHarness />)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('button', { name: '个性化' }).click()
+  await page.getByRole('button', { name: '管理项目摘要' }).click()
+  const dialog = page.getByRole('dialog', { name: '项目摘要' })
+  const list = dialog.getByRole('button', { name: /集成测试.*1 条/ })
+  await expect(dialog.getByText(path)).toHaveCount(0)
+  await list.click()
+  await expect(dialog.getByText('先检查迁移', { exact: true })).toBeVisible()
+  await expect(dialog.getByText(path, { exact: true })).toBeVisible()
+  await dialog.getByRole('button', { name: '复制笔记地址' }).click()
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(path)
+  await dialog.getByRole('button', { name: '删除测试数据库' }).click()
+  await expect(list).toHaveCount(0)
+  await expect(dialog.getByText('暂无项目记忆')).toBeVisible()
+})
+
+test('个性化读取失败可重试，保存失败保留已确认的开关值', async ({ mount, page }) => {
+  let reads = 0
+  await page.route('**/api/settings/memory', route => {
+    if (route.request().method() === 'GET' && ++reads > 1) {
+      return route.fulfill({ json: { memoryEnabled: true } })
+    }
+    return route.fulfill({ status: 500, json: { error: '本机记忆设置不可用' } })
+  })
+  await mount(<ChatPageHarness />)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('button', { name: '个性化' }).click()
+  const panel = page.getByRole('region', { name: 'SI 记忆' })
+  const memorySwitch = panel.getByRole('switch')
+  await expect(panel.getByRole('alert')).toContainText('无法加载记忆')
+  await expect(memorySwitch).toBeDisabled()
+  await panel.getByRole('button', { name: '重试' }).click()
+  await expect(memorySwitch).toBeChecked()
+  await memorySwitch.click()
+  await expect(panel.getByRole('alert')).toContainText('无法保存记忆开关')
+  await expect(memorySwitch).toBeChecked()
+  await expect(memorySwitch).toBeEnabled()
+})

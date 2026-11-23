@@ -11,7 +11,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { Type } from 'typebox'
 import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
-import { AgentSession, McpManager, SessionStore, SessionWriteError, SessionReadError, ToolRuntime, createTools, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
+import { AgentSession, McpManager, MemoryStore, SessionStore, SessionWriteError, SessionReadError, ToolRuntime, createTools, type SessionSubscriptionEvent, type ConversationSnapshot, type SessionSummary } from '@agent-learning/coding-agent'
 import { createModelStream, type ModelContext, type AssistantMessage, type ModelEvent } from '@agent-learning/model'
 
 vi.mock('node:fs/promises', { spy: true })
@@ -1238,11 +1238,14 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
     .replace('{{workspacePath}}', () => app.workspace)
   const systemPrompt = requests[0].messages[0].content
   expect(systemPrompt).toContain('<name>agents-md</name>')
-  expect(systemPrompt.replace(/\n\n如果任务符合[^\n]+\n<available_skills>[\s\S]*?<\/available_skills>/, ''))
+  expect(systemPrompt.split('\n\n## 长期记忆\n')[0].replace(/\n- memory：[^\n]+/, '').replace(/\n\n如果任务符合[^\n]+\n<available_skills>[\s\S]*?<\/available_skills>/, ''))
     .toBe(expectedPrompt)
-  expect(requests[1].messages[0]).toEqual(requests[0].messages[0])
-  expect(requests[0].tools).toHaveLength(11)
-  expect(requests[1].tools).toHaveLength(11)
+  for (const request of requests) {
+    expect(request.messages[0].content).toContain('## 记录长期记忆')
+    expect(request.messages[0].content.split('\n\n## 长期记忆\n')[0]).toBe(systemPrompt.split('\n\n## 长期记忆\n')[0])
+    expect(request.tools).toHaveLength(12)
+    expect(request.tools.at(-1)).toMatchObject({ function: { name: 'memory' } })
+  }
   expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })
   expect(await readFile(join(app.workspace, 'written.txt'), 'utf8')).toBe('working-directory')
   let history!: ConversationSnapshot
@@ -1275,6 +1278,103 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
     'POST', JSON.stringify({ sessionId, text: '继续', modelId: 'deepseek-flash', clientMessageId: randomUUID() }))
   expect(unavailable.status).toBe(409)
   expect(requests).toHaveLength(2)
+})
+
+it('persists the memory switch independently of other local settings', async () => {
+  const app = await setup()
+  const endpoint = app.url + '/api/settings/memory'
+  const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+  expect((await http(endpoint)).status).toBe(401)
+  const initial = await http(endpoint, headers)
+  expect(initial.status).toBe(200)
+  expect(JSON.parse(initial.text)).toEqual({ memoryEnabled: true })
+  expect((await http(endpoint, headers, 'PUT', '{"memoryEnabled":"false"}')).status).toBe(400)
+
+  const [memory, language] = await Promise.all([
+    http(endpoint, headers, 'PUT', '{"memoryEnabled":false}'),
+    http(app.url + '/api/settings/language', headers, 'PUT', '{"language":"zh-CN"}'),
+  ])
+  expect(memory.status).toBe(200)
+  expect(JSON.parse(memory.text)).toEqual({ memoryEnabled: false })
+  expect(language.status).toBe(200)
+  expect(JSON.parse(await readFile(app.config.webSettingsPath, 'utf8'))).toEqual({
+    memoryEnabled: false, locale: { preference: 'zh-CN' },
+  })
+  await app.server.close()
+  const next = new WebServer(app.config)
+  const restarted = await next.start()
+  cleanups.push(() => next.close())
+  const persisted = await http(restarted.url + '/api/settings/memory', { Cookie: await cookie(restarted.authUrl) })
+  expect(JSON.parse(persisted.text)).toEqual({ memoryEnabled: false })
+})
+
+it('edits personal memory while automation is off and rejects stale or oversized drafts', async () => {
+  const app = await setup()
+  const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+  const endpoint = app.url + '/api/memory/user'
+  expect((await http(app.url + '/api/settings/memory', headers, 'PUT', '{"memoryEnabled":false}')).status).toBe(200)
+  const initial = await http(endpoint, headers)
+  expect(initial.status).toBe(200)
+  const { revision } = JSON.parse(initial.text)
+  expect(JSON.parse(initial.text)).toEqual({ markdown: '', revision })
+  const markdown = '## 沟通\n先说用户会看到什么。\n'
+  const save = (draft: string, expectedRevision: number) => http(endpoint, headers, 'PUT', JSON.stringify({
+    markdown: draft, expectedRevision,
+  }))
+  const saved = await save(markdown, revision)
+  expect(saved.status).toBe(200)
+  const view = JSON.parse(saved.text)
+  expect(view).toEqual({ markdown, revision: expect.any(Number) })
+  expect(view.revision).toBeGreaterThan(revision)
+
+  const stale = await save('另一份草稿', revision)
+  expect(stale.status).toBe(409)
+  expect(JSON.parse(stale.text)).toMatchObject({ code: 'version_conflict' })
+  const tooLong = await save('早'.repeat(1376), view.revision)
+  expect(tooLong.status).toBe(422)
+  expect(JSON.parse(tooLong.text)).toMatchObject({ code: 'capacity_exceeded' })
+  expect(JSON.parse((await http(endpoint, headers)).text)).toEqual(view)
+})
+
+it('lists populated project memory and deletes only the current note revision', async () => {
+  const app = await setup()
+  const headers = { Cookie: await cookie(app.authUrl), 'Content-Type': 'application/json' }
+  const endpoint = app.url + '/api/memory/projects'
+  expect((await http(endpoint)).status).toBe(401)
+  expect(JSON.parse((await http(endpoint, headers)).text)).toEqual({ projects: [] })
+  const store = new MemoryStore(join(app.config.globalContextDirectory, 'memory'))
+  const project = await store.resolveProject(app.workspace)
+  await store.apply('project', project, [{
+    operation: 'write', type: 'feedback', title: '测试数据库', summary: '运行前检查迁移', content: '测试需要连接真实数据库。',
+  }], { sessionId: 'source-session' })
+  const listed = await http(endpoint, headers)
+  expect(listed.status).toBe(200)
+  const { projects } = JSON.parse(listed.text)
+  expect(projects).toHaveLength(1)
+  const [view] = projects
+  expect(view).toMatchObject({ ...project, count: 1, directoryPath: expect.stringContaining('MEMORY.md'),
+    markdown: expect.stringContaining('运行前检查迁移'), entries: [{ title: '测试数据库', summary: '运行前检查迁移', path: expect.any(String) }] })
+  expect(listed.text).not.toContain('测试需要连接真实数据库。')
+  expect(listed.text).not.toContain('source-session')
+  const [entry] = view.entries
+  const remove = (id: string, expectedRevision: number) => {
+    const body = JSON.stringify({ expectedRevision })
+    return http(`${endpoint}/${project.projectId}/entries/${encodeURIComponent(id)}`,
+      { ...headers, 'Content-Length': String(Buffer.byteLength(body)) }, 'DELETE', body)
+  }
+  const traversal = await remove('../USER.md', entry.revision)
+  expect(traversal.status).toBe(400)
+  const absent = await remove(randomUUID(), entry.revision)
+  expect(absent.status).toBe(200)
+  expect(JSON.parse(absent.text)).toEqual({ project: view })
+  const stale = await remove(entry.entryId, entry.revision + 1)
+  expect(stale.status).toBe(409)
+  expect(JSON.parse(stale.text)).toMatchObject({ code: 'version_conflict' })
+  const deleted = await remove(entry.entryId, entry.revision)
+  expect(deleted.status).toBe(200)
+  expect(JSON.parse(deleted.text)).toEqual({ project: null })
+  expect(JSON.parse((await http(endpoint, headers)).text)).toEqual({ projects: [] })
+  await expect(stat(entry.path)).rejects.toMatchObject({ code: 'ENOENT' })
 })
 
 it('language settings validate, share the settings file safely and survive a restart', async () => {
@@ -1725,7 +1825,7 @@ it('首发按绑定工作区选说明，真实 edit 后续轮刷新，同目录�
   await idle(b.id, 5)
   expect((await submit(c.id, '继续 C')).status).toBe(202)
   await idle(c.id, 6)
-  expect(requests[4][0]).toEqual(requests[5][0])
+  expect(requests[4][0].content.split('\n\n## 长期记忆\n')[0]).toBe(requests[5][0].content.split('\n\n## 长期记忆\n')[0])
   expect(requests[4][0].content).toContain('项目说明 B 新版')
   expect(requests[4].filter(message => message.role === 'user').map(message => message.content)).toEqual(['首发 B', '继续 B'])
   expect(requests[5].filter(message => message.role === 'user').map(message => message.content)).toEqual(['会话 C 私有消息', '继续 C'])

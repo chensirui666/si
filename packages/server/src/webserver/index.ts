@@ -9,7 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import {
   AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode, loadExtensions,
   AttachmentInputError, SessionAttachments, ATTACHMENT_TTL_MS, MAX_ATTACHMENT_UPLOAD_BYTES,
-  McpManager, McpSettingsError,
+  McpManager, McpSettingsError, MemoryStore, MemoryStoreError,
   type AttachmentScope, type ScheduledRun, type ScheduledSubmission, type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
@@ -23,6 +23,8 @@ import { isSettingsObject, readSettingsFile, updateSettingsFile } from '../setti
 import { createTavilyProvider } from '../web-providers.js'
 import { BrowserAuth, trustedRequest } from './browser-auth.js'
 import { finishMcpOAuth, handleMcpSettings, isMcpOAuthCallback, isMcpSettingsPath, mcpClientMetadataDocuments } from './mcp.js'
+import { MemorySettings } from './memory.js'
+import type { DeleteMemoryEntryView, MemorySettingsView, ProjectMemoriesView, UserMemoryView } from './protocol.js'
 import type { BashJobsView, StopBashJobResult, ClientFrame, ConversationMessage as BrowserMessage, LanguageSettings, PermissionSettings, SessionPermission, ServerFrame, StartSessionResult, StartSessionRequest, WorkspaceSkills } from './protocol.js'
 
 type SessionTarget = {
@@ -89,6 +91,7 @@ export type WebServerOptions = {
   workspacePath?: string
   sessionPath?: string
   webSettingsPath?: string
+  memoryDirectory?: string
   globalContextDirectory?: string
   mcpConfigDirectory?: string
   mcpClientMetadataBaseUrl?: string
@@ -103,6 +106,9 @@ export type WebServerOptions = {
 }
 const mime: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.woff2': 'font/woff2', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8' }
 const maxBufferedBytes = 1024 * 1024
+const memoryErrorStatus: Partial<Record<string, number>> = {
+  version_conflict: 409, capacity_exceeded: 422, invalid_request: 400,
+}
 class InputError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
 }
@@ -200,6 +206,8 @@ export class WebServer {
   private readonly sessionPath: string
   private readonly attachments: SessionAttachments
   private attachmentCleanup?: ReturnType<typeof setInterval>
+  private readonly memorySettings: MemorySettings
+  private readonly memoryStore: MemoryStore
   private readonly webSettings: WebSettings
   private selection?: AbortController
   private stopWatching?: () => void
@@ -208,6 +216,9 @@ export class WebServer {
 
   constructor(private readonly options: WebServerOptions = {}) {
     this.credentials = new Credentials(options.modelAuthPath)
+    const appData = options.globalContextDirectory ?? (options.webSettingsPath ? dirname(options.webSettingsPath) : join(homedir(), '.agent-learning'))
+    this.memoryStore = new MemoryStore(options.memoryDirectory ?? join(appData, 'memory'), options.now)
+    this.memorySettings = new MemorySettings(options.webSettingsPath)
     this.workspaces = new Workspaces(options.workspacePath)
     this.sessionPath = options.sessionPath ?? join(homedir(), '.agent-learning', 'sessions.sqlite')
     this.attachments = new SessionAttachments(resolve(this.sessionPath + '.files', 'attachments'))
@@ -224,6 +235,10 @@ export class WebServer {
       createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode, sessionId) => new AgentSession({
         resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd, persistence?.summary.id ?? sessionId), compaction: this.options.compaction,
         mcp: this.mcp,
+        memory: {
+          store: this.memoryStore,
+          settings: () => this.memorySettings.read(true),
+        },
         ...(this.schedules && { manageSchedule: (owner, input) => {
           if (!this.schedules) throw new InputError(503, '定时任务服务暂时不可用')
           return this.schedules.manageFromChat(owner, input)
@@ -232,6 +247,7 @@ export class WebServer {
         titleStream: stream, onTitleChanged: () => this.notify('sessions_changed'), attachments: this.attachments,
         referenceDirectory: resolve(this.sessionPath + '.files', 'references'),
         isWorkspaceRegistered: id => this.workspaces.isRegistered(id),
+        resolveWorkspaceDirectory: id => this.workspaces.resolveDirectory(id),
         globalContextDirectory: this.options.globalContextDirectory ?? join(homedir(), '.agent-learning'),
         skillHome: this.options.skillHome,
         documentationRoot: existsSync(resolve(siRoot, 'README.md')) && existsSync(resolve(siRoot, 'web/README.md')) ? siRoot : undefined,
@@ -565,6 +581,14 @@ export class WebServer {
       await this.handleLanguageSettings(req, res)
       return
     }
+    const memoryEntry = /^\/api\/memory\/projects\/([^/]+)\/entries\/([^/]+)$/.exec(url.pathname)
+    if (((url.pathname === '/api/settings/memory' || url.pathname === '/api/memory/user')
+      && (req.method === 'GET' || req.method === 'PUT'))
+      || (url.pathname === '/api/memory/projects' && req.method === 'GET')
+      || (memoryEntry && req.method === 'DELETE')) {
+      await this.handleMemory(req, res, url.pathname, memoryEntry)
+      return
+    }
     const webProvider = /^\/api\/web\/providers\/([a-z][a-z0-9-]*)$/.exec(url.pathname)?.[1]
     if ((url.pathname === '/api/web/settings' && (req.method === 'GET' || req.method === 'PUT'))
       || (webProvider && (req.method === 'PUT' || req.method === 'DELETE'))) {
@@ -810,6 +834,52 @@ export class WebServer {
       this.json(res, error instanceof InputError ? error.status : 500, {
         error: error instanceof InputError ? error.message : '无法读取或保存语言设置，请检查本机设置文件及权限。',
       })
+    }
+  }
+
+  private async handleMemory(req: IncomingMessage, res: ServerResponse, pathname: string, entry: RegExpExecArray | null) {
+    try {
+      if (pathname === '/api/settings/memory') {
+        if (req.method === 'GET') {
+          const { enabled } = await this.memorySettings.read()
+          this.json(res, 200, { memoryEnabled: enabled } satisfies MemorySettingsView)
+        } else {
+          const value = await readJson(req)
+          if (!isSettingsObject(value) || Object.keys(value).length !== 1 || typeof value.memoryEnabled !== 'boolean') {
+            throw new InputError(400, '请提交有效的记忆开关。')
+          }
+          const { enabled } = await this.memorySettings.save(value.memoryEnabled)
+          this.json(res, 200, { memoryEnabled: enabled } satisfies MemorySettingsView)
+        }
+      } else if (pathname === '/api/memory/projects') {
+        this.json(res, 200, { projects: await this.memoryStore.listProjects() } satisfies ProjectMemoriesView)
+      } else if (req.method === 'GET') {
+        const { markdown, revision } = await this.memoryStore.readUser()
+        this.json(res, 200, { markdown, revision } satisfies UserMemoryView)
+      } else {
+        const value = await readJson(req)
+        if (!isSettingsObject(value) || typeof value.expectedRevision !== 'number'
+          || !Number.isSafeInteger(value.expectedRevision) || value.expectedRevision < 0) {
+          throw new InputError(400, '请提交有效的记忆版本。')
+        }
+        if (entry) {
+          if (Object.keys(value).length !== 1) throw new InputError(400, '请仅提交记忆版本。')
+          const project = await this.memoryStore.deleteProjectEntry(checkedPathId(entry[1]!), checkedPathId(entry[2]!), value.expectedRevision)
+          this.json(res, 200, { project } satisfies DeleteMemoryEntryView)
+        } else {
+          if (Object.keys(value).length !== 2 || typeof value.markdown !== 'string') {
+            throw new InputError(400, '请提交 Markdown 正文和记忆版本。')
+          }
+          const { markdown, revision } = await this.memoryStore.saveUser(value.markdown, value.expectedRevision)
+          this.json(res, 200, { markdown, revision } satisfies UserMemoryView)
+        }
+      }
+    } catch (error) {
+      if (error instanceof MemoryStoreError) {
+        const status = memoryErrorStatus[error.code]
+        if (status) { this.json(res, status, { code: error.code, error: error.message }); return }
+      }
+      this.sessionError(res, error, '无法读取或更新本机记忆。')
     }
   }
 
