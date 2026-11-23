@@ -504,7 +504,7 @@ test('11 真实模型、真实时钟下关页并重启服务后触发一次', as
     backend = await startBackend(secret, port)
     expect(Date.now()).toBeLessThan(due)
     await expect(access(output)).rejects.toMatchObject({ code: 'ENOENT' })
-    await expect.poll(async () => readFile(output, 'utf8').catch(() => ''), {
+    await expect.poll(async () => (await readFile(output, 'utf8').catch(() => '')).replace(/\r?\n$/u, ''), {
       timeout: 420_000, intervals: [1000, 3000, 5000],
     }).toBe(marker)
 

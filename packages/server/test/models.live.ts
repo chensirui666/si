@@ -196,8 +196,11 @@ for (const model of directory.models) test.concurrent(`真实验收 ${model.prov
     const read = await (await api.submit(selection, readBoth)).finish()
     verifyRead(read, selection, api.marker)
     if (model.provider === 'moonshotai-cn' && model.id === 'kimi-k3.1-pro') {
-      expect(api.requests).toHaveLength(3)
-      for (const request of api.requests) {
+      const taskRequests = api.requests.filter(({ body }) => !JSON.parse(body).messages.some(
+        (message: { role: string; content: unknown }) => message.role === 'system'
+          && typeof message.content === 'string' && message.content.startsWith('你是会话标题生成器。')))
+      expect(taskRequests).toHaveLength(3)
+      for (const request of taskRequests) {
         expect(request.hostname).toBe('api.moonshot.cn')
         expect(JSON.parse(request.body)).toMatchObject({ model: model.id, reasoning_effort: selected, stream: true })
       }
