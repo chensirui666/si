@@ -232,7 +232,8 @@ test('Feature 1 小模型容量不足后，从同一网页用大模型压缩，�
   const target = original.getModels().find(item => item.id === 'kimi-k3')!
   piModels.setProvider(createProvider({
     id: original.id, name: original.name, auth: original.auth, api: openAICompletionsApi(),
-    models: [{ ...target, contextWindow: 3200, maxTokens: 128 }],
+    // 压缩后的请求需要为工具定义和工作树路径留出空间。
+    models: [{ ...target, contextWindow: 3456, maxTokens: 128 }],
   }))
   const directory = await mkdtemp(join(tmpdir(), 'agent-model-capacity-'))
   const model = await startModelServer()
