@@ -1243,7 +1243,8 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
   for (const request of requests) {
     expect(request.messages[0].content).toContain('## 记录长期记忆')
     expect(request.messages[0].content.split('\n\n## 长期记忆\n')[0]).toBe(systemPrompt.split('\n\n## 长期记忆\n')[0])
-    expect(request.tools).toHaveLength(12)
+    expect(request.tools).toHaveLength(13)
+    expect(request.tools).toContainEqual(expect.objectContaining({ function: expect.objectContaining({ name: 'ask_user_question' }) }))
     expect(request.tools.at(-1)).toMatchObject({ function: { name: 'memory' } })
   }
   expect(requests[1].messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'write-1' })

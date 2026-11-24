@@ -34,11 +34,11 @@ export function DraftAttachments({ items, remove, retry }: {
   </div>
 }
 
-export function SentAttachments({ attachments }: { attachments: readonly Attachment[] }) {
+export function SentAttachments({ attachments, previews }: { attachments: readonly Attachment[]; previews?: ReadonlyMap<string, string> }) {
   const { t } = useTranslation()
   if (!attachments.length) return null
   return <div className="attachment-list" role="group" aria-label={t('attachment.sent')}>
-    {attachments.map(attachment => <PreviewLink key={attachment.id} url={attachmentPath(attachment.id)}
+    {attachments.map(attachment => <PreviewLink key={attachment.id} url={previews?.get(attachment.id) ?? attachmentPath(attachment.id)}
       name={attachment.name} image={attachment.mediaType.startsWith('image/')} />)}
   </div>
 }

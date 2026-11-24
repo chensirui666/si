@@ -11,8 +11,8 @@ import WebSocket from 'ws'
 import { WebServer } from '../src/webserver/index.js'
 import type { ConversationSnapshot, ScheduledRunView, ScheduleView, ServerFrame } from '../src/webserver/protocol.js'
 
-type Tool = { action: string; [key: string]: unknown }
-type ResponseValue = { text: string } | { tool: Tool; id: string } | { error: number }
+type Tool = Record<string, unknown>
+type ResponseValue = { text: string } | { tool: Tool; id: string; name?: string } | { error: number }
 type ModelRequest = {
   model: string
   reasoning_effort: string
@@ -25,7 +25,7 @@ function modelResponse(value: ResponseValue) {
   if ('error' in value) return Response.json({ error: { message: 'controlled model failure' } }, { status: value.error })
   const delta = 'tool' in value ? { tool_calls: [{
     index: 0, id: value.id, type: 'function',
-    function: { name: 'cronjob_manage', arguments: JSON.stringify(value.tool) },
+    function: { name: value.name ?? 'cronjob_manage', arguments: JSON.stringify(value.tool) },
   }] } : { content: value.text }
   const chunk = (data: object, finish_reason: string | null) => 'data: ' + JSON.stringify({
     id: 'controlled-schedules', object: 'chat.completion.chunk', model: 'deepseek-flash',
@@ -478,4 +478,52 @@ it('a scheduled run with a definite end-write failure records a failed result an
   const [second] = await app.runs(plan!.id)
   expect(second?.status).toBe('accepted')
   await terminal(app, second!.runId!)
+}))
+
+it('Feature 10 case 26 scheduled runs reject forced questions without waiting', async () => withServer(async app => {
+  const { sessionId } = await app.newSession('a')
+  await app.snapshot(sessionId)
+  app.reply({ tool: { action: 'create', prompt: '定时测试', schedule: { kind: 'daily', time: '09:00' } }, id: 'create' },
+    { text: '计划已保存' })
+  await terminal(app, await send(app, sessionId, '每天 09:00 测试'))
+  const [saved] = await app.plans()
+  app.reply({ name: 'ask_user_question', id: 'forced-ask', tool: { questions: [{ id: 'q', question: '需要回答？' }] } },
+    { text: '定时任务仍可完成' })
+  app.nowAt(saved!.nextRunAt!)
+  await app.server.scanScheduledTasks()
+  const [run] = await app.runs(saved!.id)
+  await terminal(app, run!.runId!)
+  expect(app.requests[2]!.tools.some(tool => tool.function.name === 'ask_user_question')).toBe(false)
+  expect(app.requests[3]!.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'forced-ask' })
+  const history = await app.snapshot(sessionId)
+  expect(history.interaction?.questions ?? []).toEqual([])
+  expect(history.messages.find(entry => entry.message.role === 'toolResult' && entry.message.toolCallId === 'forced-ask')?.message)
+    .toMatchObject({ isError: true })
+}))
+
+it('a manual message waits for a scheduled run and then starts without an extra send', async () => withServer(async app => {
+  const { sessionId } = await app.newSession('a')
+  await app.snapshot(sessionId)
+  app.reply({ tool: { action: 'create', prompt: '定时测试', schedule: { kind: 'daily', time: '09:00' } }, id: 'create' },
+    { text: '计划已保存' })
+  await terminal(app, await send(app, sessionId, '每天 09:00 测试'))
+  const [saved] = await app.plans()
+  const held = Promise.withResolvers<ResponseValue>()
+  app.reply(held.promise, { text: '已完成手动消息' })
+  try {
+    app.nowAt(saved!.nextRunAt!)
+    await app.server.scanScheduledTasks()
+    const [run] = await app.runs(saved!.id)
+    await vi.waitFor(() => expect(app.requests).toHaveLength(3))
+    const clientMessageId = randomUUID()
+    const receipt = await app.call('/api/messages', 'POST', { ...primary, sessionId, clientMessageId, text: '手动继续', mode: 'steer' })
+    expect(receipt.status).toBe(202)
+    expect(await receipt.json()).toMatchObject({ kind: 'queued', clientMessageId })
+    held.resolve({ text: '定时结束' })
+    await terminal(app, run!.runId!)
+    await vi.waitFor(() => expect(app.requests).toHaveLength(4))
+    expect(app.requests[3]!.messages.at(-1)?.content).toBe('手动继续')
+    await vi.waitFor(() => expect(app.frames.some(frame => frame.type === 'update' &&
+      frame.update.run?.clientMessageId === clientMessageId && frame.update.run.status === 'completed')).toBe(true))
+  } finally { held.resolve({ text: '定时结束' }) }
 }))

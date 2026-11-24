@@ -74,3 +74,5 @@
 @media (max-height: 500px) {
   .message-editor { max-height: clamp(24px, calc(100dvh - 184px), 200px); }
 }
+
+.message-input[hidden], .message-input button[hidden] { display: none; }

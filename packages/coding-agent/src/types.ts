@@ -4,12 +4,13 @@ import type { ExtensionMessage } from './extensions/runtime.js'
 import type { SkillInvocation } from './skills.js'
 import type { PermissionMode } from './permissions.js'
 import type { MessageAttachment } from './session-attachments.js'
+import type { InteractionState } from './collaboration.js'
 import type { SessionReference } from './session-references.js'
 
 export type SubmissionSources = { attachmentIds?: string[]; referenceSessionIds?: string[] }
 
 export type SubmissionInput = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & SubmissionSources
-  & { clientMessageId: string; text: string; permissionMode?: PermissionMode }
+  & { clientMessageId: string; text: string; permissionMode?: PermissionMode; mode?: 'steer' }
 
 export function sameSubmissionSources(before: SubmissionSources, after: SubmissionSources): boolean {
   return JSON.stringify(before.attachmentIds ?? []) === JSON.stringify(after.attachmentIds ?? [])
@@ -25,6 +26,8 @@ type ToolLocation = {
 export type ConversationMessage = {
   id: string
   clientMessageId?: string
+  steering?: true
+  runId?: string
   toolCall?: ToolLocation
   toolErrorCode?: string
   imageOmitted?: true
@@ -88,6 +91,7 @@ export type PlanState = { state: 'planning' } | { state: 'review'; assistantMess
 
 export type ConversationSnapshot = {
   seq: number
+  interaction?: InteractionState
   permissionMode: PermissionMode
   plan?: PlanState | null
   messages: ConversationMessage[]
@@ -111,7 +115,8 @@ export type ConversationUpdate = {
     | { type: 'permission'; permissionMode: PermissionMode }
     | { type: 'plan'; plan: PlanState | null }
     | { type: 'selection'; selection: ModelSelection }
-    | { type: 'accepted'; user: ConversationMessage; running: Extract<RunningState, { kind: 'task' }> }
+    | { type: 'interaction'; interaction: InteractionState }
+    | { type: 'accepted'; user: ConversationMessage; steering?: ConversationMessage[]; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }
     | { type: 'compaction'; record: CompactionRecord; running: RunningState }
     | ({ type: 'task'; running: RunningState } & ({ message: ConversationMessage; messageIndex: number } | { message?: never; messageIndex?: never }))

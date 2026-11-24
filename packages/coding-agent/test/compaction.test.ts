@@ -77,6 +77,22 @@ describe('compaction preparation', () => {
       .toEqual(entries.slice(2).map(entry => entry.message))
   })
 
+  it('keeps a steering batch together with the immediately preceding completed tool calls', () => {
+    const steering = (id: string, value: string): ConversationMessage => ({ ...user(id, value), steering: true, runId: 'u1' })
+    const entries = [user('old', 'old task'), user('u1', 'task'), assistant('a1', [call], 'toolUse'),
+      result('r1', 'completed'), steering('s1', 'first instruction'), steering('s2', 'second '.repeat(100))]
+    const prepared = ready(prepareCompaction(entries, undefined, 10, true))
+    expect(prepared.firstKeptMessageId).toBe('a1')
+    expect(prepared.messagesToSummarize).toEqual(entries.slice(0, 2).map(entry => entry.message))
+  })
+
+  it('keeps inherited steering and the new task message on the same side of the cut', () => {
+    const inherited: ConversationMessage = { ...user('s1', 'new instruction'), steering: true, runId: 'u2' }
+    const entries = [user('old', 'old task'), inherited, user('u2', 'new task '.repeat(100))]
+    const prepared = ready(prepareCompaction(entries, undefined, 10, true))
+    expect(prepared.firstKeptMessageId).toBe('s1')
+  })
+
   it('can move an entire old tool group into the summary while retaining newer messages', () => {
     const entries = [user('u1', 'task'), assistant('a1', [call], 'toolUse'), result('r1', 'old tool result'), user('u2', 'new '.repeat(100))]
     const prepared = ready(prepareCompaction(entries, undefined, 10, true))

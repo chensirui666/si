@@ -42,6 +42,9 @@ import './message-input.css'
 type MessageInputProps = {
   onSend: (text: string, restoreDraft: () => void) => boolean
   sendDisabled: boolean
+  onSteer?: (text: string) => boolean
+  activeRunId?: string
+  hidden?: boolean
   action?: 'send' | 'abort' | 'aborting'
   abortDisabled?: boolean
   onAbort?: () => void
@@ -91,6 +94,7 @@ const optionId = (option: string) =>
   option.startsWith('@') ? `session-option-${option.slice(1)}` : option === '/compact' || option === '/plan'
     ? `${option.slice(1)}-option` : `skill-option-${option.slice(7).trim()}`
 const isControl = (text: string) => ['/compact', '/plan'].includes(text.trim())
+const isPlanCommand = (text: string) => /^\/plan(?:$|\s)/u.test(text.trim())
 const isPlanExit = (text: string) => /^\/plan\s+off$/u.test(text.trim())
 
 function $mentionAtCursor() {
@@ -111,15 +115,19 @@ export function MessageInput(props: MessageInputProps) {
   )
 }
 
-function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, permissionControl, footerControl, commandsEnabled = true, skillWorkspaceId, draft, onDraftChange, editorRef, quote, onRemoveQuote,
+function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, permissionControl, footerControl, commandsEnabled = true, skillWorkspaceId, draft, onDraftChange, editorRef, quote, onRemoveQuote,
   attachments, onAddFiles, hasAttachments = false, attachmentsPending = false, referenceDraft,
   referenceSessions, onSelectReference, onPlan, planActive = false, onExitPlan }: MessageInputProps) {
   const { t } = useTranslation()
   const [editor] = useLexicalComposerContext()
   const [hasSkillPrefix, setHasSkillPrefix] = useState(() => skillPrefix.test(draft?.text ?? ''))
   const [inputText, setInputText] = useState(draft?.text ?? '')
-  const canSend = (inputText.trim() || hasAttachments) && (!attachmentsPending || isControl(inputText))
+  const hasDraft = Boolean(inputText.trim()) || hasAttachments
+  const canSend = hasDraft && (!attachmentsPending || isControl(inputText))
   const canSubmit = isPlanExit(inputText) ? Boolean(onExitPlan) : canSend && !sendDisabled
+    && (action === 'send' || Boolean(activeRunId) && !isControl(inputText) && !isPlanCommand(inputText))
+  const primaryStops = action !== 'send' && (action === 'aborting' || !activeRunId || !hasDraft || sendDisabled && !canSubmit)
+  const canAbort = action === 'abort' && !abortDisabled && Boolean(onAbort)
   const placeholder = t(planActive ? 'plan.placeholder' : 'chat.placeholder')
   const draftRevision = useRef(0)
   const [query, setQuery] = useState<string | null>(null)
@@ -145,6 +153,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
   const active = options[Math.min(highlight, options.length - 1)]
 
   const dismissedText = useRef<string | undefined>(undefined)
+  const firstEscape = useRef<{ runId: string; at: number } | undefined>(undefined)
   const composingRef = useRef(false)
   const composingUntilRef = useRef(0)
   const closeMenu = useCallback(() => {
@@ -215,9 +224,9 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       closeMenu()
     }, { discrete: true, tag: HISTORY_PUSH_TAG })
   }
-  const label = t(action === 'send' ? 'chat.send' : action === 'abort' ? 'chat.abort' : 'chat.aborting')
+  const label = t(primaryStops ? (action === 'aborting' ? 'chat.aborting' : 'chat.abort') : 'chat.send')
 
-  const submit = useCallback((text: string) => {
+  const submit = useCallback((text: string, steer = false) => {
     let clearedRevision: number | undefined
     const restoreDraft = () => editor.update(() => {
       if (clearedRevision !== draftRevision.current || $readDraft() !== '') return
@@ -227,13 +236,14 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     }, { discrete: true, tag: SKIP_SCROLL_INTO_VIEW_TAG })
 
     try {
-      if (isPlanExit(text)) { onExitPlan?.(text); return }
+      if (isPlanExit(text)) { if (!steer) onExitPlan?.(text); return }
+      if ((isControl(text) || isPlanCommand(text)) && (action !== 'send' || steer)) return
       if (sendDisabled || !text.trim() && !hasAttachments || attachmentsPending && !isControl(text)) return
       if (text.trim() === '/plan' && onPlan) {
         onPlan(text)
         return
       }
-      if (onSend(text, restoreDraft) !== true) return
+      if ((steer ? onSteer?.(text) : onSend(text, restoreDraft)) !== true) return
     } catch (error) {
       // Report receiver errors after Lexical has finished its active update.
       queueMicrotask(() => { throw error })
@@ -254,7 +264,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
         editor.getRootElement()?.focus({ preventScroll: true })
       },
     })
-  }, [editor, onPlan, onExitPlan, onSend, sendDisabled, hasAttachments, attachmentsPending])
+  }, [editor, onPlan, onExitPlan, onSend, onSteer, action, sendDisabled, hasAttachments, attachmentsPending])
 
   const pickOption = useCallback((option: string) => {
     if (option.startsWith('@')) {
@@ -311,6 +321,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     }
 
     const blur = () => {
+      firstEscape.current = undefined
       dismissedText.current = editor.getEditorState().read($readDraft)
       closeMenu()
     }
@@ -352,10 +363,21 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       editor.registerCommand(KEY_ARROW_DOWN_COMMAND, move(1), COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ARROW_UP_COMMAND, move(-1), COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ESCAPE_COMMAND, event => {
-        if (!menu.current) return false
-        event?.preventDefault()
-        dismissedText.current = $readDraft()
-        closeMenu()
+        const previous = firstEscape.current
+        firstEscape.current = undefined
+        if (menu.current) {
+          event?.preventDefault()
+          dismissedText.current = $readDraft()
+          closeMenu()
+          return true
+        }
+        if (!event || event.defaultPrevented || event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey
+          || !activeRunId || !canAbort || composingRef.current || editor.isComposing() || event.isComposing || event.keyCode === 229
+          || Date.now() < composingUntilRef.current) return false
+        event.preventDefault()
+        const now = performance.now()
+        if (previous?.runId === activeRunId && now - previous.at <= 500) onAbort?.()
+        else firstEscape.current = { runId: activeRunId, at: now }
         return true
       }, COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_TAB_COMMAND, event => {
@@ -377,19 +399,21 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
       }, COMMAND_PRIORITY_CRITICAL),
       editor.registerCommand(KEY_ENTER_COMMAND, (event) => {
         if (event === null) return true
-        if (event.ctrlKey || event.metaKey || event.altKey || event.getModifierState('AltGraph')) return true
+        if (event.altKey || event.getModifierState('AltGraph') || event.ctrlKey && event.metaKey) return true
+        const steer = event.ctrlKey || event.metaKey
+        if (steer && (!onSteer || event.shiftKey)) return true
         if (event.shiftKey) return false
         if (composingRef.current || editor.isComposing() || event.isComposing || event.keyCode === 229 || Date.now() < composingUntilRef.current) return true
         event.preventDefault()
         if (!event.repeat) {
           const text = $readDraft()
           if (menu.current && active && !(active === '/plan' && text.trim() === '/plan')) pickOption(active)
-          else submit(text)
+          else submit(text, steer)
         }
         return true
       }, COMMAND_PRIORITY_CRITICAL),
     )
-  }, [editor, submit, pickOption, closeMenu, active, options.length, onAddFiles])
+  }, [editor, submit, pickOption, closeMenu, active, options.length, onAddFiles, onSteer, activeRunId, canAbort, onAbort])
 
   useEffect(() => {
     if (active) document.getElementById(optionId(active))?.scrollIntoView({ block: 'nearest' })
@@ -401,7 +425,7 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
     </Button>
 
   return (
-    <div className="message-input">
+    <div hidden={hidden} className="message-input">
       {quote && <div className="composer-quote" role="group" aria-label={t('chat.quotedText')}>
         <QuoteIcon aria-hidden="true" />
         <div className="composer-quote-text">{quote}</div>
@@ -447,6 +471,8 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
             role="textbox"
             aria-label={t('chat.message')}
             aria-multiline="true"
+            aria-keyshortcuts={onSteer ? 'Control+Enter Meta+Enter' : undefined}
+            onKeyDownCapture={event => { if (event.key !== 'Escape') firstEscape.current = undefined }}
             aria-controls={referenceMenu ? 'reference-menu' : slashMenu ? 'compact-menu' : undefined}
             aria-activedescendant={menuOpen && active ? optionId(active) : undefined}
             aria-autocomplete={commandsEnabled || skillWorkspaceId || referenceSessions ? 'list' : undefined}
@@ -469,10 +495,12 @@ function Composer({ onSend, sendDisabled, action = 'send', abortDisabled = false
         <div className="composer-trailing">
           {footerControl}
           {contextMeter}
-          <Button className="send-button" size="icon" type="button" aria-label={label} title={label}
-            disabled={action === 'send' ? !canSubmit : action === 'aborting' || abortDisabled || !onAbort}
-            onClick={() => { if (action === 'send') submit(editor.read($readDraft)); else if (action === 'abort') onAbort?.() }}>
-            {action === 'send' ? <ArrowUpIcon aria-hidden="true" /> : <SquareIcon aria-hidden="true" fill="currentColor" />}
+          <Button className="send-button" size="icon" type="button" aria-label={label}
+            title={primaryStops && canAbort && activeRunId ? t('chat.abortShortcut') : label}
+            disabled={primaryStops ? !canAbort : !canSubmit}
+            onMouseDown={event => { if (document.activeElement === editor.getRootElement()) event.preventDefault() }}
+            onClick={primaryStops ? () => { firstEscape.current = undefined; onAbort?.() } : () => submit(editor.read($readDraft))}>
+            {primaryStops ? <SquareIcon aria-hidden="true" fill="currentColor" /> : <ArrowUpIcon aria-hidden="true" />}
           </Button>
         </div>
       </div>

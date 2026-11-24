@@ -157,9 +157,9 @@ it('27 读取会话各表时维持同一事务，第二连接无法在中途改�
       })
       try {
         expect(store.loadSession(summary.id)).toEqual({ summary, runs: [run], messages: [user], compactions: [], permissionMode: 'normal' })
-        expect(readSteps).toHaveLength(8)
-        expect(readSteps.at(-2)).toContain('FROM session_plan_state')
-        expect(readSteps.at(-1)).toContain('FROM session_plan_commands')
+        for (const table of ['session_plan_state', 'session_plan_commands', 'pending_submissions', 'user_questions']) {
+          expect(readSteps.some(sql => sql.includes(`FROM ${table}`))).toBe(true)
+        }
       } finally { observe.mockRestore() }
     } finally { other.close(); store.close() }
   } finally { await rm(directory, { recursive: true, force: true }) }
@@ -241,5 +241,168 @@ it('Feature 1 保存会话选择与默认值，失败时同时回滚', () => {
     store.saveModelSelection(next, summary.id)
     expect(store.getDefaultSelection()).toEqual(next)
     expect(store.loadSession(summary.id)?.modelSelection).toEqual(next)
+  } finally { store.close() }
+})
+
+it('重开会话恢复待发顺序、编辑文本和删除项的原始提交', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-store-pending-'))
+  const path = join(directory, 'sessions.sqlite')
+  const first = {
+    input: { clientMessageId: 'first', text: '原始第一条', modelId: run.modelId },
+    text: '原始第一条', status: 'queued' as const, acceptedSeq: 5,
+  }
+  const second = {
+    input: { clientMessageId: 'second', text: '原始第二条', modelId: run.modelId },
+    text: '原始第二条', status: 'queued' as const, acceptedSeq: 6,
+  }
+  const edit = { ...first, text: '编辑后第一条' }
+  const deleted = { ...second, status: 'deleted' as const }
+  try {
+    const store = SessionStore.open(path)
+    try {
+      store.save(summary.id, { summary, pending: [first, second] })
+      const bypass = { ...run, clientMessageId: first.input.clientMessageId, text: first.text }
+      expect(() => store.save(summary.id, { run: bypass, messages: [{ ...user, clientMessageId: bypass.clientMessageId }] })).toThrow(/未保存/)
+      expect(() => store.save(summary.id, { pending: [{ ...edit, input: { ...edit.input, text: edit.text } }] })).toThrow(/未保存/)
+      store.save(summary.id, { pending: [deleted, edit] })
+    } finally { store.close() }
+    const reopened = SessionStore.open(path)
+    try { expect(reopened.loadSession(summary.id)?.pending).toEqual([edit, deleted]) }
+    finally { reopened.close() }
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+it('待发附件归原提交保留，领取时与每条正式消息的绑定一起保存', () => {
+  const store = SessionStore.open(':memory:')
+  const scope = { sessionId: summary.id }
+  const uploadedAt = Date.now()
+  const attachment = { id: 'held', name: 'held.txt', mediaType: 'text/plain' as const, size: 1 }
+  const other = { ...attachment, id: 'other' }
+  const queued = {
+    input: { clientMessageId: run.clientMessageId, text: run.text, modelId: run.modelId, attachmentIds: [other.id] },
+    text: run.text, status: 'queued' as const, acceptedSeq: 1, attachments: [other],
+  }
+  const steering = {
+    ...queued, input: { ...queued.input, clientMessageId: 'steer', attachmentIds: [attachment.id] },
+    status: 'steering' as const, acceptedSeq: 2, attachments: [attachment],
+  }
+  const preceding: ConversationMessage = {
+    ...user, id: 'steering-user', clientMessageId: 'steer', runId: run.id, steering: true, attachments: [attachment],
+  }
+  const primary = { ...user, attachments: [other] }
+  const cutoff = uploadedAt + 1
+  const dispatch = {
+    run, messages: [preceding, primary],
+    pending: [{ ...queued, status: 'started' as const }, { ...steering, status: 'delivered' as const }],
+    attachments: [
+      { ids: [attachment.id], scope, cutoff, pendingId: steering.input.clientMessageId, messageId: preceding.id },
+      { ids: [other.id], scope, cutoff, pendingId: queued.input.clientMessageId, messageId: primary.id },
+    ],
+  }
+  try {
+    store.save(summary.id, { summary })
+    store.registerAttachment({ ...attachment, scope, uploadedAt })
+    store.registerAttachment({ ...other, scope, uploadedAt })
+    store.save(summary.id, { pending: [queued, steering] })
+    expect(store.expiredAttachments(cutoff)).toEqual([])
+    expect(store.pendingAttachment(attachment.id, scope, uploadedAt - 1)).toBeUndefined()
+    expect(store.pendingAttachment(attachment.id, scope, cutoff, steering.input.clientMessageId)).toEqual(attachment)
+    expect(() => store.save(summary.id, { ...dispatch, attachments: [
+      dispatch.attachments[0]!, { ...dispatch.attachments[1]!, pendingId: steering.input.clientMessageId },
+    ] })).toThrow(/未保存/)
+    expect(store.sentAttachment(attachment.id)).toBeUndefined()
+    expect(store.loadSession(summary.id)).toMatchObject({ runs: [], messages: [], pending: [queued, steering] })
+    store.save(summary.id, dispatch)
+    expect(store.loadSession(summary.id)).toMatchObject({ runs: [run], messages: [preceding, primary], pending: dispatch.pending })
+    expect(store.sentAttachment(attachment.id)).toEqual({ ...attachment, workspaceId: summary.workspaceId })
+    expect(store.sentAttachment(other.id)).toEqual({ ...other, workspaceId: summary.workspaceId })
+  } finally { store.close() }
+})
+
+it('拒绝用其他会话或其他待发项的附件，删除待发项后允许清理附件', () => {
+  const store = SessionStore.open(':memory:')
+  const scope = { sessionId: summary.id }
+  const foreignScope = { sessionId: 'other-session' }
+  const uploadedAt = Date.now()
+  const attachment = { id: 'owned', name: 'owned.txt', mediaType: 'text/plain' as const, size: 1 }
+  const foreign = { ...attachment, id: 'foreign' }
+  const first = {
+    input: { clientMessageId: 'first', text: '第一条', modelId: run.modelId, attachmentIds: [attachment.id] },
+    text: '第一条', status: 'queued' as const, acceptedSeq: 2,
+  }
+  try {
+    store.save(summary.id, { summary })
+    store.registerAttachment({ ...attachment, scope, uploadedAt })
+    store.registerAttachment({ ...foreign, scope: foreignScope, uploadedAt })
+    expect(store.queuedAttachment(attachment.id)).toBeUndefined()
+    expect(() => store.save(summary.id, { pending: [{ ...first, input: { ...first.input, attachmentIds: [foreign.id] } }] })).toThrow(/未保存/)
+    store.save(summary.id, { pending: [first] })
+    expect(store.queuedAttachment(attachment.id)).toEqual({ ...attachment, workspaceId: summary.workspaceId })
+    expect(() => store.save(summary.id, { pending: [{ ...first, input: { ...first.input, clientMessageId: 'second' } }] })).toThrow(/未保存/)
+    store.forgetExpiredAttachment(attachment.id, uploadedAt + 1)
+    expect(store.hasAttachment(attachment.id)).toBe(true)
+    store.save(summary.id, { pending: [{ ...first, status: 'deleted' }] })
+    expect(store.queuedAttachment(attachment.id)).toBeUndefined()
+    expect(store.expiredAttachments(uploadedAt + 1)).toContain(attachment.id)
+    store.forgetExpiredAttachment(attachment.id, uploadedAt + 1)
+    expect(store.hasAttachment(attachment.id)).toBe(false)
+  } finally { store.close() }
+})
+
+const ask: ConversationMessage = {
+  id: 'ask', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+    timestamp: 2, stopReason: 'toolUse', content: [
+      { type: 'toolCall', name: 'ask_user_question', id: 'question-call', arguments: { questions: [{ id: 'q1', question: '保留旧接口？' }] } },
+      { type: 'toolCall', name: 'read', id: 'read-call', arguments: { path: 'note.txt' } },
+    ] },
+}
+const timedOutResult: ConversationMessage = {
+  id: 'ask-result', toolCall: { assistantMessageId: ask.id, contentIndex: 0 },
+  message: { role: 'toolResult', toolCallId: 'question-call', toolName: 'ask_user_question', isError: false,
+    timestamp: 3, content: [{ type: 'text', text: '{"pending":true}' }] },
+}
+const readResult: ConversationMessage = {
+  id: 'read-result', toolCall: { assistantMessageId: ask.id, contentIndex: 1 },
+  message: { role: 'toolResult', toolCallId: 'read-call', toolName: 'read', isError: false,
+    timestamp: 4, content: [{ type: 'text', text: '读到的内容' }] },
+}
+
+it('重开会话恢复超时问题及其原工具结果，插话保留在工具批次之后', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-store-questions-'))
+  const path = join(directory, 'sessions.sqlite')
+  const question = {
+    id: 'question-id', runId: run.id, assistantMessageId: ask.id, toolCallId: 'question-call',
+    status: 'timed-out' as const, deadlineAt: 3, questions: [{ id: 'q1', question: '保留旧接口？' }],
+  }
+  const steering: ConversationMessage = {
+    id: 'steer', clientMessageId: 'steering', runId: run.id, steering: true,
+    message: { role: 'user', content: '保留旧接口', timestamp: 5 },
+  }
+  try {
+    const store = SessionStore.open(path)
+    try {
+      const waiting = { ...question, status: 'waiting' as const }
+      store.save(summary.id, { summary, run, messages: [user, ask], questions: [waiting] })
+      expect(store.loadSession(summary.id)?.questions).toEqual([waiting])
+      store.save(summary.id, { runId: run.id, messages: [timedOutResult], questions: [question] })
+      store.save(summary.id, { runId: run.id, messages: [readResult, steering] })
+    } finally { store.close() }
+    const reopened = SessionStore.open(path)
+    try {
+      expect(reopened.loadSession(summary.id)).toMatchObject({
+        messages: [user, ask, timedOutResult, readResult, steering], questions: [question],
+      })
+    } finally { reopened.close() }
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+it('有未回填的工具调用时拒绝把后续插话当成完整历史', () => {
+  const store = SessionStore.open(':memory:')
+  const steering: ConversationMessage = {
+    ...user, id: 'steer', clientMessageId: 'steering', runId: run.id, steering: true,
+  }
+  try {
+    store.save(summary.id, { summary, run, messages: [user, ask, timedOutResult, steering] })
+    expect(() => store.loadSession(summary.id)).toThrow('无法读取完整会话历史')
   } finally { store.close() }
 })

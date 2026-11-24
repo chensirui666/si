@@ -36,3 +36,5 @@ export type { ExtensionAPI, ExtensionContext, ExtensionEntry, ExtensionEvents, E
 export { McpManager, type McpOAuthStartView, type McpServerView } from './mcp/manager.js'
 export { McpSettingsError } from './mcp/settings.js'
 export { MemoryStore, MemoryStoreError, type ProjectMemory } from './memory-store.js'
+
+export type { InteractionState, PendingMessage, QuestionAnswer, QuestionReply, QuestionWaitSettings, QueueAction, QueueResult, SubmissionPending, UserQuestion, UserQuestionBatch } from './collaboration.js'

@@ -1,6 +1,7 @@
 import { StrictMode, type ComponentProps } from 'react'
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { InteractionState, SubmitMessageResult } from '@agent-learning/server/protocol'
 import type { ChatState, Subscribe } from '../chat/state'
 import { ChatPage as Page } from './ChatPage'
 import { draftKey, recentSessionKey } from '../chat/drafts'
@@ -122,7 +123,7 @@ it.each([true, false])('旧中止%s回执不能改变新运行、按钮与草稿
   source.emit(runningState('new-user'))
   const editor = await pasteDraft('下一轮草稿')
   await act(async () => { if (success) receipt.resolve({ sessionId, runId: 'user-1', handled: false }); else receipt.reject(new Error('旧错误')) })
-  expect(screen.getByRole('button', { name: '中止' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: /^发送$/ })).toBeEnabled()
   expect(screen.queryByText(/旧错误/)).not.toBeInTheDocument()
   expect(editor.textContent).toBe('下一轮草稿')
 })
@@ -250,7 +251,7 @@ it('有效发送立即清空，HTTP 回执等待 WS；渲染前双手势只提�
   expect(screen.getByRole('button', { name: '中止' })).toBeDisabled()
   source.emit({ connection: 'ready', snapshot: { ...empty, seq: 1, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }], running: { kind: 'task' as const, runId: 'user', assistantMessageId: 'answer', phase: 'model', activeTools: [] } }, slow: false, error: null })
   expect(screen.getAllByRole('listitem')).toHaveLength(1)
-  expect(screen.getByRole('button', { name: '中止' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: /^发送$/ })).toBeEnabled()
   expect(editor.textContent).toBe('新草稿')
   source.emit({ connection: 'ready', snapshot: { ...empty, seq: 2, messages: [{ id: 'user', clientMessageId: input.clientMessageId, message: { role: 'user', content: input.text, timestamp: 1 } }] }, slow: false, error: null })
   expect(screen.getByRole('button', { name: '发送' })).toBeEnabled()
@@ -309,7 +310,7 @@ it('明确拒绝可编辑下一条，同步抛错保留当前草稿', async () =
   expect(editor.textContent).toBe('被拒绝')
 })
 
-it('有模型时仍逐项检查连接、快照、运行与模型门禁，切换后保留原草稿', async () => {
+it('有模型时仍逐项检查连接、快照、模型门禁，切换后保留原草稿', async () => {
   const source = controlled()
   const submitMessage = vi.fn(() => new Promise<never>(() => {}))
   let changed = () => {}
@@ -329,10 +330,6 @@ it('有模型时仍逐项检查连接、快照、运行与模型门禁，切换�
   source.emit({ connection: 'ready', snapshot: null, slow: false, error: null })
   fireEvent.keyDown(editor, { key: 'Enter' })
   expect(submitMessage).not.toHaveBeenCalled()
-  source.emit({ connection: 'ready', snapshot: { ...empty, running: { kind: 'task' as const, runId: 'other-user', assistantMessageId: 'other-answer', phase: 'model', activeTools: [] } }, slow: false, error: null })
-  fireEvent.keyDown(editor, { key: 'Enter' })
-  expect(submitMessage).not.toHaveBeenCalled()
-  await act(async () => { source.emit({ connection: 'ready', snapshot: empty, slow: false, error: null }) })
   getModels.mockResolvedValue(missing)
   await act(async () => { changed() })
   fireEvent.keyDown(editor, { key: 'Enter' })
@@ -415,7 +412,10 @@ it('压缩正式记录先到只展示一次操作，迟到回执保留新草稿�
   expect(screen.getByRole('region', { name: '压缩记录' }).querySelectorAll('[data-compaction-id]')).toHaveLength(1)
   expect(editor.textContent).toBe('下一条问题')
   expect(screen.getByRole('status')).toHaveTextContent('正在压缩对话')
-  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '中止' })) })
+  await act(async () => {
+    fireEvent.keyDown(editor, { key: 'Escape' })
+    fireEvent.keyDown(editor, { key: 'Escape' })
+  })
   expect(abortMessage).toHaveBeenCalledExactlyOnceWith({ sessionId, runId: 'c1' })
   source.emit({ connection: 'ready', snapshot: { ...empty, seq: 2, compactions: [{ ...compaction, status: 'aborted', finishedAt: 2, reason: '已停止压缩' }] }, slow: false, error: null })
   expect(screen.getByRole('button', { name: '发送' })).toBeEnabled()
@@ -583,4 +583,91 @@ it('存储只读时发送被拒仍可恢复本页原稿，旧保存不会被误�
     expect(editor.textContent).toBe(submitted)
     expect(localStorage.getItem(draftKey(sessionA.id))).toBe('旧保存')
   } finally { set.mockRestore(); remove.mockRestore() }
+})
+
+it('运行中普通发送等待排队确认，快捷键插话只出现一次', async () => {
+  const source = controlled()
+  const receipt = deferred<SubmitMessageResult>()
+  const steerReceipt = deferred<SubmitMessageResult>()
+  const submitMessage = vi.fn().mockReturnValueOnce(receipt.promise).mockReturnValueOnce(steerReceipt.promise)
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} submitMessage={submitMessage} />)
+  const running = runningState().snapshot!
+  const interaction: InteractionState = { queue: { items: [{ clientMessageId: 'original', text: '已排队的说明' }], paused: null }, steering: [], questions: [] }
+  await act(async () => { source.emit({ ...runningState(), snapshot: { ...running, interaction } }) })
+  const queue = screen.getByRole('region', { name: '待发送消息' })
+  expect(within(queue).getByText('已排队的说明')).toBeVisible()
+  expect(screen.queryByRole('button', { name: '插话' })).not.toBeInTheDocument()
+  await pasteDraft('下一轮说明')
+  fireEvent.click(screen.getByRole('button', { name: '发送' }))
+  const queued = submitMessage.mock.calls[0]![0]
+  expect(queued).toMatchObject({ text: '下一轮说明' })
+  expect(queued.mode).toBeUndefined()
+  expect(within(queue).queryByText(queued.text)).toBeNull()
+  await act(async () => { receipt.resolve({ sessionId, kind: 'queued', clientMessageId: queued.clientMessageId, acceptedSeq: 2 }) })
+  const editor = await pasteDraft('保留旧接口')
+  fireEvent.keyDown(editor, { key: 'Enter', metaKey: true })
+  const steer = submitMessage.mock.calls[1]![0]
+  expect(steer).toMatchObject({ text: '保留旧接口', mode: 'steer' })
+  expect(screen.getByText('保留旧接口', { exact: true }).closest('li')).toHaveTextContent('正在提交')
+  source.emit({ ...runningState(), snapshot: { ...running, seq: 3, interaction: { ...interaction, steering: [steer] } } })
+  await act(async () => { steerReceipt.resolve({ sessionId, kind: 'steering', clientMessageId: steer.clientMessageId, acceptedSeq: 3 }) })
+  expect(screen.getAllByText('保留旧接口', { exact: true })).toHaveLength(1)
+  expect(screen.getByText('保留旧接口', { exact: true }).closest('li')).toHaveTextContent('等待交给模型')
+})
+
+it('整组提问逐题保存选择与跳过，提交后恢复原聊天草稿', async () => {
+  const source = controlled()
+  const reply = vi.spyOn(client, 'replyToQuestions').mockImplementation(async (_session, _batch, replyId) => ({ kind: 'answered', replyId }))
+  render(<ChatPage getWorkspaces={getConfiguredWorkspaces} subscribe={source.subscribe} getModels={async () => configured} />)
+  const running = runningState().snapshot!
+  await act(async () => { source.emit(runningState()) })
+  const editor = await pasteDraft('仍未发送的内容')
+  const interaction: InteractionState = { queue: { items: [], paused: null }, steering: [], questions: [{
+    id: 'batch', runId: 'user-1', assistantMessageId: 'answer', toolCallId: 'ask-1', status: 'waiting',
+    questions: [{ id: 'pick', question: '请选择', options: [{ label: '选项 A' }, { label: '选项 B' }] },
+      { id: 'constructor', question: '还有补充吗？' }],
+  }] }
+  const messages = [{ id: 'answer', runId: 'user-1', message: {
+    role: 'assistant' as const, api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash', timestamp: 1,
+    stopReason: 'toolUse' as const, content: [{ type: 'toolCall' as const, id: 'ask-1', name: 'ask_user_question', arguments: {} }],
+  } }]
+  source.emit({ ...runningState(), snapshot: { ...running, messages, interaction } })
+  const panel = screen.getByRole('region', { name: '回答问题' })
+  const record = screen.getByRole('button', { name: /2 Questions.*等待回答/ })
+  expect(record).toHaveTextContent(/^2 Questions$/)
+  expect(editor).not.toBeVisible()
+  fireEvent.click(within(panel).getByRole('button', { name: '收起' }))
+  expect(editor).toBeVisible()
+  fireEvent.click(record)
+  expect(screen.getByRole('region', { name: '回答问题' })).toBeVisible()
+  expect(editor).not.toBeVisible()
+  const reopenedPanel = screen.getByRole('region', { name: '回答问题' })
+  expect(within(reopenedPanel).getByRole('button', { name: '下一题' })).toBeDisabled()
+  fireEvent.click(within(reopenedPanel).getByRole('radio', { name: '选项 B' }), { detail: 1 })
+  expect(within(reopenedPanel).getByText('2/2', { exact: true })).toBeVisible()
+  expect(within(reopenedPanel).getByRole('button', { name: '提交' })).toBeDisabled()
+  fireEvent.click(within(reopenedPanel).getByRole('button', { name: '跳过本题' }))
+  expect(reply).not.toHaveBeenCalled()
+  fireEvent.click(within(reopenedPanel).getByRole('button', { name: '上一题' }))
+  expect(within(reopenedPanel).getByRole('radio', { name: '选项 B' })).toBeChecked()
+  fireEvent.click(within(reopenedPanel).getByRole('button', { name: '向后翻题' }))
+  await act(async () => { fireEvent.click(within(reopenedPanel).getByRole('button', { name: '提交' })) })
+  expect(reply).toHaveBeenCalledExactlyOnceWith(sessionId, 'batch', expect.any(String), [
+    { id: 'pick', selected: ['选项 B'] }, { id: 'constructor', selected: [] },
+  ])
+  source.emit({ ...runningState(), snapshot: { ...running, seq: 2, messages,
+    interaction: { ...interaction, questions: [{ ...interaction.questions[0]!, status: 'answered',
+      answers: [{ id: 'pick', selected: ['选项 B'] }, { id: 'constructor', selected: [] }] }] } } })
+  expect(editor).toBeVisible()
+  expect(editor).toHaveTextContent('仍未发送的内容')
+  fireEvent.click(record)
+  const review = within(screen.getByRole('region', { name: '查看问题' }))
+  expect(review.getByRole('radio', { name: '选项 B' })).toBeChecked()
+  expect(review.getByRole('radio', { name: '选项 B' })).toBeDisabled()
+  expect(review.queryByRole('button', { name: '提交' })).not.toBeInTheDocument()
+  fireEvent.click(review.getByRole('button', { name: '向后翻题' }))
+  expect(review.getByText('已跳过')).toBeVisible()
+  fireEvent.click(review.getByRole('button', { name: '收起' }))
+  expect(editor).toBeVisible()
+  reply.mockRestore()
 })

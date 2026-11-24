@@ -3,7 +3,7 @@ import type { AssistantMessage, JsonObject, ModelContext, ModelEvent, ModelInfo,
 export type ExecutableTool = Tool & {
   executionMode?: 'parallel' | 'sequential'
   validateArguments?(arguments_: JsonObject): boolean
-  execute(arguments_: JsonObject, context: { signal: AbortSignal; recordDetails(details: unknown): void }):
+  execute(arguments_: JsonObject, context: { signal: AbortSignal; toolCallId: string; recordDetails(details: unknown): void }):
     Promise<string | ToolResultMessage['content'] | Pick<ToolResultMessage, 'content' | 'isError'>>
 }
 
@@ -27,6 +27,7 @@ export type AgentRunInput = {
     | { type: 'assistant'; message: AssistantMessage }
     | (Extract<AgentEvent, { type: 'tool_result' }> & { executed: boolean })
   ): void | Promise<void>
+  afterStep?(reply: AssistantMessage, hasTools: boolean): boolean | Promise<boolean>
   beforeToolCall?(call: ToolCall): { code: string; message: string } | undefined
   prepareToolCall?(call: ToolCall, tool: ExecutableTool): Promise<{ arguments: JsonObject; denial?: string }>
   rewriteToolResult?(call: ToolCall, result: ToolResultMessage): Promise<ToolResultMessage>

@@ -1,15 +1,17 @@
 import { useTranslation } from 'react-i18next'
 import { NoticeText } from '../i18n/messages'
 import { useRef, useState, type ReactNode } from 'react'
-import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure } from '@agent-learning/server/protocol'
+import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure, UserQuestionBatch } from '@agent-learning/server/protocol'
 import type { AssistantMessage as Message, ToolCall } from '@agent-learning/model'
 import { MarkdownText } from './markdown/MarkdownText'
 import { CopyMarkdownButton } from './markdown/CopyMarkdownButton'
 import { ModelRequestDetail } from './ModelRequestDetail'
+import { QuestionRecord } from './QuestionRecord'
 import { RunStatus } from './RunStatus'
 
 export type AssistantEntry = { id: string; message: Message }
 export type ToolResults = ReadonlyMap<string, ReadonlyMap<number, ConversationMessage>>
+type ToolQuestions = ReadonlyMap<string, ReadonlyMap<string, UserQuestionBatch>>
 
 type ToolState = 'preparing' | 'running' | 'ok' | 'error' | 'stopped' | 'denied' | 'unknown'
 
@@ -82,13 +84,15 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
   </details>
 }
 
-export function AssistantMessage({ messages, activeContent = [], running = null, run, showRetry = true, toolResults, restored, saveFailure }: {
+export function AssistantMessage({ messages, activeContent = [], running = null, run, showRetry = true, toolResults, toolQuestions, onOpenQuestion, restored, saveFailure }: {
   messages: readonly AssistantEntry[]
   activeContent?: readonly ActiveContent[]
   running?: Extract<RunningState, { kind: 'task' }> | null
   run?: RunRecord
   showRetry?: boolean
   toolResults?: ToolResults
+  toolQuestions?: ToolQuestions
+  onOpenQuestion?: (batch: UserQuestionBatch) => void
   restored?: true
   saveFailure?: SaveFailure
 }) {
@@ -113,6 +117,7 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
   }
 
   for (const { id, message } of messages) {
+    const questions = toolQuestions?.get(id)
     message.content.forEach((block, index) => {
       const key = `${id}:${index}`
       const active = activeContent.find(item => item.messageId === id && item.contentIndex === index)
@@ -121,6 +126,16 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
         reply.push(block.text)
         flushProcess()
         rows.push(<MarkdownText key={key} text={block.text} streaming={active?.type === 'text'} response />)
+        return
+      }
+      const question = block.type === 'toolCall' && block.name === 'ask_user_question' ? questions?.get(block.id) : undefined
+      if (question) {
+        flushProcess()
+        if (activityRun) {
+          rows.push(<p className="run-status-line" key={`${key}:status`}><RunStatus run={activityRun} /></p>)
+          activityRun = undefined
+        }
+        rows.push(<QuestionRecord key={key} batch={question} onOpen={onOpenQuestion && (() => onOpenQuestion(question))} />)
         return
       }
       if (block.type === 'thinking' && !block.thinking) return

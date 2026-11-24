@@ -3,6 +3,7 @@ import { draftKey, recentSessionKey } from '../chat/drafts'
 import { ChatPageHarness } from '../test/ChatPageHarness'
 
 test.beforeEach(async ({ page }) => {
+  await page.route('**/api/settings/question-wait', route => route.fulfill({ json: { timeout: 120 } }))
   await page.route('**/api/web/settings', route => route.fulfill({
     json: {
       searchProvider: 'tavily', fetchProvider: 'tavily',
@@ -39,9 +40,11 @@ test('桌面切换分类保持弹窗尺寸，窄屏铺满窗口且长内容独�
   }
   const headingStart = await checkHeading('通用设置')
   const general = dialog.getByRole('region', { name: '通用设置', exact: true }).getByRole('combobox')
-  await expect(general).toHaveCount(2)
+  await expect(general).toHaveCount(3)
   const generalChoice = (await general.first().boundingBox())!
-  expect(await general.last().boundingBox()).toMatchObject({ x: generalChoice.x, width: generalChoice.width })
+  for (const choice of await general.all()) {
+    expect(await choice.boundingBox()).toMatchObject({ x: generalChoice.x, width: generalChoice.width })
+  }
 
   for (const name of ['网页工具', 'MCP', '模型']) {
     await nav.getByRole('button', { name, exact: true }).click()

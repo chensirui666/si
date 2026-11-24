@@ -8,7 +8,9 @@ import { extensionMessage, isJson, object } from './extensions/runtime.js'
 import type { McpToolCatalog, McpToolIdentity } from './mcp/manager.js'
 import { planCommandArgument } from './plan-mode.js'
 import { skillCommand } from './skills.js'
-import type { AttachmentScope, MessageAttachment, StagedAttachment } from './session-attachments.js'
+import { ATTACHMENT_TTL_MS, type AttachmentScope, type MessageAttachment, type StagedAttachment } from './session-attachments.js'
+import type { PendingSubmission, UserQuestionBatch } from './collaboration.js'
+import { ASK_USER_QUESTION_TOOL_NAME } from './user-question-tool.js'
 import type { ReferenceSource } from './session-references.js'
 import { numberedSessionTitle, temporarySessionTitle } from './session-title.js'
 import type { CompactionRecord, ConversationMessage, PlanState, RunRecord, SubmissionAccepted, SubmissionInput } from './types.js'
@@ -16,7 +18,7 @@ import { scheduleSchema, ScheduleStore, type ScheduledSubmission } from './sched
 
 export type StoredRun = Omit<RunRecord, 'restored'> & {
   text: string; finalText?: string; acceptedSeq: number; firstPermissionMode?: PermissionMode; approvedPlanId?: string
-  attachmentIds?: string[]; referenceSessionIds?: string[]; firstTitle?: string
+  attachmentIds?: string[]; referenceSessionIds?: string[]; firstTitle?: string; mode?: SubmissionInput['mode']
 }
 export type SessionHistory = {
   summary: SessionSummary
@@ -26,6 +28,8 @@ export type SessionHistory = {
   permissionMode: PermissionMode
   plan?: PlanState
   planCommands?: SubmissionInput[]
+  pending?: PendingSubmission[]
+  questions?: UserQuestionBatch[]
   modelSelection?: ModelSelection
 }
 export type SessionPersistence = {
@@ -34,10 +38,13 @@ export type SessionPersistence = {
   first?: () => SessionSummary
   history?: SessionHistory
 }
+type AttachmentBinding = { ids: readonly string[]; scope: AttachmentScope; cutoff: number; messageId?: string; pendingId?: string }
 type SessionWrite = {
   summary?: SessionSummary
   name?: { value: string; expected: string }
-  attachments?: { ids: readonly string[]; scope: AttachmentScope; cutoff: number }
+  attachments?: AttachmentBinding | AttachmentBinding[]
+  pending?: PendingSubmission[]
+  questions?: UserQuestionBatch[]
   run?: StoredRun
   runId?: string
   messages?: ConversationMessage[]
@@ -56,6 +63,18 @@ function scopeWhere(scope: AttachmentScope): [string, string[]] {
   return 'sessionId' in scope
     ? ['staged_session = ?', [scope.sessionId]]
     : ['workspace_id = ? AND draft_id = ?', [scope.workspaceId, scope.draftSessionId]]
+}
+
+const unreservedAttachment = 'NOT EXISTS (SELECT 1 FROM pending_attachments WHERE attachment_id = attachments.id)'
+
+function stagedAttachmentWhere(scope: AttachmentScope, cutoff: number, pendingId?: string): [string, (string | number)[]] {
+  const [condition, values] = scopeWhere(scope)
+  if (pendingId !== undefined) {
+    if (!('sessionId' in scope)) throw new Error('Pending attachment requires an existing session')
+    return [`bound_session IS NULL AND ${condition} AND EXISTS (SELECT 1 FROM pending_attachments
+      WHERE attachment_id = attachments.id AND session_id = ? AND client_id = ?)`, [...values, scope.sessionId, pendingId]]
+  }
+  return [`bound_session IS NULL AND ${condition} AND uploaded_at > ? AND ${unreservedAttachment}`, [...values, cutoff]]
 }
 
 function storedMessage(entry: ConversationMessage): ConversationMessage {
@@ -113,6 +132,21 @@ const schema = `
     assistant_message_id TEXT, steps TEXT CHECK(json_valid(steps)),
     CHECK((state = 'planning' AND assistant_message_id IS NULL AND steps IS NULL)
       OR (state = 'review' AND assistant_message_id IS NOT NULL AND steps IS NOT NULL)),
+    FOREIGN KEY(session_id, assistant_message_id) REFERENCES messages(session_id, id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS pending_submissions (
+    session_id TEXT NOT NULL REFERENCES sessions(id), client_id TEXT NOT NULL, accepted_seq INTEGER NOT NULL,
+    data TEXT NOT NULL CHECK(json_valid(data)), PRIMARY KEY(session_id, client_id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS pending_attachments (
+    attachment_id TEXT PRIMARY KEY REFERENCES attachments(id), session_id TEXT NOT NULL, client_id TEXT NOT NULL,
+    FOREIGN KEY(session_id, client_id) REFERENCES pending_submissions(session_id, client_id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS user_questions (
+    session_id TEXT NOT NULL, id TEXT NOT NULL, run_id TEXT NOT NULL, assistant_message_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)), PRIMARY KEY(session_id, id),
+    UNIQUE(session_id, assistant_message_id, tool_call_id),
+    FOREIGN KEY(session_id, run_id) REFERENCES runs(session_id, id),
     FOREIGN KEY(session_id, assistant_message_id) REFERENCES messages(session_id, id)
   ) STRICT;
   ${scheduleSchema}
@@ -196,7 +230,7 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand, scheduledSubmission }: SessionWrite) {
+  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, pending, questions, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand, scheduledSubmission }: SessionWrite) {
     return this.write(() => {
       if (summary) {
         this.db.prepare('INSERT INTO sessions (id, workspaceId, name, createdAt) VALUES (?, ?, ?, ?)')
@@ -214,6 +248,11 @@ export class SessionStore {
       }
       if (plan === null) this.db.prepare('DELETE FROM session_plan_state WHERE session_id = ?').run(sessionId)
       if (run) {
+        const current = this.db.prepare(`SELECT json_extract(data, '$.status') AS status FROM pending_submissions
+          WHERE session_id = ? AND client_id = ? AND NOT EXISTS (SELECT 1 FROM runs WHERE session_id = ? AND id = ?)`)
+          .get(sessionId, run.clientMessageId, sessionId, run.id)
+        if (current && (!['queued', 'steering'].includes(String(current.status)) || !pending?.some(item =>
+          item.input.clientMessageId === run.clientMessageId && item.status === 'started'))) throw new Error('Run must claim its pending submission')
         this.db.prepare(`INSERT INTO runs (session_id, id, client_id, data) VALUES (?, ?, ?, ?)
           ON CONFLICT(session_id, id) DO UPDATE SET data = excluded.data`)
           .run(sessionId, run.id, run.clientMessageId, JSON.stringify(run))
@@ -236,12 +275,21 @@ export class SessionStore {
         for (const tool of mcpToolLoads) load.run(sessionId, tool.serverId, tool.credentialRef, tool.remoteToolName, entry.id)
       }
       if (attachments) {
-        const [condition, values] = scopeWhere(attachments.scope)
-        const bind = this.db.prepare(`UPDATE attachments SET bound_session = ?, bound_message = ?
-          WHERE id = ? AND bound_session IS NULL AND uploaded_at > ? AND ${condition}`)
-        for (const id of attachments.ids) if (bind.run(sessionId, runId!, id, attachments.cutoff, ...values).changes !== 1) {
-          throw new Error('Attachment ownership changed')
+        for (const { ids, scope, cutoff, messageId = runId, pendingId } of Array.isArray(attachments) ? attachments : [attachments]) {
+          if ('sessionId' in scope && scope.sessionId !== sessionId) throw new Error('Attachment belongs to another session')
+          if (pendingId !== undefined && (!pending?.some(item => item.input.clientMessageId === pendingId
+            && (item.status === 'started' || item.status === 'delivered')) || !messages?.some(message =>
+              message.id === messageId && message.clientMessageId === pendingId))) throw new Error('Binding must claim its pending submission')
+          const [condition, values] = stagedAttachmentWhere(scope, cutoff, pendingId)
+          const bind = this.db.prepare(`UPDATE attachments SET bound_session = ?, bound_message = ? WHERE id = ? AND ${condition}`)
+          for (const id of ids) if (bind.run(sessionId, messageId!, id, ...values).changes !== 1) throw new Error('Attachment ownership changed')
         }
+      }
+      if (pending?.length) this.savePending(sessionId, pending)
+      if (questions?.length) {
+        const upsert = this.db.prepare(`INSERT INTO user_questions (session_id, id, run_id, assistant_message_id, tool_call_id, data)
+          VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, id) DO UPDATE SET data = excluded.data`)
+        for (const batch of questions) upsert.run(sessionId, batch.id, batch.runId, batch.assistantMessageId, batch.toolCallId, JSON.stringify(batch))
       }
       if (plan) {
         this.db.prepare(`INSERT INTO session_plan_state (session_id, state, assistant_message_id, steps) VALUES (?, ?, ?, ?)
@@ -261,6 +309,35 @@ export class SessionStore {
       }
       return renamed === true
     })
+  }
+
+  private savePending(sessionId: string, pending: PendingSubmission[]) {
+    const upsert = this.db.prepare(`INSERT INTO pending_submissions (session_id, client_id, accepted_seq, data)
+      VALUES (?, ?, ?, ?) ON CONFLICT(session_id, client_id) DO UPDATE SET data = excluded.data
+      WHERE pending_submissions.accepted_seq = excluded.accepted_seq
+        AND json_extract(pending_submissions.data, '$.input') = json_extract(excluded.data, '$.input')`)
+    const release = this.db.prepare('DELETE FROM pending_attachments WHERE session_id = ? AND client_id = ?')
+    const reserve = this.db.prepare(`INSERT INTO pending_attachments (attachment_id, session_id, client_id)
+      SELECT id, ?, ? FROM attachments WHERE id = ? AND staged_session = ? AND bound_session IS NULL AND uploaded_at > ?
+      ON CONFLICT(attachment_id) DO NOTHING`)
+    const held = this.db.prepare('SELECT 1 FROM pending_attachments WHERE attachment_id = ? AND session_id = ? AND client_id = ?')
+    const cutoff = Date.now() - ATTACHMENT_TTL_MS
+    for (const item of pending) {
+      const { clientMessageId, attachmentIds } = item.input
+      if (upsert.run(sessionId, clientMessageId, item.acceptedSeq, JSON.stringify(item)).changes !== 1) {
+        throw new Error('Pending submission identity changed')
+      }
+      if (item.status !== 'queued' && item.status !== 'steering') {
+        release.run(sessionId, clientMessageId)
+        continue
+      }
+      // Active edits and transfers preserve the originally accepted attachment IDs.
+      for (const id of attachmentIds ?? []) {
+        if (!held.get(id, sessionId, clientMessageId) && reserve.run(sessionId, clientMessageId, id, sessionId, cutoff).changes !== 1) {
+          throw new Error('Attachment unavailable for pending submission')
+        }
+      }
+    }
   }
 
   private write<T>(operation: () => T): T {
@@ -291,11 +368,10 @@ export class SessionStore {
     } catch (error) { throw new SessionWriteError(sqliteCode(error) === 13 ? 'storage-full' : 'write-failed', error) }
   }
 
-  pendingAttachment(id: string, scope: AttachmentScope, cutoff: number): MessageAttachment | undefined {
+  pendingAttachment(id: string, scope: AttachmentScope, cutoff: number, pendingId?: string): MessageAttachment | undefined {
     if (this.uncertain) throw new SessionReadError('无法确认附件归属，请重启服务后重试')
-    const [condition, values] = scopeWhere(scope)
-    const row = this.db.prepare(`SELECT id, data FROM attachments
-      WHERE id = ? AND bound_session IS NULL AND uploaded_at > ? AND ${condition}`).get(id, cutoff, ...values)
+    const [condition, values] = stagedAttachmentWhere(scope, cutoff, pendingId)
+    const row = this.db.prepare(`SELECT id, data FROM attachments WHERE id = ? AND ${condition}`).get(id, ...values)
     return row && parse<MessageAttachment>(row)
   }
 
@@ -307,9 +383,19 @@ export class SessionStore {
     return row && { ...parse<MessageAttachment>(row), workspaceId: String(row.workspaceId) }
   }
 
+  queuedAttachment(id: string): (MessageAttachment & { workspaceId: string }) | undefined {
+    if (this.uncertain) throw new SessionReadError('无法确认附件归属，请重启服务后重试')
+    const row = this.db.prepare(`SELECT a.id, a.data, s.workspaceId FROM attachments a
+      JOIN pending_attachments p ON p.attachment_id = a.id AND p.session_id = a.staged_session
+      JOIN pending_submissions q ON q.session_id = p.session_id AND q.client_id = p.client_id
+      JOIN sessions s ON s.id = p.session_id
+      WHERE a.id = ? AND a.bound_session IS NULL AND json_extract(q.data, '$.status') IN ('queued', 'steering')`).get(id)
+    return row && { ...parse<MessageAttachment>(row), workspaceId: String(row.workspaceId) }
+  }
+
   expiredAttachments(cutoff: number): string[] {
     if (this.uncertain) return []
-    return this.db.prepare('SELECT id FROM attachments WHERE bound_session IS NULL AND uploaded_at <= ?')
+    return this.db.prepare(`SELECT id FROM attachments WHERE bound_session IS NULL AND uploaded_at <= ? AND ${unreservedAttachment}`)
       .all(cutoff).map(row => String(row.id))
   }
 
@@ -318,7 +404,7 @@ export class SessionStore {
   }
 
   forgetExpiredAttachment(id: string, cutoff: number) {
-    if (!this.uncertain) this.db.prepare('DELETE FROM attachments WHERE id = ? AND bound_session IS NULL AND uploaded_at <= ?').run(id, cutoff)
+    if (!this.uncertain) this.db.prepare(`DELETE FROM attachments WHERE id = ? AND bound_session IS NULL AND uploaded_at <= ? AND ${unreservedAttachment}`).run(id, cutoff)
   }
 
   saveModelSelection(selection: ModelSelection, sessionId?: string) {
@@ -420,6 +506,7 @@ export class SessionStore {
           || (run.approvedPlanId !== undefined && (typeof run.approvedPlanId !== 'string' || !run.approvedPlanId
             || run.kind !== 'task' || run.clientMessageId !== `plan:${run.approvedPlanId}`))
           || (run.finalText !== undefined && (run.kind !== 'task' || typeof run.finalText !== 'string' || !run.finalText.trim()))
+          || (run.mode !== undefined && run.mode !== 'steer')
           || (run.firstPermissionMode !== undefined && !isPermissionMode(run.firstPermissionMode))
           || typeof run.modelId !== 'string' || !['task', 'compaction'].includes(run.kind)
           || (run.scheduledRunId !== undefined && (run.kind !== 'task' || run.scheduledRunId !== run.clientMessageId))
@@ -431,13 +518,15 @@ export class SessionStore {
     const byRun = new Map(runs.map(run => [run.id, run]))
     const seen = new Map<string, { entry: ConversationMessage; runId: string; index: number }>()
     const resultPositions = new Map<string, number>()
-    let lastId = '', currentRunId = ''
+    let lastId = '', currentRunId = '', remainingCalls = 0
     const messages = this.db.prepare('SELECT id, run_id, data FROM messages WHERE session_id = ? ORDER BY seq').all(summary.id)
       .map((row, index) => {
         const entry = parse<ConversationMessage>(row)
         const run = byRun.get(String(row.run_id))
         const message = entry.message
         if (!run || run.kind !== 'task' || !message || !Number.isFinite(message.timestamp)) throw new Error('Invalid message owner')
+        if ((entry.runId !== undefined && entry.runId !== run.id) || (entry.steering !== undefined
+          && (entry.steering !== true || entry.runId !== run.id || message.role !== 'user' || entry.extension !== undefined))) throw new Error('Invalid message owner')
         if (entry.imageOmitted !== undefined && (entry.imageOmitted !== true || message.role !== 'toolResult')) throw new Error('Invalid image marker')
         const invocation = entry.skillInvocation
         if (invocation !== undefined && (!invocation || message.role !== 'user' || typeof message.content !== 'string'
@@ -447,12 +536,21 @@ export class SessionStore {
             ? typeof invocation.body !== 'string' || typeof invocation.directory !== 'string' || !invocation.directory
             : invocation.status !== 'failed' || typeof invocation.reason !== 'string'))) throw new Error('Invalid Skill invocation')
         if (entry.extension !== undefined) {
-          if (run.id !== currentRunId || message.role !== 'user' || entry.id === run.id || entry.clientMessageId !== undefined
+          if (run.id !== currentRunId || !seen.has(run.id) || message.role !== 'user' || entry.id === run.id || entry.clientMessageId !== undefined
             || !extensionMessage({ ...entry.extension, content: message.content })) throw new Error('Invalid extension message')
         } else if (message.role === 'user') {
-          if (entry.id !== run.id || entry.clientMessageId !== run.clientMessageId || message.content !== (run.finalText ?? run.text)) throw new Error('Invalid submitted message')
-          currentRunId = run.id
-        } else if (run.id !== currentRunId) throw new Error('Invalid message order')
+          if (run.id !== currentRunId) {
+            if (seen.has(run.id) || (currentRunId && !seen.has(currentRunId))) throw new Error('Invalid message order')
+            currentRunId = run.id
+            remainingCalls = 0
+          }
+          if (entry.steering) {
+            if (entry.id === run.id || typeof entry.clientMessageId !== 'string' || !entry.clientMessageId
+              || entry.clientMessageId === run.clientMessageId || typeof message.content !== 'string' || remainingCalls) throw new Error('Invalid steering message')
+          } else if (entry.id !== run.id || entry.clientMessageId !== run.clientMessageId || message.content !== (run.finalText ?? run.text)) {
+            throw new Error('Invalid submitted message')
+          }
+        } else if (run.id !== currentRunId || !seen.has(run.id)) throw new Error('Invalid message order')
         else if (message.role === 'assistant') {
           if (!Array.isArray(message.content) || typeof message.model !== 'string' || typeof message.api !== 'string'
             || typeof message.provider !== 'string' || !['stop', 'length', 'toolUse', 'error', 'aborted'].includes(message.stopReason)
@@ -460,6 +558,7 @@ export class SessionStore {
               || block.type === 'thinking' && typeof block.thinking === 'string' || block.type === 'toolCall'
                 && typeof block.id === 'string' && typeof block.name === 'string' && block.arguments
                 && typeof block.arguments === 'object' && !Array.isArray(block.arguments)))) throw new Error('Invalid assistant message')
+          remainingCalls = message.content.filter(block => block.type === 'toolCall').length
         } else if (message.role === 'toolResult' && entry.toolCall) {
           const { assistantMessageId, contentIndex } = entry.toolCall
           const assistant = seen.get(assistantMessageId)
@@ -475,6 +574,7 @@ export class SessionStore {
           const actual = entry.toolCall.actualArguments
           if (actual !== undefined && (!object(actual) || !isJson(actual))) throw new Error('Invalid actual tool arguments')
           resultPositions.set(assistantMessageId, contentIndex)
+          remainingCalls--
         } else throw new Error('Invalid message')
         if (message.role !== 'toolResult' && entry.toolCall !== undefined) throw new Error('Invalid tool result reference')
         const restored = storedMessage(entry)
@@ -528,6 +628,28 @@ export class SessionStore {
         }
         return input
       })
-    return { summary, runs, messages, compactions, permissionMode, ...(planCommands.length && { planCommands }), ...(modelSelection && { modelSelection }), ...(plan && { plan }) }
+    const pending = this.db.prepare('SELECT client_id, accepted_seq, data FROM pending_submissions WHERE session_id = ? ORDER BY accepted_seq, rowid')
+      .all(summary.id).map(row => {
+        const item: PendingSubmission = JSON.parse(String(row.data))
+        if (item?.input?.clientMessageId !== row.client_id || typeof item.input.text !== 'string' || typeof item.input.modelId !== 'string'
+          || typeof item.text !== 'string' || item.acceptedSeq !== row.accepted_seq || !Number.isSafeInteger(item.acceptedSeq) || item.acceptedSeq < 1
+          || (item.steeringSeq !== undefined && (!Number.isSafeInteger(item.steeringSeq) || item.steeringSeq < item.acceptedSeq))
+          || !['queued', 'steering', 'deleted', 'started', 'delivered'].includes(item.status)) throw new Error('Invalid pending submission')
+        return item
+      })
+    const questions = this.db.prepare('SELECT id, run_id, assistant_message_id, tool_call_id, data FROM user_questions WHERE session_id = ? ORDER BY rowid')
+      .all(summary.id).map(row => {
+        const batch = parse<UserQuestionBatch>(row)
+        const assistant = seen.get(batch.assistantMessageId)
+        const reply = assistant?.entry.message
+        if (batch.runId !== row.run_id || batch.assistantMessageId !== row.assistant_message_id || batch.toolCallId !== row.tool_call_id
+          || assistant?.runId !== batch.runId || reply?.role !== 'assistant'
+          || !reply.content.some(block => block.type === 'toolCall' && block.id === batch.toolCallId && block.name === ASK_USER_QUESTION_TOOL_NAME)
+          || !Array.isArray(batch.questions) || !batch.questions.length || (batch.deadlineAt !== undefined && !Number.isFinite(batch.deadlineAt))
+          || !['waiting', 'answered', 'timed-out', 'closed', 'aborted'].includes(batch.status)) throw new Error('Invalid user question batch')
+        return batch
+      })
+    return { summary, runs, messages, compactions, permissionMode, ...(planCommands.length && { planCommands }),
+      ...(modelSelection && { modelSelection }), ...(plan && { plan }), ...(pending.length && { pending }), ...(questions.length && { questions }) }
   }
 }

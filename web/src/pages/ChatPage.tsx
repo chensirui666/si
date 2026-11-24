@@ -14,6 +14,8 @@ import { PermissionPicker } from '../components/PermissionPicker'
 import { ModelPicker } from '../components/ModelPicker'
 import { ContextMeter } from '../components/ContextMeter'
 import { CompactionRecords } from '../components/CompactionRecords'
+import { MessageQueue } from '../components/MessageQueue'
+import { QuestionComposer } from '../components/QuestionComposer'
 import { MessageList } from '../components/MessageList'
 import { BackgroundTasks } from '../components/BackgroundTasks'
 import { NewChatParticles } from '../components/NewChatParticles'
@@ -238,6 +240,12 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const draftId = sessionId ?? newSessionDraft
   const attachments = attachmentDrafts.items(draftId)
   const references = referenceView.get(draftId) ?? []
+  const [selectedQuestion, setSelectedQuestion] = useState<{ sessionId: string; batchId: string }>()
+  const [hiddenQuestion, setHiddenQuestion] = useState<{ sessionId: string; batchId: string }>()
+  const interaction = state.snapshot?.interaction
+  const questionBatches = interaction?.questions ?? []
+  const openedQuestion = questionBatches.find(batch => selectedQuestion?.sessionId === sessionId && selectedQuestion.batchId === batch.id)
+    ?? questionBatches.find(batch => batch.status === 'waiting' && (hiddenQuestion?.sessionId !== sessionId || hiddenQuestion.batchId !== batch.id))
   const plan = state.snapshot?.plan
   const planId = plan?.state === 'review' ? plan.assistantMessageId : null
   const referenceWorkspace = isNew ? draftWorkspace?.id : workspace?.id
@@ -505,7 +513,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const updateSubmissions = useCallback((next: LocalSubmission[]) => {
     const { sessionId, snapshot } = stateRef.current
     const current = next.filter(item => item.sessionId === sessionId)
-    const merged = mergeSubmissions(snapshot?.messages ?? [], current, snapshot?.compactions)
+    const merged = mergeSubmissions(snapshot?.messages ?? [], current, snapshot?.compactions, snapshot?.interaction, snapshot?.seq)
     const unresolved = [...next.filter(item => item.sessionId !== sessionId), ...merged.filter((item): item is LocalSubmission => 'state' in item)]
     submissionsRef.current = unresolved
     setSubmissions(unresolved)
@@ -581,7 +589,8 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       }
       stateRef.current = next
       if (sourceSends.current.size) {
-        for (const message of next.snapshot?.messages ?? []) {
+        const interaction = next.snapshot?.interaction
+        for (const message of [...next.snapshot?.messages ?? [], ...interaction?.queue.items ?? [], ...interaction?.steering ?? []]) {
           if (message.clientMessageId) settleSourceDraft(message.clientMessageId)
         }
       }
@@ -711,9 +720,17 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   }
   const canStart = () => selected.current === null && draftWorkspace?.available && !workspaceError && !pickingRef.current
     && stateRef.current.connection === 'ready' && hasModel() && draftPermission !== null && !firstSend.current && !planCommand.current
-  const canSubmit = () => !!sessionId && sessionId === selected.current && workspace?.available && !workspaceError && stateRef.current.sessionId === sessionId && stateRef.current.connection === 'ready' && stateRef.current.snapshot !== null && stateRef.current.snapshot.running === null
-    && hasModel() && !savingSessionPermission.current && !planCommand.current && planId === null
-    && !submissionsRef.current.some(local => local.sessionId === sessionId && local.state !== 'failed')
+  const canSubmit = (allowRunning = false) => {
+    const { snapshot } = stateRef.current
+    if (!sessionId || sessionId !== selected.current || !workspace?.available || workspaceError
+      || stateRef.current.sessionId !== sessionId || stateRef.current.connection !== 'ready' || !snapshot
+      || !hasModel() || savingSessionPermission.current || planCommand.current || snapshot.plan?.state === 'review'
+      || openedQuestion || !allowRunning && snapshot.running) return false
+    const stopping = abortRef.current.get(sessionId)
+    return !(stopping?.status === 'pending' && stopping.runId === snapshot.running?.runId)
+      && !submissionsRef.current.some(local => local.sessionId === sessionId && local.state !== 'failed'
+        && local.accepted?.kind !== 'queued' && local.accepted?.kind !== 'steering')
+  }
 
   function queueFirstSend(input: StartSessionRequest, source?: FirstSend['source']) {
     const pending = firstSend.current = { input, source, revision: draftRevision(newSessionDraft), sending: false }
@@ -859,12 +876,13 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     }
   }
 
-  const send = (text: string, fromSchedule = false) => {
+  const send = (text: string, fromSchedule = false, mode?: SubmitMessageRequest['mode']) => {
     const draftQuote = fromSchedule ? undefined : quote
     const control = text.trim() === '/compact' && !draftQuote
     const currentAttachments = control || fromSchedule ? [] : attachmentDrafts.read(draftId)
     if (currentAttachments.some(item => item.status !== 'ready') || !selection || !text.trim() && !currentAttachments.length) return false
-    const attachmentIds = currentAttachments.flatMap(item => item.status === 'ready' ? [item.attachment.id] : [])
+    const readyAttachments = currentAttachments.filter(item => item.status === 'ready')
+    const attachmentIds = readyAttachments.map(item => item.attachment.id)
     const referenceSessionIds = control || fromSchedule ? [] : (referenceDrafts.current.get(draftId) ?? []).map(item => item.id)
     if (referenceSessionIds.length && !text.trim()) return false
     const sources = {
@@ -901,7 +919,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       // Keep the text until the server accepts the first message.
       return false
     }
-    if (!canSubmit()) return false
+    if (!canSubmit(!fromSchedule && !control)) return false
     setSelectionError(undefined)
     const quotedText = draftQuote && draftQuote.split(/\r\n|\n|\r/).map(line => `> ${line}`).join('\n')
     const body = text.trimStart()
@@ -912,13 +930,22 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
         : `${quotedText}\n\n${text}`
     }
     const input: SubmitMessageRequest = {
-      clientMessageId: crypto.randomUUID(), ...selection, ...sources, sessionId, text: requestText,
+      clientMessageId: crypto.randomUUID(), ...selection, ...sources, sessionId, text: requestText, ...(mode && { mode }),
     }
     const clearedRevision = draftRevision(sessionId) + 1
     const syncTarget = () => {
       if (selected.current === sessionId) subscription.current?.requestSnapshot?.()
     }
-    const local: LocalSubmission = { ...input, kind: input.text.trim() === '/compact' ? 'compaction' : 'message', state: 'pending', afterMessageId: stateRef.current.snapshot?.messages.at(-1)?.id }
+    const snapshot = stateRef.current.snapshot
+    const local: LocalSubmission = {
+      ...input, kind: control ? 'compaction' : 'message', state: 'pending',
+      deferred: Boolean(snapshot?.running || snapshot?.interaction?.queue.items.length),
+      afterMessageId: snapshot?.messages.at(-1)?.id,
+      ...(mode === 'steer' && readyAttachments.length && {
+        attachments: readyAttachments.map(item => item.attachment),
+        attachmentPreviews: new Map(readyAttachments.map(item => [item.attachment.id, item.preview])),
+      }),
+    }
     // 同步写门禁，React 渲染前的第二次发送手势也会被拦住。
     const previous = submissionsRef.current
     submissionsRef.current = [...previous, local]
@@ -1000,8 +1027,9 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   }, [scheduleRun, section, selectedSchedule?.id, sessionId, state])
 
   const retryingSource = submissions.find(item => item.state === 'unconfirmed' && sourceSends.current.has(item.clientMessageId))
-  const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions.filter(local => local.kind === 'message'))
-  const waiting = submissions.some(local => local.state !== 'failed')
+  const messages = mergeSubmissions(state.snapshot?.messages ?? [], submissions.filter(local => local.kind === 'message'
+    && local.accepted?.kind !== 'queued' && (!local.deferred || local.mode === 'steer' || local.state !== 'pending' || local.accepted?.kind === 'message')))
+  const waiting = submissions.some(local => local.state !== 'failed' && local.accepted?.kind !== 'queued' && local.accepted?.kind !== 'steering')
   const target = state.snapshot?.running?.runId
   const abortState = sessionId ? aborts.get(sessionId) : undefined
   const activeAbort = abortState?.runId === target ? abortState : null
@@ -1115,7 +1143,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       }} permissionSettings={{ mode: defaultPermission, busy: defaultPermissionBusy,
         readError: permissionReadError, saveError: defaultPermissionError,
         onSelect: changeDefaultPermission, onRetry: () => { setDefaultPermissionError(undefined); void refreshPermission() },
-      }} mcpSettings={{ servers: mcpServers, error: mcpError, refresh: refreshMcpServers }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
+      }} showQuestionWait mcpSettings={{ servers: mcpServers, error: mcpError, refresh: refreshMcpServers }} discovery={discovery} onChange={applyModels} webSettings={webSettings} webSettingsError={webSettingsError} onWebSettingsChange={result => {
         if (!mounted.current) return
         applyWebSettings(result)
         void refreshWebSettings()
@@ -1162,6 +1190,14 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       {section === 'home' && isNew && <NewChatParticles />}
       <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
         {!isNew && <MessageList key={sessionId} messages={messages} showRetry={state.connection === 'ready'} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
+          steering={interaction?.steering} questions={questionBatches}
+          onOpenQuestion={batch => {
+            if (!sessionId) return
+            if (batch.status === 'waiting') {
+              setSelectedQuestion(undefined)
+              setHiddenQuestion(undefined)
+            } else setSelectedQuestion({ sessionId, batchId: batch.id })
+          }}
           onQuote={text => {
             setQuotes(current => ({ ...current, [sessionId]: text }))
             editor.current?.focus({ preventScroll: true })
@@ -1214,14 +1250,28 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
             const sent = sourceSends.current.get(retryingSource.clientMessageId)
             if (sent) void sendSources(sent)
           }}>{t('chat.retrySend')}</Button>}
-          <ChatFileDrop onAddFiles={settingsOpen ? undefined : addFiles} onDirectoryDrop={() => {
+          <ChatFileDrop onAddFiles={settingsOpen || openedQuestion ? undefined : addFiles} onDirectoryDrop={() => {
             setDraftIssue({ key: draftId, notice: { key: 'attachment.folderUnsupported' } })
           }} />
           {sessionId && plan?.state === 'review' && <PlanReview
             key={`${sessionId}:${plan.assistantMessageId}`} sessionId={sessionId} planId={plan.assistantMessageId} steps={plan.steps}
             disabled={state.connection !== 'ready'} onSync={() => syncConversation(sessionId)}
             onAction={action => { discuss.current = action === 'discuss' ? { sessionId, planId: plan.assistantMessageId } : undefined }} />}
-          <MessageInput key={draftId} editorRef={editor} draft={draft} onDraftChange={saveCurrentDraft}
+          {submissions.some(item => item.deferred && !item.mode && item.state === 'pending' && !item.accepted) &&
+            <p className="interaction-note" role="status">{t('chat.sending')}</p>}
+          {sessionId && interaction && <MessageQueue key={`queue:${sessionId}`} sessionId={sessionId} value={interaction.queue}
+            disabled={state.connection !== 'ready'} canSteer={state.snapshot?.running?.kind === 'task' && activeAbort?.status !== 'pending'}
+            onSync={() => syncConversation(sessionId)} />}
+          {sessionId && questionBatches.filter(batch => batch.status === 'waiting' || batch.status === 'timed-out' || batch.id === openedQuestion?.id).map(batch =>
+            <QuestionComposer key={`${sessionId}:${batch.id}`} sessionId={sessionId} batch={batch} open={openedQuestion?.id === batch.id}
+              disabled={state.connection !== 'ready' || activeAbort?.status === 'pending' && batch.status === 'waiting'}
+              onAbort={target ? () => { void abort(target) } : undefined} abortPending={activeAbort?.status === 'pending'} abortDisabled={abortDisabled}
+              onClose={() => {
+                if (batch.status === 'waiting') setHiddenQuestion({ sessionId, batchId: batch.id })
+                setSelectedQuestion(current => current?.sessionId === sessionId && current.batchId === batch.id ? undefined : current)
+              }}
+              onSync={() => syncConversation(sessionId)} />)}
+          <MessageInput key={draftId} editorRef={editor} draft={draft} onDraftChange={saveCurrentDraft} hidden={!!openedQuestion}
             attachments={<DraftAttachments items={attachments} remove={id => {
               removeAttachments(draftId, item => item.key === id)
               editor.current?.focus({ preventScroll: true })
@@ -1256,7 +1306,9 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
                 onSelect={mode => { if (sessionId) void changeSessionPermission(sessionId, mode); else changeDraftPermission(mode) }} />}
             footerControl={modelSelect}
             skillWorkspaceId={quote ? undefined : (isNew ? draftWorkspace?.id : workspace?.id)}
-            commandsEnabled={!isNew && !quote} onPlan={text => { void activatePlan(text) }} onSend={text => send(text)} sendDisabled={isNew ? !canStart() : !canSubmit()}
+            commandsEnabled={!isNew && !quote && !target} onPlan={target ? undefined : text => { void activatePlan(text) }}
+            onSend={text => send(text)} onSteer={state.snapshot?.running?.kind === 'task' ? text => send(text, false, 'steer') : undefined}
+            activeRunId={target} sendDisabled={isNew ? !canStart() : !canSubmit(true)}
             action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
         </div>
       </main>

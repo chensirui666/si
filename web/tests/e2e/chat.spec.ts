@@ -44,7 +44,7 @@ for (const mode of ['node', 'vite'] as const) {
       expect(first.path).toBe('/v1/chat/completions')
       expect(first.authorized).toBe(true)
       expect(first.body).toMatchObject({ model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'high' })
-      expect(first.body.tools).toHaveLength(12)
+      expect(first.body.tools).toHaveLength(13)
       expect(first.body.messages).toEqual([
         expect.objectContaining({ role: 'system', content: expect.stringContaining(`<cwd>\n${await realpath(temporary)}\n</cwd>`) }),
         { role: 'user', content: original },
@@ -56,9 +56,8 @@ for (const mode of ['node', 'vite'] as const) {
       await expect.poll(() => observed.updates.some(({ update }) => update.change.type === 'model' && update.change.event.type === 'text_delta')).toBe(true)
       expect(observed.updates.some(({ update }) => update.change.type === 'model' && update.change.event.type === 'done')).toBe(false)
       await editor.fill('生成期间编辑的草稿')
-      await editor.press('Enter')
       await expect(editor).toHaveText('生成期间编辑的草稿')
-      await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
+      await expect(send).toBeEnabled()
 
       const second = await context.newPage()
       const otherObserved = observe(second)
@@ -66,7 +65,7 @@ for (const mode of ['node', 'vite'] as const) {
       await ready(second, otherObserved, 0, false)
       await expect(second.getByRole('region', { name: '消息列表' })).toContainText('第一段已经到达。')
       await second.getByRole('textbox', { name: '消息', exact: true }).fill('另一个页面的草稿')
-      await expect(second.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
+      await expect(second.getByRole('button', { name: '发送', exact: true })).toBeEnabled()
       const running = otherObserved.snapshots.at(-1)!.snapshot.running
       expect(running?.kind).toBe('task')
       if (running?.kind !== 'task') throw new Error('当前运行应为普通任务')
@@ -80,7 +79,7 @@ for (const mode of ['node', 'vite'] as const) {
       expect(observed.snapshots.at(-1)!.snapshot.running).toEqual(running)
       await expect(firstRunStatus).toHaveText(/^正在执行 · .+秒$/)
       await editor.fill('断线期间保留的新草稿')
-      await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
+      await expect(send).toBeEnabled()
       await context.setOffline(true)
       await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection', 'disconnected')
       first.delta({ content: '离线时继续生成的第二段。' })
@@ -91,7 +90,7 @@ for (const mode of ['node', 'vite'] as const) {
       await expect(second.getByRole('region', { name: '消息列表' })).toContainText('离线时继续生成的第二段。')
       expect(observed.snapshots.at(-1)!.snapshot.running).toEqual(running)
       await expect(editor).toHaveText('断线期间保留的新草稿')
-      await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
+      await expect(send).toBeEnabled()
       expect(provider.exchanges).toHaveLength(1)
       expect(observed.submissions).toEqual(['POST'])
       expect(otherObserved.submissions).toEqual([])

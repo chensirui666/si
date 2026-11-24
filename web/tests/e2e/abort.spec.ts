@@ -29,11 +29,22 @@ for (const mode of ['node', 'vite'] as const) {
       provider.exchanges[0]!.delta({ content: '已经生成的部分内容。' })
       await expect(page.locator('.assistant-message')).toContainText('已经生成的部分内容。')
       await editor.fill('停止时保留的新草稿')
-      const receipt = page.waitForResponse(response => new URL(response.url()).pathname === '/api/abort')
-      await page.getByRole('button', { name: '中止', exact: true }).click()
-      const response = await receipt
+      await expect(send).toBeVisible()
+      await expect(send).toBeEnabled()
+      await expect(page.getByRole('button', { name: '中止', exact: true })).toHaveCount(0)
+      const isAbort = (url: string) => new URL(url).pathname === '/api/abort'
+      let abortRequests = 0
+      page.on('request', request => { if (isAbort(request.url())) abortRequests++ })
+      await editor.press('Escape')
+      expect(await send.isVisible()).toBe(true)
+      expect(abortRequests).toBe(0)
+      const [response] = await Promise.all([
+        page.waitForResponse(response => isAbort(response.url())),
+        editor.press('Escape'),
+      ])
       expect(response.status()).toBe(200)
       expect(await response.json()).toMatchObject({ handled: true })
+      expect(abortRequests).toBe(1)
       await expect.poll(() => provider.exchanges[0]!.closed).toBe(true)
       await expect(page.locator('.assistant-message')).toContainText('已取消')
       await expect(page.locator('.assistant-message')).toContainText('已经生成的部分内容。')

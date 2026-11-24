@@ -144,8 +144,15 @@ export function prepareCompaction(
     tokens += estimateMessageTokens(messageForModel(effective[index], files), includeThinking, model)
     if (tokens >= keepRecentTokens) {
       firstKept = index
-      // A tool result cannot survive without the assistant's entire call batch.
-      while (firstKept > 0 && (effective[firstKept].extension || !['user', 'assistant'].includes(effective[firstKept].message.role))) firstKept--
+      while (firstKept > 0) {
+        const entry = effective[firstKept]
+        const preceding = effective[firstKept - 1]
+        const splitSteering = preceding.steering && preceding.runId === (entry.runId ?? entry.id)
+        // Keep the new input together with the tool results it follows.
+        if (!entry.extension && ['user', 'assistant'].includes(entry.message.role)
+          && !splitSteering && !(entry.steering && preceding.toolCall)) break
+        firstKept--
+      }
       break
     }
   }

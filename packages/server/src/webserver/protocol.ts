@@ -1,14 +1,14 @@
 import type { ModelSelection } from '@agent-learning/model'
 import type {
   ConversationMessage as StoredMessage, ConversationSnapshot as StoredSnapshot, ConversationUpdate as StoredUpdate,
-  PermissionMode, SessionSummary, SkillInvocation, SkillSummary, SubmissionAccepted, SubmissionHandled, SubmissionSources, FinishedBashJob, RunningBashJob,
+  PermissionMode, SessionSummary, SkillInvocation, SubmissionPending, SkillSummary, SubmissionAccepted, SubmissionHandled, SubmissionSources, FinishedBashJob, RunningBashJob,
 } from '@agent-learning/coding-agent'
 import type { WorkspaceRegistration } from '../workspaces.js'
 import type { ScheduledPlan, ScheduledRunView as StoredScheduledRun } from '@agent-learning/coding-agent'
 
 export type {
   ExtensionNotice, ActiveContent, CompactionRecord, ContextUsage, ModelFrame, ModelRetryState, PermissionMode, RunRecord, RunningState, SaveFailure,
-  SessionSummary, SkillSource, SubmissionAccepted, MessageAttachment, PlanState,
+  SessionSummary, SkillSource, SubmissionAccepted, MessageAttachment, PlanState, InteractionState, PendingMessage, QuestionAnswer, QuestionReply, QuestionWaitSettings, QueueAction, QueueResult, UserQuestion, UserQuestionBatch,
 } from '@agent-learning/coding-agent'
 export { isPermissionMode } from '@agent-learning/coding-agent/permissions'
 export type { WorkspaceView } from '../workspaces.js'
@@ -36,7 +36,7 @@ type Change = StoredUpdate['change']
 type Accepted = Extract<Change, { type: 'accepted' }>
 export type ConversationUpdate = Omit<StoredUpdate, 'change'> & {
   change: Exclude<Change, { type: 'accepted' | 'task' }>
-    | (Omit<Accepted, 'user'> & { user: ConversationMessage })
+    | (Omit<Accepted, 'user' | 'steering'> & { user: ConversationMessage; steering?: ConversationMessage[] })
     | ({ type: 'task'; running: StoredSnapshot['running'] }
       & ({ message: ConversationMessage; messageIndex: number } | { message?: never; messageIndex?: never }))
 }
@@ -50,11 +50,11 @@ export type SchedulePatch = { action: 'pause' | 'resume' } | {
   action: 'update'; prompt?: string; schedule?: ScheduleView['schedule']; sessionMode?: ScheduleView['sessionMode']
 }
 export type SubmitMessageRequest = Pick<ModelSelection, 'modelId'> & Partial<ModelSelection> & SubmissionSources
-  & { clientMessageId: string; text: string; sessionId: string }
+  & { clientMessageId: string; text: string; sessionId: string; mode?: 'steer' }
 export type SaveModelSelectionRequest = ModelSelection & { sessionId?: string }
 export type SubmitMessageAccepted = SubmissionAccepted & { sessionId: string }
-export type SubmitMessageResult = SubmitMessageAccepted | (SubmissionHandled & { sessionId: string })
-export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId'> & { workspaceId: string; permissionMode?: PermissionMode; draftSessionId?: string }
+export type SubmitMessageResult = SubmitMessageAccepted | ((SubmissionHandled | SubmissionPending) & { sessionId: string })
+export type StartSessionRequest = Omit<SubmitMessageRequest, 'sessionId' | 'mode'> & { workspaceId: string; permissionMode?: PermissionMode; draftSessionId?: string }
 export type PermissionSettings = { defaultPermissionMode: PermissionMode }
 export type SessionPermission = { permissionMode: PermissionMode }
 export type StartSessionAccepted = { session: SessionSummary; accepted: SubmitMessageAccepted }

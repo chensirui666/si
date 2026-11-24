@@ -10,7 +10,7 @@ import {
   AgentSession, SessionSubmitError, Sessions, SessionStore, SessionReadError, SessionWriteError, ToolRuntime, createTools, createWebTools, discoverSkills, isPermissionMode, loadExtensions,
   AttachmentInputError, SessionAttachments, ATTACHMENT_TTL_MS, MAX_ATTACHMENT_UPLOAD_BYTES,
   McpManager, McpSettingsError, MemoryStore, MemoryStoreError,
-  type AttachmentScope, type ScheduledRun, type ScheduledSubmission, type ConversationMessage, type ExtensionEntry, type PermissionMode, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
+  type AttachmentScope, type ScheduledRun, type ScheduledSubmission, type ConversationMessage, type ExtensionEntry, type PermissionMode, type QuestionWaitSettings, type SessionPersistence, type SessionSubscriptionEvent, type WebProvider,
 } from '@agent-learning/coding-agent'
 import { Credentials, loadOrCreateBrowserSecret } from '@agent-learning/credentials'
 import { createModelStream, defaultSelection, discoverModels, isModelProvider, type AssistantMessage, type ModelSelection, type ToolCall } from '@agent-learning/model'
@@ -29,7 +29,7 @@ import type { BashJobsView, StopBashJobResult, ClientFrame, ConversationMessage 
 
 type SessionTarget = {
   subscribe(signal: AbortSignal): AsyncIterable<SessionSubscriptionEvent>
-} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'initialize' | 'selectModel' | 'selectPermissionMode' | 'reviewPlan' | 'getScheduledSettings' | 'submitScheduled'>>
+} & Partial<Pick<AgentSession, 'submit' | 'abort' | 'close' | 'initialize' | 'selectModel' | 'selectPermissionMode' | 'reviewPlan' | 'getScheduledSettings' | 'submitScheduled' | 'updateQueue' | 'replyToQuestion' | 'freezeQueue'>>
 
 type Notification = Exclude<ServerFrame, { subscriptionId: string }>['type']
 
@@ -66,7 +66,7 @@ function browserEvent(event: SessionSubscriptionEvent): BrowserEvent {
   }
   const { change } = event.update
   if (change.type === 'accepted') {
-    return { ...event, update: { ...event.update, change: { ...change, user: browserMessage(change.user) } } }
+    return { ...event, update: { ...event.update, change: { ...change, user: browserMessage(change.user), ...(change.steering && { steering: change.steering.map(browserMessage) }) } } }
   }
   if (change.type === 'task') {
     return { ...event, update: { ...event.update, change: change.message
@@ -160,12 +160,14 @@ async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspa
   const targetLabel = target === 'sessionId' ? '会话' : '工作区'
   const targetId = value && typeof value === 'object' ? (value as Record<string, unknown>)[target] : undefined
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => ![target, 'text', 'modelId', 'provider', 'reasoningEffort', 'clientMessageId', 'attachmentIds', 'referenceSessionIds'].includes(key)
-    && !(target === 'workspaceId' && ['permissionMode', 'draftSessionId'].includes(key)))
+    && !(target === 'workspaceId' && ['permissionMode', 'draftSessionId'].includes(key))
+    && !(target === 'sessionId' && key === 'mode'))
     || !validId(targetId)
     || !('text' in value) || typeof value.text !== 'string'
     || !('modelId' in value) || !validId(value.modelId)
     || ('provider' in value && !validId(value.provider))
     || ('reasoningEffort' in value && (!('provider' in value) || !validId(value.reasoningEffort)))
+    || ('mode' in value && value.mode !== 'steer')
     || !('clientMessageId' in value) || !validId(value.clientMessageId)) {
     throw new InputError(400, `请提交原文、模型、有效临时编号和${targetLabel}编号`)
   }
@@ -178,6 +180,7 @@ async function messageInput(req: IncomingMessage, target: 'sessionId' | 'workspa
   if (!value.text.trim() && !attachmentIds.length) throw new InputError(400, '请填写原文或添加附件')
   return { targetId, permissionMode, draftSessionId, message: { clientMessageId: value.clientMessageId, modelId: value.modelId, text: value.text,
     ...(attachmentIds.length && { attachmentIds }), ...(referenceSessionIds.length && { referenceSessionIds }),
+    ...('mode' in value && value.mode === 'steer' && { mode: 'steer' as const }),
     ...('provider' in value && { provider: value.provider as string }),
     ...('reasoningEffort' in value && { reasoningEffort: value.reasoningEffort as ModelSelection['reasoningEffort'] }), } }
 }
@@ -234,7 +237,7 @@ export class WebServer {
       getDefaultPermissionMode: () => this.readDefaultPermissionMode(),
       createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode, sessionId) => new AgentSession({
         resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd, persistence?.summary.id ?? sessionId), compaction: this.options.compaction,
-        mcp: this.mcp,
+        mcp: this.mcp, questionWait: () => this.readQuestionWaitSettings(),
         memory: {
           store: this.memoryStore,
           settings: () => this.memorySettings.read(true),
@@ -517,7 +520,11 @@ export class WebServer {
         if (!uuid.test(input.clientMessageId)) {
           throw new InputError(400, '首次发送需要有效的 UUID 临时编号')
         }
-        const result = await this.sessions.start(input, target => this.submit(target, { ...message, ...(permissionMode !== undefined && { permissionMode }) }))
+        const result = await this.sessions.start(input, async target => {
+          const accepted = await this.submit(target, { ...message, ...(permissionMode !== undefined && { permissionMode }) })
+          if ('kind' in accepted && (accepted.kind === 'queued' || accepted.kind === 'steering')) throw new InputError(409, '首条消息未启动')
+          return accepted
+        })
         const response: StartSessionResult = 'session' in result
           ? { session: result.session, accepted: { ...result.accepted, sessionId: result.session.id } } : result
         this.json(res, 202, response)
@@ -538,6 +545,38 @@ export class WebServer {
           this.json(res, 200, { sessionId, job } satisfies StopBashJobResult)
         } else this.json(res, 200, { sessionId, jobs: this.runtime.listRunningJobs(sessionId) } satisfies BashJobsView)
       } catch (error) { this.sessionError(res, error, '后台任务请求失败，请重试') }
+      return
+    }
+    const queueRoute = /^\/api\/sessions\/([^/]+)\/queue\/([^/]+)$/.exec(url.pathname)
+    if (queueRoute && (req.method === 'PATCH' || req.method === 'DELETE')) {
+      try {
+        const id = checkedPathId(queueRoute[2]!)
+        const sessionId = checkedPathId(queueRoute[1]!)
+        const value = req.method === 'PATCH' ? await readJson(req) : { action: 'delete' }
+        const target = this.target(sessionId)
+        if (!target.updateQueue) throw new InputError(503, '当前会话不支持管理待发消息')
+        if (!isSettingsObject(value)) throw new InputError(400, '待发条目操作无效')
+        if (value.action === 'edit' && typeof value.text === 'string' && Object.keys(value).length === 2) {
+          this.json(res, 200, target.updateQueue(id, { action: 'edit', text: value.text }))
+        } else if ((value.action === 'steer' || req.method === 'DELETE' && value.action === 'delete') && Object.keys(value).length === 1) {
+          this.json(res, 200, target.updateQueue(id, { action: value.action }))
+        } else throw new InputError(400, '待发条目操作无效')
+      } catch (error) { this.sessionError(res, error, '无法更新待发消息，请重试。') }
+      return
+    }
+    const questionRoute = /^\/api\/sessions\/([^/]+)\/questions\/([^/]+)\/reply$/.exec(url.pathname)
+    if (questionRoute && req.method === 'POST') {
+      try {
+        const sessionId = checkedPathId(questionRoute[1]!)
+        const questionId = checkedPathId(questionRoute[2]!)
+        const value = await readJson(req)
+        if (!isSettingsObject(value) || Object.keys(value).length !== 2 || !validId(value.replyId) || !Array.isArray(value.answers)) {
+          throw new InputError(400, '请提交有效的整组回答')
+        }
+        const target = this.target(sessionId)
+        if (!target.replyToQuestion) throw new InputError(503, '当前会话不支持回答问题')
+        this.json(res, 200, await target.replyToQuestion(questionId, value.replyId, value.answers))
+      } catch (error) { this.sessionError(res, error, '无法提交回答，请重试。') }
       return
     }
     const permissionSession = /^\/api\/sessions\/([^/]+)\/permission$/.exec(url.pathname)?.[1]
@@ -575,6 +614,10 @@ export class WebServer {
     }
     if (url.pathname === '/api/settings/permission' && (req.method === 'GET' || req.method === 'PUT')) {
       await this.handlePermissionSettings(req, res)
+      return
+    }
+    if (url.pathname === '/api/settings/question-wait' && (req.method === 'GET' || req.method === 'PUT')) {
+      await this.handleQuestionWaitSettings(req, res)
       return
     }
     if (url.pathname === '/api/settings/language' && (req.method === 'GET' || req.method === 'PUT')) {
@@ -668,7 +711,7 @@ export class WebServer {
       if (!store || this.closing) throw new InputError(503, '附件服务暂时不可用')
       if (req.method === 'GET') {
         const id = checkedPathId(url.pathname.slice('/api/attachments/'.length))
-        const saved = uuid.test(id) ? store.sentAttachment(id) : undefined
+        const saved = uuid.test(id) ? store.sentAttachment(id) ?? store.queuedAttachment(id) : undefined
         if (!saved || !await this.workspaces.isRegistered(saved.workspaceId)) throw new InputError(404, '附件已不可用')
         const bytes = await this.attachments.read(saved.id, controller.signal)
         this.respond(res, 200, bytes, {
@@ -811,6 +854,27 @@ export class WebServer {
       this.json(res, 200, { defaultPermissionMode } satisfies PermissionSettings)
       this.notify('permission_settings_changed')
     } catch (error) { this.sessionError(res, error, '无法读取或保存默认权限，请检查本机设置文件。') }
+  }
+
+  private async readQuestionWaitSettings(): Promise<QuestionWaitSettings> {
+    const { questionWaitTimeout } = await readSettingsFile(this.options.webSettingsPath)
+    return { timeout: questionWaitTimeout === -1 ? -1 : 120 }
+  }
+
+  private async handleQuestionWaitSettings(req: IncomingMessage, res: ServerResponse) {
+    try {
+      if (req.method === 'GET') {
+        this.json(res, 200, await this.readQuestionWaitSettings())
+        return
+      }
+      const value = await readJson(req)
+      if (!isSettingsObject(value) || Object.keys(value).length !== 1 || value.timeout !== 120 && value.timeout !== -1) {
+        throw new InputError(400, '请选择有效的答题等待方式')
+      }
+      const { timeout } = value
+      await updateSettingsFile(this.options.webSettingsPath, file => { file.questionWaitTimeout = timeout })
+      this.json(res, 200, { timeout } satisfies QuestionWaitSettings)
+    } catch (error) { this.sessionError(res, error, '无法读取或保存答题等待设置，请重试。') }
   }
 
   private async handleLanguageSettings(req: IncomingMessage, res: ServerResponse) {
@@ -975,6 +1039,7 @@ export class WebServer {
   }
   close(): Promise<void> {
     if (this.closing) return this.closing
+    this.sessions?.freezeQueues()
     this.closing = (async () => {
       await this.scheduleRunner?.stop()
       this.scheduleRunner = undefined

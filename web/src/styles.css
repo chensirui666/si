@@ -155,6 +155,9 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .message-items { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 24px; }
 .message-item { max-width: 72%; min-width: 0; border-radius: 16px; background: var(--surface); padding: 10px 16px; }
 .message-text { white-space: pre-wrap; overflow-wrap: anywhere; font: var(--type-reading); }
+.message-item:has(> .steering-status) { position: relative; }
+.steering-status { position: absolute; inset-inline-end: calc(100% + 8px); inset-block-end: 9px; color: var(--muted-text); }
+.steering-status svg { width: 14px; height: 14px; stroke-width: 1.5; }
 
 @media (forced-colors: active) {
   .new-chat-particles { display: none; }
@@ -287,7 +290,7 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .schedule-dialog .schedule-actions { justify-content: flex-end; }
 .schedule-create-dialog .schedule-actions, .schedule-action-dialog .schedule-editor .schedule-actions { margin-top: 8px; }
 .chat-page { width: 100%; }
-.composer-stack { flex: none; min-width: 0; width: var(--chat-column-width); margin-inline: auto; display: flex; flex-direction: column; gap: 8px; }
+.composer-stack { --composer-stack-gap: 8px; flex: none; min-width: 0; width: var(--chat-column-width); margin-inline: auto; display: flex; flex-direction: column; gap: var(--composer-stack-gap); }
 .chat-page:not([data-new-session]) .composer-stack {
   position: sticky;
   bottom: 0;
@@ -295,7 +298,7 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
   padding-bottom: var(--chat-bottom-space);
   background: linear-gradient(to top, var(--background) var(--chat-bottom-space), transparent var(--chat-bottom-space));
 }
-.chat-page:not([data-new-session]) .composer-stack > :not(.message-input, .chat-to-bottom) { background-color: var(--background); }
+.chat-page:not([data-new-session]) .composer-stack > :not(.message-input, .message-queue, .chat-to-bottom) { background-color: var(--background); }
 .composer-stack > .chat-to-bottom { position: absolute; bottom: calc(100% + 12px); right: 16px; border-color: var(--border); border-radius: 50%; }
 .chat-page[data-new-session] .chat-main { padding-block: 24px; }
 .chat-page[data-new-session] .composer-stack { margin-block: auto; }

@@ -870,10 +870,17 @@ it('续聊只在用完图片预算余量时推进已省略的消息', async () =
       return queue.output
     },
   })
+  const controller = new AbortController()
+  const events = agent.subscribe(controller.signal)
+  await events.next()
   try {
     for (let count = 49; count <= 57; count++) {
       await agent.submit({ ...input, clientMessageId: `read-${count}` })
-      await until(async () => (await snapshot(agent)).running === null)
+      for (;;) {
+        const { done, value } = await events.next()
+        if (done) throw new Error('会话未报告任务结束')
+        if (value.type === 'update' && value.update.change.type === 'task' && value.update.change.running === null) break
+      }
       const omitted = count === 57 ? 16 : 8
       expect(requests.at(-1)).toEqual({
         paths: Array.from({ length: count }, (_, index) => `${index + 1}.png`),
@@ -881,7 +888,7 @@ it('续聊只在用完图片预算余量时推进已省略的消息', async () =
         recorded: omitted,
       })
     }
-  } finally { await agent.close() }
+  } finally { controller.abort(); await agent.close() }
 })
 
 describe('每轮项目说明', () => {

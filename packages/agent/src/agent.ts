@@ -34,7 +34,7 @@ export class Agent {
     return this.run(input)
   }
 
-  private async loop({ model, reasoningEffort, context, tools = [], signal, prepareContext, finalizeContext, beforeToolCall, saveToolCheckpoint, observe, userMessage, resolveTools, prepareToolCall,
+  private async loop({ model, reasoningEffort, context, tools = [], signal, prepareContext, finalizeContext, afterStep, beforeToolCall, saveToolCheckpoint, observe, userMessage, resolveTools, prepareToolCall,
     rewriteToolResult, streamOptions }: AgentRunInput, messages: AgentObservations['agent_end']['messages']): Promise<AgentResult> {
     if (tools.length) context = {
       ...context,
@@ -77,9 +77,13 @@ export class Agent {
         const complete: AgentResult = { type: 'response', message: response }
         if (response.stopReason === 'error' || response.stopReason === 'aborted') return complete
         const calls = response.content.flatMap((call, contentIndex) => call.type === 'toolCall' ? [{ call, contentIndex }] : [])
-        if (!calls.length) return response.stopReason === 'toolUse'
-          ? failure('模型未返回可处理的工具调用。')
-          : complete
+        if (!calls.length) {
+          if (response.stopReason === 'toolUse') return failure('模型未返回可处理的工具调用。')
+          if (!afterStep || !await afterStep(response, false)) return complete
+          afterReply = true
+          context = { ...context, messages: [...context.messages, response] }
+          continue
+        }
         afterReply = true
         if (saveToolCheckpoint) await saveToolCheckpoint({ type: 'assistant', message: response })
         signal.throwIfAborted()
@@ -131,7 +135,7 @@ export class Agent {
             this.emit({ type: 'tool_start', contentIndex, ...(actualArguments && { actualArguments }) })
             executed = true
             const toolOutput = await tool.execute(prepareToolCall ? structuredClone(prepared.arguments) : prepared.arguments,
-              { signal, recordDetails: detail => { details.push(detail) } })
+              { signal, toolCallId: call.id, recordDetails: detail => { details.push(detail) } })
             if (typeof toolOutput === 'string' || Array.isArray(toolOutput)) output = toolOutput
             else ({ content: output, isError } = toolOutput)
           } catch (error) {
@@ -169,6 +173,7 @@ export class Agent {
           }
         }
         signal.throwIfAborted()
+        if (afterStep) await afterStep(response, true)
         context = { ...context, messages: [...context.messages, response, ...results] }
       }
     } catch {

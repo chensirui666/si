@@ -1,6 +1,7 @@
 import type { ModelDiscovery } from '@agent-learning/model'
 import { isPermissionMode } from '@agent-learning/server/protocol'
 import type { BashJobsView, StopBashJobResult, WorkspaceSkills, PermissionMode, PermissionSettings, SessionPermission, SaveModelSelectionRequest, AbortRequest, AbortResult, ClientFrame, InterfaceLanguage, McpOAuthStartView, McpServerView, SaveMcpServerRequest, SessionList, SessionSummary, StartSessionResult, StartSessionRequest, SubmitMessageAccepted, SubmitMessageRequest, SubmitMessageResult, WebSettingsView, WorkspacePick, WorkspaceView } from '@agent-learning/server/protocol'
+import type { QuestionAnswer, QuestionReply, QuestionWaitSettings, QueueAction, QueueResult } from '@agent-learning/server/protocol'
 import type { DeleteMemoryEntryView, MemorySettingsView, ProjectMemoriesView, ProjectMemoryView, SchedulePatch, ScheduleView, UserMemoryView } from '@agent-learning/server/protocol'
 import { RequestError } from '../i18n/messages'
 import type { CopyKey } from '../i18n/en'
@@ -484,10 +485,41 @@ export async function submitMessage(input: SubmitMessageRequest): Promise<Submit
   const value = await postSubmission('/api/messages', input, awaitsReceipt ? AbortSignal.timeout(10_000) : undefined)
   const handled = input.text.trim() !== '/compact' && handledSubmission(value, input.clientMessageId, 'sessionId', input.sessionId)
   if (handled) return { ...handled, sessionId: input.sessionId }
-  if (!acceptedSubmission(value, input.sessionId, input.clientMessageId, input.text.trim() === '/compact' ? 'compaction' : 'message')) {
+  const isCompaction = input.text.trim() === '/compact'
+  if (!isCompaction && record(value) && (value.kind === 'queued' || value.kind === 'steering')
+    && value.sessionId === input.sessionId && value.clientMessageId === input.clientMessageId
+    && typeof value.acceptedSeq === 'number' && Number.isSafeInteger(value.acceptedSeq) && value.acceptedSeq >= 0) {
+    return { kind: value.kind, sessionId: input.sessionId, clientMessageId: input.clientMessageId, acceptedSeq: value.acceptedSeq }
+  }
+  if (!acceptedSubmission(value, input.sessionId, input.clientMessageId, isCompaction ? 'compaction' : 'message')) {
     throw new RequestError({ key: 'request.sendInvalid' })
   }
   return value
+}
+
+export function updateQueuedMessage(sessionId: string, messageId: string, action: QueueAction) {
+  const statuses: QueueResult['status'][] = ['queued', 'steering', 'started', 'deleted', 'delivered', 'missing', 'unavailable']
+  return requestView(`/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(messageId)}`, 'queue.label',
+    (value): value is QueueResult => record(value) && statuses.some(status => status === value.status),
+    { ...(action.action === 'delete' ? { method: 'DELETE' } : { ...putJson(action), method: 'PATCH' }), signal: AbortSignal.timeout(10_000) })
+}
+
+export function replyToQuestions(sessionId: string, batchId: string, replyId: string, answers: QuestionAnswer[]) {
+  return requestView(`/api/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(batchId)}/reply`, 'question.submit',
+    (value): value is QuestionReply =>
+      record(value) && (value.kind === 'answered' || value.kind === 'late' || value.kind === 'closed') && value.replyId === replyId,
+    { ...putJson({ replyId, answers }), method: 'POST', signal: AbortSignal.timeout(10_000) })
+}
+
+const isQuestionWait = (value: unknown): value is QuestionWaitSettings => record(value) && (value.timeout === 120 || value.timeout === -1)
+
+export function getQuestionWait() {
+  return requestView('/api/settings/question-wait', 'question.setting', isQuestionWait)
+}
+
+export function saveQuestionWait(timeout: QuestionWaitSettings['timeout']) {
+  return requestView('/api/settings/question-wait', 'question.setting', isQuestionWait,
+    { ...putJson({ timeout }), signal: AbortSignal.timeout(10_000) })
 }
 
 export async function startSession(input: StartSessionRequest): Promise<StartSessionResult> {

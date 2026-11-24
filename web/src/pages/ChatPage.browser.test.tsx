@@ -6,6 +6,7 @@ import { draftKey, newSessionDraft, recentSessionKey } from '../chat/drafts'
 import { Button } from '../components/ui/button'
 
 test.beforeEach(async ({ page }) => {
+  await page.route('**/api/settings/question-wait', route => route.fulfill({ json: { timeout: 120 } }))
   await page.route('**/api/settings/permission', route => route.fulfill({ json: { defaultPermissionMode: 'normal' } }))
   await page.route('**/api/web/settings', route => route.fulfill({
     json: {
@@ -565,7 +566,7 @@ test('真实异步发送保留原文、清空撤销历史和焦点，WS 先到�
   await expect(page.getByText('发送失败', { exact: true })).toHaveCount(0)
   await expect(editor).toHaveText('新的草稿')
   await expect(editor).toBeFocused()
-  await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
+  await expect(send).toBeEnabled()
   await page.evaluate(input => {
     window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
       connection: 'ready', slow: false, error: null,

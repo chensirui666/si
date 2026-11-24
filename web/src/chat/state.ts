@@ -1,5 +1,5 @@
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, ExtensionNotice, PlanState, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
+import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, ExtensionNotice, InteractionState, PlanState, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelFailureKind, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 import { retryReasons, terminalOnly } from './model-retry'
@@ -130,6 +130,45 @@ export function messageAttachment(value: unknown): value is NonNullable<Conversa
     && sequence(value.size)
 }
 
+function pendingMessage(value: unknown) {
+  return record(value) && typeof value.clientMessageId === 'string' && typeof value.text === 'string'
+    && (value.attachments === undefined || Array.isArray(value.attachments) && value.attachments.every(messageAttachment))
+}
+
+function questionAnswer(value: unknown) {
+  return record(value) && typeof value.id === 'string' && Array.isArray(value.selected)
+    && value.selected.every(label => typeof label === 'string') && (value.custom === undefined || typeof value.custom === 'string')
+}
+
+function question(value: unknown) {
+  return record(value) && typeof value.id === 'string' && typeof value.question === 'string'
+    && (value.header === undefined || typeof value.header === 'string')
+    && (value.multi_select === undefined || typeof value.multi_select === 'boolean')
+    && (value.options === undefined || Array.isArray(value.options) && value.options.every(option =>
+      record(option) && typeof option.label === 'string' && (option.description === undefined || typeof option.description === 'string')))
+}
+
+function questionBatch(value: unknown) {
+  return record(value) && ['id', 'runId', 'assistantMessageId', 'toolCallId'].every(key => typeof value[key] === 'string')
+    && ['waiting', 'answered', 'timed-out', 'closed', 'aborted'].includes(value.status as string)
+    && Array.isArray(value.questions) && value.questions.length > 0 && value.questions.every(question)
+    && (value.deadlineAt === undefined || retryTime(value.deadlineAt))
+    && (value.answers === undefined || Array.isArray(value.answers) && value.answers.every(questionAnswer))
+    && (value.replyId === undefined || typeof value.replyId === 'string')
+    && (value.replyKind === undefined || ['answered', 'late', 'closed'].includes(value.replyKind as string))
+}
+
+function interactionState(value: unknown): value is InteractionState {
+  return record(value) && record(value.queue) && Array.isArray(value.queue.items) && value.queue.items.every(pendingMessage)
+    && (value.queue.paused === null || typeof value.queue.paused === 'string')
+    && Array.isArray(value.steering) && value.steering.every(pendingMessage)
+    && Array.isArray(value.questions) && value.questions.every(questionBatch)
+}
+
+function steeringMessage(value: unknown, runId: string): value is ConversationMessage {
+  return conversationMessage(value) && value.message.role === 'user' && value.steering === true && value.runId === runId
+}
+
 function sessionReference(value: unknown) {
   return record(value) && typeof value.sourceSessionId === 'string' && !!value.sourceSessionId
     && typeof value.label === 'string' && !!value.label
@@ -147,7 +186,19 @@ function conversationMessage(value: unknown): value is ConversationMessage {
     && (value.toolErrorCode === undefined || (typeof value.toolErrorCode === 'string' && value.message.role === 'toolResult' && value.message.isError))
     && (value.attachments === undefined || value.message.role === 'user' && Array.isArray(value.attachments) && value.attachments.every(messageAttachment))
     && (value.references === undefined || value.message.role === 'user' && Array.isArray(value.references) && value.references.every(sessionReference))
+    && (value.runId === undefined || typeof value.runId === 'string')
+    && (value.steering === undefined || value.steering === true && value.message.role === 'user' && typeof value.runId === 'string')
     && fileOperation(value.fileOperation, value.message) && skillInvocation(value.skillInvocation, value.message)
+}
+
+function removeDelivered(interaction: InteractionState | undefined, ...messages: ConversationMessage[]) {
+  if (!interaction) return {}
+  const ids = new Set(messages.map(message => message.clientMessageId))
+  return { interaction: {
+    ...interaction,
+    queue: { ...interaction.queue, items: interaction.queue.items.filter(item => !ids.has(item.clientMessageId)) },
+    steering: interaction.steering.filter(item => !ids.has(item.clientMessageId)),
+  } }
 }
 
 function validRelations(messages: ConversationMessage[], running: ConversationSnapshot['running']): boolean {
@@ -168,7 +219,7 @@ function validRelations(messages: ConversationMessage[], running: ConversationSn
   if (running?.kind === 'task') {
     const userIndex = messages.findIndex(entry => entry.id === running.runId)
     const assistantIndex = messages.findIndex(entry => entry.id === running.assistantMessageId)
-    if (userIndex < 0 || messages[userIndex]?.message.role !== 'user' || messages.slice(userIndex + 1).some(entry => entry.message.role === 'user')) return false
+    if (userIndex < 0 || messages[userIndex]?.message.role !== 'user' || messages.slice(userIndex + 1).some(entry => entry.message.role === 'user' && !steeringMessage(entry, running.runId))) return false
     if (assistantIndex < 0) {
       if (running.phase !== 'model' && running.phase !== 'compaction') return false
     } else if (assistantIndex <= userIndex || messages[assistantIndex]?.message.role !== 'assistant') return false
@@ -207,6 +258,7 @@ function validSnapshot(value: unknown): value is ConversationSnapshot {
   return record(value) && sequence(value.seq) && isPermissionMode(value.permissionMode) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
     && (value.modelSelection === undefined || modelSelection(value.modelSelection))
     && (value.plan === undefined || planState(value.plan))
+    && (value.interaction === undefined || interactionState(value.interaction))
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
     && value.activeContent.every(activeBlock)
     && Array.isArray(value.compactions) && value.compactions.every(compactionRecord)
@@ -268,6 +320,12 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
       ...state.snapshot, ...metadata, seq: frame.update.seq, plan: change.plan, contextUsage: capacity,
     } }, resubscribe: false }
   }
+  if (change.type === 'interaction') {
+    if (!interactionState(change.interaction)) return { state, resubscribe: true }
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, ...metadata, seq: frame.update.seq, interaction: change.interaction, contextUsage: capacity,
+    } }, resubscribe: false }
+  }
   if (change.type === 'model') {
     const snapshot = applyModel(state.snapshot, change.messageId, change.event)
     return snapshot ? { state: { ...state, snapshot: { ...snapshot, ...metadata, seq: frame.update.seq, contextUsage: capacity } }, resubscribe: false } : { state, resubscribe: true }
@@ -276,10 +334,13 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   const update = valid.update.change
   if (update.type === 'accepted') {
     if (!conversationMessage(change.user) || change.user.message.role !== 'user' || !runningState(change.running) || !record(change.running) || change.running.kind !== 'task') return { state, resubscribe: true }
-    const messages = [...state.snapshot.messages, update.user]
+    const steering = change.steering
+    if (steering !== undefined && (!Array.isArray(steering) || !steering.every(entry => steeringMessage(entry, update.running.runId)))) return { state, resubscribe: true }
+    const messages = [...state.snapshot.messages, ...(steering ?? []), update.user]
     if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, ...metadata, seq: valid.update.seq, messages, running: update.running, contextUsage: capacity,
+      ...state.snapshot, ...metadata, ...removeDelivered(state.snapshot.interaction, ...(steering ?? []), update.user),
+      seq: valid.update.seq, messages, running: update.running, contextUsage: capacity,
     } }, resubscribe: false }
   }
   if (update.type === 'compaction') {
@@ -296,6 +357,7 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     const messages = [...state.snapshot.messages]
     if (change.message !== undefined || change.messageIndex !== undefined) {
       if (!conversationMessage(change.message) || change.message.message.role !== 'toolResult'
+        && !(update.running?.kind === 'task' && steeringMessage(change.message, update.running.runId))
         || !sequence(change.messageIndex) || change.messageIndex > messages.length) return { state, resubscribe: true }
       messages.splice(change.messageIndex, 0, change.message)
     }
@@ -306,7 +368,8 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     }
     if (!validRelations(messages, update.running)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
-      ...state.snapshot, ...metadata, seq: valid.update.seq, running: update.running, messages, contextUsage: capacity,
+      ...state.snapshot, ...metadata, ...(update.message?.steering && removeDelivered(state.snapshot.interaction, update.message)),
+      seq: valid.update.seq, running: update.running, messages, contextUsage: capacity,
     } }, resubscribe: false }
   }
   return unchanged
@@ -371,10 +434,15 @@ function applyModel(snapshot: ConversationSnapshot, messageId: unknown, event: u
   return { ...snapshot, messages: existing ? snapshot.messages.map(item => item.id === messageId ? entry : item) : [...snapshot.messages, entry], activeContent }
 }
 
-export function mergeSubmissions(messages: readonly ConversationMessage[], submissions: readonly LocalSubmission[], compactions: readonly CompactionRecord[] = []): (ConversationMessage | LocalSubmission)[] {
-  const unresolved = submissions.filter(local => local.kind === 'compaction'
-    ? !compactions.some(item => item.clientMessageId === local.clientMessageId || local.accepted?.kind === 'compaction' && item.id === local.accepted.compactionId)
-    : !messages.some(item => item.message.role === 'user' && (item.clientMessageId === local.clientMessageId || local.accepted?.kind === 'message' && item.id === local.accepted.userMessageId)))
+export function mergeSubmissions(messages: readonly ConversationMessage[], submissions: readonly LocalSubmission[], compactions: readonly CompactionRecord[] = [], interaction?: InteractionState, seq = -1): (ConversationMessage | LocalSubmission)[] {
+  const pendingIds = new Set([...interaction?.queue.items ?? [], ...interaction?.steering ?? []].map(item => item.clientMessageId))
+  const unresolved = submissions.filter(local => {
+    if (pendingIds.has(local.clientMessageId)) return false
+    if ((local.accepted?.kind === 'queued' || local.accepted?.kind === 'steering') && local.accepted.acceptedSeq <= seq) return false
+    return local.kind === 'compaction'
+      ? !compactions.some(item => item.clientMessageId === local.clientMessageId || local.accepted?.kind === 'compaction' && item.id === local.accepted.compactionId)
+      : !messages.some(item => item.message.role === 'user' && (item.clientMessageId === local.clientMessageId || local.accepted?.kind === 'message' && item.id === local.accepted.userMessageId))
+  })
   const formalIds = new Set(messages.map(item => item.id))
   const anchored = new Map<string | undefined, LocalSubmission[]>()
   for (const local of unresolved) {

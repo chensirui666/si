@@ -19,7 +19,7 @@ type FirstMessage = Parameters<AgentSession['submit']>[0] & { workspaceId: strin
 type StartedSession = { session: SessionSummary; accepted: SubmissionAccepted } | (SubmissionHandled & { draftSessionId: string })
 type Draft<T> = { summary: SessionSummary; session: T; close(): Promise<void>; submitting?: boolean }
 
-export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (selection: ModelSelection) => void | Promise<void>; initialize?: () => Promise<void> | undefined }> {
+export class Sessions<T extends { freezeQueue?: () => void; close?: () => Promise<void>; selectModel?: (selection: ModelSelection) => void | Promise<void>; initialize?: () => Promise<void> | undefined }> {
   private readonly sessions = new Map<string, { summary: SessionSummary; session: T }>()
   private readonly starts = new Map<string, { input: FirstMessage; scheduled: boolean; result: Promise<StartedSession> }>()
   private readonly drafts = new Map<string, { workspaceId: string; pending: Promise<Draft<T>> }>()
@@ -175,6 +175,10 @@ export class Sessions<T extends { close?: () => Promise<void>; selectModel?: (se
     this.sessions.set(sessionId, { summary, session })
     void session.initialize?.()?.catch(() => undefined)
     return session
+  }
+
+  freezeQueues() {
+    for (const { session } of this.sessions.values()) session.freezeQueue?.()
   }
 
   close(): Promise<void> {

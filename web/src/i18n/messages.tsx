@@ -1,4 +1,4 @@
-import type { SkillSource } from '@agent-learning/server/protocol'
+import type { SkillSource, UserQuestionBatch } from '@agent-learning/server/protocol'
 import type { TFunction } from 'i18next'
 import { useTranslation } from 'react-i18next'
 import { i18n } from './copy'
@@ -11,6 +11,12 @@ export const skillSourceKey = {
   'user-agents': 'chat.skillPersonal',
   bundled: 'chat.skillBundled',
 } as const satisfies Record<SkillSource, CopyKey>
+
+export function questionStatusKey(batch: UserQuestionBatch): CopyKey {
+  if (batch.status === 'answered' && batch.answers?.length === batch.questions.length
+    && batch.answers.every(answer => !answer.selected.length && !answer.custom?.trim())) return 'question.skipped'
+  return batch.replyKind === 'late' ? 'question.lateReply' : `question.status.${batch.status}`
+}
 
 export type Notice = { key: CopyKey; detail?: string; label?: CopyKey; status?: number }
 

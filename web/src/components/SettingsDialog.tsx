@@ -1,9 +1,9 @@
-import { useRef, useState, type ComponentProps, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type ComponentProps, type FormEvent } from 'react'
 import { GlobeIcon, LayersIcon, PlusIcon, PlugIcon, SettingsIcon, SlidersHorizontalIcon, UserRoundIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { ModelDiscovery } from '@agent-learning/model'
 import type { PermissionMode, WebSettingsView } from '@agent-learning/server/protocol'
-import { deleteApiKey, saveApiKey, deleteWebApiKey, saveWebApiKey, saveWebSettings } from '../chat/client'
+import { deleteApiKey, saveApiKey, deleteWebApiKey, saveWebApiKey, saveWebSettings, getQuestionWait, saveQuestionWait } from '../chat/client'
 import { loadLanguage, selectLanguage, useLanguage } from '../i18n'
 import type { CopyKey } from '../i18n/en'
 import { errorNotice, NoticeText, type Notice } from '../i18n/messages'
@@ -27,6 +27,7 @@ type Props = {
   onCloseAutoFocus: (event: Event) => void
   discovery: ModelDiscovery | null
   onChange: (discovery: ModelDiscovery) => void
+  showQuestionWait?: boolean
   permissionSettings?: {
     mode: PermissionMode | null
     busy: boolean
@@ -60,7 +61,7 @@ export function SettingsButton(props: ComponentProps<typeof Button>) {
   </Button>
 }
 
-export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, permissionSettings, mcpSettings, webSettings, webSettingsError, onWebSettingsChange }: Props) {
+export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery, onChange, permissionSettings, showQuestionWait, mcpSettings, webSettings, webSettingsError, onWebSettingsChange }: Props) {
   const { t } = useTranslation()
   const { language, status: languageStatus, detail: languageDetail } = useLanguage()
   const languageBusy = languageStatus === 'loading' || languageStatus === 'saving'
@@ -257,6 +258,7 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
             <p className="configuration-error" role="alert"><NoticeText notice={{ key: `settings.language.${languageStatus}`, detail: languageDetail }} /></p>
             {languageStatus === 'readFailed' && <Button variant="ghost" onClick={() => { void loadLanguage() }}>{t('common.retry')}</Button>}
           </>}
+          {showQuestionWait && <QuestionWaitSetting />}
           {permissionSettings && <>
             <div className="settings-option-row">
               <div>
@@ -345,4 +347,50 @@ export function SettingsDialog({ open, onOpenChange, onCloseAutoFocus, discovery
       </Dialog>}
     </DialogContent>
   </Dialog>
+}
+
+function QuestionWaitSetting() {
+  const { t } = useTranslation()
+  const [timeout, setTimeout] = useState<120 | -1>()
+  const [busy, setBusy] = useState(true)
+  const [error, setError] = useState<Notice>()
+  const [attempt, retry] = useState(0)
+  useEffect(() => {
+    let active = true
+    void getQuestionWait().then(result => {
+      if (active) setTimeout(result.timeout)
+    }, error => {
+      if (active) setError(errorNotice('question.setting', error))
+    }).finally(() => { if (active) setBusy(false) })
+    return () => { active = false }
+  }, [attempt])
+
+  async function select(value: 120 | -1) {
+    setBusy(true)
+    setError(undefined)
+    try {
+      setTimeout((await saveQuestionWait(value)).timeout)
+    } catch (error) {
+      setError(errorNotice('question.settingSaveFailed', error))
+      try { setTimeout((await getQuestionWait()).timeout) } catch { setTimeout(undefined) }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <>
+    <div className="settings-option-row">
+      <label htmlFor="settings-question-wait">{t('question.setting')}</label>
+      <Select value={timeout === undefined ? '' : String(timeout)} disabled={busy || timeout === undefined}
+        onValueChange={value => { if (value === '120' || value === '-1') void select(value === '120' ? 120 : -1) }}>
+        <SelectTrigger id="settings-question-wait"><SelectValue /></SelectTrigger>
+        <SelectContent align="end">
+          <SelectItem value="120">{t('question.settingTimed')}</SelectItem>
+          <SelectItem value="-1">{t('question.settingForever')}</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+    {error && <p className="configuration-error" role="alert"><NoticeText notice={error} /> {timeout === undefined &&
+      <Button variant="ghost" size="sm" disabled={busy} onClick={() => { setError(undefined); setBusy(true); retry(value => value + 1) }}>{t('common.retry')}</Button>}</p>}
+  </>
 }
