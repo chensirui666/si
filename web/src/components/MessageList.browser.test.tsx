@@ -382,3 +382,25 @@ test.describe('模型请求恢复文案', () => {
     await expect(detail).toHaveText('正在重试 · 第 1/5 次')
   })
 })
+
+test('后台完成输出只替换原助手消息原位置的回执', async ({ mount }) => {
+  const call = { type: 'toolCall', id: 'reused-id', name: 'subagent', arguments: { task: '检查入口' } } as const;
+  const assistant = (id: string, content: Extract<ConversationMessage['message'], { role: 'assistant' }>['content']): ConversationMessage =>
+    ({ id, message: { role: 'assistant', provider: 'deepseek', api: 'openai-completions', model: 'deepseek-flash', timestamp: 1, content, stopReason: 'toolUse' } });
+  const receipt = (id: string, assistantMessageId: string, contentIndex: number): ConversationMessage => ({
+    id, toolCall: { assistantMessageId, contentIndex },
+    message: { role: 'toolResult', toolCallId: call.id, toolName: 'subagent', timestamp: 2, isError: false, content: [{ type: 'text', text: id }] },
+  });
+  const messages = [assistant('assistant-one', [call, call]), receipt('回执一', 'assistant-one', 0), receipt('回执二', 'assistant-one', 1),
+    assistant('assistant-two', [call]), receipt('回执三', 'assistant-two', 0)];
+  const component = await mount(<MessageList messages={messages} />);
+  await component.locator('.process-group > summary').click();
+  const tools = component.locator('.tool-block');
+  for (const row of await tools.all()) await row.locator('summary').click();
+  await expect(tools.nth(1).locator('.tool-result')).toHaveText('回执二');
+  await component.update(<MessageList messages={messages} delegationOutputs={[{ assistantMessageId: 'assistant-one', contentIndex: 1, output: '检查结果' }]} />);
+  await expect(tools.nth(1).locator('.tool-result')).toHaveText('检查结果');
+  await expect(tools.nth(1).locator('.tool-details')).toContainText('检查入口');
+  await expect(tools.nth(0).locator('.tool-result')).toHaveText('回执一');
+  await expect(tools.nth(2).locator('.tool-result')).toHaveText('回执三');
+});

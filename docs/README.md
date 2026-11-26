@@ -4,10 +4,13 @@
 
 - [开发指南](development.md)
 - [Skill 使用与编写规则](skills.md)
+- [创建和使用子 Agent 角色](subagents.md)
+- [数据库结构和功能来源](database/README.md)
 - [交流与讲解约定](communication.md)
 - [视觉设计规范](design.md)
 - [设计妥协记录](设计妥协记录.md)
 - [systemPrompt（普通任务）](prompts/systemPrompt.md)
+- [Multi-Agent 提示词与工具说明](prompts/subagents/systemPrompt.md)
 - [systemPrompt（生成压缩摘要）](prompts/compaction/systemPrompt.md)
 - [content（压缩后续接任务）](prompts/compaction/content.md)
 

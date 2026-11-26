@@ -5,10 +5,10 @@ import { homedir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
 import { readCredentialFile, withCredentialFileLock, writeCredentialFile } from '@agent-learning/credentials'
 
-type Workspace = { id: string; path: string }
+type Workspace = { id: string; path: string; projectAgentsEnabled?: boolean }
 type WorkspaceFile = { workspaces: Workspace[] }
 export type WorkspaceView = {
-  workspaces: (Workspace & { name: string; available: boolean })[]
+  workspaces: (Pick<Workspace, 'id' | 'path'> & { name: string; available: boolean })[]
 }
 export type WorkspaceRegistration = { workspaceId: string; created: boolean; view: WorkspaceView }
 export class WorkspaceBindingError extends Error {}
@@ -72,5 +72,9 @@ export class Workspaces {
 
   async isRegistered(id: string): Promise<boolean> {
     return (await this.read()).workspaces.some(workspace => workspace.id === id)
+  }
+
+  async getProjectAgentsEnabled(id: string): Promise<boolean> {
+    return (await this.read()).workspaces.find(workspace => workspace.id === id)?.projectAgentsEnabled === true
   }
 }

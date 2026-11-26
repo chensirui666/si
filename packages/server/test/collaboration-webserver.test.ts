@@ -1,114 +1,10 @@
-import { fork, type ChildProcess } from 'node:child_process'
-import { on, once } from 'node:events'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { SessionStore, type SessionSummary } from '@agent-learning/coding-agent'
-import { afterEach, expect, it, vi } from 'vitest'
-import WebSocket from 'ws'
-import { startModelServer } from '../../../web/tests/e2e/model-server.js'
-import type { ConversationSnapshot, ServerFrame, SubmitMessageRequest } from '../src/webserver/protocol.js'
+import { SessionStore } from '@agent-learning/coding-agent'
+import { expect, it, vi } from 'vitest'
+import type { ConversationSnapshot } from '../src/webserver/protocol.js'
+import { deepseek, finish, fixture, stop, toolCall, userTexts, vision } from './collaboration-fixture.js'
 
-const fixturePath = fileURLToPath(new URL('../../../web/tests/e2e/server-fixture.mjs', import.meta.url))
-const fixtureKey = 'controlled-stage3-key'
-const deepseek = { modelId: 'deepseek-flash' }
-const vision = { provider: 'qwen', modelId: 'qwen3.6-plus', reasoningEffort: 'high' } as const
-const cleanup: (() => Promise<unknown>)[] = []
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
-
-async function stop(child: ChildProcess, signal: NodeJS.Signals) {
-  if (child.exitCode !== null || child.signalCode !== null) return [child.exitCode, child.signalCode]
-  const exited = once(child, 'exit')
-  child.kill(signal)
-  const deadline = setTimeout(() => child.kill('SIGKILL'), 3000)
-  try { return await exited }
-  finally { clearTimeout(deadline) }
-}
-
-async function fixture() {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-collaboration-webserver-'))
-  cleanup.push(() => rm(directory, { recursive: true, force: true }))
-  const provider = await startModelServer()
-  cleanup.push(provider.close)
-  const requestNumber = async (number: number) => {
-    await vi.waitFor(() => expect(provider.exchanges).toHaveLength(number), { timeout: 4000 })
-    return provider.exchanges[number - 1]!
-  }
-  const start = async () => {
-    const child = fork(fixturePath, ['0', join(directory, 'browser-auth.json')], {
-      env: { ...process.env, AGENT_LEARNING_E2E_MODEL_BASE_URL: provider.baseURL, AGENT_LEARNING_E2E_MODEL_CLOCK: '' },
-      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
-    })
-    cleanup.push(() => stop(child, 'SIGKILL'))
-    const [startup] = await once(child, 'message', { signal: AbortSignal.timeout(6000) }) as [{ type: string; result: { url: string; authUrl: string } }]
-    expect(startup.type).toBe('started')
-    const { url, authUrl } = startup.result
-    const auth = await fetch(authUrl, { redirect: 'manual', signal: AbortSignal.timeout(3000) })
-    expect(auth.status).toBe(303)
-    const cookie = auth.headers.getSetCookie()[0]!.split(';')[0]!
-    const request = (path: string, init: RequestInit = {}) => fetch(url + path, {
-      signal: AbortSignal.timeout(6000), ...init, headers: { Cookie: cookie, ...init.headers },
-    })
-    const call = (path: string, body?: unknown, method = 'POST') => request(path, {
-      method, ...(body !== undefined && { body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } }),
-    })
-    const pick = async () => {
-      const response = await call('/api/workspaces/pick')
-      expect(response.status).toBe(200)
-      return (await response.json() as { workspaceId: string }).workspaceId
-    }
-    const create = async (workspaceId: string) => {
-      const response = await call('/api/sessions', { workspaceId })
-      expect(response.status).toBe(201)
-      return (await response.json() as SessionSummary).id
-    }
-    const saveKey = async (providerId = 'deepseek') => {
-      expect((await call(`/api/providers/${providerId}`, { apiKey: fixtureKey }, 'PUT')).status).toBe(200)
-    }
-    const snapshot = async (sessionId: string): Promise<ConversationSnapshot> => {
-      const signal = AbortSignal.timeout(3000)
-      const socket = new WebSocket(url.replace('http:', 'ws:') + '/api/events', { headers: { Cookie: cookie } })
-      try {
-        await once(socket, 'open', { signal })
-        const frames = on(socket, 'message', { signal })
-        socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'collaboration' }))
-        for await (const [data] of frames) {
-          const frame = JSON.parse(String(data)) as ServerFrame
-          if (frame.type === 'snapshot') return frame.snapshot
-          if (frame.type === 'subscription_error') throw new Error(frame.error)
-        }
-        throw new Error('会话未发送快照')
-      } finally { socket.terminate() }
-    }
-    const send = (sessionId: string, clientMessageId: string, text = clientMessageId,
-      options: Partial<SubmitMessageRequest> = {}) => call('/api/messages', { sessionId, clientMessageId, text, ...deepseek, ...options })
-    const accept = async (...args: Parameters<typeof send>) => {
-      const res = await send(...args)
-      const receipt = await res.json() as { kind: string; clientMessageId: string; userMessageId?: string }
-      expect(res.status, JSON.stringify(receipt)).toBe(202)
-      return receipt
-    }
-    const queue = (sessionId: string, clientMessageId: string, action?: { action: 'edit'; text: string } | { action: 'steer' }) =>
-      call(`/api/sessions/${sessionId}/queue/${clientMessageId}`, action, action ? 'PATCH' : 'DELETE')
-    return { child, request, call, pick, create, saveKey, snapshot, accept, queue }
-  }
-  return { directory, provider, requestNumber, start }
-}
-
-type Exchange = Awaited<ReturnType<typeof startModelServer>>['exchanges'][number]
-function finish(exchange: Exchange, content = '已完成。') {
-  exchange.delta({ role: 'assistant', content })
-  exchange.finish()
-}
-function toolCall(exchange: Exchange, name: string, args: object) {
-  exchange.delta({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${name}`, type: 'function',
-    function: { name, arguments: JSON.stringify(args) } }] })
-  exchange.finish('tool_calls')
-}
-function userTexts(exchange: Exchange) {
-  return exchange.body.messages.filter(message => message.role === 'user').map(message => message.content)
-}
 const queueIds = (snapshot: ConversationSnapshot) => snapshot.interaction?.queue.items.map(item => item.clientMessageId)
 
 it('03 拒绝编辑图片队列项，按编号删除后只启动其余条目', async () => {
@@ -499,4 +395,37 @@ it('图片队列不转入仍用纯文本模型的当前任务', async () => {
   expect(JSON.stringify(userTexts(next).at(-1))).toContain('带图下一轮')
   finish(next)
   await vi.waitFor(async () => expect((await app.snapshot(id)).running).toBeNull())
+}, 15000)
+
+it('Feature 12 前台委派等待独立子会话，回填真实答复并可从原历史续办', async () => {
+  const { requestNumber, provider, start } = await fixture()
+  const app = await start()
+  await app.saveKey()
+  const id = await app.create(await app.pick())
+  await app.accept(id, 'parent', '交给 reviewer 一项任务')
+  const first = await requestNumber(1)
+  expect(JSON.stringify(first.body.tools)).toContain('"name":"subagent"')
+  toolCall(first, 'subagent', { action: 'run', name: 'reviewer', task: '检查 login-v2', background: false })
+  const child = await requestNumber(2)
+  expect(userTexts(child).at(-1)).toBe('Task: 检查 login-v2')
+  expect(JSON.stringify(child.body.tools)).toContain('"name":"team"')
+  expect(JSON.stringify(child.body.tools)).not.toContain('"name":"subagent"')
+  const running = (await app.snapshot(id)).subagents?.[0]
+  expect(running).toMatchObject({ name: 'reviewer', status: 'running' })
+  expect(provider.exchanges).toHaveLength(2)
+  finish(child, '缺少 login-v2 的超时测试')
+  const firstReturn = await requestNumber(3)
+  expect(firstReturn.body.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'call-subagent' })
+  expect(JSON.stringify(firstReturn.body.messages.at(-1))).toContain('缺少 login-v2 的超时测试')
+  toolCall(firstReturn, 'subagent', { action: 'continue', sessionId: running?.sessionId, message: '解释发现', background: false })
+  const resumed = await requestNumber(4)
+  expect(JSON.stringify(resumed.body.messages)).toContain('缺少 login-v2 的超时测试')
+  expect(String(userTexts(resumed).at(-1))).toContain('解释发现')
+  finish(resumed, '应当断言超时错误')
+  finish(await requestNumber(5))
+  await vi.waitFor(async () => {
+    expect((await app.snapshot(id)).subagents?.[0]).toMatchObject({ sessionId: running?.sessionId, status: 'completed' })
+    expect((await app.snapshot(id)).running).toBeNull()
+  })
+  expect(await (await app.request('/api/sessions')).json()).toMatchObject({ sessions: [{ id }] })
 }, 15000)

@@ -28,3 +28,31 @@ test('迁移旧登记后保留编号，允许多个目录并发去重和重启�
     await expect(restarted.resolveDirectory(id)).rejects.toBeInstanceOf(WorkspaceBindingError)
   } finally { await rm(temp, { recursive: true, force: true }) }
 })
+
+test('项目角色默认关闭，重新读取工作区设置并在重复登记后保留原授权', async () => {
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'agent-learning-workspaces-')))
+  try {
+    const path = join(temp, 'workspace'), other = join(temp, 'other'), file = join(temp, 'workspaces.json')
+    await Promise.all([mkdir(path), mkdir(other)])
+    const workspaces = new Workspaces(file)
+    const { workspaceId: id } = await workspaces.register(path)
+    expect(await workspaces.getProjectAgentsEnabled(id)).toBe(false)
+    expect(await workspaces.getProjectAgentsEnabled('missing')).toBe(false)
+
+    const save = (projectAgentsEnabled: unknown) => writeFile(file, JSON.stringify({
+      workspaces: [{ id, path, projectAgentsEnabled }],
+    }))
+    await save(true)
+    expect(await workspaces.getProjectAgentsEnabled(id)).toBe(true)
+    expect(await workspaces.register(path)).toMatchObject({ workspaceId: id, created: false })
+    await workspaces.register(other)
+    expect(await new Workspaces(file).getProjectAgentsEnabled(id)).toBe(true)
+
+    await save('true')
+    expect(await workspaces.getProjectAgentsEnabled(id)).toBe(false)
+    await save(false)
+    expect(await workspaces.getProjectAgentsEnabled(id)).toBe(false)
+    await save(undefined)
+    expect(await workspaces.getProjectAgentsEnabled(id)).toBe(false)
+  } finally { await rm(temp, { recursive: true, force: true }) }
+})

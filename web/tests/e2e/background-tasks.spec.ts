@@ -73,8 +73,8 @@ for (const mode of ['node', 'vite'] as const) test(`${mode} 后台任务卡片�
     })
 
     await switchTo(a.id)
-    const trigger = page.getByRole('button', { name: '后台任务', exact: true })
-    const panel = page.getByRole('region', { name: '后台任务', exact: true })
+    const trigger = page.getByRole('button', { name: '任务', exact: true })
+    const panel = page.getByRole('region', { name: '任务', exact: true })
     await trigger.click()
     await expect(panel.getByRole('listitem')).toHaveCount(2)
     holdA = true

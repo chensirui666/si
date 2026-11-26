@@ -37,12 +37,13 @@ function ProcessGroup({ running, run, children }: { running: boolean; run?: RunR
   </details>
 }
 
-function ToolBlock({ block, argumentsText, running, executing, result, stopped, failure, unknown, unsaved }: {
+function ToolBlock({ block, argumentsText, running, executing, result, completedOutput, stopped, failure, unknown, unsaved }: {
   block: ToolCall
   argumentsText?: string
   running: boolean
   executing: boolean
   result?: ConversationMessage
+  completedOutput?: string
   stopped: boolean
   failure?: string
   unknown?: boolean
@@ -50,7 +51,8 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
 }) {
   const { t } = useTranslation()
   const targetKey = Object.hasOwn(toolTargets, block.name) ? toolTargets[block.name] : undefined
-  const action = targetKey ? t(`tool.${block.name}`) : block.name || t('tool.call')
+  const action = targetKey ? t(`tool.${block.name}`)
+    : block.name === 'subagent' ? `${t('tool.call')} · ${block.name}` : block.name || t('tool.call')
   const target = targetKey ? block.arguments[targetKey] : undefined
   const firstUrl = Array.isArray(target) ? target.find(value => typeof value === 'string') : undefined
   const label = typeof target === 'string' ? target : firstUrl
@@ -62,7 +64,8 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
   const state: ToolState = outcome ? ['permission_denied', 'hook_blocked'].includes(result?.toolErrorCode ?? '') ? 'denied'
     : result?.toolErrorCode === 'interrupted' ? 'stopped' : outcome.isError ? 'error' : 'ok'
     : executing ? 'running' : unknown ? 'unknown' : stopped ? 'stopped' : failure ? 'error' : running ? 'preparing' : 'error'
-  const reason = outcome || state === 'preparing' || state === 'running' ? undefined
+  const output = completedOutput ?? outcome?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n')
+  const reason = output !== undefined || state === 'preparing' || state === 'running' ? undefined
     : state === 'unknown' ? t('tool.noSavedResult')
     : state === 'stopped' ? t('tool.cancelled')
     : failure ?? t('tool.noResult')
@@ -76,21 +79,22 @@ function ToolBlock({ block, argumentsText, running, executing, result, stopped, 
       <pre>{argumentsText ?? JSON.stringify(block.arguments, null, 2)}</pre>
       {block.argumentsError && <p className="message-error">{block.argumentsError}</p>}
       {reason && <p className="message-error">{reason}</p>}
-      {outcome && <>
+      {output !== undefined && <>
         <div className="tool-detail-label">{t('tool.result')}</div>
-        <pre className="tool-result">{outcome.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n')}</pre>
+        <pre className="tool-result">{output}</pre>
       </>}
     </div>
   </details>
 }
 
-export function AssistantMessage({ messages, activeContent = [], running = null, run, showRetry = true, toolResults, toolQuestions, onOpenQuestion, restored, saveFailure }: {
+export function AssistantMessage({ messages, activeContent = [], running = null, run, showRetry = true, toolResults, completedOutputs, toolQuestions, onOpenQuestion, restored, saveFailure }: {
   messages: readonly AssistantEntry[]
   activeContent?: readonly ActiveContent[]
   running?: Extract<RunningState, { kind: 'task' }> | null
   run?: RunRecord
   showRetry?: boolean
   toolResults?: ToolResults
+  completedOutputs?: ReadonlyMap<string, ReadonlyMap<number, string>>
   toolQuestions?: ToolQuestions
   onOpenQuestion?: (batch: UserQuestionBatch) => void
   restored?: true
@@ -158,7 +162,7 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
           unsaved={unsaved?.assistantMessageId === id && unsaved.contentIndex === index ? saveFailure?.reason : undefined}
           stopped={!running && terminal?.stopReason === 'aborted'}
           failure={message.stopReason === 'length' ? t('tool.truncated') : !running && terminal?.stopReason === 'error' ? t('tool.taskFailed') : undefined}
-          result={result} />)
+          result={result} completedOutput={block.name === 'subagent' ? completedOutputs?.get(id)?.get(index) : undefined} />)
       }
     })
     const recoveringOverflow = message.errorCode === 'context_overflow' && !message.failure && (message !== last || running)

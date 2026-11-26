@@ -3,7 +3,7 @@ import type { AssistantMessage, JsonObject, ModelContext, ModelEvent, ModelInfo,
 export type ExecutableTool = Tool & {
   executionMode?: 'parallel' | 'sequential'
   validateArguments?(arguments_: JsonObject): boolean
-  execute(arguments_: JsonObject, context: { signal: AbortSignal; toolCallId: string; recordDetails(details: unknown): void }):
+  execute(arguments_: JsonObject, context: { signal: AbortSignal; toolCallId: string; contentIndex: number; recordDetails(details: unknown): void }):
     Promise<string | ToolResultMessage['content'] | Pick<ToolResultMessage, 'content' | 'isError'>>
 }
 

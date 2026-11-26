@@ -1,7 +1,21 @@
 import type { CopyKey } from './en'
 
 export const zh = {
-  'background.title': '后台任务',
+  'background.title': '任务',
+  'background.subagents': '子 Agent',
+  'background.bash': '后台 Bash',
+  'background.completed': '已完成',
+  'background.aborted': '已停止',
+  'background.failed': '失败',
+  'background.interrupted': '已中断',
+  'background.stopAgent': '停止 {{name}}',
+  'background.stopUnconfirmed': '无法确认子任务是否已停止',
+  'chat.stopCommand': '停止当前会话的任务',
+  'chat.stopEmpty': '当前会话已无在途任务。',
+  'chat.stopStopped': '已停止 {{count}} 项',
+  'chat.stopCompleted': '已自然结束 {{count}} 项',
+  'chat.stopUnconfirmed': '{{count}} 项未确认停止',
+  'chat.stopFailed': '停止任务失败',
   'background.stop': '停止',
   'background.running': '运行中',
   'background.stopping': '正在停止',

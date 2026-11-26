@@ -4,7 +4,7 @@ import type { ExtensionMessage } from './extensions/runtime.js'
 import type { SkillInvocation } from './skills.js'
 import type { PermissionMode } from './permissions.js'
 import type { MessageAttachment } from './session-attachments.js'
-import type { InteractionState } from './collaboration.js'
+import type { AgentInputSource, InteractionState } from './collaboration.js'
 import type { SessionReference } from './session-references.js'
 
 export type SubmissionSources = { attachmentIds?: string[]; referenceSessionIds?: string[] }
@@ -27,6 +27,7 @@ export type ConversationMessage = {
   id: string
   clientMessageId?: string
   steering?: true
+  agentSource?: AgentInputSource
   runId?: string
   toolCall?: ToolLocation
   toolErrorCode?: string
@@ -89,7 +90,11 @@ export type ContextUsage = {
 
 export type PlanState = { state: 'planning' } | { state: 'review'; assistantMessageId: string; steps: string[] }
 
-export type ConversationSnapshot = {
+export type SubagentTaskView = { sessionId: string; runId: string; name: string; status: RunRecord['status'] }
+export type DelegationOutputView = { assistantMessageId: string; contentIndex: number; output: string }
+export type SubagentView = { subagents: SubagentTaskView[]; delegationOutputs: DelegationOutputView[] }
+
+export type ConversationSnapshot = Partial<SubagentView> & {
   seq: number
   interaction?: InteractionState
   permissionMode: PermissionMode
@@ -116,6 +121,7 @@ export type ConversationUpdate = {
     | { type: 'plan'; plan: PlanState | null }
     | { type: 'selection'; selection: ModelSelection }
     | { type: 'interaction'; interaction: InteractionState }
+    | ({ type: 'subagents' } & SubagentView)
     | { type: 'accepted'; user: ConversationMessage; steering?: ConversationMessage[]; running: Extract<RunningState, { kind: 'task' }> }
     | { type: 'model'; messageId: string; event: ModelFrame }
     | { type: 'compaction'; record: CompactionRecord; running: RunningState }

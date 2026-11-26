@@ -7,7 +7,7 @@ const questions = [
   { id: 'content', question: '要包括什么？', multi_select: true, options: [{ label: '示例' }] },
   { id: 'notes', question: '还有什么补充？' },
 ]
-const context = { toolCallId: 'call-1', signal: new AbortController().signal, recordDetails() {} }
+const context = { toolCallId: 'call-1', contentIndex: 0, signal: new AbortController().signal, recordDetails() {} }
 
 it('将规范化的整组问题与原调用编号交给会话，返回会话的结果', async () => {
   const tool = createUserQuestionTool(async (request, execution) => {

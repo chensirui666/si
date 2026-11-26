@@ -252,3 +252,24 @@ it('恢复期间只接受当前 Run 的助手消息替换，并原子清除等�
     running: { retry: undefined } })
   expect(state.snapshot).toEqual(snapshot)
 })
+
+it('子任务更新替换状态和显示输出，保留原工具回执并拒绝异常位置', () => {
+  const subagent = { sessionId: 'child-a', runId: 'child-run', name: 'scout', status: 'running' }
+  const receipt = { id: 'receipt', toolCall: { assistantMessageId: 'a', contentIndex: 1 }, message: {
+    role: 'toolResult', toolCallId: 'call', toolName: 'subagent', timestamp: 2, isError: false, content: [{ type: 'text', text: '已接单' }],
+  } }
+  const assistant = { id: 'a', message: { role: 'assistant', api: 'openai-completions', provider: 'deepseek', model: 'deepseek-flash',
+    timestamp: 1, stopReason: 'toolUse', content: [{ type: 'text', text: '开始' }, { type: 'toolCall', id: 'call', name: 'subagent', arguments: {} }],
+  } }
+  const state = applyFrame(initialState, { type: 'snapshot', sessionId, subscriptionId: 'current', snapshot: {
+    ...empty, messages: [assistant, receipt], subagents: [subagent], delegationOutputs: [],
+  } }, 'current').state
+  const change = { type: 'subagents', subagents: [{ ...subagent, status: 'completed' }],
+    delegationOutputs: [{ assistantMessageId: 'a', contentIndex: 1, output: '完成结果' }],
+  }
+  const update = (change: unknown) => applyFrame(state, { type: 'update', sessionId, subscriptionId: 'current', update: { seq: 1, change } }, 'current')
+  const next = update(change)
+  expect(next.resubscribe).toBe(false)
+  expect(next.state.snapshot).toMatchObject({ seq: 1, messages: [assistant, receipt], subagents: change.subagents, delegationOutputs: change.delegationOutputs })
+  expect(update({ ...change, delegationOutputs: [{ ...change.delegationOutputs[0], contentIndex: -1 }] }).resubscribe).toBe(true)
+})

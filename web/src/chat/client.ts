@@ -430,6 +430,17 @@ export const startMcpOAuth = (id: string) =>
 export const cancelMcpOAuth = (id: string, attemptId: string) =>
   requestMcp(`${mcpServerPath(id)}/oauth/${encodeURIComponent(attemptId)}`, (value): value is undefined => value === undefined, { method: 'DELETE' })
 
+export type StopSessionResult = { stopped: number; completed: number; unconfirmed: number }
+export const stopSession = (sessionId: string) => requestView(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, 'chat.stopCommand',
+  (value): value is StopSessionResult => record(value) && [value.stopped, value.completed, value.unconfirmed]
+    .every(count => typeof count === 'number' && Number.isSafeInteger(count) && count >= 0),
+  { method: 'POST', signal: AbortSignal.timeout(30_000) })
+
+export const stopSubagent = (sessionId: string, childId: string, runId: string) => requestView(
+  `/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(childId)}/stop`, 'background.stop',
+  (value): value is { status: string } => record(value) && ['running', 'completed', 'failed', 'aborted', 'interrupted'].includes(value.status as string),
+  { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ runId }), signal: AbortSignal.timeout(30_000) })
+
 export async function abortMessage(input: AbortRequest): Promise<AbortResult> {
   let response: Response
   try { response = await fetch('/api/abort', { method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) }

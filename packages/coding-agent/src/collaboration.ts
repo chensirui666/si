@@ -7,12 +7,21 @@ export type PendingMessage = {
   attachments?: MessageAttachment[]
 }
 
+export type AgentInputSource = {
+  kind: 'steer' | 'report' | 'continue' | 'task'
+  sessionId: string
+  name: string
+}
+
 export type PendingSubmission = {
   input: SubmissionInput
   text: string
-  status: 'queued' | 'steering' | 'deleted' | 'started' | 'delivered'
+  status: 'queued' | 'steering' | 'deleted' | 'started' | 'delivered' | 'undelivered'
   acceptedSeq: number
   steeringSeq?: number
+  agentSource?: AgentInputSource
+  targetRunId?: string
+  waitForUser?: true
   attachments?: MessageAttachment[]
   receipt?: SubmissionAccepted | SubmissionHandled
 }

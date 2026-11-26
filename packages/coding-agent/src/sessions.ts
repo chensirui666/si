@@ -1,11 +1,13 @@
 import { sameSelection, type ModelSelection } from '@agent-learning/model'
 import { randomUUID } from 'node:crypto'
-import { SessionSubmitError, type AgentSession } from './agent-session.js'
+import { SessionSubmitError, AgentSession } from './agent-session.js'
 import { runSelection, submissionReceipt, type SessionPersistence, type SessionStore } from './session-store.js'
 import { planCommandArgument } from './plan-mode.js'
 import type { PermissionMode } from './permissions.js'
 import type { SubmissionAccepted, SubmissionHandled } from './types.js'
 import { sameSubmissionSources } from './types.js'
+import { Subagents, resolveSubagentDirectory } from './subagents.js'
+import type { SubagentSession } from './subagent-types.js'
 
 export type SessionSummary = {
   id: string
@@ -13,6 +15,7 @@ export type SessionSummary = {
   name: string
   createdAt: string
   hasScheduledTask?: boolean
+  subagent?: SubagentSession
 }
 
 type FirstMessage = Parameters<AgentSession['submit']>[0] & { workspaceId: string; draftSessionId?: string }
@@ -24,6 +27,7 @@ export class Sessions<T extends { freezeQueue?: () => void; close?: () => Promis
   private readonly starts = new Map<string, { input: FirstMessage; scheduled: boolean; result: Promise<StartedSession> }>()
   private readonly drafts = new Map<string, { workspaceId: string; pending: Promise<Draft<T>> }>()
   private closing?: Promise<void>
+  readonly subagents?: Subagents
 
   constructor(private readonly options: {
     resolveDirectory(workspaceId: string): Promise<string>
@@ -32,12 +36,41 @@ export class Sessions<T extends { freezeQueue?: () => void; close?: () => Promis
     store?: SessionStore
     closeTools?(): Promise<void>
     onStarted?(): void
-  }) {}
+    subagents?: Pick<ConstructorParameters<typeof Subagents>[0], 'home' | 'models' | 'projectEnabled' | 'stopBash'>
+  }) {
+    if (options.store && options.subagents) this.subagents = new Subagents({
+      ...options.subagents, store: options.store, workspace: id => options.resolveDirectory(id),
+      get: id => {
+        const session = this.get(id)
+        return session instanceof AgentSession ? session : undefined
+      },
+      activeRun: id => {
+        const session = this.sessions.get(id)?.session
+        return session instanceof AgentSession ? session.activeRunId : undefined
+      },
+      members: root => [...this.sessions.values()].filter(({ summary }) =>
+        summary.subagent?.parentSessionId === root).map(({ summary }) => summary.id),
+      create: (summary, permissionMode) => {
+        this.ensureOpen()
+        const session = options.createSession(this.sessionDirectory(summary), {
+          summary, store: options.store!, first: () => summary,
+        }, permissionMode, summary.id)
+        if (!(session instanceof AgentSession)) throw new Error('当前会话不支持子 Agent。')
+        this.sessions.set(summary.id, { summary, session })
+        return session
+      },
+      discard: async id => {
+        const record = this.sessions.get(id)
+        this.sessions.delete(id)
+        await record?.session.close?.()
+      },
+    })
+  }
 
   selectModel(selection: ModelSelection, sessionId?: string) {
     this.ensureOpen()
     if (sessionId) {
-      const session = this.get(sessionId)
+      const session = this.getPublic(sessionId)
       if (!session) return false
       if (!session.selectModel) throw new SessionSubmitError('invalid', '当前会话不支持模型选择')
       const notification = session.selectModel(selection)
@@ -164,6 +197,20 @@ export class Sessions<T extends { freezeQueue?: () => void; close?: () => Promis
     return this.options.store?.listSessions() ?? [...this.sessions.values()].map(({ summary }) => summary)
   }
 
+  getPublic(sessionId: string): T | undefined {
+    const summary = this.sessions.get(sessionId)?.summary ?? this.options.store?.readSessionSummary(sessionId)
+    return summary?.subagent ? undefined : this.get(sessionId)
+  }
+
+  private sessionDirectory(summary: SessionSummary): () => Promise<string> {
+    const cwd = summary.subagent?.cwd
+    return cwd ? async () => {
+      const directory = await resolveSubagentDirectory(cwd)
+      if (directory !== cwd) throw new Error(`子任务工作目录已变更：${cwd}`)
+      return directory
+    } : () => this.options.resolveDirectory(summary.workspaceId)
+  }
+
   get(sessionId: string): T | undefined {
     const cached = this.sessions.get(sessionId)
     if (cached) return cached.session
@@ -171,7 +218,7 @@ export class Sessions<T extends { freezeQueue?: () => void; close?: () => Promis
     const history = store?.loadSession(sessionId)
     if (!store || !history) return undefined
     const { summary } = history
-    const session = this.options.createSession(() => this.options.resolveDirectory(summary.workspaceId), { store, summary, history }, undefined, summary.id)
+    const session = this.options.createSession(this.sessionDirectory(summary), { store, summary, history }, undefined, summary.id)
     this.sessions.set(sessionId, { summary, session })
     void session.initialize?.()?.catch(() => undefined)
     return session
@@ -183,7 +230,9 @@ export class Sessions<T extends { freezeQueue?: () => void; close?: () => Promis
 
   close(): Promise<void> {
     return this.closing ??= Promise.resolve().then(async () => {
+      this.freezeQueues()
       const results = await Promise.allSettled([
+        this.subagents?.close(),
         ...[...this.sessions.values()].map(async ({ session }) => session.close?.()),
         ...[...this.drafts.values()].map(async ({ pending }) => {
           const draft = await pending.catch(() => undefined)

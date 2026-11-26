@@ -432,3 +432,31 @@ it('a new manual run clears the pause left by deleting the previous queue', asyn
     replies[2](text('completed D'))
   } finally { await close() }
 })
+
+it('Feature 12 案例 34 重投同编号插话返回原轮回执且不进入新轮', async () => {
+  const { session, store, summary, requests, replies, close } = await fixture()
+  const source = { kind: 'steer' as const, sessionId: 'scout-id', name: 'scout' }
+  try {
+    const first = await session.submit(input('first'))
+    expect(first.kind).toBe('message')
+    await vi.waitFor(() => expect(replies).toHaveLength(1))
+    const original = session.receiveAgentInput('steer:old-call', source, 'scout 的发现 STEER-34')
+    expect(original).toMatchObject({ status: 'accepted', runId: first.kind === 'message' && first.userMessageId })
+    replies[0]!(text('首轮文字'))
+    await vi.waitFor(() => expect(replies).toHaveLength(2))
+    expect(requests[1]!.messages.filter(message => message.role === 'user' && message.content === 'scout 的发现 STEER-34')).toHaveLength(1)
+    replies[1]!(text('首轮结束'))
+    await vi.waitFor(() => expect(store.loadSession(summary.id)?.runs[0]?.status).toBe('completed'))
+    const next = await session.submit(input('next'))
+    expect(next.kind).toBe('message')
+    await vi.waitFor(() => expect(replies).toHaveLength(3))
+    expect(session.receiveAgentInput('steer:old-call', source, '重复投递，不能重复读')).toEqual(original)
+    replies[2]!(text('新轮结束'))
+    await vi.waitFor(() => expect(store.loadSession(summary.id)?.runs[1]?.status).toBe('completed'))
+    const saved = store.loadSession(summary.id)
+    expect(saved?.pending?.filter(item => item.input.clientMessageId === 'agent:steer:old-call')).toHaveLength(1)
+    expect(saved?.messages.filter(message => message.agentSource?.sessionId === 'scout-id')).toHaveLength(1)
+    expect(requests).toHaveLength(3)
+    expect(JSON.stringify(requests[2]?.messages)).not.toContain('重复投递')
+  } finally { await close() }
+})

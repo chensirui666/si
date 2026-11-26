@@ -48,6 +48,7 @@ type MessageInputProps = {
   action?: 'send' | 'abort' | 'aborting'
   abortDisabled?: boolean
   onAbort?: () => void
+  onStop?: () => boolean
   contextMeter?: ReactNode
   permissionControl?: ReactNode
   footerControl?: ReactNode
@@ -91,9 +92,10 @@ function $writeDraft(text: string) {
 
 const restoreTag = 'restore-session-draft'
 const optionId = (option: string) =>
-  option.startsWith('@') ? `session-option-${option.slice(1)}` : option === '/compact' || option === '/plan'
+  option.startsWith('@') ? `session-option-${option.slice(1)}` : isControl(option)
     ? `${option.slice(1)}-option` : `skill-option-${option.slice(7).trim()}`
-const isControl = (text: string) => ['/compact', '/plan'].includes(text.trim())
+const isControl = (text: string) => ['/compact', '/plan', '/stop'].includes(text.trim())
+const isStopCommand = (text: string) => /^\/stop(?:$|\s)/iu.test(text.trimStart())
 const isPlanCommand = (text: string) => /^\/plan(?:$|\s)/u.test(text.trim())
 const isPlanExit = (text: string) => /^\/plan\s+off$/u.test(text.trim())
 
@@ -115,7 +117,7 @@ export function MessageInput(props: MessageInputProps) {
   )
 }
 
-function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, action = 'send', abortDisabled = false, onAbort, contextMeter, permissionControl, footerControl, commandsEnabled = true, skillWorkspaceId, draft, onDraftChange, editorRef, quote, onRemoveQuote,
+function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, action = 'send', abortDisabled = false, onAbort, onStop, contextMeter, permissionControl, footerControl, commandsEnabled = true, skillWorkspaceId, draft, onDraftChange, editorRef, quote, onRemoveQuote,
   attachments, onAddFiles, hasAttachments = false, attachmentsPending = false, referenceDraft,
   referenceSessions, onSelectReference, onPlan, planActive = false, onExitPlan }: MessageInputProps) {
   const { t } = useTranslation()
@@ -124,9 +126,10 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
   const [inputText, setInputText] = useState(draft?.text ?? '')
   const hasDraft = Boolean(inputText.trim()) || hasAttachments
   const canSend = hasDraft && (!attachmentsPending || isControl(inputText))
-  const canSubmit = isPlanExit(inputText) ? Boolean(onExitPlan) : canSend && !sendDisabled
+  const stopDraft = isStopCommand(inputText)
+  const canSubmit = stopDraft ? Boolean(onStop) : isPlanExit(inputText) ? Boolean(onExitPlan) : canSend && !sendDisabled
     && (action === 'send' || Boolean(activeRunId) && !isControl(inputText) && !isPlanCommand(inputText))
-  const primaryStops = action !== 'send' && (action === 'aborting' || !activeRunId || !hasDraft || sendDisabled && !canSubmit)
+  const primaryStops = !stopDraft && action !== 'send' && (action === 'aborting' || !activeRunId || !hasDraft || sendDisabled && !canSubmit)
   const canAbort = action === 'abort' && !abortDisabled && Boolean(onAbort)
   const placeholder = t(planActive ? 'plan.placeholder' : 'chat.placeholder')
   const draftRevision = useRef(0)
@@ -143,13 +146,14 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
   const canRunCompact = commandsEnabled && !sendDisabled
   const canRunPlan = Boolean(onPlan) && !sendDisabled
   const showCompact = slashMenu && canRunCompact && '/compact'.startsWith(query!)
+  const showStop = slashMenu && Boolean(onStop) && '/stop'.startsWith(query!)
   const showPlan = slashMenu && canRunPlan && '/plan'.startsWith(query!)
   const referenceOptions = query?.startsWith('@') ? (referenceSessions ?? []).filter(session =>
     session.name.toLowerCase().includes(query.slice(1).trim().toLowerCase())) : []
   const skillOptions = !slashMenu ? [] : (currentCatalog?.view?.skills ?? []).filter(skill =>
     `/skill:${skill.name}`.startsWith(query!) || `/${skill.name}`.startsWith(query!))
   const options = referenceMenu ? referenceOptions.map(session => `@${session.id}`)
-    : [...(showCompact ? ['/compact'] : []), ...(showPlan ? ['/plan'] : []), ...skillOptions.map(skill => `/skill:${skill.name} `)]
+    : [...(showCompact ? ['/compact'] : []), ...(showPlan ? ['/plan'] : []), ...(showStop ? ['/stop'] : []), ...skillOptions.map(skill => `/skill:${skill.name} `)]
   const active = options[Math.min(highlight, options.length - 1)]
 
   const dismissedText = useRef<string | undefined>(undefined)
@@ -169,7 +173,7 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
       && selection.anchor.offset === selection.anchor.getNode().getTextContentSize()
     const prefix = text.trimStart().toLowerCase()
     const available = (canRunCompact && '/compact'.startsWith(prefix))
-      || (canRunPlan && '/plan'.startsWith(prefix)) || Boolean(skillWorkspaceId)
+      || (canRunPlan && '/plan'.startsWith(prefix)) || (onStop && '/stop'.startsWith(prefix)) || Boolean(skillWorkspaceId)
     const visible = editor.getRootElement() === document.activeElement && !composingRef.current && !editor.isComposing()
       && dismissedText.current !== text
     const slash = visible && available && /^[ \t]*\/[a-z0-9:-]*$/i.test(text) && atEnd
@@ -180,7 +184,7 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
     menu.current = next
     setQuery(next)
     setHighlight(0)
-  }, [closeMenu, canRunCompact, canRunPlan, editor, skillWorkspaceId, referenceSessions])
+  }, [closeMenu, canRunCompact, canRunPlan, onStop, editor, skillWorkspaceId, referenceSessions])
   const needsCatalog = skillMenu || hasSkillPrefix
   useEffect(() => {
     if (!skillWorkspaceId || !needsCatalog || (!skillMenu && loadedCatalog.current === skillWorkspaceId)) return
@@ -236,14 +240,18 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
     }, { discrete: true, tag: SKIP_SCROLL_INTO_VIEW_TAG })
 
     try {
-      if (isPlanExit(text)) { if (!steer) onExitPlan?.(text); return }
-      if ((isControl(text) || isPlanCommand(text)) && (action !== 'send' || steer)) return
-      if (sendDisabled || !text.trim() && !hasAttachments || attachmentsPending && !isControl(text)) return
-      if (text.trim() === '/plan' && onPlan) {
-        onPlan(text)
-        return
+      if (isStopCommand(text)) {
+        if (steer || composingRef.current || editor.isComposing() || Date.now() < composingUntilRef.current || onStop?.() !== true) return
+      } else {
+        if (isPlanExit(text)) { if (!steer) onExitPlan?.(text); return }
+        if ((isControl(text) || isPlanCommand(text)) && (action !== 'send' || steer)) return
+        if (sendDisabled || !text.trim() && !hasAttachments || attachmentsPending && !isControl(text)) return
+        if (text.trim() === '/plan' && onPlan) {
+          onPlan(text)
+          return
+        }
+        if ((steer ? onSteer?.(text) : onSend(text, restoreDraft)) !== true) return
       }
-      if ((steer ? onSteer?.(text) : onSend(text, restoreDraft)) !== true) return
     } catch (error) {
       // Report receiver errors after Lexical has finished its active update.
       queueMicrotask(() => { throw error })
@@ -264,7 +272,7 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
         editor.getRootElement()?.focus({ preventScroll: true })
       },
     })
-  }, [editor, onPlan, onExitPlan, onSend, onSteer, action, sendDisabled, hasAttachments, attachmentsPending])
+  }, [editor, onPlan, onExitPlan, onSend, onSteer, onStop, action, sendDisabled, hasAttachments, attachmentsPending])
 
   const pickOption = useCallback((option: string) => {
     if (option.startsWith('@')) {
@@ -287,8 +295,8 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
     const current = editor.getEditorState().read($readDraft).trimStart().toLowerCase()
     if (current !== menu.current || !option.startsWith(current)) return
     if (option === '/plan' && canRunPlan) completeCommand('/plan ')
-    if (option === '/compact' && canRunCompact) submit(option)
-  }, [canRunCompact, canRunPlan, completeCommand, editor, submit, referenceSessions, onSelectReference, closeMenu])
+    if (option === '/compact' && canRunCompact || option === '/stop' && onStop) submit(option)
+  }, [canRunCompact, canRunPlan, onStop, completeCommand, editor, submit, referenceSessions, onSelectReference, closeMenu])
 
   useEffect(() => editor.registerUpdateListener(({ editorState, prevEditorState, tags }) => {
     const text = editorState.read($readDraft)
@@ -407,7 +415,7 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
         event.preventDefault()
         if (!event.repeat) {
           const text = $readDraft()
-          if (menu.current && active && !(active === '/plan' && text.trim() === '/plan')) pickOption(active)
+          if (!isStopCommand(text) && menu.current && active && !(active === '/plan' && text.trim() === '/plan')) pickOption(active)
           else submit(text, steer)
         }
         return true
@@ -441,10 +449,11 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
         {!referenceOptions.length && <div className="command-menu-label">{t('chat.referenceEmpty')}</div>}
       </div>}
       {slashMenu && <div className="command-menu" role="listbox" aria-label={t('chat.slashMenu')} id="compact-menu">
-        {(showCompact || showPlan) && <div role="group" aria-label={t('chat.commands')}>
+        {(showCompact || showPlan || showStop) && <div role="group" aria-label={t('chat.commands')}>
           <div className="command-menu-label">{t('chat.commands')}</div>
           {showCompact && renderOption('/compact', <><span>/compact</span><span>{t('chat.compactCommand')}</span></>)}
           {showPlan && renderOption('/plan', <><span>/plan</span><span>{t('plan.command')}</span></>)}
+          {showStop && renderOption('/stop', <><span>/stop</span><span>{t('chat.stopCommand')}</span></>)}
         </div>}
         {skillMenu && <div role="group" aria-label={t('chat.skills')}>
           <div className="command-menu-label">{t('chat.skills')}</div>
@@ -475,7 +484,7 @@ function Composer({ onSend, onSteer, activeRunId, hidden = false, sendDisabled, 
             onKeyDownCapture={event => { if (event.key !== 'Escape') firstEscape.current = undefined }}
             aria-controls={referenceMenu ? 'reference-menu' : slashMenu ? 'compact-menu' : undefined}
             aria-activedescendant={menuOpen && active ? optionId(active) : undefined}
-            aria-autocomplete={commandsEnabled || skillWorkspaceId || referenceSessions ? 'list' : undefined}
+            aria-autocomplete={commandsEnabled || onStop || skillWorkspaceId || referenceSessions ? 'list' : undefined}
             aria-placeholder={placeholder}
             placeholder={<div className="message-placeholder">{placeholder}</div>}
           />

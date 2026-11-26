@@ -51,12 +51,13 @@ export function buildSystemPrompt(cwd: string, tools: readonly CodingTool[], doc
     '- 处理文件时，清楚地写出文件路径。',
   ].filter(Boolean).join('\n')
   const docs = documentationRoot && names.has('read') ? `<docs>
-SI 文档（用户询问 SI 本身，或要求创建、修改 Skill 时查阅）
+SI 文档（用户询问 SI 本身，或要求创建、修改 Skill${names.has('subagent') ? ' 或子 Agent 角色' : ''}时查阅）
 - 主文档：${join(documentationRoot, 'README.md')}
 - 补充文档位于 ${join(documentationRoot, 'docs')}。
 - 从 SI 应用目录定位文档。文档里的相对链接以该文档所在目录为起点。
 - 启动、模型配置、工作区、网页工具、中止和对话压缩见主文档。页面操作和开发校验见 ${join(documentationRoot, 'web', 'README.md')}。Skill 规则见 ${join(documentationRoot, 'docs', 'skills.md')}。
-- 创建或修改 Skill 前，先用 read 完整阅读 Skill 规则文档，并查阅其中与本次任务有关的引用。个人 Skill 目录是 ${JSON.stringify(join(skillHome, '.si', 'skills'))}。
+- 创建或修改 Skill 前，先用 read 完整阅读 Skill 规则文档，并查阅其中与本次任务有关的引用。个人 Skill 目录是 ${JSON.stringify(join(skillHome, '.si', 'skills'))}。${names.has('subagent') ? `
+- 创建或修改子 Agent 角色前，先用 read 完整阅读 ${join(documentationRoot, 'docs', 'subagents.md')}。个人角色目录是 ${JSON.stringify(join(skillHome, '.si', 'agents'))}。` : ''}
 </docs>` : ''
 
   const visibleSkills = names.has('read') ? skills.filter(skill => !skill.disableModelInvocation) : []

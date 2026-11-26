@@ -234,9 +234,14 @@ export class WebServer {
     return new Sessions<SessionTarget>({
       resolveDirectory: id => this.workspaces.resolveDirectory(id),
       store: this.store,
+      ...(!this.options.createSession && { subagents: {
+        home: this.options.skillHome, models: () => this.modelDiscovery(),
+        projectEnabled: id => this.workspaces.getProjectAgentsEnabled(id),
+        stopBash: ids => runtime.stopSessionJobs(ids),
+      } }),
       getDefaultPermissionMode: () => this.readDefaultPermissionMode(),
       createSession: this.options.createSession ?? ((resolveDirectory, persistence, permissionMode, sessionId) => new AgentSession({
-        resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd, persistence?.summary.id ?? sessionId), compaction: this.options.compaction,
+        resolveDirectory, persistence, permissionMode, sessionId, extensions, stream, subagents: () => this.sessions.subagents, discoverModels: () => this.modelDiscovery(), tools: cwd => createTools(runtime, webTools, cwd, persistence?.summary.id ?? sessionId), compaction: this.options.compaction,
         mcp: this.mcp, questionWait: () => this.readQuestionWaitSettings(),
         memory: {
           store: this.memoryStore,
@@ -338,6 +343,7 @@ export class WebServer {
         await this.scheduleRunner.start()
       }
       if (this.server !== server) throw new Error('服务启动已取消')
+      this.sessions.subagents?.recover()
       return { url, authUrl: this.auth.authenticatedUrl(url), ...(this.options.devOrigin ? { devAuthUrl: this.auth.authenticatedUrl(this.options.devOrigin + '/auth') } : {}) }
     } catch (error) {
       if (this.server === server) await this.close()
@@ -354,7 +360,7 @@ export class WebServer {
     if (submission.modelSelection && submission.permissionMode) return submission
 
     const reuse = submission.sessionId !== run.id
-    const target = reuse ? this.sessions.get(submission.sessionId) : undefined
+    const target = reuse ? this.sessions.getPublic(submission.sessionId) : undefined
     if (reuse && !target?.getScheduledSettings) throw new InputError(404, '原会话已不可用')
     const settings = target?.getScheduledSettings?.()
     const modelSelection = settings?.modelSelection ?? (await this.modelDiscovery()).defaultSelection
@@ -377,7 +383,7 @@ export class WebServer {
       if (!('session' in result)) throw new InputError(409, '会话未接收定时任务')
       return
     }
-    const target = this.sessions.get(sessionId)
+    const target = this.sessions.getPublic(sessionId)
     if (!target) throw new InputError(404, '原会话已不可用')
     const result = await submit(target)
     if (result.kind === 'handled') throw new InputError(409, '会话未接收定时任务')
@@ -638,6 +644,28 @@ export class WebServer {
       await this.handleWebSettings(req, res, webProvider)
       return
     }
+    const stopTask = /^\/api\/sessions\/([^/]+)(?:\/subagents\/([^/]+))?\/stop$/.exec(url.pathname)
+    if (stopTask && req.method === 'POST') {
+      try {
+        const sessionId = checkedPathId(stopTask[1]!)
+        this.target(sessionId)
+        const subagents = this.sessions.subagents
+        if (!subagents) throw new InputError(503, '任务停止服务不可用')
+        if (!stopTask[2]) {
+          this.json(res, 200, await subagents.stopAll(sessionId))
+        } else {
+          const id = checkedPathId(stopTask[2])
+          const input = await readJson(req)
+          if (!isSettingsObject(input) || Object.keys(input).length !== 1 || !validId(input.runId)) {
+            throw new InputError(400, '请提交有效的运行编号')
+          }
+          const result = await subagents.stopChild(sessionId, id, input.runId)
+          if (!result) throw new InputError(404, '所选子任务已不可用')
+          this.json(res, 200, result)
+        }
+      } catch (error) { this.sessionError(res, error, '停止暂时不可用，请重新同步会话后重试') }
+      return
+    }
     if (url.pathname === '/api/abort' && req.method === 'POST') {
       try {
         const input = await readJson(req)
@@ -699,7 +727,7 @@ export class WebServer {
   }
   private target(id: string): SessionTarget {
     if (this.closing) throw new InputError(503, '服务正在关闭')
-    const session = this.sessions.get(id)
+    const session = this.sessions.getPublic(id)
     if (!session) throw new InputError(404, '会话已不可用')
     return session
   }
@@ -1024,7 +1052,7 @@ export class WebServer {
         try {
           await this.sends.get(client)
           if (signal.aborted) return
-          const session = this.sessions.get(sessionId)
+          const session = this.sessions.getPublic(sessionId)
           if (!session) { await send({ type: 'subscription_error', error: '会话已不可用' }); return }
           for await (const event of session.subscribe(signal)) {
             if (signal.aborted) break

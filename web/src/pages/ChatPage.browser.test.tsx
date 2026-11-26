@@ -407,7 +407,7 @@ test('消息区键盘焦点使用固定局部标记，滚动和高对比度下�
   const frame = page.locator('.chat-main-frame')
   const scroll = page.locator('.chat-main')
   const title = page.getByRole('heading', { name: '会话 1' })
-  const tasks = page.getByRole('button', { name: '后台任务', exact: true })
+  const tasks = page.getByRole('button', { name: '任务', exact: true })
   await expect(title).toHaveCSS('font-size', '16px')
   await expect(tasks).toHaveText('')
   const taskIcon = tasks.locator('svg')
@@ -1446,4 +1446,111 @@ test('定时任务记住所选会话，行尾菜单只显示管理操作', async
   await expect(deleteDialog).toBeHidden()
   await expect(page.getByRole('button', { name: '展开侧边栏' })).toBeFocused()
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375)
+})
+
+for (const method of ['Tab', '点击命令', 'Enter'] as const) {
+  test(`忙碌会话用 ${method} 提交 /stop，正文不进入聊天或队列`, async ({ mount, page }) => {
+    let stops = 0
+    const submitted: unknown[] = []
+    await page.route('**/api/messages', async route => {
+      submitted.push(route.request().postDataJSON())
+      await route.fulfill({ status: 500 })
+    })
+    await page.route('**/api/sessions/session-a/stop', async route => {
+      expect(route.request().method()).toBe('POST')
+      stops++
+      await route.fulfill({ json: { stopped: 1, completed: 0, unconfirmed: 0 } })
+    })
+    await page.route('**/api/workspaces/workspace-1/skills', route => route.fulfill({ json: { complete: true, skills: [] } }))
+    await mount(<ChatPageHarness messages={['在途任务']} modelConfigured />)
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null, snapshot: { seq: 1, permissionMode: 'normal', messages: [],
+        running: { kind: 'task', runId: 'active-run', phase: 'requesting', activeTools: [] }, compactions: [], contextUsage: null, activeContent: [] },
+    } })))
+    await expect(page.getByRole('button', { name: '中止', exact: true })).toBeEnabled()
+    const editor = page.getByRole('textbox', { name: '消息', exact: true })
+    if (method === 'Enter') {
+      await editor.fill('/stop 然后改 README')
+      await editor.dispatchEvent('compositionstart')
+      await editor.press('Enter')
+      await expect(editor).toHaveText('/stop 然后改 README')
+      expect(stops).toBe(0)
+      await editor.dispatchEvent('compositionend')
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+      await editor.press('Enter')
+    } else {
+      await editor.pressSequentially('/st')
+      const option = page.getByRole('option', { name: /\/stop/ })
+      await expect(option).toHaveAttribute('aria-selected', 'true')
+      if (method === 'Tab') await editor.press('Tab')
+      else await option.click()
+    }
+    await expect(page.getByRole('status').filter({ hasText: '已停止 1 项' })).toBeVisible()
+    await expect(editor).toHaveText('')
+    expect(stops).toBe(1)
+    expect(submitted).toEqual([])
+    await expect(page.getByText('然后改 README')).toHaveCount(0)
+  })
+}
+
+test('普通问题中提到 /stop 时把原文交给聊天', async ({ mount, page }) => {
+  const submitted: unknown[] = []
+  let stops = 0
+  await page.route('**/api/messages', async route => {
+    submitted.push(route.request().postDataJSON())
+    await route.fulfill({ status: 500 })
+  })
+  await page.route('**/api/sessions/session-a/stop', async route => {
+    stops++
+    await route.fulfill({ json: { stopped: 0, completed: 0, unconfirmed: 0 } })
+  })
+  await mount(<ChatPageHarness messages={['历史']} modelConfigured />)
+  const editor = page.getByRole('textbox', { name: '消息', exact: true })
+  await expect(page.getByText('历史', { exact: true })).toBeVisible()
+  await editor.fill('解释 /stop 怎么用')
+  await editor.press('Enter')
+  await expect.poll(() => submitted).toMatchObject([{ sessionId: 'session-a', text: '解释 /stop 怎么用' }])
+  expect(stops).toBe(0)
+})
+
+test('子 Agent 停止请求携带卡片所见轮次，等待服务端更新后显示已停止', async ({ mount, page }) => {
+  let finishStop!: () => void
+  const stopGate = new Promise<void>(resolve => { finishStop = resolve })
+  let stopBody: unknown
+  await page.route('**/api/sessions/session-a/subagents/child-a/stop', async route => {
+    stopBody = route.request().postDataJSON()
+    await stopGate
+    await route.fulfill({ json: { status: 'aborted' } })
+  })
+  await page.route('**/api/sessions/session-a/jobs', route => route.fulfill({ json: { sessionId: 'session-a', jobs: [] } }))
+  await mount(<ChatPageHarness messages={['历史']} modelConfigured />)
+  const update = (status: 'running' | 'aborted') => page.evaluate(status => {
+    window.dispatchEvent(new CustomEvent('chat-test-state', { detail: {
+      connection: 'ready', slow: false, error: null, snapshot: { seq: status === 'running' ? 1 : 2, permissionMode: 'normal',
+        messages: [], running: null, compactions: [], contextUsage: null, activeContent: [],
+        subagents: [{ sessionId: 'child-a', runId: 'seen-run', name: 'A', status },
+          { sessionId: 'child-b', runId: 'other-run', name: 'B', status: 'running' }] },
+    } }))
+  }, status)
+  try {
+    await update('running')
+    await page.getByRole('button', { name: '任务', exact: true }).click()
+    const panel = page.getByRole('region', { name: '任务', exact: true })
+    const stopA = panel.getByRole('button', { name: '停止 A', exact: true })
+    const stopB = panel.getByRole('button', { name: '停止 B', exact: true })
+    await stopA.focus()
+    await expect(page.getByRole('tooltip')).toHaveText('停止')
+    await stopA.click()
+    await expect.poll(() => stopBody).toEqual({ runId: 'seen-run' })
+    await expect(stopA).toBeDisabled()
+    await expect(stopB).toBeEnabled()
+    const stopped = page.waitForResponse('**/api/sessions/session-a/subagents/child-a/stop')
+    finishStop()
+    await stopped
+    await update('aborted')
+    await expect(panel.getByText('已停止', { exact: true })).toBeVisible()
+    await expect(stopB).toBeEnabled()
+  } finally {
+    finishStop()
+  }
 })

@@ -254,11 +254,27 @@ function saveFailure(value: unknown): value is SaveFailure {
     && (value.toolCall === undefined || value.stage === 'tool-result' && toolPosition(value.toolCall))
 }
 
+function subagents(value: unknown): value is NonNullable<ConversationSnapshot['subagents']> {
+  return Array.isArray(value) && value.every(child => record(child)
+    && typeof child.sessionId === 'string' && child.sessionId !== '' && typeof child.runId === 'string' && child.runId !== ''
+    && typeof child.name === 'string' && child.name !== ''
+    && ['running', 'completed', 'failed', 'aborted', 'interrupted'].includes(child.status as string))
+    && new Set(value.map(child => child.sessionId)).size === value.length
+}
+
+function delegationOutputs(value: unknown): value is NonNullable<ConversationSnapshot['delegationOutputs']> {
+  return Array.isArray(value) && value.every(output => record(output)
+    && typeof output.assistantMessageId === 'string' && output.assistantMessageId !== ''
+    && sequence(output.contentIndex) && typeof output.output === 'string')
+}
+
 function validSnapshot(value: unknown): value is ConversationSnapshot {
   return record(value) && sequence(value.seq) && isPermissionMode(value.permissionMode) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
     && (value.modelSelection === undefined || modelSelection(value.modelSelection))
     && (value.plan === undefined || planState(value.plan))
     && (value.interaction === undefined || interactionState(value.interaction))
+    && (value.subagents === undefined || subagents(value.subagents))
+    && (value.delegationOutputs === undefined || delegationOutputs(value.delegationOutputs))
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
     && value.activeContent.every(activeBlock)
     && Array.isArray(value.compactions) && value.compactions.every(compactionRecord)
@@ -324,6 +340,13 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
     if (!interactionState(change.interaction)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: {
       ...state.snapshot, ...metadata, seq: frame.update.seq, interaction: change.interaction, contextUsage: capacity,
+    } }, resubscribe: false }
+  }
+  if (change.type === 'subagents') {
+    if (!subagents(change.subagents) || !delegationOutputs(change.delegationOutputs)) return { state, resubscribe: true }
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, ...metadata, seq: frame.update.seq, contextUsage: capacity,
+      subagents: change.subagents, delegationOutputs: change.delegationOutputs,
     } }, resubscribe: false }
   }
   if (change.type === 'model') {

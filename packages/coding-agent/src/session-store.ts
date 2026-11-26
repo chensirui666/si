@@ -9,12 +9,14 @@ import type { McpToolCatalog, McpToolIdentity } from './mcp/manager.js'
 import { planCommandArgument } from './plan-mode.js'
 import { skillCommand } from './skills.js'
 import { ATTACHMENT_TTL_MS, type AttachmentScope, type MessageAttachment, type StagedAttachment } from './session-attachments.js'
-import type { PendingSubmission, UserQuestionBatch } from './collaboration.js'
+import type { AgentInputSource, PendingSubmission, UserQuestionBatch } from './collaboration.js'
 import { ASK_USER_QUESTION_TOOL_NAME } from './user-question-tool.js'
 import type { ReferenceSource } from './session-references.js'
 import { numberedSessionTitle, temporarySessionTitle } from './session-title.js'
 import type { CompactionRecord, ConversationMessage, PlanState, RunRecord, SubmissionAccepted, SubmissionInput } from './types.js'
 import { scheduleSchema, ScheduleStore, type ScheduledSubmission } from './schedule-store.js'
+import { readSubagent, subagentSchema, SubagentStore } from './subagent-store.js'
+import type { DelegatedItemWrite, Delegation } from './subagent-types.js'
 
 export type StoredRun = Omit<RunRecord, 'restored'> & {
   text: string; finalText?: string; acceptedSeq: number; firstPermissionMode?: PermissionMode; approvedPlanId?: string
@@ -56,6 +58,7 @@ type SessionWrite = {
   planCommand?: SubmissionInput
   defaultSelection?: ModelSelection
   scheduledSubmission?: ScheduledSubmission
+  delegatedItem?: DelegatedItemWrite
 }
 type Row = Record<string, SQLOutputValue>
 
@@ -107,6 +110,7 @@ const schema = `
     id TEXT NOT NULL, client_id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
     UNIQUE(session_id, id), UNIQUE(session_id, client_id)
   ) STRICT;
+  CREATE INDEX IF NOT EXISTS runs_session_seq ON runs(session_id, seq);
   CREATE TABLE IF NOT EXISTS messages (
     seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL,
     id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
@@ -150,6 +154,7 @@ const schema = `
     FOREIGN KEY(session_id, assistant_message_id) REFERENCES messages(session_id, id)
   ) STRICT;
   ${scheduleSchema}
+  ${subagentSchema}
 `
 
 function sqliteCode(error: unknown): number | undefined {
@@ -181,20 +186,28 @@ function parse<T extends { id: string }>(row: Row): T {
   return value
 }
 
+function validAgentInputSource(source: AgentInputSource | undefined): boolean {
+  return source === undefined || Boolean(source && ['steer', 'report', 'continue', 'task'].includes(source.kind)
+    && typeof source.sessionId === 'string' && source.sessionId && typeof source.name === 'string' && source.name)
+}
+
 function summaryFrom(row: Row): SessionSummary {
   const { id, workspaceId, name, createdAt } = row
   if (typeof id !== 'string' || !id || typeof workspaceId !== 'string' || !workspaceId
     || typeof name !== 'string' || !name || typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))) {
     throw new Error('Invalid session summary')
   }
-  return { id, workspaceId, name, createdAt, ...(row.hasScheduledTask === 1 && { hasScheduledTask: true }) }
+  const subagent = typeof row.subagentData === 'string' ? readSubagent(row.subagentData, String(row.parent_session_id)) : undefined
+  return { id, workspaceId, name, createdAt, ...(row.hasScheduledTask === 1 && { hasScheduledTask: true }), ...(subagent && { subagent }) }
 }
 
 export class SessionStore {
   private uncertain = false
   readonly schedules: ScheduleStore
+  private readonly subagents: SubagentStore
 
   private constructor(private readonly db: DatabaseSync) {
+    this.subagents = new SubagentStore(db)
     this.schedules = new ScheduleStore(db, operation => this.write(operation), () => {
       if (this.uncertain) throw new SessionReadError('定时任务保存状态未确认，请重启服务后核对')
     })
@@ -230,11 +243,12 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, pending, questions, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand, scheduledSubmission }: SessionWrite) {
+  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, pending, questions, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand, scheduledSubmission, delegatedItem }: SessionWrite) {
     return this.write(() => {
       if (summary) {
         this.db.prepare('INSERT INTO sessions (id, workspaceId, name, createdAt) VALUES (?, ?, ?, ?)')
           .run(summary.id, summary.workspaceId, summary.name, summary.createdAt)
+        if (summary.subagent) this.subagents.saveSession(summary.id, summary.subagent)
       }
       const renamed = name && this.db.prepare('UPDATE sessions SET name = ? WHERE id = ? AND name = ?')
         .run(name.value, sessionId, name.expected).changes === 1
@@ -260,6 +274,10 @@ export class SessionStore {
       if (messages?.length) {
         const insert = this.db.prepare('INSERT INTO messages (session_id, run_id, id, data) VALUES (?, ?, ?, ?)')
         for (const message of messages) insert.run(sessionId, runId!, message.id, JSON.stringify(storedMessage(message)))
+      }
+      if (delegatedItem) {
+        if (!run || run.id !== runId || run.sessionId !== sessionId) throw new Error('Invalid delegated run')
+        this.subagents.writeItem(delegatedItem, run)
       }
       if (scheduledSubmission) {
         if (!run?.scheduledRunId || run.id !== runId || run.sessionId !== scheduledSubmission.sessionId) throw new Error('无效的定时执行关联')
@@ -435,16 +453,67 @@ export class SessionStore {
       return this.db.prepare(`SELECT s.*, EXISTS (
         SELECT 1 FROM schedules p WHERE p.session_id = s.id AND p.deleted = 0
           AND p.status = 'enabled' AND p.session_mode = 'reuse' AND p.next_run_at IS NOT NULL
-      ) AS hasScheduledTask FROM sessions s ORDER BY s.rowid`).all().map(summaryFrom)
+      ) AS hasScheduledTask FROM sessions s
+      WHERE NOT EXISTS (SELECT 1 FROM subagent_sessions WHERE session_id = s.id) ORDER BY s.rowid`).all().map(summaryFrom)
     } catch (error) { throw new SessionReadError('无法读取会话列表，请重试', { cause: error }) }
   }
 
   readSessionSummary(id: string): SessionSummary | undefined {
     try {
       if (this.uncertain) throw new Error('Commit state unknown')
-      const row = this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id)
+      const row = this.db.prepare(`SELECT s.*, c.parent_session_id, c.data AS subagentData FROM sessions s
+        LEFT JOIN subagent_sessions c ON c.session_id = s.id WHERE s.id = ?`).get(id)
       return row ? summaryFrom(row) : undefined
     } catch (error) { throw new SessionReadError('无法读取会话信息，请重试', { cause: error }) }
+  }
+
+  listSubagents(parentSessionId: string): SessionSummary[] {
+    try {
+      if (this.uncertain) throw new Error('Commit state unknown')
+      return this.db.prepare(`SELECT s.*, c.parent_session_id, c.data AS subagentData FROM subagent_sessions c
+        JOIN sessions s ON s.id = c.session_id WHERE c.parent_session_id = ? ORDER BY s.rowid`).all(parentSessionId).map(summaryFrom)
+    } catch (error) { throw new SessionReadError('无法读取子会话列表，请重试', { cause: error }) }
+  }
+
+  readSubagentRun(sessionId: string, runId?: string): StoredRun | undefined {
+    try {
+      if (this.uncertain) throw new Error('Commit state unknown')
+      const row = runId === undefined
+        ? this.db.prepare('SELECT id, data FROM runs WHERE session_id = ? ORDER BY seq DESC LIMIT 1').get(sessionId)
+        : this.db.prepare('SELECT id, data FROM runs WHERE session_id = ? AND id = ?').get(sessionId, runId)
+      return row && parse<StoredRun>(row)
+    } catch (error) { throw new SessionReadError('无法读取委派运行记录，请重试', { cause: error }) }
+  }
+
+  createDelegation(delegation: Delegation) {
+    this.write(() => this.subagents.create(delegation))
+  }
+
+  updateDelegationItem(change: DelegatedItemWrite) {
+    this.write(() => this.subagents.writeItem(change))
+  }
+
+  finishDelegation(id: string): Delegation {
+    return this.write(() => this.subagents.finish(id))
+  }
+
+  listDelegations(callerSessionId: string): Delegation[] {
+    try {
+      if (this.uncertain) throw new Error('Commit state unknown')
+      return this.subagents.list(callerSessionId)
+    } catch (error) { throw new SessionReadError('无法读取委派记录，请重试', { cause: error }) }
+  }
+
+  recoverDelegations(): Delegation[] {
+    return this.write(() => this.subagents.recover())
+  }
+
+  setDelegationReport(id: string, status: 'delivered' | 'suppressed'): boolean {
+    return this.write(() => this.subagents.markReport(id, status))
+  }
+
+  suppressDelegationReports(rootSessionId: string) {
+    this.write(() => this.subagents.suppressReports(rootSessionId))
   }
 
   listMcpToolLoads(sessionId: string): McpToolIdentity[] {
@@ -485,6 +554,7 @@ export class SessionStore {
   }
 
   readReferenceSource(id: string): ReferenceSource | undefined {
+    if (this.readSessionSummary(id)?.subagent) return
     const history = this.loadSession(id)
     if (!history) return
     const capturedThroughSeq = this.db.prepare('SELECT MAX(seq) AS seq FROM messages WHERE session_id = ?').get(id)?.seq
@@ -527,6 +597,7 @@ export class SessionStore {
         if (!run || run.kind !== 'task' || !message || !Number.isFinite(message.timestamp)) throw new Error('Invalid message owner')
         if ((entry.runId !== undefined && entry.runId !== run.id) || (entry.steering !== undefined
           && (entry.steering !== true || entry.runId !== run.id || message.role !== 'user' || entry.extension !== undefined))) throw new Error('Invalid message owner')
+        if (!validAgentInputSource(entry.agentSource) || (entry.agentSource && message.role !== 'user')) throw new Error('Invalid agent input source')
         if (entry.imageOmitted !== undefined && (entry.imageOmitted !== true || message.role !== 'toolResult')) throw new Error('Invalid image marker')
         const invocation = entry.skillInvocation
         if (invocation !== undefined && (!invocation || message.role !== 'user' || typeof message.content !== 'string'
@@ -634,7 +705,10 @@ export class SessionStore {
         if (item?.input?.clientMessageId !== row.client_id || typeof item.input.text !== 'string' || typeof item.input.modelId !== 'string'
           || typeof item.text !== 'string' || item.acceptedSeq !== row.accepted_seq || !Number.isSafeInteger(item.acceptedSeq) || item.acceptedSeq < 1
           || (item.steeringSeq !== undefined && (!Number.isSafeInteger(item.steeringSeq) || item.steeringSeq < item.acceptedSeq))
-          || !['queued', 'steering', 'deleted', 'started', 'delivered'].includes(item.status)) throw new Error('Invalid pending submission')
+          || !validAgentInputSource(item.agentSource)
+          || (item.waitForUser !== undefined && (item.waitForUser !== true || item.agentSource?.kind !== 'report'))
+          || (item.targetRunId !== undefined && (typeof item.targetRunId !== 'string' || !item.targetRunId))
+          || !['queued', 'steering', 'deleted', 'started', 'delivered', 'undelivered'].includes(item.status)) throw new Error('Invalid pending submission')
         return item
       })
     const questions = this.db.prepare('SELECT id, run_id, assistant_message_id, tool_call_id, data FROM user_questions WHERE session_id = ? ORDER BY rowid')

@@ -232,8 +232,8 @@ test('Feature 1 小模型容量不足后，从同一网页用大模型压缩，�
   const target = original.getModels().find(item => item.id === 'kimi-k3')!
   piModels.setProvider(createProvider({
     id: original.id, name: original.name, auth: original.auth, api: openAICompletionsApi(),
-    // 压缩后的请求需要为工具定义和工作树路径留出空间。
-    models: [{ ...target, contextWindow: 3456, maxTokens: 128 }],
+    // 压缩后的请求需要容纳完整工具定义（含子 Agent）和工作树路径。
+    models: [{ ...target, contextWindow: 4096, maxTokens: 128 }],
   }))
   const directory = await mkdtemp(join(tmpdir(), 'agent-model-capacity-'))
   const model = await startModelServer()
@@ -253,7 +253,8 @@ test('Feature 1 小模型容量不足后，从同一网页用大模型压缩，�
     const saved = await page.request.put(url + '/api/providers/moonshotai-cn', { data: { apiKey: 'controlled-test-key' } })
     expect(saved.status()).toBe(200)
     for (const index of [0, 1]) {
-      await editor(page).fill('原有历史' + 'a'.repeat(5000))
+      // 只增大旧消息，使试验模型无法生成首份摘要，但能读完手动压缩保留的近期消息。
+      await editor(page).fill('原有历史' + 'a'.repeat(index === 0 ? 9500 : 5000))
       await send(page).click()
       await expect.poll(() => model.exchanges.length).toBe(index + 1)
       model.exchanges[index].delta({ content: '原回复' + 'b'.repeat(3000) })

@@ -81,6 +81,7 @@ async function rejectedHandshake(url: string, headers: Record<string, string>) {
   })
 }
 const empty = { seq: 0, permissionMode: 'normal' as const, messages: [], running: null, activeContent: [], compactions: [], contextUsage: null }
+const emptyWithSubagents = { ...empty, subagents: [], delegationOutputs: [] }
 
 describe('MCP 设置入口', () => {
   it('保存后保持关闭，通过启用请求连接，只向已授权网页返回状态并发送脱敏通知', async () => {
@@ -375,7 +376,7 @@ describe('Cookie 交换与重启', () => {
     expect(await rejectedHandshake(app.url, { Cookie: credentials })).toBe(401)
     const next = nextConversationFrame(socket)
     socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'after-expiry' }))
-    expect((await next).snapshot).toEqual(empty)
+    expect((await next).snapshot).toEqual(emptyWithSubagents)
   })
   it('同密钥同地址重启 Cookie 可用，启动令牌更新，换密钥重启后 Cookie 失效', async () => {
     const app = await setup()
@@ -543,7 +544,7 @@ describe('会话订阅转发与清理', () => {
       const socket = await connect(app.url, credentials)
       const next = nextConversationFrame(socket)
       socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId }))
-      expect(await next).toEqual({ type: 'snapshot', sessionId, subscriptionId, snapshot: empty })
+      expect(await next).toEqual({ type: 'snapshot', sessionId, subscriptionId, snapshot: emptyWithSubagents })
     }
   })
   it('受控源先快照后更新，替换/取消只释放所属订阅和连接', async () => {
@@ -749,7 +750,7 @@ describe('消息提交与模型生命周期', () => {
     const socket = await connect(app.url, auth)
     const first = nextConversationFrame(socket)
     socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId: 'after-rejects' }))
-    expect((await first).snapshot).toEqual(empty)
+    expect((await first).snapshot).toEqual(emptyWithSubagents)
   })
 
   it('凭据未配置也先回执，随后形成正式失败回复并释放忙碌', async () => {
@@ -1234,7 +1235,7 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
   const promptDocument = await readFile(new URL('../../../docs/prompts/systemPrompt.md', import.meta.url), 'utf8')
   const expectedPrompt = promptDocument.split('```text\n')[1].split('\n```')[0]
     .replaceAll('{{siRoot}}/', () => fileURLToPath(new URL('../../../', import.meta.url)))
-    .replace('{{home}}', () => app.config.skillHome)
+    .replaceAll('{{home}}', () => app.config.skillHome)
     .replace('{{workspacePath}}', () => app.workspace)
   const systemPrompt = requests[0].messages[0].content
   expect(systemPrompt).toContain('<name>agents-md</name>')
@@ -1243,7 +1244,7 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
   for (const request of requests) {
     expect(request.messages[0].content).toContain('## 记录长期记忆')
     expect(request.messages[0].content.split('\n\n## 长期记忆\n')[0]).toBe(systemPrompt.split('\n\n## 长期记忆\n')[0])
-    expect(request.tools).toHaveLength(13)
+    expect(request.tools).toHaveLength(14)
     expect(request.tools).toContainEqual(expect.objectContaining({ function: expect.objectContaining({ name: 'ask_user_question' }) }))
     expect(request.tools.at(-1)).toMatchObject({ function: { name: 'memory' } })
   }
@@ -1593,9 +1594,9 @@ describe('会话路由', () => {
       socket.send(JSON.stringify({ type: 'subscribe', sessionId, subscriptionId }))
       return frame
     }
-    expect(await subscribe(a.id, 'open-a')).toEqual({ type: 'snapshot', sessionId: a.id, subscriptionId: 'open-a', snapshot: empty })
+    expect(await subscribe(a.id, 'open-a')).toEqual({ type: 'snapshot', sessionId: a.id, subscriptionId: 'open-a', snapshot: emptyWithSubagents })
     expect(await subscribe('missing', 'unknown')).toMatchObject({ type: 'subscription_error', sessionId: 'missing', subscriptionId: 'unknown', error: expect.any(String) })
-    expect(await subscribe(b.id, 'open-b')).toEqual({ type: 'snapshot', sessionId: b.id, subscriptionId: 'open-b', snapshot: empty })
+    expect(await subscribe(b.id, 'open-b')).toEqual({ type: 'snapshot', sessionId: b.id, subscriptionId: 'open-b', snapshot: emptyWithSubagents })
   })
 })
 

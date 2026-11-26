@@ -10,6 +10,8 @@
 
 说明按全局、外层祖先、工作区的顺序放在 `<project_context>` 中。每份说明以 `<project_instructions path="绝对路径">` 标记来源，段落放在 `<cwd>` 前。路径中的标记符号和换行会转义，说明正文保留全文。有 read 工具时，模型可自动调用的 Skill 摘要放在 <available_skills> 中，正文按需读取。下面是普通权限的手动聊天使用内置工具且没有项目说明或 Skill 摘要时的原文。摘要请求使用独立的摘要提示词。
 
+Feature 12 按会话类型追加主会话角色目录或子会话指令。主会话有 `read` 和 `subagent` 时，`<docs>` 也指向角色创建指南。 [Multi-Agent 提示词](subagents/systemPrompt.md) · [应用文档指引](docs.md)
+
 展开 `this.configuration` 后，请求数据如下。
 
 ```ts
@@ -36,6 +38,7 @@ const context: ModelContext = {
 - ls：列出目录的直接子项，包括隐藏项。目录名以 / 结尾。
 - web_search：搜索网页，返回标题、链接和相关片段。
 - web_fetch：获取指定公网网页的正文。
+- subagent：委派、续用和管理独立子 Agent。
 - cronjob_manage：管理当前会话的重复定时任务。仅在用户明确请求时创建或变更。支持每天、工作日、每周指定星期几。信息不足先询问，明确只执行一次时说明目前仅支持重复任务。根据保存回执报告实际结果。
 - ask_user_question：缺少会影响结果的关键信息、偏好或选择时，向用户提出一组简洁的问题。依赖答案的操作必须在读取结果之后安排，不能与提问放在同一批调用。答案按题号返回，空 selected 且省略 custom 表示用户跳过该题。pending 表示等待超时，用户仍可补答。跳过或超时后继续不依赖缺失答案的工作，只有明确答复才能确认用户的选择。
 </tools>
@@ -55,12 +58,13 @@ const context: ModelContext = {
 </rules>
 
 <docs>
-SI 文档（用户询问 SI 本身，或要求创建、修改 Skill 时查阅）
+SI 文档（用户询问 SI 本身，或要求创建、修改 Skill 或子 Agent 角色时查阅）
 - 主文档：{{siRoot}}/README.md
 - 补充文档位于 {{siRoot}}/docs。
 - 从 SI 应用目录定位文档。文档里的相对链接以该文档所在目录为起点。
 - 启动、模型配置、工作区、网页工具、中止和对话压缩见主文档。页面操作和开发校验见 {{siRoot}}/web/README.md。Skill 规则见 {{siRoot}}/docs/skills.md。
 - 创建或修改 Skill 前，先用 read 完整阅读 Skill 规则文档，并查阅其中与本次任务有关的引用。个人 Skill 目录是 "{{home}}/.si/skills"。
+- 创建或修改子 Agent 角色前，先用 read 完整阅读 {{siRoot}}/docs/subagents.md。个人角色目录是 "{{home}}/.si/agents"。
 </docs>
 
 <cwd>

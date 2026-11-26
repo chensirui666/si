@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Agent } from '@agent-learning/agent'
 import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
-import { IMAGE_BUDGET_BYTES, estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
+import { IMAGE_BUDGET_BYTES, defaultSelection, estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
 import type { AssistantMessage, JsonObject, ModelContext, ModelDiscovery, ModelEvent, ModelInfo, ModelSelection, ModelStreamOptions, ReasoningEffort } from '@agent-learning/model'
 import { buildModelHistory, createSummaryContext, prepareCompaction } from './compaction.js'
 import { loadProjectContextFiles, ProjectContextOverflow, type ProjectContextFile } from './project-context.js'
@@ -9,7 +9,7 @@ import { SessionWriteError, runSelection, submissionReceipt, type SessionPersist
 import { discoverSkills, loadSkill, skillCommand, type SkillSummary } from './skills.js'
 import { withModelRetry } from './model-retry.js'
 import { extractPlan, planCommandArgument, planGitArgs, planInstruction, planReadTools } from './plan-mode.js'
-import { buildSystemPrompt } from './system-prompt.js'
+import { buildSystemPrompt, escapePromptAttribute } from './system-prompt.js'
 import { defaultTools, protectMemoryRead, type CodingTool } from './tools.js'
 import { createMemoryTool, MEMORY_TOOL_NAME } from './memory-tool.js'
 import { createMemorySourceTool, MEMORY_SOURCE_TOOL_NAME } from './memory-source-tool.js'
@@ -26,10 +26,27 @@ import type { McpToolIdentity } from './mcp/manager.js'
 import { createMcpToolSearch, isMcpToolSearchDetails, MCP_TOOL_SEARCH_NAME } from './mcp/tool-search.js'
 import { createMcpTools, mcpToolIdentity, mcpToolKey, type McpToolSource } from './mcp/tools.js'
 import { createCronjobTool, CRONJOB_TOOL_NAME, type ManageSchedule } from './cronjob-tool.js'
-import type { InteractionState, PendingSubmission, QuestionAnswer, QuestionReply, QuestionWaitSettings, QueueAction, QueueResult, SubmissionPending, UserQuestion, UserQuestionBatch } from './collaboration.js'
+import type { AgentInputSource, InteractionState, PendingSubmission, QuestionAnswer, QuestionReply, QuestionWaitSettings, QueueAction, QueueResult, SubmissionPending, UserQuestion, UserQuestionBatch } from './collaboration.js'
 import { ASK_USER_QUESTION_TOOL_NAME, createUserQuestionTool, validateQuestionAnswers } from './user-question-tool.js'
 import { sameSubmissionSources, type SubmissionInput } from './types.js'
 import type { CompactionRecord, ExtensionNotice, SubmissionAccepted, SubmissionHandled, SessionSubscriptionEvent, ConversationMessage, ConversationSnapshot, ConversationUpdate, ModelFrame, PlanState, RunRecord, RunningState, SaveFailure } from './types.js'
+
+import type { Subagents } from './subagents.js'
+import type { DelegatedItemWrite, DelegationItem } from './subagent-types.js'
+import type { SubagentRoleSummary } from './subagent-roles.js'
+import { createSubagentTool, SUBAGENT_TOOL, TEAM_TOOL } from './subagent-tools.js'
+import type { SubagentView } from './types.js'
+
+type DelegatedInput = Pick<DelegatedItemWrite, 'id' | 'index'> & {
+  source: AgentInputSource
+}
+
+function assistantOutcome(entry: ConversationMessage | undefined) {
+  const message = entry?.message
+  if (message?.role !== 'assistant') return {}
+  const output = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+  return { ...(output && { output }), ...(message.errorMessage && { error: message.errorMessage }) }
+}
 
 type SubmissionResult = SubmissionAccepted | SubmissionHandled
 type AvailableTools = { local: CodingTool[]; remote?: CodingTool[]; servers?: ReturnType<McpToolSource['listDiscoveryServers']> }
@@ -64,6 +81,8 @@ export class AgentSession {
   private readonly questions = new Map<string, UserQuestionBatch>()
   private readonly questionWaiters = new Map<string, QuestionWaiter>()
   private queueFrozen = false
+  private groupStopping = false
+  private roleCatalog: readonly SubagentRoleSummary[] = []
   private queuePaused: string | null = null
   private startingPendingId?: string
   private resumeAfterAbort = false
@@ -102,6 +121,7 @@ export class AgentSession {
 
   constructor(private readonly options: {
     persistence?: SessionPersistence
+    subagents?: () => Subagents | undefined
     sessionId?: string
     extensions?: readonly ExtensionEntry[]
     reportExtensionError?: (message: string, error: unknown) => void
@@ -147,7 +167,10 @@ export class AgentSession {
       }
       this.state.seq = history.runs.at(-1)?.acceptedSeq ?? 0
       for (const item of history.pending ?? []) {
-        this.pending.set(item.input.clientMessageId, item)
+        const restored = item.status !== 'steering' ? item
+          : item.agentSource?.kind === 'steer' ? { ...item, status: 'undelivered' as const }
+            : item.agentSource?.kind === 'report' ? { ...item, waitForUser: true as const } : item
+        this.pending.set(item.input.clientMessageId, restored)
         this.state.seq = Math.max(this.state.seq, item.acceptedSeq, item.steeringSeq ?? 0, item.receipt && 'acceptedSeq' in item.receipt ? item.receipt.acceptedSeq : 0)
       }
       for (const batch of history.questions ?? []) this.questions.set(batch.id, batch.status === 'waiting' ? { ...batch, status: 'aborted' } : batch)
@@ -201,6 +224,7 @@ export class AgentSession {
       if (selected && selection && !model) selected.defaultReasoningEffort = selection.reasoningEffort
       const ctx = this.extensionContext(path, selected, signal)
       const reserved = [...defaultTools, ...this.options.tools?.(path) ?? []].map(tool => tool.name)
+      if (this.options.subagents) reserved.push(SUBAGENT_TOOL, TEAM_TOOL)
       if (this.options.mcp) reserved.push(MCP_TOOL_SEARCH_NAME)
       if (this.options.manageSchedule) reserved.push(CRONJOB_TOOL_NAME)
       if (this.options.memory) reserved.push(MEMORY_TOOL_NAME, MEMORY_SOURCE_TOOL_NAME)
@@ -257,12 +281,41 @@ export class AgentSession {
     this.publish({ type: 'permission', permissionMode })
   }
 
+  get toolPolicy() {
+    return { permission: this.state.permissionMode, planning: Boolean(this.state.plan), unconfirmed: this.permissionUnconfirmed }
+  }
+
+  private effectiveToolPolicy(planning: boolean) {
+    const { permission, unconfirmed } = this.toolPolicy
+    const parentId = this.options.persistence?.summary.subagent?.parentSessionId
+    const parent = parentId && this.options.subagents?.()?.toolPolicy(parentId)
+    return {
+      readOnly: permission === 'read-only' || Boolean(parentId && (!parent || parent.permission === 'read-only')),
+      planning: planning || Boolean(parent && parent.planning),
+      unconfirmed: unconfirmed || Boolean(parent && parent.unconfirmed),
+    }
+  }
+
   private availableTools(tools: CodingTool[], planning: boolean, scheduled: boolean): AvailableTools {
-    const local = [...tools, ...(this.runtime?.tools() ?? []).filter(tool => tool.name !== ASK_USER_QUESTION_TOOL_NAME)].filter(tool => !scheduled || tool.name !== CRONJOB_TOOL_NAME)
-    if (this.state.permissionMode !== 'normal') return { local: local.filter(tool => readOnlyTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)) }
-    if (planning) return { local: local.flatMap(tool => planReadTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)
+    const effective = this.effectiveToolPolicy(planning)
+    const child = this.options.persistence?.summary.subagent
+    const collaboration = (name: string) => name === SUBAGENT_TOOL || name === TEAM_TOOL
+    const local = [...tools, ...(this.runtime?.tools() ?? []).filter(tool => tool.name !== ASK_USER_QUESTION_TOOL_NAME)].filter(tool =>
+      (!scheduled || tool.name !== CRONJOB_TOOL_NAME) && (!child || tool.name === TEAM_TOOL || child.allowedTools.includes(tool.name)))
+    if (effective.readOnly) return { local: local.filter(tool => collaboration(tool.name) || readOnlyTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)) }
+    if (effective.planning) return { local: local.flatMap(tool => collaboration(tool.name) || planReadTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)
       ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : []) }
     const mcp = this.options.mcp
+    if (child) {
+      const allowed = new Set(child.mcpToolKeys)
+      const bindings = mcp?.listToolsForAgent().filter(binding => child.allowedTools.includes(binding.name)
+        && allowed.has(mcpToolKey(mcpToolIdentity(binding))))
+      const remote = mcp && bindings?.length ? createMcpTools(local, bindings, mcp, (name, args) => {
+        const denial = this.toolDenial(name, args, Boolean(this.state.plan), false)
+        if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
+      }) : undefined
+      return { local, remote }
+    }
     const servers = mcp?.listDiscoveryServers()
     if (!mcp || !servers?.length || local.some(tool => tool.name === MCP_TOOL_SEARCH_NAME)) return { local }
 
@@ -290,14 +343,27 @@ export class AgentSession {
   }
 
   private toolDenial(name: string, args: JsonObject, planning: boolean, planBash: boolean) {
-    if (this.permissionUnconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
-    if (name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(name)) return
-    if (this.state.permissionMode === 'read-only' && !readOnlyTools.has(name)) {
+    const effective = this.effectiveToolPolicy(planning)
+    if (effective.unconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
+    if (name === SUBAGENT_TOOL || name === TEAM_TOOL || name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(name)) return
+    if (effective.readOnly && !readOnlyTools.has(name)) {
       return { code: 'permission_denied', message: '只读模式下未执行此工具。' }
     }
-    if (planning && !planReadTools.has(name) && (name !== 'bash' || !planBash || !planGitArgs(args.command))) {
+    if (effective.planning && !planReadTools.has(name) && (name !== 'bash' || !planBash || !planGitArgs(args.command))) {
       return { code: 'permission_denied', message: '计划模式仅允许只读调查工具及获准的 Git 命令。' }
     }
+  }
+
+  private agentPrompt(tools: readonly CodingTool[]) {
+    const summary = this.options.persistence?.summary
+    const child = summary?.subagent
+    if (child) return [
+      `你是子 Agent「${escapePromptAttribute(summary!.name)}」，为主 Agent 工作。完成交给你的任务，简洁作答。最终答复会报告给发起者。工作中可用 team 联系主 Agent 或同级子 Agent。`,
+      child.role?.systemPrompt,
+    ].filter(Boolean).join('\n\n')
+    if (!tools.some(tool => tool.name === SUBAGENT_TOOL) || !this.roleCatalog.length) return ''
+    return ['<subagent_roles>', ...this.roleCatalog.map(({ name, description }) =>
+      `- ${escapePromptAttribute(name)}：${escapePromptAttribute(description.slice(0, 500))}`), '</subagent_roles>'].join('\n')
   }
 
   private configure(cwd: string, { local, remote, servers }: AvailableTools, files: ProjectContextFile[], skills: readonly SkillSummary[]) {
@@ -305,7 +371,8 @@ export class AgentSession {
     const declarations = tools.map(({ name, description, parameters }) => ({ name, description, parameters }))
     this.configurationKeyBeforeMemory = undefined
     this.configuration = {
-      systemPrompt: buildSystemPrompt(cwd, local, this.options.documentationRoot, files, skills, this.options.skillHome, servers),
+      systemPrompt: [buildSystemPrompt(cwd, local, this.options.documentationRoot, files, skills, this.options.skillHome, servers),
+        this.agentPrompt(local)].filter(Boolean).join('\n\n'),
       ...(declarations.length ? { tools: declarations } : {}),
     }
     return tools
@@ -344,7 +411,8 @@ export class AgentSession {
 
   async submit(input: SubmissionInput): Promise<SubmissionResult | SubmissionPending> {
     if (this.closed || this.queueFrozen) throw new SessionSubmitError('closed', '服务正在关闭')
-    if (typeof input?.clientMessageId === 'string' && (input.clientMessageId.startsWith('plan:') || input.clientMessageId.startsWith('question:'))) {
+    if (this.groupStopping) throw new SessionSubmitError('busy', '会话正在停止')
+    if (typeof input?.clientMessageId === 'string' && (input.clientMessageId.startsWith('plan:') || input.clientMessageId.startsWith('question:') || input.clientMessageId.startsWith('agent:'))) {
       throw new SessionSubmitError('invalid', '提交编号无效')
     }
     return this.submitUserInput(input)
@@ -376,7 +444,8 @@ export class AgentSession {
     return Promise.resolve(this.pendingReceipt(item))
   }
 
-  private enqueue(input: SubmissionInput, status: 'queued' | 'steering', question?: UserQuestionBatch) {
+  private enqueue(input: SubmissionInput, status: 'queued' | 'steering', question?: UserQuestionBatch,
+    agentSource?: AgentInputSource, targetRunId?: string) {
     if (!input || typeof input.clientMessageId !== 'string' || !input.clientMessageId.trim() || input.clientMessageId.length > 128
       || typeof input.text !== 'string' || !input.text.trim() && !input.attachmentIds?.length
       || typeof input.modelId !== 'string' || !input.provider && input.modelId !== 'deepseek-flash') {
@@ -392,11 +461,12 @@ export class AgentSession {
     const item: PendingSubmission = {
       input: structuredClone(input), text: input.text, status, acceptedSeq: this.state.seq + 1,
       ...(attachments.length && { attachments }),
+      ...(agentSource && { agentSource }), ...(targetRunId && { targetRunId }),
     }
     this.save({ pending: [item], ...(question && { questions: [question] }) })
     this.pending.set(input.clientMessageId, item)
     if (question) this.questions.set(question.id, question)
-    if (!this.controller?.signal.aborted) this.queuePaused = null
+    if (!agentSource && !this.controller?.signal.aborted) this.queuePaused = null
     this.publishInteraction()
     return item
   }
@@ -415,6 +485,11 @@ export class AgentSession {
   private pendingSteering() {
     return [...this.pending.values()].filter(item => item.status === 'steering')
       .sort((a, b) => (a.steeringSeq ?? a.acceptedSeq) - (b.steeringSeq ?? b.acceptedSeq))
+  }
+
+  private steeringForRun(runId: string, userStart = false) {
+    return this.pendingSteering().filter(item => (userStart || !item.waitForUser)
+      && (item.agentSource?.kind !== 'steer' || item.targetRunId === runId))
   }
 
   private interactionView(): InteractionState {
@@ -446,7 +521,7 @@ export class AgentSession {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
     const item = this.pending.get(id)
     if (!item) return { status: this.storedRuns.has(id) ? 'started' : 'missing' }
-    if (item.status !== 'queued') return { status: item.status }
+    if (item.status !== 'queued' || item.agentSource) return { status: item.status }
     if (this.startingPendingId === id) return { status: 'unavailable' }
     let updated: PendingSubmission
     if (change.action === 'edit') {
@@ -468,7 +543,7 @@ export class AgentSession {
   }
 
   private async drainQueue(resume = false) {
-    if (this.closed || this.queueFrozen || this.startingPendingId || this.submitting || this.state.running || this.state.plan?.state === 'review'
+    if (this.closed || this.queueFrozen || this.groupStopping || this.startingPendingId || this.submitting || this.state.running || this.state.plan?.state === 'review'
       || this.queuePaused && !resume) return
     const item = this.queued()[0]
     if (!item) return
@@ -588,15 +663,17 @@ export class AgentSession {
     return this.submitMessage(input, undefined, true, signal)
   }
 
-  private async submitMessage(input: SubmissionInput, approvedPlanId?: string, scheduled = false, admissionSignal?: AbortSignal, queued?: PendingSubmission): Promise<SubmissionResult> {
+  private async submitMessage(input: SubmissionInput, approvedPlanId?: string, scheduled = false, admissionSignal?: AbortSignal, queued?: PendingSubmission, delegated?: DelegatedInput): Promise<SubmissionResult> {
     if (this.closed) throw new SessionSubmitError('closed', '服务正在关闭')
+    if (this.groupStopping) throw new SessionSubmitError('busy', '会话正在停止')
     if (typeof input?.modelId !== 'string' || !input.provider && input.modelId !== 'deepseek-flash'
       || typeof input.text !== 'string' || (!input.text.trim() && !input.attachmentIds?.length)
       || typeof input.clientMessageId !== 'string' || !input.clientMessageId.trim() || input.clientMessageId.length > 128) {
       throw new SessionSubmitError('invalid', '请提交有效原文、支持的模型和临时编号')
     }
-    const planArgument = scheduled ? undefined : planCommandArgument(input.text)
-    const manualCompaction = !scheduled && input.text.trim() === '/compact'
+    const internal = Boolean(delegated || queued?.agentSource)
+    const planArgument = scheduled || internal ? undefined : planCommandArgument(input.text)
+    const manualCompaction = !scheduled && !internal && input.text.trim() === '/compact'
     const planControl = planArgument === '' || planArgument === 'off'
     if ((planControl || manualCompaction) && (input.attachmentIds?.length || input.referenceSessionIds?.length)) {
       throw new SessionSubmitError('invalid', '控制命令不能同时发送附件或会话引用')
@@ -644,7 +721,7 @@ export class AgentSession {
       this.initializing?.abort()
     }
     admissionSignal?.addEventListener('abort', stopPreparing, { once: true })
-    const promise = this.accept(input, selection, model, controller, { approvedPlanId, planArgument, scheduled, manualCompaction, queued })
+    const promise = this.accept(input, selection, model, controller, { approvedPlanId, planArgument, scheduled, manualCompaction, queued, delegated })
     this.submitting = { input, scheduled, settled: promise }
     try {
       return await promise
@@ -657,13 +734,15 @@ export class AgentSession {
   }
 
   private async accept(input: SubmissionInput, selection: ModelSelection, model: ModelInfo, controller: AbortController,
-    { approvedPlanId, planArgument, scheduled, manualCompaction: manual, queued }: { approvedPlanId?: string; planArgument?: string; scheduled: boolean; manualCompaction: boolean; queued?: PendingSubmission },
+    { approvedPlanId, planArgument, scheduled, manualCompaction: manual, queued, delegated }:
+      { approvedPlanId?: string; planArgument?: string; scheduled: boolean; manualCompaction: boolean; queued?: PendingSubmission; delegated?: DelegatedInput },
   ): Promise<SubmissionResult> {
     const { signal } = controller
+    const agentSource = delegated?.source ?? queued?.agentSource
     const cwd = await this.options.resolveDirectory()
     const directory = await this.options.discoverModels?.()
     this.checkPreparing(signal)
-    this.checkModelSelection(input, selection, directory)
+    this.checkModelSelection(input, selection, directory, Boolean(agentSource))
     model.defaultReasoningEffort = selection.reasoningEffort
     this.model = model
     if (this.options.persistence?.first && !this.storedRuns.size && input.permissionMode !== undefined) {
@@ -675,7 +754,7 @@ export class AgentSession {
     this.checkPreparing(signal)
     const submittedText = planArgument ?? input.text
     let text = submittedText
-    if (!manual && !scheduled && !approvedPlanId && this.runtime?.has('input')) {
+    if (!manual && !scheduled && !approvedPlanId && !agentSource && this.runtime?.has('input')) {
       const notices: ExtensionNotice[] = []
       const result = await this.runtime.input(text, this.extensionContext(cwd, model, signal, notices))
       this.checkPreparing(signal)
@@ -688,14 +767,27 @@ export class AgentSession {
       for (const notice of notices) this.publishNotice(notice)
     }
     const skills = manual ? [] : (await discoverSkills(cwd, { home: this.options.skillHome, applicationRoot: this.options.documentationRoot })).skills
-    const namedSkill = skillCommand.exec(text)?.[1]
+    const namedSkill = agentSource ? undefined : skillCommand.exec(text)?.[1]
     const selectedSkill = namedSkill ? skills.find(skill => skill.name === namedSkill) : undefined
     const skillInvocation = selectedSkill ? await loadSkill(selectedSkill) : undefined
     const userId = randomUUID()
     const tools = (this.options.tools?.(cwd) ?? []).filter(tool => tool.name !== ASK_USER_QUESTION_TOOL_NAME)
     const storage = this.options.persistence
+    const subagents = storage && this.options.subagents?.()
+    if (!manual && subagents && storage) {
+      const name = storage.summary.subagent ? TEAM_TOOL : SUBAGENT_TOOL
+      tools.push(createSubagentTool(name, (args, context) => {
+        const running = this.state.running
+        if (running?.kind !== 'task' || running.runId !== userId) throw new Error('原工具调用已结束。')
+        return subagents.execute(this, args, {
+          assistantMessageId: running.assistantMessageId, runId: running.runId,
+          contentIndex: context.contentIndex, toolCallId: context.toolCallId,
+        }, context.signal)
+      }))
+      if (!storage.summary.subagent) this.roleCatalog = await subagents.roleCatalog(storage.summary.workspaceId)
+    }
     const manageSchedule = this.options.manageSchedule
-    if (!manual && !scheduled && storage && manageSchedule) {
+    if (!manual && !scheduled && storage && !storage.summary.subagent && manageSchedule) {
       const { id: sessionId, workspaceId } = storage.summary
       tools.push(createCronjobTool(args => manageSchedule({ sessionId, workspaceId, runId: userId }, args)))
     }
@@ -735,6 +827,7 @@ export class AgentSession {
     const prepared = await this.prepareSources(input, model, queued?.input.clientMessageId)
     const user: ConversationMessage = {
       id: userId, clientMessageId: input.clientMessageId,
+      ...(agentSource && { agentSource }),
       message: { role: 'user', content: text, timestamp: Date.now() },
       ...(skillInvocation && { skillInvocation }),
       ...(prepared.attachments.length && { attachments: prepared.attachments }),
@@ -744,7 +837,7 @@ export class AgentSession {
     let systemPrompt: string | undefined
     let extra: ConversationMessage[] = []
     const first = !this.state.messages.some(entry => entry.message.role === 'user' && !entry.extension)
-    const title = first ? temporarySessionTitle(submittedText.trim() ? submittedText : prepared.attachments[0]?.name ?? '') : ''
+    const title = first && !storage?.summary.subagent ? temporarySessionTitle(submittedText.trim() ? submittedText : prepared.attachments[0]?.name ?? '') : ''
     const planChange = approvedPlanId ? null : planArgument !== undefined && !this.state.plan ? { state: 'planning' } as const : undefined
     let run: StoredRun | undefined
     let carried: Awaited<ReturnType<AgentSession['prepareSteering']>> = []
@@ -756,9 +849,11 @@ export class AgentSession {
         if (start.overridden) systemPrompt = start.systemPrompt
         extra = start.extra.map(message => this.extensionEntry(message))
       }
-      if (!scheduled) carried = await this.prepareSteering(model, user.id, signal)
+      if (!scheduled) carried = await this.prepareSteering(model, user.id, signal,
+        !agentSource || Boolean(delegated && storage?.summary.subagent))
+      if (storage?.summary.subagent) await subagents?.authorizeRole(storage.summary)
       this.checkPreparing(signal)
-      this.checkModelSelection(input, selection, directory)
+      this.checkModelSelection(input, selection, directory, Boolean(agentSource))
       const acceptedSeq = this.state.seq + 1
       const claimed = [
         ...carried.map(({ item, entry }) => this.delivered(item, entry, acceptedSeq)),
@@ -772,6 +867,8 @@ export class AgentSession {
       })
       run = this.saveStart(input, selection, user.id, 'task', {
         messages: [...carried.map(({ entry }) => entry), user, ...extra], plan: planChange,
+        ...(delegated && { delegatedItem: { id: delegated.id, index: delegated.index,
+          item: { status: 'running', sessionId: this.sessionId, runId: user.id, name: storage?.summary.name } } }),
         ...(attachments.length && { attachments }), ...(claimed.length && { pending: claimed }),
       }, text, approvedPlanId, title, scheduled)
       for (const item of claimed) this.pending.set(item.input.clientMessageId, item)
@@ -796,7 +893,7 @@ export class AgentSession {
     }
     if (approvedPlanId) this.approvedPlans.set(approvedPlanId, { ...receipt })
     if (planChange !== undefined) this.publish({ type: 'plan', plan: planChange })
-    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal, user, systemPrompt, scheduled))
+    this.task = Promise.resolve().then(() => this.runTask(model, selection.reasoningEffort, running, cwd, tools, skills, controller.signal, user, systemPrompt, scheduled, delegated))
     if (run && title) this.startTitle(model, submittedText, title)
     return receipt
   }
@@ -806,14 +903,14 @@ export class AgentSession {
     return { ...item, status: 'delivered', receipt: { kind: 'message', clientMessageId, userMessageId: entry.id, acceptedSeq } }
   }
 
-  private async prepareSteering(model: ModelInfo, runId: string, signal: AbortSignal) {
+  private async prepareSteering(model: ModelInfo, runId: string, signal: AbortSignal, userStart = false) {
     const entries: Array<{ item: PendingSubmission; entry: ConversationMessage; binding?: {
       ids: string[]; scope: AttachmentScope; cutoff: number; messageId: string; pendingId?: string
     } }> = []
     try {
       const preparedIds = new Set<string>()
       for (;;) {
-        const remaining = this.pendingSteering().filter(item => !preparedIds.has(item.input.clientMessageId))
+        const remaining = this.steeringForRun(runId, userStart).filter(item => !preparedIds.has(item.input.clientMessageId))
         if (!remaining.length) return entries
         for (const item of remaining) {
           const clientMessageId = item.input.clientMessageId
@@ -822,6 +919,7 @@ export class AgentSession {
           const id = randomUUID()
           const entry: ConversationMessage = {
             id, clientMessageId, steering: true, runId,
+            ...(item.agentSource && { agentSource: item.agentSource }),
             message: { role: 'user', content: item.text, timestamp: Date.now() },
             ...(attachments.length && { attachments }), ...(references.length && { references }),
           }
@@ -903,10 +1001,10 @@ export class AgentSession {
     return model
   }
 
-  private checkModelSelection(input: SubmissionInput, selection: ModelSelection, directory?: ModelDiscovery) {
+  private checkModelSelection(input: SubmissionInput, selection: ModelSelection, directory?: ModelDiscovery, delegated = false) {
     const storedDefault = this.options.persistence?.store.getDefaultSelection()
     const fallback = directory?.defaultSelection
-    const current = this.state.modelSelection ?? storedDefault ?? fallback
+    const current = this.state.modelSelection ?? (delegated ? selection : storedDefault ?? fallback)
     const legacyUnconfigured = !input.provider && !current && !directory?.models.length
     if (!legacyUnconfigured && (directory || current) && !sameSelection(selection, current)) {
       throw new SessionSubmitError('model_selection_changed', staleSelection)
@@ -965,7 +1063,7 @@ export class AgentSession {
   }
 
   private saveStart(input: SubmissionInput, selection: ModelSelection, id: string, kind: RunRecord['kind'],
-    data: Pick<Parameters<SessionPersistence['store']['save']>[1], 'messages' | 'compaction' | 'plan' | 'attachments' | 'pending'>,
+    data: Pick<Parameters<SessionPersistence['store']['save']>[1], 'messages' | 'compaction' | 'plan' | 'attachments' | 'pending' | 'delegatedItem'>,
     finalText?: string, approvedPlanId?: string, title?: string, scheduled = false) {
     const storage = this.options.persistence
     if (!storage) return
@@ -1026,7 +1124,8 @@ export class AgentSession {
   private async readMemorySession(memory: MemoryStore, project: MemoryProject, id: string) {
     const persistence = this.options.persistence
     const summary = persistence?.store.readSessionSummary(id)
-    if (!persistence || !summary) return
+    if (!persistence || !summary || summary.subagent?.parentSessionId !== undefined && summary.id !== this.sessionId
+      && summary.subagent.parentSessionId !== (persistence.summary.subagent?.parentSessionId ?? this.sessionId)) return
     if (summary.workspaceId !== persistence.summary.workspaceId) {
       const directory = await this.options.resolveWorkspaceDirectory?.(summary.workspaceId).catch(() => undefined)
       if (!directory) return
@@ -1036,9 +1135,9 @@ export class AgentSession {
     return persistence.store.loadSession(id)?.messages
   }
 
-  private context(compaction = this.latestCompaction()): ModelContext {
+  private context(compaction = this.latestCompaction(), extra: ConversationMessage[] = []): ModelContext {
     return {
-      ...this.configuration, messages: buildModelHistory(this.historyMessages(), compaction, !!this.options.persistence, this.options.attachments, this.hiddenMemoryPath()),
+      ...this.configuration, messages: buildModelHistory([...this.historyMessages(), ...extra], compaction, !!this.options.persistence, this.options.attachments, this.hiddenMemoryPath()),
       ...(this.state.running?.kind === 'task' && { currentUserMessageId: this.state.running.runId }),
       omittedToolImageResults: this.omittedToolImageResults,
     }
@@ -1177,7 +1276,7 @@ export class AgentSession {
   }
 
   private async finish(signal: AbortSignal, status: RunRecord['status'], entry?: ConversationMessage,
-    compaction?: Extract<CompactionRecord, { status: 'success' }>, assistantMessageId?: string) {
+    compaction?: Extract<CompactionRecord, { status: 'success' }>, assistantMessageId?: string, delegated?: DelegatedInput) {
     if (this.controller?.signal !== signal) return
     if (this.state.running?.kind === 'task' && signal.aborted) status = 'aborted'
     const savedReply = !entry && assistantMessageId && this.savedMessages.has(assistantMessageId)
@@ -1190,7 +1289,18 @@ export class AgentSession {
     if (stored?.status === 'running') {
       run = this.endedRun(stored, this.failure ? 'failed' : status)
       const followup = entry && this.followup(compaction, entry)
-      const data = { run, messages: entry && [entry], compaction: followup, plan }
+      const unclaimed = this.pendingSteering().flatMap<PendingSubmission>(item => {
+        if (item.targetRunId !== stored.id) return []
+        if (item.agentSource?.kind === 'steer') return [{ ...item, status: 'undelivered' as const }]
+        if (status === 'aborted' && item.agentSource?.kind === 'report') return [{ ...item, waitForUser: true as const }]
+        return []
+      })
+      const data = { run, messages: entry && [entry], compaction: followup, plan, pending: unclaimed,
+        ...(delegated && { delegatedItem: { id: delegated.id, index: delegated.index, item: {
+          status: run.status, sessionId: this.sessionId, runId: run.id,
+          ...assistantOutcome(entry ?? savedReply),
+        } } }) }
+
       const plainAnswer = entry?.message.role === 'assistant' && ['stop', 'length'].includes(entry.message.stopReason)
         && entry.message.content.some(block => block.type === 'text' && block.text.length > 0)
       try {
@@ -1200,12 +1310,18 @@ export class AgentSession {
           this.save(data)
         }
         if (followup) this.applyFollowup(followup)
+        for (const item of unclaimed) this.pending.set(item.input.clientMessageId, item)
+        if (unclaimed.length) this.publishInteraction()
       } catch (error) {
         this.noteFailure(error, plainAnswer ? 'answer' : 'finish')
         run = this.endedRun(stored, 'failed')
-        if (stored.scheduledRunId && error instanceof SessionWriteError && error.reason !== 'unconfirmed') {
-          // Preserve the terminal result even if the answer and its checkpoint could not be saved together.
-          try { this.save({ run }) } catch { /* The existing save failure remains visible in the session. */ }
+        if ((stored.scheduledRunId || delegated) && error instanceof SessionWriteError && error.reason !== 'unconfirmed') {
+          // Record failure even when saving the terminal answer failed.
+          try {
+            this.save({ run, ...(delegated && { delegatedItem: { id: delegated.id, index: delegated.index, item: {
+              sessionId: this.sessionId, runId: stored.id, status: 'failed', error: '子任务结果未能保存。',
+            } } }) })
+          } catch { /* The original save failure remains visible in the session. */ }
         }
         plan = undefined
       }
@@ -1241,7 +1357,7 @@ export class AgentSession {
         this.queuePaused = status === 'aborted' ? '任务已中止。发送新消息后继续。' : '任务未完成。发送新消息后继续。'
         this.publishInteraction()
       }
-      if (!plan) void this.drainQueue(resume)
+      if (!plan && !this.groupStopping) void this.drainQueue(resume)
     }
     if (scheduledRunId && this.options.onScheduledRunFinished) {
       void Promise.resolve().then(() => this.options.onScheduledRunFinished?.(scheduledRunId)).catch(() => undefined)
@@ -1263,7 +1379,7 @@ export class AgentSession {
   private publish(change: ConversationUpdate['change'], run?: RunRecord, saveFailure?: SaveFailure, modelSelection?: ModelSelection) {
     if (run) this.state.runs = [...(this.state.runs ?? []).filter(item => item.id !== run.id), run]
     if (saveFailure) this.state.saveFailures = [...this.state.saveFailures ?? [], saveFailure]
-    const refresh = change.type !== 'notice' && (change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error' || change.event.type === 'replace')
+    const refresh = change.type !== 'notice' && change.type !== 'subagents' && (change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error' || change.event.type === 'replace')
     if (refresh) this.refreshUsage()
     const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(modelSelection && { modelSelection }), ...(run && { run }), ...(saveFailure && { saveFailure }), ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
     for (const listener of this.listeners) listener(structuredClone(update))
@@ -1276,7 +1392,7 @@ export class AgentSession {
     this.publish(message ? { type: 'task', running, message, messageIndex: visibleIndex } : { type: 'task', running })
   }
 
-  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], skills: readonly SkillSummary[], signal: AbortSignal, user: ConversationMessage, systemPrompt: string | undefined, scheduled: boolean) {
+  private async runTask(model: ModelInfo, reasoningEffort: ReasoningEffort | undefined, running: Extract<RunningState, { kind: 'task' }>, cwd: string, tools: CodingTool[], skills: readonly SkillSummary[], signal: AbortSignal, user: ConversationMessage, systemPrompt: string | undefined, scheduled: boolean, delegated?: DelegatedInput) {
     let messageId = running.assistantMessageId
     let advanceRound = false
     let recovered = false
@@ -1285,13 +1401,14 @@ export class AgentSession {
     let activeTools: typeof running.activeTools = []
     let terminalEntry: ConversationMessage | undefined
     let savedToolResult: ConversationMessage | undefined
+    let stagedSteering: Awaited<ReturnType<AgentSession['prepareSteering']>> = []
     let status: RunRecord['status'] = 'failed'
 
     const runtime = this.runtime
-    if (runtime) this.cwd = cwd
+    this.cwd = cwd
     const ctx = () => this.extensionContext(cwd, model, signal)
     const runId = running.runId
-    if (!scheduled && this.options.persistence && this.options.questionWait) tools = [...tools, createUserQuestionTool((input, context) =>
+    if (!scheduled && this.options.persistence && !this.options.persistence.summary.subagent && this.options.questionWait) tools = [...tools, createUserQuestionTool((input, context) =>
       this.waitForQuestion(input, runId, messageId, context.toolCallId, context.signal))]
     const memoryStore = this.options.memory?.store
     let memorySettings: MemorySettings | undefined
@@ -1299,15 +1416,16 @@ export class AgentSession {
     let projectMemory: ProjectMemory | undefined
     let memoryTool: CodingTool | undefined
     let memorySourceTool: CodingTool | undefined
-    const canWriteMemory = () => this.memoryEnabled && !this.permissionUnconfirmed && this.state.permissionMode === 'normal' && !this.state.plan
+    const canWriteMemory = () => this.memoryEnabled && !this.toolDenial(MEMORY_TOOL_NAME, {}, Boolean(this.state.plan), false)
     const turnTools = memoryStore ? tools.map(tool => tool.name === 'read' ? protectMemoryRead(tool, cwd, memoryStore,
       () => ({ enabled: this.memoryEnabled, project: memoryProject })) : tool) : tools
     let roundTools = tools
-    let roundPlanning = Boolean(this.state.plan)
+    let roundPlanning = this.effectiveToolPolicy(Boolean(this.state.plan)).planning
     let leftPlan = false
     const configure = (files: ProjectContextFile[], memoryTools: CodingTool[] = []) => {
-      if (roundPlanning && !this.state.plan) leftPlan = true
-      roundPlanning = Boolean(this.state.plan)
+      const planning = this.effectiveToolPolicy(Boolean(this.state.plan)).planning
+      if (roundPlanning && !planning) leftPlan = true
+      roundPlanning = planning
       roundTools = this.configure(cwd, this.availableTools([...turnTools, ...memoryTools], roundPlanning, scheduled), files, skills)
       if (systemPrompt !== undefined) this.configuration.systemPrompt = systemPrompt
       if (roundPlanning) this.configuration.systemPrompt += '\n\n' + planInstruction
@@ -1326,6 +1444,9 @@ export class AgentSession {
         activeTools = []
         modelPhase()
       }
+      const summary = this.options.persistence?.summary
+      const subagents = this.options.subagents?.()
+      if (subagents && summary && !summary.subagent) this.roleCatalog = await subagents.roleCatalog(summary.workspaceId)
       const inputBudget = model.contextWindow - model.maxTokens
       let files: ProjectContextFile[]
       try {
@@ -1340,8 +1461,9 @@ export class AgentSession {
       if (this.estimate({ ...this.configuration, messages: [] }) > inputBudget) {
         return { error: files.length ? new ProjectContextOverflow().message : '系统提示和工具定义超出当前模型容量，请切换模型。' }
       }
-      if (!scheduled && this.pendingSteering().length) await claimSteering()
-      let context = this.context()
+      if (!scheduled && this.steeringForRun(runId).length) stagedSteering = await this.prepareSteering(model, runId, signal)
+      const staged = stagedSteering.map(({ entry }) => entry)
+      let context = this.context(undefined, staged)
       const fingerprint = JSON.stringify(context.messages)
       const margin = Math.min(16_384, Math.floor(inputBudget / 8))
       const trigger = Math.min(this.options.compaction?.triggerTokens ?? Infinity, inputBudget - margin)
@@ -1350,7 +1472,7 @@ export class AgentSession {
         await this.compact(model, reasoningEffort, 'auto', { ...running, assistantMessageId: messageId }, signal)
         signal.throwIfAborted()
         modelPhase()
-        context = this.context()
+        context = this.context(undefined, staged)
       }
       if (memoryStore && memorySettings?.enabled && !this.memoryUser) {
         const document = await memoryStore.readUser().catch(() => undefined)
@@ -1424,11 +1546,27 @@ export class AgentSession {
       if (memoryStore && (call.name === MEMORY_TOOL_NAME || call.name === MEMORY_SOURCE_TOOL_NAME) && !this.memoryEnabled) {
         return { code: 'permission_denied', message: '已关闭长期记忆，工具未执行。' }
       }
-      return this.toolDenial(call.name, call.arguments, roundPlanning, call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
+      return this.toolDenial(call.name, call.arguments, roundPlanning, roundPlanning && call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
     }
 
     let preview: Pick<ConversationSnapshot, 'messages' | 'activeContent'> | undefined
-    const agent = new Agent({ stream: withModelRetry(this.options.stream ?? stream, retry => {
+    const upstream = this.options.stream ?? stream
+    const submitSteering: typeof stream = (model, context, options) => {
+      signal.throwIfAborted()
+      if (stagedSteering.length) {
+        const entries = stagedSteering.map(({ entry }) => entry)
+        const claimed = stagedSteering.map(({ item, entry }, index) => this.delivered(item, entry, this.state.seq + index + 1))
+        const bindings = stagedSteering.flatMap(({ binding }) => binding ? [binding] : [])
+        try { this.save({ messages: entries, pending: claimed, attachments: bindings }) }
+        catch (error) { this.noteFailure(error, 'finish'); throw error }
+        stagedSteering = []
+        for (const item of claimed) this.pending.set(item.input.clientMessageId, item)
+        for (const entry of entries) this.updateTask(this.state.running, entry)
+        this.publishInteraction()
+      }
+      return upstream(model, context, options)
+    }
+    const agent = new Agent({ stream: withModelRetry(submitSteering, retry => {
       preview = { messages: [], activeContent: [] }
       const current = this.state.messages.find(entry => entry.id === messageId)?.message
       const incomplete = current?.role === 'assistant' && current.content.some(block => block.type === 'text' && block.text.trim())
@@ -1532,34 +1670,16 @@ export class AgentSession {
         savedToolResult = result
       }
     }
-    const claimSteering = async (answer?: ConversationMessage) => {
-      const carried = await this.prepareSteering(model, runId, signal)
-      const entries = carried.map(({ entry }) => entry)
-      const claimed = carried.map(({ item, entry }, index) => this.delivered(item, entry, this.state.seq + index + 1))
-      const bindings = carried.flatMap(({ binding }) => binding ? [binding] : [])
-      const followup = answer && this.followup(usedCompaction, answer)
-      try {
-        this.save({ messages: answer ? [answer, ...entries] : entries, pending: claimed, attachments: bindings, compaction: followup })
-      } catch (error) {
-        if (!(error instanceof SessionWriteError && error.reason === 'unconfirmed')) {
-          await removeReferenceSnapshots(entries.flatMap(entry => entry.references ?? []))
-        }
-        this.noteFailure(error, 'finish')
-        throw error
-      }
-      if (followup) this.applyFollowup(followup)
-      terminalEntry = undefined
-      for (const item of claimed) this.pending.set(item.input.clientMessageId, item)
-      for (const entry of entries) this.updateTask(this.state.running, entry)
-      this.publishInteraction()
-    }
     const afterStep: AgentRunInput['afterStep'] = async (reply, hasTools) => {
       if (signal.aborted) return false
-      if (!this.pendingSteering().length) {
+      if (!this.steeringForRun(runId).length) {
         if (!hasTools) this.steeringBoundaryClosed = true
         return false
       }
-      await claimSteering(hasTools ? undefined : terminalEntry ?? { id: messageId, message: reply })
+      if (!hasTools) {
+        try { saveReply(terminalEntry ?? { id: messageId, message: reply }) }
+        catch (error) { this.noteFailure(error, 'finish'); throw error }
+      }
       return true
     }
     try {
@@ -1644,7 +1764,10 @@ export class AgentSession {
       terminalEntry = this.fail(model, messageId, signal.aborted ? '本次生成已取消' : '模型调用意外中断，请重新发送', signal.aborted)
     } finally {
       unsubscribe()
-      await this.finish(signal, status, terminalEntry, usedCompaction, messageId)
+      if (stagedSteering.length && this.failure?.reason !== 'unconfirmed') {
+        await removeReferenceSnapshots(stagedSteering.flatMap(({ entry }) => entry.references ?? []))
+      }
+      await this.finish(signal, status, terminalEntry, usedCompaction, messageId, delegated)
     }
   }
 
@@ -1800,7 +1923,8 @@ export class AgentSession {
     }
     if (!closed) {
       this.listeners.add(receive)
-      queue.push({ type: 'snapshot', snapshot: structuredClone({ ...this.state, messages: this.state.messages.filter(message => !message.extension) }) })
+      const view = this.options.subagents?.()?.view(this.sessionId)
+      queue.push({ type: 'snapshot', snapshot: structuredClone({ ...this.state, ...view, messages: this.state.messages.filter(message => !message.extension) }) })
       signal.addEventListener('abort', close, { once: true })
     }
     return {
@@ -1813,6 +1937,108 @@ export class AgentSession {
       return() { close(); return Promise.resolve(done) },
     }
   }
+
+  get delegationSession() { return this.options.persistence?.summary }
+
+  get activeRunId() { return this.state.running?.runId }
+
+  get delegationSelection() { return this.state.modelSelection }
+
+  get delegationContext() {
+    const permissionMode = this.state.permissionMode
+    const planning = Boolean(this.state.plan)
+    const tools = this.configuration.tools?.map(tool => tool.name).filter(name => !this.toolDenial(name, {}, planning, false)) ?? []
+    const activated = new Set(this.options.persistence?.store.listMcpToolLoads(this.sessionId).map(mcpToolKey))
+    const mcpToolKeys = this.options.mcp?.listToolsForAgent().filter(binding => tools.includes(binding.name))
+      .map(binding => mcpToolKey(mcpToolIdentity(binding))).filter(key => activated.has(key)) ?? []
+    return {
+      cwd: this.cwd,
+      selection: this.model && defaultSelection(this.model),
+      permissionMode,
+      tools, mcpToolKeys,
+      roleCatalog: this.roleCatalog,
+    }
+  }
+
+  get agentAdmissionStatus() {
+    if (this.closed || this.queueFrozen) return 'closed'
+    if (this.groupStopping || this.controller?.signal.aborted || this.settling) return 'stopping'
+    if (this.state.running || this.submitting) return 'running'
+    if (this.state.plan?.state === 'review') return 'review'
+    if (this.startingPendingId) return 'queued'
+    if (!this.options.persistence?.summary.subagent
+      && (this.queued().length || this.queuePaused && this.pendingSteering().length)) return 'queued'
+    return 'idle'
+  }
+
+  async runDelegatedTask(input: Omit<SubmissionInput, 'clientMessageId'>, delegated: DelegatedInput, signal: AbortSignal) {
+    const status = this.agentAdmissionStatus
+    if (status !== 'idle') return { status } as const
+    signal.throwIfAborted()
+    const receipt = await this.submitMessage({ ...input, clientMessageId: `agent:${delegated.id}:${delegated.index}` },
+      undefined, false, signal, undefined, delegated)
+    if (receipt.kind !== 'message' || !this.task) throw new Error('目标未接收子 Agent 任务。')
+    const runId = receipt.userMessageId
+    const done: Promise<DelegationItem> = this.task.then(() => {
+      const run = this.state.runs?.find(run => run.id === runId)
+      const start = this.state.messages.findIndex(entry => entry.id === runId)
+      const last = this.state.messages.slice(start + 1).reverse().find(entry => entry.message.role === 'assistant'
+        && this.savedMessages.has(entry.id))
+      return { sessionId: this.sessionId, runId, status: run?.status ?? 'failed', ...assistantOutcome(last) }
+    })
+    return { status: 'accepted', runId, done } as const
+  }
+
+  receiveAgentInput(id: string, source: AgentInputSource, text: string) {
+    const clientMessageId = `agent:${id}`
+    const prior = this.pending.get(clientMessageId)
+    if (prior) return { status: 'accepted' as const, runId: prior.targetRunId }
+    const status = this.agentAdmissionStatus
+    if (this.closed || this.queueFrozen) return { status: 'closed' as const }
+    const explicit = source.kind === 'steer'
+    const runId = this.state.running?.runId
+    const steering = !this.groupStopping && this.canSteer()
+    if (explicit && !steering) return { status }
+    if (this.groupStopping) return { status: 'stopping' as const }
+    const selection = this.state.modelSelection
+    if (!selection) return { status }
+    this.enqueue({ ...selection, clientMessageId, text, ...(steering && { mode: 'steer' }) },
+      steering ? 'steering' : 'queued', undefined, source, steering ? runId : undefined)
+    if (!steering && status === 'stopping') this.resumeAfterAbort = true
+    if (!steering && !this.state.running && !this.submitting) void this.drainQueue(!this.queuePaused)
+    return { status: 'accepted' as const, runId: steering ? runId : undefined }
+  }
+
+  publishSubagentView(view: SubagentView) {
+    this.publish({ type: 'subagents', ...view })
+  }
+
+  async stopSessionWork(): Promise<boolean> {
+    this.groupStopping = true
+    this.resumeAfterAbort = false
+    this.queuePaused = '会话已停止。发送新消息后继续。'
+    const preparing = this.submitting?.settled
+    this.preparing?.abort()
+    this.initializing?.abort()
+    const running = this.state.running
+    const stopping = running ? this.abort(running.runId) : undefined
+    const suppressed = [...this.queued(), ...this.pendingSteering()].filter(item => item.agentSource?.kind === 'report')
+      .map(item => ({ ...item, status: 'deleted' as const }))
+    let stopped = Boolean(preparing)
+    try {
+      if (suppressed.length) {
+        this.save({ pending: suppressed })
+        for (const item of suppressed) this.pending.set(item.input.clientMessageId, item)
+      }
+      this.publishInteraction()
+    } finally {
+      if (stopping) stopped = await stopping
+      else await preparing?.catch(() => undefined)
+    }
+    return stopped
+  }
+
+  finishSessionStop() { this.groupStopping = false }
 
   async abort(runId: string): Promise<boolean> {
     if (this.state.running?.runId !== runId) return false
@@ -1843,7 +2069,7 @@ export class AgentSession {
     return this.closing = (async () => {
       await Promise.allSettled([this.initialization, this.submitting?.settled, this.titleRequest?.pending, ...this.selectionNotifications])
       await task
-      const cleared = [...this.queued(), ...this.pendingSteering()].map(item => ({ ...item, status: 'deleted' as const }))
+      const cleared = [...this.queued(), ...this.pendingSteering()].filter(item => item.agentSource?.kind !== 'report').map(item => ({ ...item, status: 'deleted' as const }))
       if (cleared.length) {
         this.save({ pending: cleared })
         for (const item of cleared) this.pending.set(item.input.clientMessageId, item)

@@ -135,7 +135,7 @@ export class Agent {
             this.emit({ type: 'tool_start', contentIndex, ...(actualArguments && { actualArguments }) })
             executed = true
             const toolOutput = await tool.execute(prepareToolCall ? structuredClone(prepared.arguments) : prepared.arguments,
-              { signal, toolCallId: call.id, recordDetails: detail => { details.push(detail) } })
+              { signal, toolCallId: call.id, contentIndex, recordDetails: detail => { details.push(detail) } })
             if (typeof toolOutput === 'string' || Array.isArray(toolOutput)) output = toolOutput
             else ({ content: output, isError } = toolOutput)
           } catch (error) {

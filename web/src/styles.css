@@ -111,8 +111,19 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 }
 .background-task-list { margin: 0; padding: 0; list-style: none; }
 .background-task-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; font-size: 12px; line-height: 18px; }
-.background-task-row + .background-task-row { border-top: 1px solid var(--border); }
-.background-task-row code { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.background-task-row + .background-task-row, .background-task-item + .background-task-item { border-top: 1px solid var(--border); }
+.background-task-row code, .background-task-name { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.background-task-heading { margin: 0; padding: 4px; font: var(--type-detail); color: var(--secondary-text); }
+.background-task-list + .background-task-heading { margin-top: 8px; border-top: 1px solid var(--border); }
+.background-task-tooltip {
+  z-index: 20;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font: var(--type-detail);
+}
 .background-task-status { flex: none; color: var(--secondary-text); }
 .background-task-error { margin: 4px; color: var(--color-destructive); font-size: 12px; line-height: 18px; }
 .chat-main {

@@ -105,6 +105,7 @@ export class ToolRuntime {
   private readonly shutdown = new AbortController()
   private readonly tasks = new Set<Promise<unknown>>()
   private readonly binaries = new Map<SearchBinary, string>()
+  private readonly startingJobs = new Map<string, RunningJobRecord>()
   private readonly runningJobs = new Map<string, RunningJobRecord>()
   private readonly finishedJobs = new Map<string, JobRecord<FinishedBashJob>>()
   private directory?: Promise<string>
@@ -349,6 +350,7 @@ export class ToolRuntime {
       }
       const finish = (result: FinishedBashJob) => {
         signal.removeEventListener('abort', cancelStartup)
+        this.startingJobs.delete(jobId)
         if (this.runningJobs.delete(jobId)) {
           append(decoders.stdout.end())
           append(decoders.stderr.end())
@@ -363,6 +365,7 @@ export class ToolRuntime {
           cwd, signal: stop.signal, processGroup: true, timeout, abortMessage: '已停止',
           onSpawn: () => {
             signal.removeEventListener('abort', cancelStartup)
+            this.startingJobs.delete(jobId)
             this.runningJobs.set(jobId, job)
             resolve(view)
           },
@@ -375,10 +378,17 @@ export class ToolRuntime {
           })
         }, error => {
           reject(error)
-          return finish({ jobId, command, status: 'failed', exitCode: null, signal: null, reason: String(error) })
+          return finish({ jobId, command, status: stop.signal.aborted ? 'stopped' : 'failed', exitCode: null, signal: null, reason: String(error) })
         }),
       }
+      this.startingJobs.set(jobId, job)
     })
+  }
+
+  async stopSessionJobs(sessionIds: ReadonlySet<string>): Promise<FinishedBashJob[]> {
+    const jobs = [...this.startingJobs.values(), ...this.runningJobs.values()].filter(job => sessionIds.has(job.sessionId))
+    for (const job of jobs) job.stop.abort()
+    return Promise.all(jobs.map(job => job.done))
   }
 
   listRunningJobs(sessionId: string): RunningBashJob[] {

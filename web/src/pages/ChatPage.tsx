@@ -20,7 +20,7 @@ import { MessageList } from '../components/MessageList'
 import { BackgroundTasks } from '../components/BackgroundTasks'
 import { NewChatParticles } from '../components/NewChatParticles'
 import { ScheduleActionDialog, ScheduleCreateDialog, ScheduledTasks, ScheduledTaskSidebar, useScheduleCatalog, type ScheduleDialogRequest } from '../components/ScheduledTasks'
-import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, getMcpServers, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat, createSession } from '../chat/client'
+import { getModels as queryModels, getWorkspaces as queryWorkspaces, pickWorkspace as chooseWorkspace, getSessions as querySessions, startSession as postFirstMessage, saveModelSelection, getDefaultPermission as queryDefaultPermission, saveDefaultPermission, saveSessionPermission, getWebSettings, getMcpServers, abortMessage as postAbort, submitMessage as postMessage, subscribe as subscribeToChat, createSession, stopSession, type StopSessionResult } from '../chat/client'
 import { Button } from '../components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select'
 import { Sidebar, SidebarDismiss, SidebarProvider, SidebarTrigger, useSidebar } from '../components/ui/sidebar'
@@ -45,6 +45,8 @@ type SentDraft = {
   key: string; text: string; revision?: number; attachmentIds?: string[]; referenceSessionIds?: string[]
 }
 type SourceSend = SentDraft & StoredSourceSend & { pending: boolean; quote?: string }
+
+type StopState = { pending: true } | { pending: false; result: StopSessionResult } | { pending: false; error: Notice }
 
 type AbortState = { runId: string; status: 'pending' | 'unconfirmed'; error?: Notice }
 
@@ -223,6 +225,8 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
   const referenceDrafts = useRef(new Map<string, SessionSummary[]>())
   const [referenceView, setReferenceView] = useState(() => new Map(referenceDrafts.current))
   const sourceSends = useRef(new Map<string, SourceSend>())
+  const stopRequests = useRef(new Set<string>())
+  const [stopStates, setStopStates] = useState<Record<string, StopState>>({})
   const [draftIssue, setDraftIssue] = useState<{ key: string; notice: Notice }>()
   const planCommand = useRef(false)
   const planDrafts = useRef(new Map<string, NonNullable<ReturnType<typeof readPlanDraft>>>())
@@ -724,7 +728,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     const { snapshot } = stateRef.current
     if (!sessionId || sessionId !== selected.current || !workspace?.available || workspaceError
       || stateRef.current.sessionId !== sessionId || stateRef.current.connection !== 'ready' || !snapshot
-      || !hasModel() || savingSessionPermission.current || planCommand.current || snapshot.plan?.state === 'review'
+      || !hasModel() || stopRequests.current.has(sessionId) || savingSessionPermission.current || planCommand.current || snapshot.plan?.state === 'review'
       || openedQuestion || !allowRunning && snapshot.running) return false
     const stopping = abortRef.current.get(sessionId)
     return !(stopping?.status === 'pending' && stopping.runId === snapshot.running?.runId)
@@ -920,6 +924,11 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       return false
     }
     if (!canSubmit(!fromSchedule && !control)) return false
+    if (stopStates[sessionId]) setStopStates(previous => {
+      const next = { ...previous }
+      delete next[sessionId]
+      return next
+    })
     setSelectionError(undefined)
     const quotedText = draftQuote && draftQuote.split(/\r\n|\n|\r/).map(line => `> ${line}`).join('\n')
     const body = text.trimStart()
@@ -1048,6 +1057,26 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
     }
     if (mounted.current && selected.current === sessionId && abortRef.current.get(sessionId)?.runId === runId) subscription.current?.requestSnapshot?.()
   }
+  const stopState = sessionId ? stopStates[sessionId] : undefined
+  const stopPending = stopState?.pending === true
+  const stopReady = Boolean(sessionId && state.sessionId === sessionId && state.connection === 'ready' && state.snapshot)
+  const stopWork = () => {
+    const current = stateRef.current
+    if (!sessionId || sessionId !== selected.current || sessionId !== current.sessionId ||
+      current.connection !== 'ready' || !current.snapshot || stopRequests.current.has(sessionId)) return false
+    stopRequests.current.add(sessionId)
+    setStopStates(previous => ({ ...previous, [sessionId]: { pending: true } }))
+    void stopSession(sessionId).then(result => {
+      if (mounted.current) setStopStates(previous => ({ ...previous, [sessionId]: { pending: false, result } }))
+    }, error => {
+      if (mounted.current) setStopStates(previous => ({ ...previous, [sessionId]: { pending: false, error: errorNotice('chat.stopFailed', error) } }))
+    }).finally(() => {
+      stopRequests.current.delete(sessionId)
+      if (mounted.current && selected.current === sessionId) subscription.current?.requestSnapshot?.()
+    })
+    return true
+  }
+  const stopResult = stopState && !stopState.pending && 'result' in stopState ? stopState.result : undefined
   const statusKey = state.connectionNotice ?? (state.slow ? 'chat.connectionSlow' : ({
     connecting: 'chat.connecting', awaitingSnapshot: 'chat.restoring', disconnected: 'chat.disconnected',
     ready: !sessionId ? firstPhase === 'sending' ? 'chat.firstSending' : 'chat.new'
@@ -1182,15 +1211,16 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       {!isNew && <header className="chat-header">
         <h1 title={session?.name}>{session?.name || t('chat.title')}</h1>
         <div className="chat-header-controls">
-          <p className="connection-status" role="status">{status}</p>
-          {sessionId && <BackgroundTasks sessionId={sessionId} />}
+          <p className="connection-status" role="status">{stopPending ? t('background.stopping') : status}</p>
+          {sessionId && <BackgroundTasks sessionId={sessionId} subagents={state.snapshot?.subagents}
+            stopDisabled={state.connection !== 'ready' || stopPending} onSync={() => syncConversation(sessionId)} />}
         </div>
       </header>}
       <div className="chat-main-frame">
       {section === 'home' && isNew && <NewChatParticles />}
       <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
         {!isNew && <MessageList key={sessionId} messages={messages} showRetry={state.connection === 'ready'} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
-          steering={interaction?.steering} questions={questionBatches}
+          delegationOutputs={state.snapshot?.delegationOutputs} steering={interaction?.steering} questions={questionBatches}
           onOpenQuestion={batch => {
             if (!sessionId) return
             if (batch.status === 'waiting') {
@@ -1245,6 +1275,13 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
             <NoticeText notice={permissionReadError} /> <Button variant="ghost" onClick={() => { void refreshPermission() }}>{t('common.retry')}</Button>
           </p>}
           {permissionError?.sessionId === sessionId && <p className="configuration-error" role="alert"><NoticeText notice={permissionError.notice} /></p>}
+          {stopState && !stopState.pending && 'error' in stopState &&
+            <p className="configuration-error" role="alert"><NoticeText notice={stopState.error} /></p>}
+          {stopResult && <p className="interaction-note" role="status">
+            {[stopResult.stopped > 0 && t('chat.stopStopped', { count: stopResult.stopped }),
+              stopResult.completed > 0 && t('chat.stopCompleted', { count: stopResult.completed }),
+              stopResult.unconfirmed > 0 && t('chat.stopUnconfirmed', { count: stopResult.unconfirmed })].filter(Boolean).join(' · ') || t('chat.stopEmpty')}
+          </p>}
           {draftIssue?.key === draftId && <p className="configuration-error" role="alert"><NoticeText notice={draftIssue.notice} /></p>}
           {retryingSource && <Button variant="outline" className="self-start" disabled={state.connection !== 'ready'} onClick={() => {
             const sent = sourceSends.current.get(retryingSource.clientMessageId)
@@ -1260,7 +1297,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
           {submissions.some(item => item.deferred && !item.mode && item.state === 'pending' && !item.accepted) &&
             <p className="interaction-note" role="status">{t('chat.sending')}</p>}
           {sessionId && interaction && <MessageQueue key={`queue:${sessionId}`} sessionId={sessionId} value={interaction.queue}
-            disabled={state.connection !== 'ready'} canSteer={state.snapshot?.running?.kind === 'task' && activeAbort?.status !== 'pending'}
+            disabled={state.connection !== 'ready' || stopPending} canSteer={state.snapshot?.running?.kind === 'task' && activeAbort?.status !== 'pending'}
             onSync={() => syncConversation(sessionId)} />}
           {sessionId && questionBatches.filter(batch => batch.status === 'waiting' || batch.status === 'timed-out' || batch.id === openedQuestion?.id).map(batch =>
             <QuestionComposer key={`${sessionId}:${batch.id}`} sessionId={sessionId} batch={batch} open={openedQuestion?.id === batch.id}
@@ -1309,7 +1346,8 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
             commandsEnabled={!isNew && !quote && !target} onPlan={target ? undefined : text => { void activatePlan(text) }}
             onSend={text => send(text)} onSteer={state.snapshot?.running?.kind === 'task' ? text => send(text, false, 'steer') : undefined}
             activeRunId={target} sendDisabled={isNew ? !canStart() : !canSubmit(true)}
-            action={action} abortDisabled={abortDisabled} onAbort={() => { void abort(target) }} />
+            action={action} abortDisabled={abortDisabled || stopPending} onAbort={() => { void abort(target) }}
+            onStop={stopReady && !stopPending ? stopWork : undefined} />
         </div>
       </main>
       </div>
