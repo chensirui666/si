@@ -137,7 +137,7 @@ function indexCandidate({ binding, namespace }: McpToolSearchCandidate) {
   }
 }
 
-function rankCandidates(query: string, candidates: readonly McpToolSearchCandidate[], limit: number) {
+export function rankCandidates(query: string, candidates: readonly McpToolSearchCandidate[], limit: number) {
   const queryTerms = new Set(tokenize(query))
   if (!queryTerms.size || !candidates.length) return []
   const indexed = candidates.map(indexCandidate)

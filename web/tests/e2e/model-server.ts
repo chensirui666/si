@@ -6,7 +6,7 @@ type ContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_u
 type RequestBody = {
   model: string
   stream: boolean
-  messages: { role: string; content: string | null | ContentPart[]; reasoning_content?: string }[]
+  messages: { role: string; content: string | null | ContentPart[]; reasoning_content?: string; tool_call_id?: string }[]
   thinking: { type: string }
   reasoning_effort: string
   max_tokens: number

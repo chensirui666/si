@@ -105,7 +105,7 @@ interface Runtime {
 
 const authorizationRequired = (error: unknown) =>
   error instanceof McpAuthRequiredError || error instanceof McpOAuthAuthorizationRequiredError;
-const unavailable = () => new Error('MCP 工具当前不可用，请检查服务连接与权限。');
+const unavailable = () => Object.assign(new Error('MCP 工具当前不可用，请检查服务连接与权限。'), { code: 'mcp_unavailable' });
 const authorizationFailed = 'MCP authorization failed or expired. Start authorization again.';
 const cleanupFailed = 'The previous MCP connection could not be closed.';
 const rejectedToken = 'The MCP service rejected its access token.';

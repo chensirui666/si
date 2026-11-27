@@ -1,5 +1,5 @@
 import { isPermissionMode } from '@agent-learning/server/protocol'
-import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, ExtensionNotice, InteractionState, PlanState, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
+import type { ActiveContent, CompactionRecord, ConversationMessage, ConversationSnapshot, ExtensionNotice, InteractionState, NestedToolCallRecord, PlanState, RunRecord, SaveFailure, ServerFrame, SkillSource } from '@agent-learning/server/protocol'
 import type { AssistantMessage, ModelFailureKind, ModelMessage, ModelSelection, ReasoningEffort } from '@agent-learning/model'
 import type { LocalSubmission } from '../types'
 import { retryReasons, terminalOnly } from './model-retry'
@@ -268,11 +268,26 @@ function delegationOutputs(value: unknown): value is NonNullable<ConversationSna
     && sequence(output.contentIndex) && typeof output.output === 'string')
 }
 
+function nestedToolCall(value: unknown, messages: readonly ConversationMessage[]): value is NestedToolCallRecord {
+  if (!record(value) || typeof value.id !== 'string' || !value.id || typeof value.name !== 'string' || !value.name
+    || typeof value.runId !== 'string' || !value.runId || !record(value.parent)
+    || typeof value.parent.assistantMessageId !== 'string' || !sequence(value.parent.contentIndex)
+    || !record(value.argumentsPreview)
+    || !['running', 'succeeded', 'failed', 'not-executed', 'stopped', 'unknown'].includes(value.status as string)
+    || value.resultPreview !== undefined && typeof value.resultPreview !== 'string') return false
+  const owner = value.parent.assistantMessageId
+  const message = messages.find(entry => entry.id === owner)?.message
+  const parent = message?.role === 'assistant' && message.content[value.parent.contentIndex]
+  return !!parent && parent.type === 'toolCall' && parent.name === 'codemode' && value.id.startsWith(parent.id + '/')
+}
+
 function validSnapshot(value: unknown): value is ConversationSnapshot {
   return record(value) && sequence(value.seq) && isPermissionMode(value.permissionMode) && Array.isArray(value.messages) && value.messages.every(conversationMessage)
     && (value.modelSelection === undefined || modelSelection(value.modelSelection))
     && (value.plan === undefined || planState(value.plan))
     && (value.interaction === undefined || interactionState(value.interaction))
+    && (value.nestedToolCalls === undefined || Array.isArray(value.nestedToolCalls)
+      && value.nestedToolCalls.every(item => nestedToolCall(item, value.messages as ConversationMessage[])))
     && (value.subagents === undefined || subagents(value.subagents))
     && (value.delegationOutputs === undefined || delegationOutputs(value.delegationOutputs))
     && (value.running === null || runningState(value.running)) && Array.isArray(value.activeContent)
@@ -314,6 +329,18 @@ export function applyFrame(state: ChatState, frame: unknown, subscriptionId: str
   const capacity = frame.update.contextUsage === undefined ? state.snapshot.contextUsage : frame.update.contextUsage as ConversationSnapshot['contextUsage']
   const change = frame.update.change
   if (!record(change)) return { state, resubscribe: true }
+  if (change.type === 'nested-tool') {
+    const item = change.record
+    if (!nestedToolCall(item, state.snapshot.messages) || item.runId !== state.snapshot.running?.runId) return { state, resubscribe: true }
+    const records = [...state.snapshot.nestedToolCalls ?? []]
+    const index = records.findIndex(current => current.id === item.id
+      && current.parent.assistantMessageId === item.parent.assistantMessageId && current.parent.contentIndex === item.parent.contentIndex)
+    if (index < 0) records.push(item)
+    else records[index] = item
+    return { state: { ...state, snapshot: {
+      ...state.snapshot, ...metadata, seq: frame.update.seq, contextUsage: capacity, nestedToolCalls: records,
+    } }, resubscribe: false }
+  }
   if (change.type === 'notice') {
     if (!extensionNotice(change.notice)) return { state, resubscribe: true }
     return { state: { ...state, snapshot: { ...state.snapshot, seq: frame.update.seq } }, resubscribe: false, notice: change.notice }

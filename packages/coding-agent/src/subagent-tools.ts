@@ -1,5 +1,6 @@
 import { Type, type Static } from 'typebox'
 import { Check } from 'typebox/value'
+import type { DelegationItem } from './subagent-types.js'
 import type { CodingTool } from './tools.js'
 
 export const SUBAGENT_TOOL = 'subagent'
@@ -47,7 +48,14 @@ export function createSubagentTool(name: typeof SUBAGENT_TOOL | typeof TEAM_TOOL
     validateArguments: args => Check(parameters, args),
     async execute(args, context) {
       if (!Check(parameters, args)) throw new Error('子 Agent 参数无效。')
-      return JSON.stringify(await run(args, context))
+      const result = await run(args, context)
+      if (context.nestedToolCallId && result && typeof result === 'object' && 'items' in result && Array.isArray(result.items)) {
+        const tasks = (result.items as DelegationItem[]).map(({ sessionId, status, output, error }) => ({
+          sessionId, status, ...(output !== undefined && { reply: output }), ...(error !== undefined && { error }),
+        }))
+        context.recordDetails({ kind: 'codemode-delegation', tasks })
+      }
+      return JSON.stringify(result)
     },
   }
 }

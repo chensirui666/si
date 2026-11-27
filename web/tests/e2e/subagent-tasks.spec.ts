@@ -276,3 +276,35 @@ test('27 用户回答前台子 Agent 的问题后，主 Agent 沿原子会话继
     }
   })
 })
+
+test('Feature 13 08 前台委派部分失败，脚本按顺序取得两项结果', async ({ page }) => {
+  await controlled(page, async ({ provider, observed, workspaceId }) => {
+    const root = await seedSession(page, observed, workspaceId)
+    const initial = await send(page, provider, '脚本并行委派两项')
+    const code = `
+      const {tasks} = await tools.subagent({action:"run",background:false,tasks:[
+        {task:"核对 MCP 模块",name:"mcp-reader"},
+        {task:"核对 Server 模块",name:"missing-directory",cwd:"no-such-workspace"}
+      ]});
+      return tasks.map(task => task.reply ? {status:task.status, result:JSON.parse(task.reply)} : {status:task.status, error:task.error});
+    `
+    initial.delta({ tool_calls: [{ index: 0, id: 'script-delegation', type: 'function',
+      function: { name: 'codemode', arguments: JSON.stringify({ code }) } }] })
+    initial.finish('tool_calls')
+    const child = await findExchange(provider, 0, exchange => hasUserText(exchange, '核对 MCP 模块'))
+    answer(child, '{"module":"MCP","issues":[]}')
+    const followup = await findExchange(provider, 0, exchange => exchange !== initial && hasUserText(exchange, '脚本并行委派两项'))
+    const result = followup.body.messages.find(message => message.role === 'tool' && message.tool_call_id === 'script-delegation')
+    expect(JSON.parse(String(result?.content))).toMatchObject([
+      { status: 'completed', result: { module: 'MCP', issues: [] } },
+      { status: 'failed', error: expect.any(String) },
+    ])
+    answer(followup, '结果已汇总')
+    await idle(page)
+    return (store: SessionStore) => {
+      const saved = store.loadSession(root)?.nestedToolCalls?.find(record => record.name === 'subagent')
+      expect(saved).toMatchObject({ id: 'script-delegation/1', status: 'succeeded' })
+      expect(store.listDelegations(root)[0]?.call.toolCallId).toBe(saved?.id)
+    }
+  })
+})

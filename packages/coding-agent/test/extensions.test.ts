@@ -301,7 +301,7 @@ it('registers a tool for the next round and preserves the original tool on colli
     if (event.type === 'update' && event.update.change.type === 'task' && event.update.change.running === null) break
   }
   await runtime.close()
-  expect(declarations).toEqual([['read'], ['read', 'custom'], ['read', 'custom']])
+  expect(declarations).toEqual([['read', 'codemode'], ['read', 'codemode', 'custom'], ['read', 'codemode', 'custom']])
   expect(execute).toHaveBeenCalledWith({ note: 'next' }, expect.any(Object))
   expect(observed).toEqual(['custom-id', 'actual:next'])
 })

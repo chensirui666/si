@@ -5,6 +5,7 @@ import type { Tool, ToolResultMessage } from '@agent-learning/model'
 import { realpath } from 'node:fs/promises'
 import { createLocalTools, pathFrom, type LocalToolContext } from './local-tools.js'
 import type { MemoryProject, MemoryStore } from './memory-store.js'
+import type { McpToolBinding } from './mcp/manager.js'
 import type { WebTools } from './web-tools.js'
 import type { ToolRuntime } from './tool-runtime.js'
 import { planBashDescription, planGitArgs } from './plan-mode.js'
@@ -86,7 +87,7 @@ const declarations = {
   web_fetch: { name: 'web_fetch', description: '获取指定网页的正文。', parameters: webFetchParameters },
 } satisfies Record<string, Tool>
 
-export type CodingTool = ExecutableTool & { promptSnippet?: string; planVersion?: CodingTool; preserveFailure?: true }
+export type CodingTool = ExecutableTool & { promptSnippet?: string; planVersion?: CodingTool; preserveFailure?: true; mcpBinding?: McpToolBinding }
 
 export function protectMemoryRead(tool: CodingTool, cwd: string, store: MemoryStore, access: () => { enabled: boolean; project?: MemoryProject }): CodingTool {
   return { ...tool, async execute(args, context) {

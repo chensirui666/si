@@ -380,7 +380,7 @@ describe('AgentSession 一批工具与最终回答', () => {
     })
     await agent.submit(input)
     await until(async () => contexts.length === 1)
-    expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search'])
     expect(contexts[0].systemPrompt).toContain('GitHub')
     expect(contexts[0].systemPrompt).toContain('Repository issues')
     expect(contexts[0].systemPrompt).not.toContain('Do not include this line')
@@ -389,7 +389,7 @@ describe('AgentSession 一批工具与最终回答', () => {
     queues[0].push({ type: 'done', reason: 'toolUse', message: { ...assistant(), stopReason: 'toolUse', content: [searchMcp, undisclosed] } })
     await until(async () => contexts.length === 2)
     expect(callTool).not.toHaveBeenCalled()
-    expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+    expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search', name])
     expect(contexts[1].systemPrompt).not.toContain(name)
     expect(contexts[1].messages).toContainEqual(expect.objectContaining({ toolCallId: undisclosed.id, isError: true }))
     const call = toolCall('issue-call-1', { name, arguments: { issue_number: 1 } })
@@ -397,7 +397,7 @@ describe('AgentSession 一批工具与最终回答', () => {
     await until(async () => contexts.length === 3)
     expect(callTool).toHaveBeenCalledOnce()
     expect(callTool.mock.calls[0]?.[1]).toEqual({ issue_number: 42 })
-    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['tool_search'])
+    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search'])
     const result = { role: 'toolResult', toolCallId: call.id, isError: true,
       content: expect.arrayContaining([{ type: 'text', text: '远端拒绝' }, { type: 'text', text: '补充说明' }]) }
     expect(contexts[2].messages).toContainEqual(expect.objectContaining(result))
@@ -440,7 +440,7 @@ describe('AgentSession 一批工具与最终回答', () => {
     finally { release.resolve() }
     await until(async () => contexts.length === 3)
     expect(sent).not.toHaveBeenCalled()
-    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['read', 'grep', 'find', 'ls'])
+    expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['read', 'grep', 'find', 'ls', 'codemode'])
     expect(contexts[2].systemPrompt).not.toContain('GitHub')
     expect((await snapshot(agent)).messages).toContainEqual(expect.objectContaining({ toolErrorCode: 'permission_denied',
       message: expect.objectContaining({ role: 'toolResult', toolCallId: call.id, isError: true }) }))
@@ -470,7 +470,7 @@ describe('AgentSession 一批工具与最终回答', () => {
     first.push({ type: 'toolcall_end', contentIndex: 1, toolCall: call, partial })
     await until(async () => (await snapshot(agent)).seq === 5)
     expect(executions).toEqual([])
-    expect(contexts[0].tools?.map(({ name }) => name)).toEqual(['read'])
+    expect(contexts[0].tools?.map(({ name }) => name)).toEqual(['read', 'codemode'])
     expect(contexts[0].systemPrompt).toContain(workspaceDirectory)
     const request = { ...partial, stopReason: 'toolUse' as const, content: [{ type: 'thinking' as const, thinking: '先读取' }, call] }
     first.push({ type: 'done', reason: 'toolUse', message: request })
@@ -701,7 +701,7 @@ describe('Feature6 连续决策与同批调度', () => {
     done(1, [toolCall('read-1', { arguments: { path: 'note.txt' } })])
     await until(async () => contexts.length === 3)
     expect(paths).toEqual(['index.txt', 'note.txt'])
-    expect(contexts.every(context => context.tools?.length === 1)).toBe(true)
+    expect(contexts.every(context => context.tools?.length === 2)).toBe(true)
     expect(contexts[2].messages.at(-1)).toMatchObject({ content: [{ text: '项目名称：青禾' }] })
     await expect(agent.submit(input)).rejects.toMatchObject({ code: 'busy' })
     expect((await snapshot(agent)).running?.runId).toBe(receipt.userMessageId)
@@ -1053,4 +1053,36 @@ it('keeps original user text when a discovered Skill disappears before loading',
     await agent.close()
     await fs.rm(cwd, { recursive: true, force: true })
   }
+})
+
+it('executes Code Mode in QuickJS and feeds back the selected output once', async () => {
+  const requests: ModelContext[] = []
+  const read: ExecutableTool = {
+    name: 'read', parameters: Type.Object({ path: Type.String() }), description: 'read',
+    async execute({ path }) { return `${path}\nlarge unselected content` },
+  }
+  const find: ExecutableTool = {
+    name: 'find', parameters: Type.Object({}), description: 'find',
+    async execute() { return 'old.md\ncurrent.md' },
+  }
+  const session = createSession({ tools: [read, find], stream: (_model, context) => {
+    requests.push(context)
+    const response = requests.length === 1
+      ? { ...assistant(), stopReason: 'toolUse' as const, content: [{ type: 'toolCall' as const, id: 'script', name: 'codemode',
+        arguments: { code: 'const path = (await tools.find({})).split("\\n")[1]; return (await tools.read({path})).split("\\n")[0]' } }] }
+      : { ...assistant(), stopReason: 'stop' as const, content: [{ type: 'text' as const, text: 'done' }] }
+    const queue = controlled()
+    queue.push({ type: 'done', reason: response.stopReason, message: response })
+    return queue.output
+  } })
+  await session.submit(input)
+  await until(async () => (await snapshot(session)).running === null)
+  expect(requests[0].tools?.map(tool => tool.name)).toEqual(expect.arrayContaining(['codemode', 'read', 'find']))
+  expect(requests[1].messages.filter(message => message.role === 'toolResult')).toMatchObject([
+    { toolCallId: 'script', isError: false, content: [{ text: 'current.md' }] },
+  ])
+  expect((await snapshot(session)).nestedToolCalls).toMatchObject([
+    { name: 'find', status: 'succeeded' },
+    { name: 'read', argumentsPreview: { path: 'current.md' }, status: 'succeeded' },
+  ])
 })

@@ -94,6 +94,17 @@ export type SubagentTaskView = { sessionId: string; runId: string; name: string;
 export type DelegationOutputView = { assistantMessageId: string; contentIndex: number; output: string }
 export type SubagentView = { subagents: SubagentTaskView[]; delegationOutputs: DelegationOutputView[] }
 
+export type NestedToolCallRecord = {
+  runId: string
+  parent: Pick<ToolLocation, 'assistantMessageId' | 'contentIndex'>
+  id: string
+  name: string
+  argumentsPreview: JsonObject
+  status: 'running' | 'succeeded' | 'failed' | 'not-executed' | 'stopped' | 'unknown'
+  resultPreview?: string
+  fileOperation?: ConversationMessage['fileOperation']
+}
+
 export type ConversationSnapshot = Partial<SubagentView> & {
   seq: number
   interaction?: InteractionState
@@ -107,6 +118,7 @@ export type ConversationSnapshot = Partial<SubagentView> & {
   contextUsage: ContextUsage | null
   runs?: RunRecord[]
   saveFailures?: SaveFailure[]
+  nestedToolCalls?: NestedToolCallRecord[]
 }
 
 export type ConversationUpdate = {
@@ -116,6 +128,7 @@ export type ConversationUpdate = {
   run?: RunRecord
   saveFailure?: SaveFailure
   change:
+    | { type: 'nested-tool'; record: NestedToolCallRecord }
     | { type: 'notice'; notice: ExtensionNotice }
     | { type: 'permission'; permissionMode: PermissionMode }
     | { type: 'plan'; plan: PlanState | null }

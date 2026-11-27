@@ -1220,7 +1220,7 @@ export function ChatPage({ subscribe = subscribeToChat, getDefaultPermission = q
       {section === 'home' && isNew && <NewChatParticles />}
       <main ref={chatScroll} className="chat-main" onScroll={updateToBottom}>
         {!isNew && <MessageList key={sessionId} messages={messages} showRetry={state.connection === 'ready'} activeContent={state.snapshot?.activeContent} running={state.snapshot?.running} runs={state.snapshot?.runs} saveFailures={state.snapshot?.saveFailures}
-          delegationOutputs={state.snapshot?.delegationOutputs} steering={interaction?.steering} questions={questionBatches}
+          delegationOutputs={state.snapshot?.delegationOutputs} nestedToolCalls={state.snapshot?.nestedToolCalls} steering={interaction?.steering} questions={questionBatches}
           onOpenQuestion={batch => {
             if (!sessionId) return
             if (batch.status === 'waiting') {

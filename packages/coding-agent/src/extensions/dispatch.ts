@@ -1,7 +1,7 @@
 import { Check } from 'typebox/value'
 import { isDeepStrictEqual } from 'node:util'
 import type { AgentRunInput } from '@agent-learning/agent'
-import type { JsonObject, ModelMessage, ToolCall, ToolResultMessage } from '@agent-learning/model'
+import type { JsonObject, ModelMessage, ToolResultMessage } from '@agent-learning/model'
 import { extensionMessage, isJson, object, type ExtensionContext, type ExtensionMessage, type ExtensionRuntime } from './runtime.js'
 
 export function textContent(block: unknown) {
@@ -61,14 +61,14 @@ export function beforeStart(runtime: ExtensionRuntime, ctx: ExtensionContext, sy
 
 const blocked = '扩展已拦截工具调用。'
 
-export function toolHooks(runtime: ExtensionRuntime, context: () => ExtensionContext, runId: string, preserveFailure?: (call: ToolCall) => boolean):
+export function toolHooks(runtime: ExtensionRuntime, context: (signal?: AbortSignal) => ExtensionContext, runId: string, preserveFailure?: (tool: import('@agent-learning/agent').ExecutableTool | undefined) => boolean):
 Pick<AgentRunInput, 'prepareToolCall' | 'rewriteToolResult'> {
   return {
-    async prepareToolCall(call, tool) {
+    async prepareToolCall(call, tool, _nested, signal) {
       const valid = (input: JsonObject) => tool.validateArguments?.(input) ?? Check(tool.parameters, input)
       if (!valid(call.arguments)) return { arguments: call.arguments, denial: '原始工具参数不符合声明。' }
       const initial: { arguments: JsonObject; denial?: string } = { arguments: call.arguments }
-      const decision = await runtime.chain('tool_call', context(), initial,
+      const decision = await runtime.chain('tool_call', context(signal), initial,
         state => ({ toolCallId: call.id, toolName: call.name, input: state.arguments }), (_state, event, result) => {
           if (result && (result.block !== undefined && typeof result.block !== 'boolean'
             || result.reason !== undefined && typeof result.reason !== 'string')) throw new Error('无效的工具调用决定')
@@ -81,14 +81,14 @@ Pick<AgentRunInput, 'prepareToolCall' | 'rewriteToolResult'> {
       if (decision.denial === undefined && !valid(decision.arguments)) return { ...decision, denial: '改写后的工具参数不符合声明。' }
       return decision
     },
-    rewriteToolResult(call, result) {
-      return runtime.chain('tool_result', context(), result,
+    rewriteToolResult(call, result, tool, signal) {
+      return runtime.chain('tool_result', context(signal), result,
         current => ({ toolCallId: call.id, toolName: call.name, input: call.arguments, content: current.content, isError: current.isError }),
         (current, _event, update) => {
           if (!update) return current
           if (update.isError !== undefined && typeof update.isError !== 'boolean'
             || update.content !== undefined && (!toolContent(update.content) || !isJson(update.content))) throw new Error('无效的工具结果改写')
-          if (result.isError && preserveFailure?.(call)) {
+          if (result.isError && preserveFailure?.(tool)) {
             const extra = update.content?.filter(block => !current.content.some(existing => isDeepStrictEqual(existing, block))) ?? []
             return { ...current, content: [...current.content, ...structuredClone(extra)] }
           }

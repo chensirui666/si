@@ -62,7 +62,7 @@ test('权限 17/23/24/29：草稿独立保存，同会话同步，服务重启�
     await send.click()
     await expect.poll(() => provider.exchanges.length).toBe(1)
     const first = provider.exchanges[0]!
-    expect((first.body.tools as { function: { name: string } }[]).map(tool => tool.function.name).sort()).toEqual(['ask_user_question', 'find', 'grep', 'ls', 'read', 'subagent'])
+    expect((first.body.tools as { function: { name: string } }[]).map(tool => tool.function.name).sort()).toEqual(['ask_user_question', 'codemode', 'find', 'grep', 'ls', 'read', 'subagent'])
     first.delta({ content: '只读已确认' })
     first.finish()
     await expect(page.locator('.message-list')).toContainText('只读已确认')
@@ -99,7 +99,7 @@ test('权限 17/23/24/29：草稿独立保存，同会话同步，服务重启�
     await send.click()
     await expect.poll(() => provider.exchanges.length).toBe(2)
     const latest = provider.exchanges[1]!
-    expect((latest.body.tools as { function: { name: string } }[]).map(tool => tool.function.name).sort()).toEqual(['ask_user_question', 'find', 'grep', 'ls', 'read', 'subagent'])
+    expect((latest.body.tools as { function: { name: string } }[]).map(tool => tool.function.name).sort()).toEqual(['ask_user_question', 'codemode', 'find', 'grep', 'ls', 'read', 'subagent'])
     latest.delta({ content: '原草稿使用只读' })
     latest.finish()
     await expect(page.locator('.message-list')).toContainText('原草稿使用只读')

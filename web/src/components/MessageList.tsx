@@ -2,7 +2,7 @@ import { NoticeText, skillSourceKey } from '../i18n/messages'
 import { useTranslation } from 'react-i18next'
 import { useRef } from 'react'
 import { Clock3Icon } from 'lucide-react'
-import type { ActiveContent, ConversationMessage, ConversationSnapshot, RunRecord, RunningState, SaveFailure, SkillInvocationView, PendingMessage, UserQuestionBatch } from '@agent-learning/server/protocol'
+import type { ActiveContent, ConversationMessage, ConversationSnapshot, NestedToolCallRecord, RunRecord, RunningState, SaveFailure, SkillInvocationView, PendingMessage, UserQuestionBatch } from '@agent-learning/server/protocol'
 import type { LocalSubmission } from '../types'
 import { AssistantMessage, type AssistantEntry } from './AssistantMessage'
 import { SentAttachments } from './MessageAttachments'
@@ -14,7 +14,7 @@ type MessageRow =
   | { type: 'user'; id: string; text: string; local?: LocalSubmission; pendingSteering?: true; runId?: string; clientMessageId?: string; skill?: SkillInvocationView; attachments?: ConversationMessage['attachments']; references?: ConversationMessage['references'] }
   | { type: 'assistant'; id: string; userId: string; messages: AssistantEntry[] }
 
-export function MessageList({ messages, activeContent = [], running = null, showRetry = true, runs = [], saveFailures = [], delegationOutputs = [], steering = [], questions = [], onOpenQuestion, onQuote }: {
+export function MessageList({ messages, activeContent = [], running = null, showRetry = true, runs = [], saveFailures = [], delegationOutputs = [], nestedToolCalls, steering = [], questions = [], onOpenQuestion, onQuote }: {
   messages: readonly (ConversationMessage | LocalSubmission)[]
   activeContent?: readonly ActiveContent[]
   running?: RunningState
@@ -22,6 +22,7 @@ export function MessageList({ messages, activeContent = [], running = null, show
   runs?: readonly RunRecord[]
   saveFailures?: readonly SaveFailure[]
   delegationOutputs?: Readonly<NonNullable<ConversationSnapshot['delegationOutputs']>>
+  nestedToolCalls?: Readonly<NonNullable<ConversationSnapshot['nestedToolCalls']>>
   steering?: readonly PendingMessage[]
   questions?: readonly UserQuestionBatch[]
   onOpenQuestion?: (batch: UserQuestionBatch) => void
@@ -31,6 +32,13 @@ export function MessageList({ messages, activeContent = [], running = null, show
   const list = useRef<HTMLElement>(null)
   const rows: MessageRow[] = []
   const toolResults = new Map<string, Map<number, ConversationMessage>>()
+  const nestedByAssistant = new Map<string, NestedToolCallRecord[]>()
+  for (const call of nestedToolCalls ?? []) {
+    const id = call.parent.assistantMessageId
+    const calls = nestedByAssistant.get(id) ?? []
+    calls.push(call)
+    nestedByAssistant.set(id, calls)
+  }
   const completedOutputs = new Map<string, Map<number, string>>()
   for (const { assistantMessageId, contentIndex, output } of delegationOutputs) {
     const outputs = completedOutputs.get(assistantMessageId) ?? new Map()
@@ -104,7 +112,7 @@ export function MessageList({ messages, activeContent = [], running = null, show
             if (first) shown.add(runId)
             return <li className={`message-item${row.type === 'assistant' ? ' message-item-assistant' : ''}`} key={first ? `run:${runId}` : row.type === 'user' ? row.clientMessageId ?? row.id : row.id} data-message-id={row.id} data-run-status={run?.status}>
             {row.type === 'assistant'
-              ? <AssistantMessage showRetry={showRetry} messages={row.messages} activeContent={activeContent} toolResults={toolResults} completedOutputs={completedOutputs} restored={run?.restored} saveFailure={failure} run={activity}
+              ? <AssistantMessage showRetry={showRetry} messages={row.messages} activeContent={activeContent} toolResults={toolResults} nestedToolCalls={row.messages.flatMap(entry => nestedByAssistant.get(entry.id) ?? [])} completedOutputs={completedOutputs} restored={run?.restored} saveFailure={failure} run={activity}
                 running={isRunning ? running : null} toolQuestions={questionsByAssistant} onOpenQuestion={onOpenQuestion} />
               : <>
                 {lateReply ? <QuestionReply batch={lateReply} />

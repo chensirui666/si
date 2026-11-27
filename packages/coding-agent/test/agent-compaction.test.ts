@@ -87,9 +87,9 @@ describe('AgentSession compaction', () => {
     try {
       agent = load()
       await seed(agent)
-      expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['tool_search'])
-      expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
-      expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      expect(contexts[0].tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search'])
+      expect(contexts[1].tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search', name])
+      expect(contexts[2].tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search', name])
       await agent.submit({ ...input, clientMessageId: 'mcp-compact', text: '/compact' })
       await idle(agent)
       expect((await state(agent)).compactions.at(-1)?.status).toBe('success')
@@ -101,16 +101,16 @@ describe('AgentSession compaction', () => {
       agent = load()
       await agent.submit({ ...input, clientMessageId: 'mcp-await-catalog', text: '目录仍在发现' })
       await idle(agent)
-      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search'])
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search'])
       expect(JSON.stringify(contexts.at(-1)?.messages)).not.toContain('load-github')
       available = [binding]
       await agent.submit({ ...input, clientMessageId: 'mcp-catalog-ready', text: '继续当前 GitHub 任务' })
       await idle(agent)
-      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search', name])
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search', name])
       store.reconcileMcpToolLoads({ serverId: binding.serverId, credentialRef: binding.credentialRef, remoteToolNames: [] })
       await agent.submit({ ...input, clientMessageId: 'mcp-returned-tool', text: '已退出并重新出现' })
       await idle(agent)
-      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['tool_search'])
+      expect(contexts.at(-1)?.tools?.map(tool => tool.name)).toEqual(['codemode', 'tool_search'])
     } finally {
       await agent?.close()
       store.close()
@@ -333,7 +333,7 @@ describe('AgentSession compaction', () => {
     const contexts: ModelContext[] = []
     const agent = createSession({
       tools: [tool, { ...tool, name: 'edit' }],
-      compaction: { triggerTokens: 1700, keepRecentTokens: 100 },
+      compaction: { triggerTokens: 1900, keepRecentTokens: 100 },
       stream: (_model, context) => {
         contexts.push(structuredClone(context))
         if (context.tools) return output(reply())
@@ -352,7 +352,7 @@ describe('AgentSession compaction', () => {
       agent.selectPermissionMode('read-only')
     } finally { release.resolve() }
     await idle(agent)
-    expect(contexts.slice(count).map(context => context.tools?.map(tool => tool.name))).toEqual([undefined, ['read']])
+    expect(contexts.slice(count).map(context => context.tools?.map(tool => tool.name))).toEqual([undefined, ['read', 'codemode']])
     expect(contexts.at(-1)?.systemPrompt).toContain('- read：')
     expect(contexts.at(-1)?.systemPrompt).not.toContain('- edit：')
   })
@@ -788,7 +788,7 @@ describe('里程碑 2 Feature 1 模型切换与容量', () => {
   const modelRequest = (clientMessageId: string, text: string) => ({ ...next, clientMessageId, text })
 
   it.each([
-    { contextWindow: 1500, summary: '简短摘要', reason: '摘要请求预计超出模型容量。', calls: 0 },
+    { contextWindow: 1800, summary: '简短摘要', reason: '摘要请求预计超出模型容量。', calls: 0 },
     { contextWindow: 2100, summary: 's'.repeat(5900), reason: '压缩后仍预计超出模型容量，保留原上下文。', calls: 1 },
   ])('小容量模型失败后原历史仍可压缩和接续（$reason）', async ({ contextWindow, summary, reason, calls }) => {
     const models = await import('@agent-learning/model')

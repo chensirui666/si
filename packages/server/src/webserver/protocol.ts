@@ -7,7 +7,7 @@ import type { WorkspaceRegistration } from '../workspaces.js'
 import type { ScheduledPlan, ScheduledRunView as StoredScheduledRun } from '@agent-learning/coding-agent'
 
 export type {
-  ExtensionNotice, ActiveContent, CompactionRecord, ContextUsage, ModelFrame, ModelRetryState, PermissionMode, RunRecord, RunningState, SaveFailure,
+  ExtensionNotice, NestedToolCallRecord, ActiveContent, CompactionRecord, ContextUsage, ModelFrame, ModelRetryState, PermissionMode, RunRecord, RunningState, SaveFailure,
   SessionSummary, SkillSource, SubmissionAccepted, MessageAttachment, PlanState, InteractionState, PendingMessage, QuestionAnswer, QuestionReply, QuestionWaitSettings, QueueAction, QueueResult, UserQuestion, UserQuestionBatch,
 } from '@agent-learning/coding-agent'
 export { isPermissionMode } from '@agent-learning/coding-agent/permissions'

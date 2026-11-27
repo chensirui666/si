@@ -84,7 +84,12 @@ export class SubagentStore {
     const entry: ConversationMessage | undefined = row && JSON.parse(String(row.data))
     const message = entry?.message
     const block = message?.role === 'assistant' && message.content[call.contentIndex]
-    if (!block || block.type !== 'toolCall' || block.id !== call.toolCallId || !items.length) {
+    const nested = block && block.type === 'toolCall' && block.name === 'codemode'
+      && this.db.prepare(`SELECT 1 FROM nested_tool_calls WHERE session_id = ? AND run_id = ?
+        AND assistant_message_id = ? AND content_index = ? AND id = ?
+        AND json_extract(data, '$.name') = 'subagent' AND json_extract(data, '$.status') = 'running'`)
+        .get(callerSessionId, call.runId, call.assistantMessageId, call.contentIndex, call.toolCallId)
+    if (!block || block.type !== 'toolCall' || (block.id !== call.toolCallId && !nested) || !items.length) {
       throw new Error('Invalid delegation tool call')
     }
     this.db.prepare(`INSERT INTO delegations (id, caller_session_id, root_session_id, assistant_message_id, content_index, tool_call_id,

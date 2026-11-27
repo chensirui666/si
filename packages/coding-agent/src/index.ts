@@ -10,6 +10,7 @@ export type {
   CompactionRecord,
   ContextUsage,
   ConversationMessage,
+  NestedToolCallRecord,
   RunningState,
   ConversationSnapshot,
   ConversationUpdate,

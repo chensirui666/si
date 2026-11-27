@@ -608,6 +608,7 @@ code, pre { font-family: var(--code-font); font-weight: 400; }
 .tool-status[data-result="failure"] { color: #b42318; }
 .thinking-block .markdown-text, .tool-details { margin: 4px 0 8px 12px; }
 .tool-detail-label { margin-top: 8px; font: var(--type-support); font-weight: 500; }
+.nested-tool-calls { margin-inline-start: 20px; }
 .tool-block pre { margin: 8px 0 0; }
 .message-error, .message-ending, .submission-status { margin: 8px 0 0; color: var(--secondary-text); font: var(--type-detail); }
 .message-error, .message-ending[role="alert"], .submission-status[data-state="failed"], .submission-status p { font: var(--type-support); }

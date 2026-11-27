@@ -122,3 +122,25 @@ test('增量渲染冻结前文后，表格仍复制对应的原始 Markdown', as
   await expect(component.getByRole('button', { name: '已复制' })).toBeVisible()
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(table)
 })
+
+test('Code Mode 的子调用在重挂载后保留独立状态和详情', async ({ mount }) => {
+  const message: Message = { ...base, stopReason: 'toolUse', content: [
+    { type: 'toolCall', id: 'script', name: 'codemode', arguments: { code: 'return 1' } },
+  ] }
+  const parent = { assistantMessageId: 'a', contentIndex: 0 }
+  const running = { kind: 'task' as const, runId: 'run', assistantMessageId: 'a', phase: 'tools' as const, activeTools: [parent] }
+  const records: import('@agent-learning/server/protocol').NestedToolCallRecord[] = [
+    { runId: 'run', parent, id: 'script/1', name: 'read', argumentsPreview: { path: 'target.md' }, resultPreview: 'selected', status: 'succeeded' as const },
+    { runId: 'run', parent, id: 'script/2', name: 'find', argumentsPreview: { pattern: '*.md' }, status: 'running' as const },
+  ]
+  const first = await mount(<AssistantMessage messages={[{ id: 'a', message }]} running={running} nestedToolCalls={records} />)
+  await expect(first.locator('.nested-tool-calls summary')).toHaveCount(2)
+  await first.unmount()
+  const restored = await mount(<AssistantMessage messages={[{ id: 'a', message }]} running={running} nestedToolCalls={records} />)
+  const children = restored.locator('.nested-tool-calls details')
+  await expect(children.nth(0).locator('[data-state="ok"]')).toBeVisible()
+  await expect(children.nth(1).locator('[data-state="running"]')).toBeVisible()
+  await children.nth(0).locator('summary').click()
+  await expect(children.nth(0).getByText('selected', { exact: true })).toBeVisible()
+  await expect(children.nth(1)).not.toHaveAttribute('open', '')
+})

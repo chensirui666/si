@@ -64,3 +64,34 @@ describe('generic Agent', () => {
     expect(calls).toBe(1)
   })
 })
+
+it('commits nested checkpoints before returning one result to the model', async () => {
+  const steps: string[] = []
+  const requests: ModelContext[] = []
+  const nested: ExecutableTool = {
+    name: 'child', description: '', parameters: Type.Object({}),
+    async execute() { steps.push('effect'); return 'selected' },
+  }
+  const parent: ExecutableTool = {
+    name: 'parent', nestedExecution: true, description: '', parameters: Type.Object({}),
+    async execute(_args, execution) {
+      const outcome = await execution.executeTool!('child', {}, execution.signal)
+      return outcome.result.content
+    },
+  }
+  const agent = new Agent({ stream: (_model, request) => {
+    requests.push(request)
+    return output(requests.length === 1
+      ? reply([{ type: 'toolCall', name: 'parent', id: 'outer', arguments: {} }], 'toolUse')
+      : reply([{ type: 'text', text: 'done' }]))
+  } })
+  await agent.run({
+    model, context, tools: [parent], signal: new AbortController().signal,
+    resolveNestedTools: () => [nested],
+    saveNestedToolCheckpoint: checkpoint => { steps.push(checkpoint.status) },
+  })
+  expect(steps).toEqual(['running', 'effect', 'succeeded'])
+  expect(requests[1].messages.filter(message => message.role === 'toolResult')).toMatchObject([
+    { toolCallId: 'outer', content: [{ text: 'selected' }] },
+  ])
+})

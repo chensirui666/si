@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next'
 import { NoticeText } from '../i18n/messages'
 import { useRef, useState, type ReactNode } from 'react'
-import type { ActiveContent, ConversationMessage, RunRecord, RunningState, SaveFailure, UserQuestionBatch } from '@agent-learning/server/protocol'
+import type { ActiveContent, ConversationMessage, NestedToolCallRecord, RunRecord, RunningState, SaveFailure, UserQuestionBatch } from '@agent-learning/server/protocol'
 import type { AssistantMessage as Message, ToolCall } from '@agent-learning/model'
 import { MarkdownText } from './markdown/MarkdownText'
 import { CopyMarkdownButton } from './markdown/CopyMarkdownButton'
@@ -14,6 +14,10 @@ export type ToolResults = ReadonlyMap<string, ReadonlyMap<number, ConversationMe
 type ToolQuestions = ReadonlyMap<string, ReadonlyMap<string, UserQuestionBatch>>
 
 type ToolState = 'preparing' | 'running' | 'ok' | 'error' | 'stopped' | 'denied' | 'unknown'
+
+const nestedStates: Record<NestedToolCallRecord['status'], ToolState> = {
+  running: 'running', succeeded: 'ok', failed: 'error', 'not-executed': 'denied', stopped: 'stopped', unknown: 'unknown',
+}
 
 const toolTargets: Readonly<Record<string, string>> = {
   read: 'path',
@@ -37,7 +41,7 @@ function ProcessGroup({ running, run, children }: { running: boolean; run?: RunR
   </details>
 }
 
-function ToolBlock({ block, argumentsText, running, executing, result, completedOutput, stopped, failure, unknown, unsaved }: {
+function ToolBlock({ block, argumentsText, running, executing, result, completedOutput, stopped, failure, unknown, unsaved, nested }: {
   block: ToolCall
   argumentsText?: string
   running: boolean
@@ -47,12 +51,13 @@ function ToolBlock({ block, argumentsText, running, executing, result, completed
   stopped: boolean
   failure?: string
   unknown?: boolean
+  nested?: NestedToolCallRecord
   unsaved?: SaveFailure['reason']
 }) {
   const { t } = useTranslation()
   const targetKey = Object.hasOwn(toolTargets, block.name) ? toolTargets[block.name] : undefined
   const action = targetKey ? t(`tool.${block.name}`)
-    : block.name === 'subagent' ? `${t('tool.call')} · ${block.name}` : block.name || t('tool.call')
+    : block.name === 'codemode' ? 'Code Mode' : block.name === 'subagent' ? `${t('tool.call')} · ${block.name}` : block.name || t('tool.call')
   const target = targetKey ? block.arguments[targetKey] : undefined
   const firstUrl = Array.isArray(target) ? target.find(value => typeof value === 'string') : undefined
   const label = typeof target === 'string' ? target : firstUrl
@@ -61,10 +66,10 @@ function ToolBlock({ block, argumentsText, running, executing, result, completed
     <span className="tool-status" data-state="error" data-result="failure">{t('tool.status.error')}</span>
   </div>
   const outcome = result?.message.role === 'toolResult' ? result.message : undefined
-  const state: ToolState = outcome ? ['permission_denied', 'hook_blocked'].includes(result?.toolErrorCode ?? '') ? 'denied'
+  const state: ToolState = nested ? nestedStates[nested.status] : outcome ? ['permission_denied', 'hook_blocked'].includes(result?.toolErrorCode ?? '') ? 'denied'
     : result?.toolErrorCode === 'interrupted' ? 'stopped' : outcome.isError ? 'error' : 'ok'
     : executing ? 'running' : unknown ? 'unknown' : stopped ? 'stopped' : failure ? 'error' : running ? 'preparing' : 'error'
-  const output = completedOutput ?? outcome?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n')
+  const output = nested?.resultPreview ?? completedOutput ?? outcome?.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n')
   const reason = output !== undefined || state === 'preparing' || state === 'running' ? undefined
     : state === 'unknown' ? t('tool.noSavedResult')
     : state === 'stopped' ? t('tool.cancelled')
@@ -76,7 +81,9 @@ function ToolBlock({ block, argumentsText, running, executing, result, completed
     </summary>
     <div className="tool-details">
       <div className="tool-detail-label">{t('tool.args')}</div>
-      <pre>{argumentsText ?? JSON.stringify(block.arguments, null, 2)}</pre>
+      <pre>{argumentsText ?? (block.name === 'codemode' && typeof block.arguments.code === 'string'
+        ? [typeof block.arguments.timeoutMs === 'number' ? `timeoutMs: ${block.arguments.timeoutMs}` : '', block.arguments.code].filter(Boolean).join('\n')
+        : JSON.stringify(block.arguments, null, 2))}</pre>
       {block.argumentsError && <p className="message-error">{block.argumentsError}</p>}
       {reason && <p className="message-error">{reason}</p>}
       {output !== undefined && <>
@@ -87,13 +94,14 @@ function ToolBlock({ block, argumentsText, running, executing, result, completed
   </details>
 }
 
-export function AssistantMessage({ messages, activeContent = [], running = null, run, showRetry = true, toolResults, completedOutputs, toolQuestions, onOpenQuestion, restored, saveFailure }: {
+export function AssistantMessage({ messages, activeContent = [], running = null, run, showRetry = true, toolResults, nestedToolCalls = [], completedOutputs, toolQuestions, onOpenQuestion, restored, saveFailure }: {
   messages: readonly AssistantEntry[]
   activeContent?: readonly ActiveContent[]
   running?: Extract<RunningState, { kind: 'task' }> | null
   run?: RunRecord
   showRetry?: boolean
   toolResults?: ToolResults
+  nestedToolCalls?: readonly NestedToolCallRecord[]
   completedOutputs?: ReadonlyMap<string, ReadonlyMap<number, string>>
   toolQuestions?: ToolQuestions
   onOpenQuestion?: (batch: UserQuestionBatch) => void
@@ -163,6 +171,14 @@ export function AssistantMessage({ messages, activeContent = [], running = null,
           stopped={!running && terminal?.stopReason === 'aborted'}
           failure={message.stopReason === 'length' ? t('tool.truncated') : !running && terminal?.stopReason === 'error' ? t('tool.taskFailed') : undefined}
           result={result} completedOutput={block.name === 'subagent' ? completedOutputs?.get(id)?.get(index) : undefined} />)
+        if (block.name === 'codemode') {
+          const children = nestedToolCalls.filter(call => call.parent.assistantMessageId === id && call.parent.contentIndex === index)
+          if (children.length) process.push(<div className="nested-tool-calls" key={`${key}:nested`}>
+            {children.map(call => <ToolBlock key={call.id} nested={call.status === 'running' && !running ? { ...call, status: 'unknown' } : call}
+              block={{ type: 'toolCall', id: call.id, name: call.name, arguments: call.argumentsPreview }}
+              running={false} executing={false} stopped={false} />)}
+          </div>)
+        }
       }
     })
     const recoveringOverflow = message.errorCode === 'context_overflow' && !message.failure && (message !== last || running)

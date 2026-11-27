@@ -2,7 +2,7 @@ import { estimateMessageTokens } from '@agent-learning/model'
 import type { ImageContent, ModelContext, ModelInfo, ModelMessage, TextContent } from '@agent-learning/model'
 import { skillCommand } from './skills.js'
 import { escapePromptAttribute } from './system-prompt.js'
-import type { CompactionRecord, ConversationMessage } from './types.js'
+import type { CompactionRecord, ConversationMessage, NestedToolCallRecord } from './types.js'
 import type { SessionAttachments } from './session-attachments.js'
 import { referencePrompt } from './session-references.js'
 
@@ -84,7 +84,8 @@ function messageForModel({ id, message, imageOmitted, skillInvocation, attachmen
   return message.content.some(block => block.type === 'image') ? { ...message, imageResultId: id } : message
 }
 
-function modelMessages(entries: ConversationMessage[], recoverTools: boolean, files?: AttachmentReader): ModelMessage[] {
+function modelMessages(entries: ConversationMessage[], recoverTools: boolean, files?: AttachmentReader,
+  nested: readonly NestedToolCallRecord[] = [], hiddenPath?: HiddenMemoryPath): ModelMessage[] {
   if (!recoverTools) return entries.map(entry => messageForModel(entry, files))
   const results = new Map<string, Map<number, ModelMessage>>()
   for (const entry of entries) {
@@ -104,16 +105,33 @@ function modelMessages(entries: ConversationMessage[], recoverTools: boolean, fi
       return [{ ...message, content: message.content.filter(block => block.type !== 'toolCall') }]
     }
     const batch = results.get(id)
+    const recoveryHint = (index: number) => {
+      const related = nested.filter(record => record.parent.assistantMessageId === id && record.parent.contentIndex === index)
+        .filter(record => !isMemoryTool(record.name))
+        .filter(record => !(record.fileOperation && hiddenPath?.(record.fileOperation.path))
+          && !(typeof record.argumentsPreview.path === 'string' && hiddenPath?.(record.argumentsPreview.path)))
+        .sort((a, b) => priority(a) - priority(b))
+        .slice(0, 8)
+      return related.length ? '\n已保存的脚本子调用：' + JSON.stringify(related.map(record => ({
+        tool: record.name, status: record.status === 'running' ? 'unknown' : record.status,
+        target: record.fileOperation?.path ?? record.argumentsPreview.path ?? record.argumentsPreview.command
+          ?? record.argumentsPreview.pattern,
+      }))) : ''
+    }
     return [message, ...calls.map(({ call, index }): ModelMessage => batch?.get(index) ?? {
       role: 'toolResult', toolCallId: call.id, toolName: call.name, timestamp: message.timestamp, isError: true,
-      content: [{ type: 'text', text: '这条工具调用没有已保存的结果，实际结果未知。文件等外部状态可能已经改变；如需继续操作，先检查当前状态。' }],
+      content: [{ type: 'text', text: '这条工具调用没有已保存的结果，实际结果未知。文件等外部状态可能已经改变；如需继续操作，先检查当前状态。' + (call.name === 'codemode' ? recoveryHint(index) : '') }],
     })]
   })
 }
 
+function priority(record: NestedToolCallRecord) {
+  return record.status === 'unknown' || record.status === 'running' ? 0 : record.fileOperation?.kind === 'modified' ? 1 : 2
+}
+
 export function buildModelHistory(entries: ConversationMessage[], latest?: LatestCompaction, recoverTools = false, files?: AttachmentReader,
-  hiddenPath?: HiddenMemoryPath): ModelMessage[] {
-  const messages = modelMessages(omitMemory(effectiveEntries(entries, latest), hiddenPath), recoverTools, files)
+  hiddenPath?: HiddenMemoryPath, nested?: readonly NestedToolCallRecord[]): ModelMessage[] {
+  const messages = modelMessages(omitMemory(effectiveEntries(entries, latest), hiddenPath), recoverTools, files, nested, hiddenPath)
   if (latest) {
     const operations = latest.fileOperations
     const visible = operations && hiddenPath ? {
@@ -133,7 +151,7 @@ export function buildModelHistory(entries: ConversationMessage[], latest?: Lates
 export function prepareCompaction(
   entries: ConversationMessage[], latest: LatestCompaction | undefined,
   keepRecentTokens: number, includeThinking: boolean, recoverTools = false, model?: ModelInfo, files?: Pick<SessionAttachments, 'path'>,
-  hiddenPath?: HiddenMemoryPath,
+  hiddenPath?: HiddenMemoryPath, nested: readonly NestedToolCallRecord[] = [],
 ): CompactionPreparation {
   const effective = omitMemory(effectiveEntries(entries, latest), hiddenPath)
   const last = effective.at(-1)
@@ -159,19 +177,27 @@ export function prepareCompaction(
   if (firstKept === 0 || !last) return { status: 'skipped', reason: 'nothing_to_compact' }
   const firstKeptMessageId = effective[firstKept].id
   const read = new Set<string>(), modified = new Set<string>()
+  const operations = new Map<string, NonNullable<ConversationMessage['fileOperation']>[]>()
+  for (const record of nested) {
+    if (!record.fileOperation) continue
+    const id = record.parent.assistantMessageId
+    const items = operations.get(id) ?? []
+    items.push(record.fileOperation)
+    operations.set(id, items)
+  }
   // Raw results retain confirmed effects even when the operation later reports interruption.
   for (const entry of entries) {
     if (entry.id === firstKeptMessageId) break
-    if (entry.message.role !== 'toolResult' || !entry.fileOperation) continue
-    const { kind, path } = entry.fileOperation
-    if (kind === 'read') read.add(path)
-    else modified.add(path)
+    for (const { kind, path } of [...operations.get(entry.id) ?? [], ...(entry.fileOperation ? [entry.fileOperation] : [])]) {
+      if (kind === 'read') read.add(path)
+      else modified.add(path)
+    }
   }
   const readFiles = [...read].filter(path => !modified.has(path)).sort()
   const modifiedFiles = [...modified].sort()
   return {
     status: 'ready', ...(latest && { previousSummary: latest.summary }),
-    messagesToSummarize: structuredClone(modelMessages(effective.slice(0, firstKept), recoverTools, files)),
+    messagesToSummarize: structuredClone(modelMessages(effective.slice(0, firstKept), recoverTools, files, nested, hiddenPath)),
     firstKeptMessageId, contextLastMessageId: last.id,
     ...(readFiles.length || modifiedFiles.length ? { fileOperations: { readFiles, modifiedFiles } } : {}),
   }

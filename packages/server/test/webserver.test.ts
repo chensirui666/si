@@ -1244,7 +1244,7 @@ it('取消不写入登记，旧登记兼容，符号链接复用目录，目录�
   for (const request of requests) {
     expect(request.messages[0].content).toContain('## 记录长期记忆')
     expect(request.messages[0].content.split('\n\n## 长期记忆\n')[0]).toBe(systemPrompt.split('\n\n## 长期记忆\n')[0])
-    expect(request.tools).toHaveLength(14)
+    expect(request.tools).toHaveLength(15)
     expect(request.tools).toContainEqual(expect.objectContaining({ function: expect.objectContaining({ name: 'ask_user_question' }) }))
     expect(request.tools.at(-1)).toMatchObject({ function: { name: 'memory' } })
   }
@@ -2186,7 +2186,7 @@ it('permission settings persist and initialize only new sessions', async () => {
 })
 
 describe('权限管理', () => {
-  const readOnly = ['find', 'grep', 'ls', 'read']
+  const readOnly = ['codemode', 'find', 'grep', 'ls', 'read']
   const edit = { type: 'toolCall' as const, id: 'edit-1', name: 'edit',
     arguments: { path: 'README.md', edits: [{ oldText: '青禾原文', newText: '改过' }] } }
   const answer = [{ type: 'text' as const, text: '本轮完成' }]
@@ -2229,7 +2229,7 @@ describe('权限管理', () => {
       arguments: ([{}, { pattern: 'index.ts' }, { pattern: '青禾', path: 'src' }, { path: 'src/index.ts' }][index])!,
     }))
     const app = await fixture(context => context.messages.at(-1)?.role !== 'user' ? answer
-      : context.tools?.length === 4 ? [...calls, edit] : [edit, {
+      : context.tools?.length === readOnly.length ? [...calls, edit] : [edit, {
         type: 'toolCall', id: 'bash-1', name: 'bash', arguments: { command: 'cat README.md' },
       }], true)
     const input = { ...app.makeFirst(), permissionMode: 'read-only' }
@@ -2254,7 +2254,7 @@ describe('权限管理', () => {
     expect((await app.change(input.clientMessageId, 'normal')).status).toBe(200)
     expect((await app.send(input.clientMessageId)).status).toBe(202)
     const second = await app.idle(input.clientMessageId)
-    expect(app.provider.calls[2]?.tools?.map(tool => tool.name)).toEqual(['read', 'bash', 'process', 'edit', 'write', 'find', 'grep', 'ls', 'web_search', 'web_fetch'])
+    expect(app.provider.calls[2]?.tools?.map(tool => tool.name)).toEqual(['read', 'bash', 'process', 'edit', 'write', 'find', 'grep', 'ls', 'web_search', 'web_fetch', 'codemode'])
     expect(await readFile(app.path, 'utf8')).toBe('改过')
     expect(second.messages.find(entry => entry.message.role === 'toolResult' && entry.message.toolCallId === 'bash-1')?.message)
       .toMatchObject({ isError: false, content: [{ text: expect.stringContaining('改过') }] })

@@ -1,4 +1,8 @@
+import { Check } from 'typebox/value'
+import { CODEMODE_TOOL, createCodeModeTool } from './codemode.js'
+import { summarizeNestedTool } from './nested-tool-record.js'
 import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
 import { Agent } from '@agent-learning/agent'
 import type { AgentEvent, AgentRunInput } from '@agent-learning/agent'
 import { IMAGE_BUDGET_BYTES, defaultSelection, estimateContextTokens, findModel, omittedToolImageIndexes, sameSelection, stream } from '@agent-learning/model'
@@ -35,7 +39,7 @@ import type { Subagents } from './subagents.js'
 import type { DelegatedItemWrite, DelegationItem } from './subagent-types.js'
 import type { SubagentRoleSummary } from './subagent-roles.js'
 import { createSubagentTool, SUBAGENT_TOOL, TEAM_TOOL } from './subagent-tools.js'
-import type { SubagentView } from './types.js'
+import type { NestedToolCallRecord, SubagentView } from './types.js'
 
 type DelegatedInput = Pick<DelegatedItemWrite, 'id' | 'index'> & {
   source: AgentInputSource
@@ -155,6 +159,7 @@ export class AgentSession {
       if (history.plan) this.state.plan = history.plan
       this.state.modelSelection = history.modelSelection ?? (last && runSelection(last))
       this.state.messages = history.messages
+      if (history.nestedToolCalls?.length) this.state.nestedToolCalls = history.nestedToolCalls
       this.state.compactions = history.compactions.map(record => record.status === 'running'
         ? { ...record, status: 'interrupted', finishedAt: Date.now(), reason: '服务中断，压缩未完成。' } : record)
       for (const entry of history.messages) this.savedMessages.add(entry.id)
@@ -224,6 +229,7 @@ export class AgentSession {
       if (selected && selection && !model) selected.defaultReasoningEffort = selection.reasoningEffort
       const ctx = this.extensionContext(path, selected, signal)
       const reserved = [...defaultTools, ...this.options.tools?.(path) ?? []].map(tool => tool.name)
+      reserved.push(CODEMODE_TOOL)
       if (this.options.subagents) reserved.push(SUBAGENT_TOOL, TEAM_TOOL)
       if (this.options.mcp) reserved.push(MCP_TOOL_SEARCH_NAME)
       if (this.options.manageSchedule) reserved.push(CRONJOB_TOOL_NAME)
@@ -302,8 +308,8 @@ export class AgentSession {
     const collaboration = (name: string) => name === SUBAGENT_TOOL || name === TEAM_TOOL
     const local = [...tools, ...(this.runtime?.tools() ?? []).filter(tool => tool.name !== ASK_USER_QUESTION_TOOL_NAME)].filter(tool =>
       (!scheduled || tool.name !== CRONJOB_TOOL_NAME) && (!child || tool.name === TEAM_TOOL || child.allowedTools.includes(tool.name)))
-    if (effective.readOnly) return { local: local.filter(tool => collaboration(tool.name) || readOnlyTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)) }
-    if (effective.planning) return { local: local.flatMap(tool => collaboration(tool.name) || planReadTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)
+    if (effective.readOnly) return { local: local.filter(tool => tool.name === CODEMODE_TOOL || collaboration(tool.name) || readOnlyTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)) }
+    if (effective.planning) return { local: local.flatMap(tool => tool.name === CODEMODE_TOOL || collaboration(tool.name) || planReadTools.has(tool.name) || tool.name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(tool.name)
       ? [tool] : tool.name === 'bash' && tool.planVersion ? [tool.planVersion] : []) }
     const mcp = this.options.mcp
     if (child) {
@@ -345,7 +351,7 @@ export class AgentSession {
   private toolDenial(name: string, args: JsonObject, planning: boolean, planBash: boolean) {
     const effective = this.effectiveToolPolicy(planning)
     if (effective.unconfirmed) return { code: 'permission_denied', message: '权限保存状态未确认，工具未执行。请重启服务后核对。' }
-    if (name === SUBAGENT_TOOL || name === TEAM_TOOL || name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(name)) return
+    if (name === CODEMODE_TOOL || name === SUBAGENT_TOOL || name === TEAM_TOOL || name === ASK_USER_QUESTION_TOOL_NAME || this.isMemorySourceTool(name)) return
     if (effective.readOnly && !readOnlyTools.has(name)) {
       return { code: 'permission_denied', message: '只读模式下未执行此工具。' }
     }
@@ -771,7 +777,7 @@ export class AgentSession {
     const selectedSkill = namedSkill ? skills.find(skill => skill.name === namedSkill) : undefined
     const skillInvocation = selectedSkill ? await loadSkill(selectedSkill) : undefined
     const userId = randomUUID()
-    const tools = (this.options.tools?.(cwd) ?? []).filter(tool => tool.name !== ASK_USER_QUESTION_TOOL_NAME)
+    const tools = (this.options.tools?.(cwd) ?? []).filter(tool => tool.name !== ASK_USER_QUESTION_TOOL_NAME && tool.name !== CODEMODE_TOOL)
     const storage = this.options.persistence
     const subagents = storage && this.options.subagents?.()
     if (!manual && subagents && storage) {
@@ -1118,7 +1124,7 @@ export class AgentSession {
 
   private hiddenMemoryPath() {
     const store = this.options.memory?.store
-    return store && !this.memoryEnabled ? (path: string) => store.isManagedPath(path) : undefined
+    return store && !this.memoryEnabled ? (path: string) => store.isManagedPath(resolve(this.cwd ?? '', path)) : undefined
   }
 
   private async readMemorySession(memory: MemoryStore, project: MemoryProject, id: string) {
@@ -1137,7 +1143,7 @@ export class AgentSession {
 
   private context(compaction = this.latestCompaction(), extra: ConversationMessage[] = []): ModelContext {
     return {
-      ...this.configuration, messages: buildModelHistory([...this.historyMessages(), ...extra], compaction, !!this.options.persistence, this.options.attachments, this.hiddenMemoryPath()),
+      ...this.configuration, messages: buildModelHistory([...this.historyMessages(), ...extra], compaction, !!this.options.persistence, this.options.attachments, this.hiddenMemoryPath(), this.state.nestedToolCalls),
       ...(this.state.running?.kind === 'task' && { currentUserMessageId: this.state.running.runId }),
       omittedToolImageResults: this.omittedToolImageResults,
     }
@@ -1204,7 +1210,7 @@ export class AgentSession {
     try {
       signal.throwIfAborted()
       const preparation = prepareCompaction(this.historyMessages(), this.latestCompaction(), this.options.compaction?.keepRecentTokens ?? 20_000,
-        Boolean(this.configuration.tools?.length), !!this.options.persistence, model, this.options.attachments, this.hiddenMemoryPath())
+        Boolean(this.configuration.tools?.length), !!this.options.persistence, model, this.options.attachments, this.hiddenMemoryPath(), this.state.nestedToolCalls)
       if (preparation.status === 'skipped') {
         final = { ...record, status: 'skipped', finishedAt: Date.now(), reason: preparation.reason === 'already_compacted' ? '刚压缩完成，尚无新内容。' : '没有可压缩的较早内容。' }
       } else {
@@ -1379,7 +1385,7 @@ export class AgentSession {
   private publish(change: ConversationUpdate['change'], run?: RunRecord, saveFailure?: SaveFailure, modelSelection?: ModelSelection) {
     if (run) this.state.runs = [...(this.state.runs ?? []).filter(item => item.id !== run.id), run]
     if (saveFailure) this.state.saveFailures = [...this.state.saveFailures ?? [], saveFailure]
-    const refresh = change.type !== 'notice' && change.type !== 'subagents' && (change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error' || change.event.type === 'replace')
+    const refresh = change.type !== 'nested-tool' && change.type !== 'notice' && change.type !== 'subagents' && (change.type !== 'model' || change.event.type === 'done' || change.event.type === 'error' || change.event.type === 'replace')
     if (refresh) this.refreshUsage()
     const update: ConversationUpdate = { seq: ++this.state.seq, change, ...(modelSelection && { modelSelection }), ...(run && { run }), ...(saveFailure && { saveFailure }), ...(refresh && { contextUsage: structuredClone(this.state.contextUsage) }) }
     for (const listener of this.listeners) listener(structuredClone(update))
@@ -1406,7 +1412,7 @@ export class AgentSession {
 
     const runtime = this.runtime
     this.cwd = cwd
-    const ctx = () => this.extensionContext(cwd, model, signal)
+    const ctx = (toolSignal = signal) => this.extensionContext(cwd, model, toolSignal)
     const runId = running.runId
     if (!scheduled && this.options.persistence && !this.options.persistence.summary.subagent && this.options.questionWait) tools = [...tools, createUserQuestionTool((input, context) =>
       this.waitForQuestion(input, runId, messageId, context.toolCallId, context.signal))]
@@ -1419,6 +1425,15 @@ export class AgentSession {
     const canWriteMemory = () => this.memoryEnabled && !this.toolDenial(MEMORY_TOOL_NAME, {}, Boolean(this.state.plan), false)
     const turnTools = memoryStore ? tools.map(tool => tool.name === 'read' ? protectMemoryRead(tool, cwd, memoryStore,
       () => ({ enabled: this.memoryEnabled, project: memoryProject })) : tool) : tools
+    const mcp = this.options.mcp
+    const discover = mcp && ((bindings: readonly CodingTool[]) => {
+      const policy = this.effectiveToolPolicy(Boolean(this.state.plan))
+      if (policy.readOnly || policy.planning || policy.unconfirmed) return []
+      const servers = new Map(mcp.listDiscoveryServers().map(server => [server.id, server]))
+      return bindings.flatMap(({ mcpBinding: binding }) => binding && mcp.isCurrentTool(binding)
+        ? [{ binding, namespace: servers.get(binding.serverId) }] : [])
+    })
+    const available = [...turnTools, createCodeModeTool(discover)]
     let roundTools = tools
     let roundPlanning = this.effectiveToolPolicy(Boolean(this.state.plan)).planning
     let leftPlan = false
@@ -1426,7 +1441,7 @@ export class AgentSession {
       const planning = this.effectiveToolPolicy(Boolean(this.state.plan)).planning
       if (roundPlanning && !planning) leftPlan = true
       roundPlanning = planning
-      roundTools = this.configure(cwd, this.availableTools([...turnTools, ...memoryTools], roundPlanning, scheduled), files, skills)
+      roundTools = this.configure(cwd, this.availableTools([...available, ...memoryTools], roundPlanning, scheduled), files, skills)
       if (systemPrompt !== undefined) this.configuration.systemPrompt = systemPrompt
       if (roundPlanning) this.configuration.systemPrompt += '\n\n' + planInstruction
       else if (leftPlan) this.configuration.systemPrompt += '\n\n用户已退出计划模式，当前采用普通模式。退出模式本身不表示用户已批准方案。'
@@ -1541,12 +1556,54 @@ export class AgentSession {
       return context
     }
 
-    const beforeToolCall: AgentRunInput['beforeToolCall'] = call => {
+    const beforeToolCall: AgentRunInput['beforeToolCall'] = (call, tool, nested) => {
+      if (nested && call.name === SUBAGENT_TOOL && (call.arguments.action !== 'run' || call.arguments.background !== false)) {
+        return { code: 'permission_denied', message: '脚本仅可通过 subagent 的 run 动作发起前台委派（background: false）。' }
+      }
+      const binding = (tool as CodingTool | undefined)?.mcpBinding
+      if (nested && binding && !mcp?.isCurrentTool(binding)) {
+        return { code: 'mcp_unavailable', message: 'MCP 工具当前不可用，请检查服务连接与权限。' }
+      }
       if (scheduled && call.name === CRONJOB_TOOL_NAME) return { code: 'permission_denied', message: '定时执行不能管理定时任务。' }
       if (memoryStore && (call.name === MEMORY_TOOL_NAME || call.name === MEMORY_SOURCE_TOOL_NAME) && !this.memoryEnabled) {
         return { code: 'permission_denied', message: '已关闭长期记忆，工具未执行。' }
       }
-      return this.toolDenial(call.name, call.arguments, roundPlanning, roundPlanning && call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
+      return this.toolDenial(call.name, call.arguments, nested ? Boolean(this.state.plan) : roundPlanning,
+        roundPlanning && call.name === 'bash' && roundTools.some(tool => tool.name === 'bash'))
+    }
+
+    const resolveNestedTools = (): CodingTool[] => {
+      const policy = this.effectiveToolPolicy(Boolean(this.state.plan))
+      if (policy.unconfirmed) return []
+      const excluded = new Set([CODEMODE_TOOL, MCP_TOOL_SEARCH_NAME, ASK_USER_QUESTION_TOOL_NAME, CRONJOB_TOOL_NAME, TEAM_TOOL])
+      const local = roundTools.filter(tool => !excluded.has(tool.name) && !tool.mcpBinding
+        && (!policy.readOnly || tool.name === SUBAGENT_TOOL || readOnlyTools.has(tool.name) || this.isMemorySourceTool(tool.name))
+        && (!policy.planning || tool.name === SUBAGENT_TOOL || planReadTools.has(tool.name) || this.isMemorySourceTool(tool.name)
+          || roundPlanning && tool.name === 'bash'))
+      if (!mcp || policy.readOnly || policy.planning) return local
+      const child = this.options.persistence?.summary.subagent
+      const bindings = mcp.listToolsForAgent().filter(binding => !child
+        || child.allowedTools.includes(binding.name) && child.mcpToolKeys?.includes(mcpToolKey(mcpToolIdentity(binding))))
+      return [...local, ...createMcpTools(local, bindings, mcp, (name, args) => {
+        const denial = this.toolDenial(name, args, Boolean(this.state.plan), false)
+        if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
+      })]
+    }
+    const saveNestedToolCheckpoint: NonNullable<AgentRunInput['saveNestedToolCheckpoint']> = checkpoint => {
+      const record: NestedToolCallRecord = {
+        ...summarizeNestedTool(checkpoint), runId, parent: { assistantMessageId: messageId, contentIndex: checkpoint.contentIndex },
+      }
+      try { this.save({ nestedToolCall: record }) }
+      catch (error) {
+        this.noteFailure(error, checkpoint.status === 'running' ? 'tool-call' : 'tool-result',
+          checkpoint.status !== 'running' ? record.parent : undefined)
+        throw error
+      }
+      const records = this.state.nestedToolCalls ??= []
+      const index = records.findIndex(item => item.id === record.id && item.parent.assistantMessageId === messageId)
+      if (index < 0) records.push(record)
+      else records[index] = record
+      this.publish({ type: 'nested-tool', record })
     }
 
     let preview: Pick<ConversationSnapshot, 'messages' | 'activeContent'> | undefined
@@ -1695,13 +1752,20 @@ export class AgentSession {
         if (this.options.persistence && project) memorySourceTool = createMemorySourceTool({ store: memoryStore, project,
           readSession: id => this.readMemorySession(memoryStore, project, id) })
       }
+      const hooks = runtime && toolHooks(runtime, ctx, runId, tool => Boolean((tool as CodingTool | undefined)?.preserveFailure))
       const options: Omit<AgentRunInput, 'context'> = {
         model, reasoningEffort, tools, signal, prepareContext, finalizeContext, afterStep: scheduled || !this.options.persistence ? undefined : afterStep, beforeToolCall,
+        resolveNestedTools, saveNestedToolCheckpoint,
+        prepareToolCall: hooks?.prepareToolCall ?? (async (call, tool, nested) => ({
+          arguments: call.arguments,
+          ...(nested && !(tool.validateArguments?.(call.arguments) ?? Check(tool.parameters, call.arguments))
+            && { denial: '工具参数不符合声明。' }),
+        })),
+        rewriteToolResult: hooks?.rewriteToolResult,
         resolveTools: () => roundTools, saveToolCheckpoint: this.options.persistence ? saveToolCheckpoint : undefined,
         ...(runtime && {
           observe: <K extends keyof ExtensionEvents>(type: K, event: ExtensionEvents[K]) =>
             runtime.has(type) ? runtime.emit(type, event, ctx(), runId) : undefined,
-          ...toolHooks(runtime, ctx, runId, call => roundTools.some(tool => tool.name === call.name && tool.preserveFailure)),
         }),
       }
       const nextInput = () => ({ ...options, context: this.context(), streamOptions: () => ({

@@ -13,7 +13,7 @@ import type { AgentInputSource, PendingSubmission, UserQuestionBatch } from './c
 import { ASK_USER_QUESTION_TOOL_NAME } from './user-question-tool.js'
 import type { ReferenceSource } from './session-references.js'
 import { numberedSessionTitle, temporarySessionTitle } from './session-title.js'
-import type { CompactionRecord, ConversationMessage, PlanState, RunRecord, SubmissionAccepted, SubmissionInput } from './types.js'
+import type { CompactionRecord, ConversationMessage, NestedToolCallRecord, PlanState, RunRecord, SubmissionAccepted, SubmissionInput } from './types.js'
 import { scheduleSchema, ScheduleStore, type ScheduledSubmission } from './schedule-store.js'
 import { readSubagent, subagentSchema, SubagentStore } from './subagent-store.js'
 import type { DelegatedItemWrite, Delegation } from './subagent-types.js'
@@ -26,6 +26,7 @@ export type SessionHistory = {
   summary: SessionSummary
   runs: StoredRun[]
   messages: ConversationMessage[]
+  nestedToolCalls?: NestedToolCallRecord[]
   compactions: CompactionRecord[]
   permissionMode: PermissionMode
   plan?: PlanState
@@ -50,6 +51,7 @@ type SessionWrite = {
   run?: StoredRun
   runId?: string
   messages?: ConversationMessage[]
+  nestedToolCall?: NestedToolCallRecord
   mcpToolLoads?: readonly McpToolIdentity[]
   compaction?: CompactionRecord
   modelSelection?: ModelSelection
@@ -115,6 +117,13 @@ const schema = `
     seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL,
     id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
     UNIQUE(session_id, id), FOREIGN KEY(session_id, run_id) REFERENCES runs(session_id, id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS nested_tool_calls (
+    seq INTEGER PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT NOT NULL, assistant_message_id TEXT NOT NULL,
+    content_index INTEGER NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
+    UNIQUE(session_id, assistant_message_id, content_index, id),
+    FOREIGN KEY(session_id, run_id) REFERENCES runs(session_id, id),
+    FOREIGN KEY(session_id, assistant_message_id) REFERENCES messages(session_id, id)
   ) STRICT;
   CREATE TABLE IF NOT EXISTS session_mcp_tool_loads (
     session_id TEXT NOT NULL, server_id TEXT NOT NULL, credential_ref TEXT NOT NULL, remote_tool_name TEXT NOT NULL,
@@ -243,7 +252,31 @@ export class SessionStore {
 
   close() { this.db.close() }
 
-  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, pending, questions, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand, scheduledSubmission, delegatedItem }: SessionWrite) {
+  private saveNestedToolCall(sessionId: string, runId: string | undefined, record: NestedToolCallRecord) {
+    const { assistantMessageId, contentIndex } = record.parent
+    const row = this.db.prepare('SELECT id, data FROM messages WHERE session_id = ? AND run_id = ? AND id = ?')
+      .get(sessionId, record.runId, assistantMessageId)
+    const message = row && parse<ConversationMessage>(row).message
+    const parent = message?.role === 'assistant' && message.content[contentIndex]
+    if (record.runId !== runId || !parent || parent.type !== 'toolCall' || parent.name !== 'codemode'
+      || !record.id.startsWith(parent.id + '/') || record.status === 'unknown') throw new Error('Invalid nested tool owner')
+    const key = [sessionId, assistantMessageId, contentIndex, record.id] as const
+    const prior = this.db.prepare(`SELECT id, data FROM nested_tool_calls
+      WHERE session_id = ? AND assistant_message_id = ? AND content_index = ? AND id = ?`).get(...key)
+    const encoded = JSON.stringify(record)
+    if (!prior && (record.status === 'running' || record.status === 'not-executed')) {
+      this.db.prepare(`INSERT INTO nested_tool_calls
+        (session_id, assistant_message_id, content_index, id, run_id, data) VALUES (?, ?, ?, ?, ?, ?)`).run(...key, record.runId, encoded)
+      return
+    }
+    const running = prior && parse<NestedToolCallRecord>(prior)
+    if (!running || record.status === 'running' || running.status !== 'running'
+      || running.name !== record.name) throw new Error('Invalid nested tool checkpoint')
+    this.db.prepare(`UPDATE nested_tool_calls SET data = ?
+      WHERE session_id = ? AND assistant_message_id = ? AND content_index = ? AND id = ?`).run(encoded, ...key)
+  }
+
+  save(sessionId: string, { summary, name, attachments, run, runId = run?.id, messages, nestedToolCall, pending, questions, mcpToolLoads, compaction, modelSelection, defaultSelection, permissionMode, plan, planCommand, scheduledSubmission, delegatedItem }: SessionWrite) {
     return this.write(() => {
       if (summary) {
         this.db.prepare('INSERT INTO sessions (id, workspaceId, name, createdAt) VALUES (?, ?, ?, ?)')
@@ -275,6 +308,7 @@ export class SessionStore {
         const insert = this.db.prepare('INSERT INTO messages (session_id, run_id, id, data) VALUES (?, ?, ?, ?)')
         for (const message of messages) insert.run(sessionId, runId!, message.id, JSON.stringify(storedMessage(message)))
       }
+      if (nestedToolCall) this.saveNestedToolCall(sessionId, runId, nestedToolCall)
       if (delegatedItem) {
         if (!run || run.id !== runId || run.sessionId !== sessionId) throw new Error('Invalid delegated run')
         this.subagents.writeItem(delegatedItem, run)
@@ -653,6 +687,22 @@ export class SessionStore {
         lastId = entry.id
         return restored
       })
+    const nestedToolCalls = this.db.prepare('SELECT * FROM nested_tool_calls WHERE session_id = ? ORDER BY seq')
+      .all(summary.id).map(row => {
+        const record = parse<NestedToolCallRecord>(row)
+        const owner = seen.get(String(row.assistant_message_id))
+        const parent = owner?.entry.message.role === 'assistant' && owner.entry.message.content[Number(row.content_index)]
+        if (!parent || parent.type !== 'toolCall' || parent.name !== 'codemode' || !record.id.startsWith(parent.id + '/')
+          || owner?.runId !== row.run_id || record.runId !== row.run_id || record.id !== row.id
+          || record.parent.assistantMessageId !== row.assistant_message_id || record.parent.contentIndex !== row.content_index
+          || !['running', 'succeeded', 'failed', 'not-executed', 'stopped'].includes(record.status)
+          || typeof record.name !== 'string' || !object(record.argumentsPreview) || !isJson(record.argumentsPreview)
+          || record.resultPreview !== undefined && typeof record.resultPreview !== 'string'
+          || record.fileOperation && (!['read', 'modified'].includes(record.fileOperation.kind) || typeof record.fileOperation.path !== 'string')) {
+          throw new Error('Invalid nested tool checkpoint')
+        }
+        return record.status === 'running' ? { ...record, status: 'unknown' as const } : record
+      })
     const compactions = this.db.prepare('SELECT id, run_id, data FROM compactions WHERE session_id = ? ORDER BY seq').all(summary.id)
       .map(row => {
         const item = parse<CompactionRecord>(row)
@@ -723,7 +773,7 @@ export class SessionStore {
           || !['waiting', 'answered', 'timed-out', 'closed', 'aborted'].includes(batch.status)) throw new Error('Invalid user question batch')
         return batch
       })
-    return { summary, runs, messages, compactions, permissionMode, ...(planCommands.length && { planCommands }),
+    return { summary, runs, messages, compactions, permissionMode, ...(nestedToolCalls.length && { nestedToolCalls }), ...(planCommands.length && { planCommands }),
       ...(modelSelection && { modelSelection }), ...(plan && { plan }), ...(pending.length && { pending }), ...(questions.length && { questions }) }
   }
 }

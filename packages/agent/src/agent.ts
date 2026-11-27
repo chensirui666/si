@@ -1,6 +1,8 @@
+import { createNestedToolRunner } from './nested-tools.js'
+import { isDeepStrictEqual } from 'node:util'
 import { stream } from '@agent-learning/model'
 import type { AssistantMessage, ModelContext, ModelInfo, ToolCall, ToolResultMessage } from '@agent-learning/model'
-import type { AgentEvent, AgentObservations, AgentResult, AgentRunInput } from './types.js'
+import type { AgentEvent, AgentObservations, AgentResult, AgentRunInput, ExecutableTool, NestedToolCheckpoint, NestedToolOutcome } from './types.js'
 
 export class Agent {
   private readonly listeners = new Set<(event: AgentEvent) => void>()
@@ -35,7 +37,7 @@ export class Agent {
   }
 
   private async loop({ model, reasoningEffort, context, tools = [], signal, prepareContext, finalizeContext, afterStep, beforeToolCall, saveToolCheckpoint, observe, userMessage, resolveTools, prepareToolCall,
-    rewriteToolResult, streamOptions }: AgentRunInput, messages: AgentObservations['agent_end']['messages']): Promise<AgentResult> {
+    rewriteToolResult, streamOptions, resolveNestedTools, saveNestedToolCheckpoint }: AgentRunInput, messages: AgentObservations['agent_end']['messages']): Promise<AgentResult> {
     if (tools.length) context = {
       ...context,
       tools: tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
@@ -101,8 +103,8 @@ export class Agent {
           this.emit(event)
           return event.result
         }
-        const execute = async ({ call, contentIndex }: typeof calls[number]) => {
-          signal.throwIfAborted()
+        const runTool = async (call: ToolCall, contentIndex: number, tool: ExecutableTool | undefined,
+          toolSignal: AbortSignal, nested = false): Promise<NestedToolOutcome> => {
           const truncated = response.stopReason === 'length'
           let output: string | ToolResultMessage['content']
           let isError = false
@@ -112,49 +114,80 @@ export class Agent {
           let actualArguments: ToolCall['arguments'] | undefined
           let prepared = call
           const identity = { toolCallId: call.id, toolName: call.name }
+          const nestedRunner = tool?.nestedExecution && !nested && resolveNestedTools
+            ? createNestedToolRunner(call.id, resolveNestedTools,
+              (child, binding, childSignal) => runTool(child, contentIndex, binding, childSignal, true))
+            : undefined
+          const saveNested = (checkpoint: Pick<NestedToolCheckpoint, 'arguments'> &
+            ({ status: 'running' } | { status: Exclude<NestedToolCheckpoint['status'], 'running'>; outcome: NestedToolOutcome })) =>
+            saveNestedToolCheckpoint?.({ contentIndex, id: call.id, name: call.name, ...checkpoint })
+          let savingStart = false
           if (observe) await observe('tool_execution_start', { ...identity, args: call.arguments })
           try {
-            if (signal.aborted) throw Object.assign(new Error('任务已取消，工具未执行。'), { code: 'interrupted' })
+            if (toolSignal.aborted) throw Object.assign(new Error('任务已取消，工具未执行。'), { code: 'interrupted' })
             if (truncated) throw new Error('本批工具未执行：本轮回复截断，请重新提供完整的工具调用。')
             if (call.argumentsError) throw new Error(call.argumentsError)
-            const tool = roundTools.find(({ name }) => name === call.name)
             if (!tool) {
-              const denied = beforeToolCall?.(call)
+              const denied = beforeToolCall?.(call, tool, nested)
               if (denied) throw Object.assign(new Error(denied.message), { code: denied.code })
               throw new Error(`未知工具：${call.name}`)
             }
             if (prepareToolCall) {
-              const decision = await prepareToolCall(call, tool)
-              if (signal.aborted) throw Object.assign(new Error('任务已取消，工具未执行。'), { code: 'interrupted' })
+              const decision = await prepareToolCall(call, tool, nested, toolSignal)
+              if (toolSignal.aborted) throw Object.assign(new Error('任务已取消，工具未执行。'), { code: 'interrupted' })
+              if (nested || decision.denial === undefined) prepared = { ...call, arguments: decision.arguments }
               if (decision.denial !== undefined) throw Object.assign(new Error(decision.denial), { code: 'hook_blocked' })
-              prepared = { ...call, arguments: decision.arguments }
               if (JSON.stringify(call.arguments) !== JSON.stringify(prepared.arguments)) actualArguments = prepared.arguments
             }
-            const denial = beforeToolCall?.(prepared)
+            const denial = beforeToolCall?.(prepared, tool, nested)
             if (denial) throw Object.assign(new Error(denial.message), { code: denial.code })
-            this.emit({ type: 'tool_start', contentIndex, ...(actualArguments && { actualArguments }) })
+            if (nested) {
+              savingStart = true
+              await saveNested({ status: 'running', arguments: prepared.arguments })
+              savingStart = false
+              toolSignal.throwIfAborted()
+              const latestDenial = beforeToolCall?.(prepared, tool, true)
+              if (latestDenial) throw Object.assign(new Error(latestDenial.message), { code: latestDenial.code })
+            } else this.emit({ type: 'tool_start', contentIndex, ...(actualArguments && { actualArguments }) })
             executed = true
             const toolOutput = await tool.execute(prepareToolCall ? structuredClone(prepared.arguments) : prepared.arguments,
-              { signal, toolCallId: call.id, contentIndex, recordDetails: detail => { details.push(detail) } })
+              { signal: nestedRunner ? AbortSignal.any([toolSignal, nestedRunner.signal]) : toolSignal, toolCallId: call.id, contentIndex, recordDetails: detail => { details.push(detail) },
+                ...(nested && { nestedToolCallId: call.id }), ...nestedRunner?.context })
             if (typeof toolOutput === 'string' || Array.isArray(toolOutput)) output = toolOutput
-            else ({ content: output, isError } = toolOutput)
+            else ({ content: output, isError, errorCode } = toolOutput)
           } catch (error) {
+            if (savingStart) throw error
             isError = true
             output = error instanceof Error ? error.message : '工具执行失败。'
+            if (toolSignal.aborted && error === toolSignal.reason) errorCode = 'interrupted'
             if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string') errorCode = error.code
           }
+          await nestedRunner?.finish()
           let result: ToolResultMessage = {
             role: 'toolResult', toolCallId: call.id, toolName: call.name,
             content: typeof output === 'string' ? [{ type: 'text', text: output }] : output, isError, timestamp: Date.now(),
           }
-          if (executed && rewriteToolResult) result = await rewriteToolResult(prepared, result)
+          const rawResult = result
+          if (executed && rewriteToolResult) result = await rewriteToolResult(prepared, result, tool, toolSignal)
+          const rewritten = nested && result !== rawResult && !isDeepStrictEqual(result, rawResult)
           if (executed && (actualArguments || result.isError !== isError)) {
             result = { ...result, content: [...result.content, { type: 'text', text:
               (actualArguments ? `实际工具参数：${JSON.stringify(actualArguments)}。` : '') + `最终状态：${result.isError ? '失败' : '成功'}。` }] }
           }
           if (observe) await observe('tool_execution_end', { ...identity, result, isError: result.isError })
-          return { type: 'tool_result' as const, contentIndex, result, details, executed, ...(errorCode && { errorCode }),
+          const outcome = { result, details, executed, rewritten, ...(errorCode && { errorCode }),
             ...(executed && actualArguments && { actualArguments }) }
+          if (nested) {
+            const status = !executed || errorCode === 'permission_denied' || errorCode === 'hook_blocked' || errorCode === 'mcp_unavailable' ? 'not-executed'
+              : !result.isError ? 'succeeded' : errorCode === 'interrupted' ? 'stopped' : 'failed'
+            await saveNested({ status, arguments: prepared.arguments, outcome })
+          }
+          return outcome
+        }
+        const execute = async ({ call, contentIndex }: typeof calls[number]) => {
+          signal.throwIfAborted()
+          const { rewritten: _rewritten, ...outcome } = await runTool(call, contentIndex, roundTools.find(tool => tool.name === call.name), signal)
+          return { type: 'tool_result' as const, contentIndex, ...outcome }
         }
         const results: ToolResultMessage[] = []
         if (calls.some(({ call }) => roundTools.find(tool => tool.name === call.name)?.executionMode === 'sequential')) {

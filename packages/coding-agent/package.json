@@ -19,6 +19,7 @@
     "@agent-learning/credentials": "0.1.0",
     "@agent-learning/mcp": "0.1.0",
     "@agent-learning/model": "0.1.0",
+    "@earendil-works/pi-codemode": "1.6.1",
     "ignore": "7.0.5",
     "jiti": "2.7.0",
     "sharp": "0.35.5",

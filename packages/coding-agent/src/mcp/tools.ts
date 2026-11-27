@@ -60,7 +60,7 @@ export function createMcpTools(local: CodingTool[], bindings: readonly McpToolBi
     tools.push({
       name, description: tool.description?.trim() || `远程 MCP 工具 ${tool.name}`,
       parameters: schema as unknown as Tool['parameters'],
-      preserveFailure: true,
+      preserveFailure: true, mcpBinding: binding,
       validateArguments: args => validateMcpArguments(tool.inputSchema, args),
       async execute(args, { signal }) {
         const result = await source.callTool(binding, args, signal, () => checkPermission(name, args))

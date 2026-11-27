@@ -40,7 +40,7 @@ export async function mcpTestServer(options: Pick<WebServerOptions, 'modelOption
   })
   try {
     const entry = await server.start()
-    return { ...entry, async close() {
+    return { ...entry, cwd, home: join(root, 'home'), async close() {
       try { await server.close() }
       finally { await rm(root, { recursive: true, force: true }) }
     } }
